@@ -430,11 +430,30 @@ fn split_into_regions(legacy: &LegacyCloudFormationState) -> CloudFormationAccou
             .events
             .insert(key.clone(), events.clone());
     }
+    // Policies are keyed by the stack's name. Older builds stored one under
+    // whatever `StackName` the caller passed (name or id) and never dropped it
+    // on delete, so: a deleted stack's policies are discarded (a later stack
+    // of that name starts without one), an id-keyed policy moves to its
+    // stack's name, and where a stack has both, the name-keyed one (what
+    // `GetStackPolicy` by name returned) wins.
+    let mut policies: Vec<(String, &String, bool)> = Vec::new();
     for (key, policy) in &state.stack_policies {
+        let by_id = state.stacks.values().find(|s| &s.stack_id == key);
+        let stack = by_id.or_else(|| state.stacks.get(key));
+        if stack.is_some_and(|s| s.status == "DELETE_COMPLETE") {
+            continue;
+        }
+        let name = by_id.map_or_else(|| key.clone(), |s| s.name.clone());
+        policies.push((name, policy, by_id.is_some()));
+    }
+    // Name-keyed entries first, so an id-keyed one never replaces them.
+    policies.sort_by_key(|(_, _, by_id)| *by_id);
+    for (name, policy, _) in policies {
         account
-            .region_mut(&region_of_stack_ref(key))
+            .region_mut(&region_of_stack_ref(&name))
             .stack_policies
-            .insert(key.clone(), policy.clone());
+            .entry(name)
+            .or_insert_with(|| policy.clone());
     }
     let mut export_regions: BTreeMap<&str, String> = BTreeMap::new();
     for (name, export) in &state.exports {
@@ -566,7 +585,10 @@ mod tests {
     fn v2_snapshot_migrates_records_into_their_regions() {
         let east_id = "arn:aws:cloudformation:us-east-1:111111111111:stack/east/1";
         let west_id = "arn:aws:cloudformation:eu-west-1:111111111111:stack/west/2";
+        let gone_id = "arn:aws:cloudformation:us-east-1:111111111111:stack/gone/3";
         let legacy_stack = |name: &str, id: &str| serde_json::to_value(stack(name, id)).unwrap();
+        let mut gone = stack("gone", gone_id);
+        gone.status = "DELETE_COMPLETE".to_string();
         let account = serde_json::json!({
             "account_id": "111111111111",
             "region": "us-east-1",
@@ -574,12 +596,21 @@ mod tests {
                 "east": legacy_stack("east", east_id),
                 "west": legacy_stack("west", west_id),
                 "unparseable": legacy_stack("unparseable", "not-an-arn"),
+                "gone": serde_json::to_value(&gone).unwrap(),
             },
             "events": {
                 east_id: [{"EventId": "e1"}],
                 west_id: [{"EventId": "w1"}],
             },
-            "stack_policies": {"west": "{}"},
+            // By name and by stack id as older builds stored them: east has
+            // both (the name-keyed one wins), a deleted stack's are dropped.
+            "stack_policies": {
+                "west": "{}",
+                east_id: "{\"by-id\":1}",
+                "east": "{\"by-name\":1}",
+                "gone": "{}",
+                gone_id: "{}",
+            },
             "exports": {
                 "WestExport": {
                     "value": "v",
@@ -643,11 +674,15 @@ mod tests {
         let mut east_stacks: Vec<&str> = east.stacks.keys().map(String::as_str).collect();
         east_stacks.sort_unstable();
         // A stack id that names no region falls back to the configured one.
-        assert_eq!(east_stacks, ["east", "unparseable"]);
+        assert_eq!(east_stacks, ["east", "gone", "unparseable"]);
         assert!(east.events.contains_key(east_id));
         assert!(east.exports.is_empty() && east.imports.is_empty());
         // A record with no ARN goes to the configured region.
         assert!(east.extras["hooks"].contains_key("My::Hook::Hook"));
+        assert_eq!(east.stack_policies["east"], "{\"by-name\":1}");
+        assert!(!east.stack_policies.contains_key(east_id));
+        assert!(!east.stack_policies.contains_key("gone"));
+        assert!(!east.stack_policies.contains_key(gone_id));
 
         let west = account.region("eu-west-1").unwrap();
         assert_eq!(west.region, "eu-west-1");

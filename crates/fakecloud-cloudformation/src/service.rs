@@ -2490,6 +2490,11 @@ impl CloudFormationService {
                         stack.status_reason = None;
                         stack.resources.clear();
                         stack.outputs.clear();
+                        // A deleted stack's policy goes with it; a later stack
+                        // of the same name starts without one. Only when this
+                        // call deleted the stack: a concurrent delete may have
+                        // finished first and the name been reused since.
+                        state.stack_policies.remove(&stack_name_for_notif);
                     }
                     // Drop this stack's exports + import-consumer entries.
                     let stale_exports: Vec<String> = state
@@ -3366,9 +3371,10 @@ impl AwsService for CloudFormationService {
         // malformed scalars.
         let params = Self::get_all_params(&req);
         crate::input_constraints::validate_input(&req.action, &params)?;
-        // Every operation that takes a stack reference has it resolved before
-        // its handler runs: a stack id becomes the live stack's name, so each
-        // handler looks stacks up by name alone.
+        // A stack id from another region or account addresses no stack this
+        // request can see; refuse it before any handler runs. Handlers then
+        // resolve the reference themselves, name or id, through
+        // `CloudFormationState::live_stack` under their own lock.
         if let Some(stack_ref) = params.get("StackName") {
             resolve_stack_ref(stack_ref, &req.account_id, &req.region)?;
         }
@@ -5537,6 +5543,17 @@ mod tests {
         .unwrap();
         ok("DeleteStack", &[]).await;
         assert!(described_contains(&svc, "app", "CREATE_COMPLETE"));
+        // The deleted stack's policy went with it.
+        let policy = body_of(
+            svc.handle(request_in(
+                "GetStackPolicy",
+                "us-east-1",
+                &[("StackName", "app")],
+            ))
+            .await
+            .unwrap(),
+        );
+        assert!(policy.contains("Update:*"), "{policy}");
         ok(
             "UpdateTerminationProtection",
             &[("EnableTerminationProtection", "true")],
