@@ -28,7 +28,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::extras::{looks_like_url, xml_response, xml_response_no_result};
 use crate::service::{AutoDeploymentClaim, CloudFormationService};
-use crate::state::CloudFormationState;
+use crate::state::{CloudFormationAccountState, CloudFormationState, RegionalAccounts};
 
 /// Service principal Organizations uses for StackSets trusted access and
 /// delegated administration.
@@ -238,14 +238,15 @@ const OPERATION_INTERRUPTED: &str = "The operation was interrupted by a restart"
 /// older builds, and settle operations that were still deploying when the
 /// process stopped. Nothing resumes those, so left RUNNING they would block
 /// every later operation on their stack set.
-pub fn restore_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>) {
+pub fn restore_stack_sets(accounts: &mut MultiAccountState<CloudFormationAccountState>) {
     migrate_legacy_stack_sets(accounts);
     let sets: Vec<(String, String)> = accounts
         .iter()
         .flat_map(|(account, state)| {
             state
-                .stack_sets
-                .keys()
+                .regions
+                .values()
+                .flat_map(|r| r.stack_sets.keys())
                 .map(move |id| (account.to_string(), id.clone()))
         })
         .collect();
@@ -255,7 +256,7 @@ pub fn restore_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>)
         CloudFormationService::refresh_stack_set(accounts, &account, &set_id);
         if let Some(set) = accounts
             .get_mut(&account)
-            .and_then(|s| s.stack_sets.get_mut(&set_id))
+            .and_then(|s| s.stack_set_mut(&set_id))
         {
             backfill_auto_deployment_targets(set);
             settle_interrupted_operations(set);
@@ -344,8 +345,14 @@ fn settle_interrupted_operations(set: &mut StackSet) {
 /// Move stack sets persisted by older builds, which kept a
 /// `{StackSetId, StackSetName, Status, TemplateBody}` JSON record in the
 /// generic `extras` store, into the typed store.
-fn migrate_legacy_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>) {
-    for (account_id, state) in accounts.iter_mut() {
+fn migrate_legacy_stack_sets(accounts: &mut MultiAccountState<CloudFormationAccountState>) {
+    let regional = accounts.iter_mut().flat_map(|(account_id, account)| {
+        account
+            .regions
+            .values_mut()
+            .map(move |state| (account_id, state))
+    });
+    for (account_id, state) in regional {
         let Some(legacy) = state.extras.remove("stack_sets") else {
             continue;
         };
@@ -1580,7 +1587,7 @@ impl CloudFormationService {
             Some(stack_id) => {
                 let accounts = self.state.read();
                 let stack = accounts
-                    .get(&admin)
+                    .regional(&admin, &req.region)
                     .and_then(|s| {
                         s.stacks
                             .values()
@@ -1643,7 +1650,7 @@ impl CloudFormationService {
             req.region
         );
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&admin);
+        let state = accounts.regional_mut(&admin, &req.region);
         if find_active(state, &name, Scope::Own).is_some() {
             return Err(aws_err(
                 StatusCode::CONFLICT,
@@ -1722,12 +1729,12 @@ impl CloudFormationService {
     /// Fold asynchronously-provisioning stacks' current status into the
     /// instances and operations of one stack set.
     fn refresh_stack_set(
-        accounts: &mut MultiAccountState<CloudFormationState>,
+        accounts: &mut MultiAccountState<CloudFormationAccountState>,
         admin: &str,
         set_id: &str,
     ) {
-        let running: Vec<(usize, String, String, Option<String>)> =
-            match accounts.get(admin).and_then(|s| s.stack_sets.get(set_id)) {
+        let running: Vec<(usize, String, String, String, Option<String>)> =
+            match accounts.get(admin).and_then(|s| s.stack_set(set_id)) {
                 Some(set) => set
                     .instances
                     .iter()
@@ -1737,6 +1744,7 @@ impl CloudFormationService {
                         Some((
                             idx,
                             i.account.clone(),
+                            i.region.clone(),
                             i.stack_id.clone()?,
                             i.last_operation_id.clone(),
                         ))
@@ -1745,8 +1753,8 @@ impl CloudFormationService {
                 None => return,
             };
         let mut outcomes = Vec::new();
-        for (idx, account, stack_id, op_id) in running {
-            let Some((status, reason)) = accounts.get(&account).and_then(|s| {
+        for (idx, account, region, stack_id, op_id) in running {
+            let Some((status, reason)) = accounts.regional(&account, &region).and_then(|s| {
                 s.stacks
                     .values()
                     .find(|st| st.stack_id == stack_id)
@@ -1771,7 +1779,7 @@ impl CloudFormationService {
         }
         let Some(set) = accounts
             .get_mut(admin)
-            .and_then(|s| s.stack_sets.get_mut(set_id))
+            .and_then(|s| s.stack_set_mut(set_id))
         else {
             return;
         };
@@ -1804,19 +1812,20 @@ impl CloudFormationService {
     fn read_stack_set(
         &self,
         admin: &str,
+        region: &str,
         name_or_id: &str,
         scope: Scope,
     ) -> Result<StackSet, AwsServiceError> {
         let mut accounts = self.state.write();
         let id = accounts
-            .get(admin)
+            .regional(admin, region)
             .and_then(|s| find_for_read(s, name_or_id, scope))
             .map(|s| s.stack_set_id.clone())
             .ok_or_else(|| stack_set_not_found(name_or_id))?;
         Self::refresh_stack_set(&mut accounts, admin, &id);
         accounts
             .get(admin)
-            .and_then(|s| s.stack_sets.get(&id))
+            .and_then(|s| s.stack_set(&id))
             .cloned()
             .ok_or_else(|| stack_set_not_found(name_or_id))
     }
@@ -1828,7 +1837,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         Ok(xml_response(
             "DescribeStackSet",
             stack_set_el(&set),
@@ -1846,7 +1855,7 @@ impl CloudFormationService {
         let mut sets: Vec<StackSet> = self
             .state
             .read()
-            .get(&admin)
+            .regional(&admin, &req.region)
             .map(|s| {
                 s.stack_sets
                     .values()
@@ -1964,7 +1973,7 @@ impl CloudFormationService {
         // Build the updated definition and resolve targets against a snapshot,
         // without holding the CloudFormation lock while Organizations and S3
         // are read. The snapshot is re-validated under the lock below.
-        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
+        let snapshot = self.active_snapshot(&admin, &req.region, &name, Scope::of(params))?;
         Self::check_can_start_operation(&snapshot, &op_id)?;
         let mut updated = snapshot.clone();
         if let Some(body) = new_template {
@@ -2097,7 +2106,7 @@ impl CloudFormationService {
             Self::refresh_stack_set(&mut accounts, &admin, &set_id);
             let current = accounts
                 .get(&admin)
-                .and_then(|s| s.stack_sets.get(&set_id))
+                .and_then(|s| s.stack_set(&set_id))
                 .filter(|s| s.status == "ACTIVE")
                 .ok_or_else(|| stack_set_not_found(&name))?;
             Self::check_not_stale(current, &snapshot)?;
@@ -2126,10 +2135,12 @@ impl CloudFormationService {
                     }
                 }
             }
-            accounts
-                .get_or_create(&admin)
-                .stack_sets
-                .insert(set_id.clone(), updated);
+            if let Some(slot) = accounts
+                .get_mut(&admin)
+                .and_then(|s| s.stack_set_mut(&set_id))
+            {
+                *slot = updated;
+            }
         }
 
         self.launch_operation(
@@ -2153,18 +2164,19 @@ impl CloudFormationService {
     fn active_snapshot(
         &self,
         admin: &str,
+        region: &str,
         name: &str,
         scope: Scope,
     ) -> Result<StackSet, AwsServiceError> {
         let mut accounts = self.state.write();
         let set_id = accounts
-            .get(admin)
+            .regional(admin, region)
             .and_then(|s| active_key(s, name, scope))
             .ok_or_else(|| stack_set_not_found(name))?;
         Self::refresh_stack_set(&mut accounts, admin, &set_id);
         accounts
             .get(admin)
-            .and_then(|s| s.stack_sets.get(&set_id))
+            .and_then(|s| s.stack_set(&set_id))
             .cloned()
             .ok_or_else(|| stack_set_not_found(name))
     }
@@ -2196,14 +2208,16 @@ impl CloudFormationService {
         // DeleteStackSet declares no not-found error; deleting a stack set that
         // does not exist is a no-op.
         let Some(set_id) = accounts
-            .get(&admin)
+            .regional(&admin, &req.region)
             .and_then(|s| active_key(s, &name, Scope::of(params)))
         else {
             return Ok(xml_response_no_result("DeleteStackSet", &req.request_id));
         };
         Self::refresh_stack_set(&mut accounts, &admin, &set_id);
-        let state = accounts.get_or_create(&admin);
-        let Some(set) = state.stack_sets.get_mut(&set_id) else {
+        let Some(set) = accounts
+            .get_mut(&admin)
+            .and_then(|s| s.stack_set_mut(&set_id))
+        else {
             return Ok(xml_response_no_result("DeleteStackSet", &req.request_id));
         };
         if set
@@ -2587,7 +2601,7 @@ impl CloudFormationService {
         Self::refresh_stack_set(&mut accounts, admin, &snapshot.stack_set_id);
         let set = accounts
             .get_mut(admin)
-            .and_then(|s| s.stack_sets.get_mut(&snapshot.stack_set_id))
+            .and_then(|s| s.stack_set_mut(&snapshot.stack_set_id))
             .filter(|s| s.status == "ACTIVE")
             .ok_or_else(|| stack_set_not_found(&snapshot.name))?;
         Self::check_not_stale(set, snapshot)?;
@@ -2636,7 +2650,7 @@ impl CloudFormationService {
         // Target resolution reads Organizations (and possibly S3) state, so it
         // runs against a snapshot of the stack set before the operation is
         // recorded under the CloudFormation lock.
-        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
+        let snapshot = self.active_snapshot(&admin, &req.region, &name, Scope::of(params))?;
         Self::check_overrides_declared(&snapshot, overrides.keys().cloned())?;
         let targets = self.resolve_new_targets(
             &snapshot,
@@ -2717,7 +2731,7 @@ impl CloudFormationService {
         });
         let overrides = overrides.transpose()?;
 
-        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
+        let snapshot = self.active_snapshot(&admin, &req.region, &name, Scope::of(params))?;
         if let Some(specs) = &overrides {
             Self::check_overrides_declared(
                 &snapshot,
@@ -2782,7 +2796,7 @@ impl CloudFormationService {
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
+        let snapshot = self.active_snapshot(&admin, &req.region, &name, Scope::of(params))?;
         let targets = self.existing_instance_targets(
             &snapshot,
             &req.account_id,
@@ -2887,7 +2901,7 @@ impl CloudFormationService {
             let accounts = self.state.read();
             accounts
                 .get(admin)
-                .and_then(|s| s.stack_sets.get(set_id))
+                .and_then(|s| s.stack_set(set_id))
                 .and_then(|set| set.operations.iter().find(|o| o.operation_id == op_id))
                 .map(|o| o.preferences.clone())
                 .unwrap_or_default()
@@ -2942,7 +2956,8 @@ impl CloudFormationService {
                                 id.clone(),
                                 applied.clone(),
                             );
-                            self.await_stack(&target.account, stack_id).await
+                            self.await_stack(&target.account, &target.region, stack_id)
+                                .await
                         }
                         _ => outcome,
                     };
@@ -2983,7 +2998,7 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         if let Some(op) = accounts
             .get_mut(admin)
-            .and_then(|s| s.stack_sets.get_mut(set_id))
+            .and_then(|s| s.stack_set_mut(set_id))
             .and_then(|set| set.operations.iter_mut().find(|o| o.operation_id == op_id))
         {
             settle_operation(op);
@@ -2993,10 +3008,10 @@ impl CloudFormationService {
     /// Wait for a stack that provisions in the background to reach a terminal
     /// status. Gives up after `STACK_WAIT_LIMIT`, leaving the target RUNNING
     /// for a later read of the stack set to settle.
-    async fn await_stack(&self, account: &str, stack_id: &str) -> Outcome {
+    async fn await_stack(&self, account: &str, region: &str, stack_id: &str) -> Outcome {
         let deadline = tokio::time::Instant::now() + STACK_WAIT_LIMIT;
         loop {
-            let outcome = match self.stack_status(account, stack_id) {
+            let outcome = match self.stack_status(account, region, stack_id) {
                 Some((_, status, reason)) => {
                     let action = if status.starts_with("UPDATE") {
                         "UPDATE"
@@ -3020,7 +3035,7 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         let Some(op) = accounts
             .get_mut(admin)
-            .and_then(|s| s.stack_sets.get_mut(set_id))
+            .and_then(|s| s.stack_set_mut(set_id))
             .and_then(|set| set.operations.iter_mut().find(|o| o.operation_id == op_id))
         else {
             return false;
@@ -3092,7 +3107,7 @@ impl CloudFormationService {
         self.state
             .read()
             .get(admin)
-            .and_then(|s| s.stack_sets.get(set_id))
+            .and_then(|s| s.stack_set(set_id))
             .and_then(|set| {
                 set.instances
                     .iter()
@@ -3104,9 +3119,10 @@ impl CloudFormationService {
     fn stack_status(
         &self,
         account: &str,
+        region: &str,
         stack_id_or_name: &str,
     ) -> Option<(String, String, Option<String>)> {
-        self.state.read().get(account).and_then(|s| {
+        self.state.read().regional(account, region).and_then(|s| {
             s.stacks
                 .values()
                 .filter(|st| st.stack_id == stack_id_or_name || st.name == stack_id_or_name)
@@ -3136,7 +3152,7 @@ impl CloudFormationService {
         let live_stack = existing
             .as_ref()
             .and_then(|i| i.stack_id.as_deref())
-            .and_then(|id| self.stack_status(&target.account, id))
+            .and_then(|id| self.stack_status(&target.account, &target.region, id))
             .filter(|(_, status, _)| status != "DELETE_COMPLETE");
 
         match action {
@@ -3157,7 +3173,7 @@ impl CloudFormationService {
                 if let Err(e) = self.delete_stack(&request).await {
                     return (Outcome::Failed(e.message()), Some(stack_id), None);
                 }
-                let outcome = match self.stack_status(&target.account, &stack_id) {
+                let outcome = match self.stack_status(&target.account, &target.region, &stack_id) {
                     Some((_, status, reason)) => {
                         stack_outcome("DELETE", &status, reason.as_deref())
                     }
@@ -3231,7 +3247,7 @@ impl CloudFormationService {
         if let Err(e) = self.create_stack(&request).await {
             return (Outcome::Failed(e.message()), None);
         }
-        match self.stack_status(&target.account, &stack_name) {
+        match self.stack_status(&target.account, &target.region, &stack_name) {
             Some((stack_id, status, reason)) => (
                 stack_outcome("CREATE", &status, reason.as_deref()),
                 Some(stack_id),
@@ -3263,7 +3279,7 @@ impl CloudFormationService {
         if let Err(e) = self.update_stack(&request).await {
             return (Outcome::Failed(e.message()), Some(stack_id.to_string()));
         }
-        let outcome = match self.stack_status(&target.account, stack_id) {
+        let outcome = match self.stack_status(&target.account, &target.region, stack_id) {
             Some((_, status, reason)) => stack_outcome("UPDATE", &status, reason.as_deref()),
             None => Outcome::Failed(format!("Stack [{stack_id}] does not exist")),
         };
@@ -3286,7 +3302,7 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         let Some(set) = accounts
             .get_mut(admin)
-            .and_then(|s| s.stack_sets.get_mut(set_id))
+            .and_then(|s| s.stack_set_mut(set_id))
         else {
             return;
         };
@@ -3410,7 +3426,7 @@ impl CloudFormationService {
         let account = required(params, "StackInstanceAccount")?;
         let region = required(params, "StackInstanceRegion")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         let instance = set
             .instances
             .iter()
@@ -3434,7 +3450,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         let mut filters: Vec<(String, String)> = Vec::new();
         for i in 1.. {
             let Some(filter_name) = params.get(&format!("Filters.member.{i}.Name")) else {
@@ -3489,7 +3505,7 @@ impl CloudFormationService {
         let name = required(params, "StackSetName")?;
         let op_id = required(params, "OperationId")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         let op = set
             .operations
             .iter()
@@ -3509,7 +3525,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         // Most recent first.
         let ops: Vec<&StackSetOperation> = set.operations.iter().rev().collect();
         let (page, next) = paginate(ops, params)?;
@@ -3533,7 +3549,7 @@ impl CloudFormationService {
         let name = required(params, "StackSetName")?;
         let op_id = required(params, "OperationId")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         let op = set
             .operations
             .iter()
@@ -3577,14 +3593,14 @@ impl CloudFormationService {
         let admin = self.stack_set_admin_account(req, params)?;
         let mut accounts = self.state.write();
         let set_id = accounts
-            .get(&admin)
+            .regional(&admin, &req.region)
             .and_then(|s| find_for_read(s, &name, Scope::of(params)))
             .map(|s| s.stack_set_id.clone())
             .ok_or_else(|| stack_set_not_found(&name))?;
         Self::refresh_stack_set(&mut accounts, &admin, &set_id);
         let op = accounts
             .get_mut(&admin)
-            .and_then(|s| s.stack_sets.get_mut(&set_id))
+            .and_then(|s| s.stack_set_mut(&set_id))
             .and_then(|set| set.operations.iter_mut().find(|o| o.operation_id == op_id))
             .ok_or_else(|| operation_not_found(&op_id))?;
         if op.status != "RUNNING" {
@@ -3611,7 +3627,7 @@ impl CloudFormationService {
         settle_operation(op);
         if let Some(set) = accounts
             .get_mut(&admin)
-            .and_then(|s| s.stack_sets.get_mut(&set_id))
+            .and_then(|s| s.stack_set_mut(&set_id))
         {
             for instance in &mut set.instances {
                 if instance.last_operation_id.as_deref() == Some(op_id.as_str())
@@ -3720,13 +3736,13 @@ impl CloudFormationService {
 
         let mut accounts = self.state.write();
         let set_id = accounts
-            .get(&admin)
+            .regional(&admin, &req.region)
             .and_then(|s| active_key(s, &name, Scope::of(params)))
             .ok_or_else(|| stack_set_not_found(&name))?;
         Self::refresh_stack_set(&mut accounts, &admin, &set_id);
         let set = accounts
             .get(&admin)
-            .and_then(|s| s.stack_sets.get(&set_id))
+            .and_then(|s| s.stack_set(&set_id))
             .cloned()
             .ok_or_else(|| stack_set_not_found(&name))?;
         Self::check_can_start_operation(&set, &op_id)?;
@@ -3748,7 +3764,7 @@ impl CloudFormationService {
         let mut new_instances = Vec::new();
         for (stack_id, account, region) in located {
             let stack = accounts
-                .get(&account)
+                .regional(&account, &region)
                 .and_then(|s| {
                     s.stacks
                         .values()
@@ -3773,13 +3789,16 @@ impl CloudFormationService {
                 None
             };
             let already_managed = accounts.iter().any(|(_, s)| {
-                s.stack_sets.values().any(|other| {
-                    other.status == "ACTIVE"
-                        && other
-                            .instances
-                            .iter()
-                            .any(|i| i.stack_id.as_deref() == Some(stack_id.as_str()))
-                })
+                s.regions
+                    .values()
+                    .flat_map(|r| r.stack_sets.values())
+                    .any(|other| {
+                        other.status == "ACTIVE"
+                            && other
+                                .instances
+                                .iter()
+                                .any(|i| i.stack_id.as_deref() == Some(stack_id.as_str()))
+                    })
             });
             let duplicate = set
                 .instances
@@ -3852,9 +3871,8 @@ impl CloudFormationService {
         op.status = settled_status(&op).to_string();
         op.ended_at = Some(Utc::now());
         let set = accounts
-            .get_or_create(&admin)
-            .stack_sets
-            .get_mut(&set_id)
+            .get_mut(&admin)
+            .and_then(|s| s.stack_set_mut(&set_id))
             .ok_or_else(|| stack_set_not_found(&name))?;
         // Adopted instances are deployments like any other: record the OUs
         // and regions they landed in, or auto-deployment would see them as
@@ -3929,7 +3947,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         let by_ou = if set.permission_model == "SERVICE_MANAGED" {
             set.auto_deployment_targets.clone()
         } else {
@@ -4046,8 +4064,9 @@ impl CloudFormationService {
                 .flat_map(|(admin, state)| {
                     let admin = admin.to_string();
                     state
-                        .stack_sets
+                        .regions
                         .values()
+                        .flat_map(|r| r.stack_sets.values())
                         .filter(|set| auto_deploys(set))
                         .map(move |set| (admin.clone(), set.stack_set_id.clone()))
                         .collect::<Vec<_>>()
@@ -4089,7 +4108,7 @@ impl CloudFormationService {
         Self::refresh_stack_set(&mut accounts, admin, set_id);
         accounts
             .get(admin)
-            .and_then(|s| s.stack_sets.get(set_id))
+            .and_then(|s| s.stack_set(set_id))
             .cloned()
     }
 
@@ -4102,7 +4121,7 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         accounts
             .get_mut(admin)
-            .and_then(|s| s.stack_sets.get_mut(set_id))
+            .and_then(|s| s.stack_set_mut(set_id))
             .map(f)
     }
 
@@ -4653,13 +4672,13 @@ impl CloudFormationService {
         let set = {
             let mut accounts = self.state.write();
             let set_id = accounts
-                .get(&admin)
+                .regional(&admin, &req.region)
                 .and_then(|s| active_key(s, &name, Scope::of(params)))
                 .ok_or_else(|| stack_set_not_found(&name))?;
             Self::refresh_stack_set(&mut accounts, &admin, &set_id);
             let set = accounts
                 .get(&admin)
-                .and_then(|s| s.stack_sets.get(&set_id))
+                .and_then(|s| s.stack_set(&set_id))
                 .cloned()
                 .ok_or_else(|| stack_set_not_found(&name))?;
             Self::check_can_start_drift(&set, &op_id)?;
@@ -4672,12 +4691,15 @@ impl CloudFormationService {
         let mut instance_drift: Vec<(String, String, String)> = Vec::new();
         for instance in &set.instances {
             let stack = instance.stack_id.as_ref().and_then(|id| {
-                self.state.read().get(&instance.account).and_then(|s| {
-                    s.stacks
-                        .values()
-                        .find(|st| &st.stack_id == id && st.status != "DELETE_COMPLETE")
-                        .cloned()
-                })
+                self.state
+                    .read()
+                    .regional(&instance.account, &instance.region)
+                    .and_then(|s| {
+                        s.stacks
+                            .values()
+                            .find(|st| &st.stack_id == id && st.status != "DELETE_COMPLETE")
+                            .cloned()
+                    })
             });
             let Some(stack) = stack else {
                 instance_drift.push((
@@ -4774,7 +4796,7 @@ impl CloudFormationService {
         Self::refresh_stack_set(&mut accounts, &admin, &set.stack_set_id);
         if let Some(stored) = accounts
             .get_mut(&admin)
-            .and_then(|s| s.stack_sets.get_mut(&set.stack_set_id))
+            .and_then(|s| s.stack_set_mut(&set.stack_set_id))
         {
             // Re-validate against what is stored now: another operation may
             // have started, or used this OperationId, while resources were
@@ -4811,7 +4833,7 @@ impl CloudFormationService {
         let region = required(params, "StackInstanceRegion")?;
         let op_id = required(params, "OperationId")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
+        let set = self.read_stack_set(&admin, &req.region, &name, Scope::of(params))?;
         let op = set
             .operations
             .iter()
@@ -4878,11 +4900,10 @@ mod tests {
     const TOPIC_TEMPLATE: &str = "Parameters:\n  Env:\n    Type: String\n    Default: dev\nResources:\n  T:\n    Type: AWS::SNS::Topic\n";
 
     fn service_with(deps: CloudFormationDeps) -> CloudFormationService {
-        let state: SharedCloudFormationState = Arc::new(RwLock::new(MultiAccountState::<
-            CloudFormationState,
-        >::new(
-            ADMIN, "us-east-1", ""
-        )));
+        let state: SharedCloudFormationState =
+            Arc::new(RwLock::new(
+                MultiAccountState::<CloudFormationAccountState>::new(ADMIN, "us-east-1", ""),
+            ));
         CloudFormationService::new(state, deps)
     }
 
@@ -4938,18 +4959,24 @@ mod tests {
     }
 
     fn stored_set(svc: &CloudFormationService, name: &str) -> StackSet {
+        stored_set_in(svc, "us-east-1", name)
+    }
+
+    fn stored_set_in(svc: &CloudFormationService, region: &str, name: &str) -> StackSet {
         svc.state
             .read()
-            .get(ADMIN)
+            .regional(ADMIN, region)
             .and_then(|s| find_active(s, name, Scope::Own))
             .cloned()
             .expect("stack set")
     }
 
     fn stack_of(svc: &CloudFormationService, account: &str, stack_id: &str) -> crate::state::Stack {
+        // An instance's stack lives in the region its stack id names.
+        let region = fakecloud_aws::arn::region_of(stack_id).expect("stack id is an ARN");
         svc.state
             .read()
-            .get(account)
+            .regional(account, region)
             .and_then(|s| {
                 s.stacks
                     .values()
@@ -5026,6 +5053,16 @@ mod tests {
                 Some("prod")
             );
             assert_eq!(stack.resources.len(), 1);
+            // The stack lives in the instance's region, and only there.
+            let accounts = svc.state.read();
+            let account = accounts.get(&instance.account).expect("account");
+            for (region, state) in &account.regions {
+                assert_eq!(
+                    state.stacks.values().any(|s| s.stack_id == stack_id),
+                    region == &instance.region,
+                    "{stack_id} in {region}"
+                );
+            }
         }
         // Each account got a queue per region, in that account.
         assert_eq!(queue_count(&svc, ACCT_B), 2);
@@ -5544,7 +5581,7 @@ mod tests {
         {
             let mut accounts = svc.state.write();
             let set = accounts
-                .get_or_create(ADMIN)
+                .regional_mut(ADMIN, "us-east-1")
                 .stack_sets
                 .values_mut()
                 .next()
@@ -5623,7 +5660,7 @@ mod tests {
         let stack_id = {
             let mut accounts = svc.state.write();
             let set = accounts
-                .get_or_create(ADMIN)
+                .regional_mut(ADMIN, "us-east-1")
                 .stack_sets
                 .values_mut()
                 .next()
@@ -5636,7 +5673,7 @@ mod tests {
             op.results[0].status = "RUNNING".to_string();
             let stack_id = set.instances[0].stack_id.clone().unwrap();
             let stack = accounts
-                .get_or_create(ACCT_B)
+                .regional_mut(ACCT_B, "us-east-1")
                 .stacks
                 .values_mut()
                 .find(|s| s.stack_id == stack_id)
@@ -5655,7 +5692,7 @@ mod tests {
         // The stack finishes: the next read reflects it.
         svc.state
             .write()
-            .get_or_create(ACCT_B)
+            .regional_mut(ACCT_B, "us-east-1")
             .stacks
             .values_mut()
             .find(|s| s.stack_id == stack_id)
@@ -5713,7 +5750,7 @@ mod tests {
         create.account_id = ADMIN.to_string();
         create.region = "cn-north-1".to_string();
         svc.handle(create).await.expect("CreateStackSet");
-        let set = stored_set(&svc, "cn-set");
+        let set = stored_set_in(&svc, "cn-north-1", "cn-set");
         assert!(
             set.arn
                 .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:stackset/cn-set:"),
@@ -5721,20 +5758,35 @@ mod tests {
             set.arn
         );
 
-        // Switching to SELF_MANAGED defaults the administration role in the
-        // stack set's partition, whichever region the update arrives in.
-        ok(
+        // A stack set lives in the region it was created in: another region
+        // does not see it.
+        let e = err(
             &svc,
+            "UpdateStackSet",
+            &[("StackSetName", "cn-set"), ("UsePreviousTemplate", "true")],
+        )
+        .await;
+        assert_eq!(e.code(), "StackSetNotFoundException");
+        let e = err(&svc, "DescribeStackSet", &[("StackSetName", "cn-set")]).await;
+        assert_eq!(e.code(), "StackSetNotFoundException");
+        let listed = ok(&svc, "ListStackSets", &[]).await;
+        assert!(!listed.contains("cn-set"), "{listed}");
+
+        // Switching to SELF_MANAGED defaults the administration role in the
+        // stack set's partition.
+        let mut update = req(
             "UpdateStackSet",
             &[
                 ("StackSetName", "cn-set"),
                 ("UsePreviousTemplate", "true"),
                 ("PermissionModel", "SELF_MANAGED"),
             ],
-        )
-        .await;
+        );
+        update.account_id = ADMIN.to_string();
+        update.region = "cn-north-1".to_string();
+        svc.handle(update).await.expect("UpdateStackSet");
         assert_eq!(
-            stored_set(&svc, "cn-set")
+            stored_set_in(&svc, "cn-north-1", "cn-set")
                 .administration_role_arn
                 .as_deref(),
             Some("arn:aws-cn:iam::000000000000:role/AWSCloudFormationStackSetAdministrationRole")
@@ -6231,7 +6283,11 @@ mod tests {
         // the delete fails and the instance stays INOPERABLE.
         {
             let mut accounts = svc.state.write();
-            for stack in accounts.get_or_create(ACCT_B).stacks.values_mut() {
+            for stack in accounts
+                .regional_mut(ACCT_B, "us-east-1")
+                .stacks
+                .values_mut()
+            {
                 stack.enable_termination_protection = true;
             }
         }
@@ -6390,7 +6446,11 @@ mod tests {
         {
             let mut accounts = svc.state.write();
             for account in [ACCT_B, ACCT_C] {
-                for stack in accounts.get_or_create(account).stacks.values_mut() {
+                for stack in accounts
+                    .regional_mut(account, "us-east-1")
+                    .stacks
+                    .values_mut()
+                {
                     stack.enable_termination_protection = true;
                 }
             }
@@ -6922,7 +6982,8 @@ mod tests {
 
     #[test]
     fn restoring_a_stack_set_ignores_refused_imports() {
-        let mut accounts = MultiAccountState::<CloudFormationState>::new(ADMIN, "us-east-1", "");
+        let mut accounts =
+            MultiAccountState::<CloudFormationAccountState>::new(ADMIN, "us-east-1", "");
         let set = StackSet {
             stack_set_id: "org:1".to_string(),
             name: "org".to_string(),
@@ -6976,12 +7037,12 @@ mod tests {
             created_at: Utc::now(),
         };
         accounts
-            .get_or_create(ADMIN)
+            .regional_mut(ADMIN, "us-east-1")
             .stack_sets
             .insert(set.stack_set_id.clone(), set);
 
         restore_stack_sets(&mut accounts);
-        let set = &accounts.get(ADMIN).unwrap().stack_sets["org:1"];
+        let set = &accounts.regional(ADMIN, "us-east-1").unwrap().stack_sets["org:1"];
         assert!(set.auto_deployment_targets.contains_key("ou-kept"));
         assert!(
             !set.auto_deployment_targets.contains_key("ou-refused"),
@@ -8083,7 +8144,7 @@ mod tests {
             // itself finished before the restart.
             let mut accounts = svc.state.write();
             let set = accounts
-                .get_or_create(ADMIN)
+                .regional_mut(ADMIN, "us-east-1")
                 .stack_sets
                 .values_mut()
                 .next()
@@ -8147,7 +8208,7 @@ mod tests {
         {
             let mut accounts = svc.state.write();
             let set = accounts
-                .get_or_create(ADMIN)
+                .regional_mut(ADMIN, "us-east-1")
                 .stack_sets
                 .values_mut()
                 .next()

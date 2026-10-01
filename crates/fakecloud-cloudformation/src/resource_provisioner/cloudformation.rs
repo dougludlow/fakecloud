@@ -4,6 +4,7 @@
 //! `cloudformation`.
 
 use super::*;
+use crate::state::RegionalAccounts;
 
 impl ResourceProvisioner {
     // --- CloudFormation Nested Stack ---
@@ -189,7 +190,7 @@ impl ResourceProvisioner {
 
         {
             let mut accounts = self.cloudformation_state.write();
-            let state = accounts.get_or_create(&self.account_id);
+            let state = accounts.regional_mut(&self.account_id, &self.region);
             state.stacks.insert(child_stack_name.clone(), stack);
 
             crate::service::record_stack_status_event(
@@ -236,7 +237,7 @@ impl ResourceProvisioner {
     pub(super) fn delete_cloudformation_stack(&self, physical_id: &str) -> Result<(), String> {
         let stack = {
             let accounts = self.cloudformation_state.read();
-            let state = accounts.get(&self.account_id);
+            let state = accounts.regional(&self.account_id, &self.region);
             state.and_then(|s| {
                 s.stacks
                     .values()
@@ -258,7 +259,7 @@ impl ResourceProvisioner {
 
             {
                 let mut accounts = self.cloudformation_state.write();
-                let state = accounts.get_or_create(&self.account_id);
+                let state = accounts.regional_mut(&self.account_id, &self.region);
                 state.stacks.remove(&stack_name);
 
                 crate::service::record_stack_status_event(
@@ -287,7 +288,7 @@ impl ResourceProvisioner {
         attribute: &str,
     ) -> Option<String> {
         let accounts = self.cloudformation_state.read();
-        let state = accounts.get(&self.account_id)?;
+        let state = accounts.regional(&self.account_id, &self.region)?;
         let stack = state.stacks.values().find(|s| s.stack_id == physical_id)?;
 
         if let Some(output_key) = attribute.strip_prefix("Outputs.") {

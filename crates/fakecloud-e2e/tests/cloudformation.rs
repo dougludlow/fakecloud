@@ -887,16 +887,17 @@ async fn s3_bucket_endpoint_attributes_follow_region() {
     ] {
         let cfg = server.aws_config_in(region).await;
         let cfn = aws_sdk_cloudformation::Client::new(&cfg);
-        let stack_name = format!("s3-endpoints-{region}");
+        // The same stack name in every region: stacks are regional.
+        let stack_name = "s3-endpoints";
         cfn.create_stack()
-            .stack_name(&stack_name)
+            .stack_name(stack_name)
             .template_body(template)
             .send()
             .await
             .unwrap_or_else(|e| panic!("create_stack in {region}: {e:?}"));
         let described = cfn
             .describe_stacks()
-            .stack_name(&stack_name)
+            .stack_name(stack_name)
             .send()
             .await
             .expect("describe_stacks");

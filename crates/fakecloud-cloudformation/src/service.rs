@@ -21,8 +21,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::resource_provisioner::ResourceProvisioner;
 use crate::state;
 use crate::state::{
-    CloudFormationSnapshot, CloudFormationState, SharedCloudFormationState, Stack, StackResource,
-    CLOUDFORMATION_SNAPSHOT_SCHEMA_VERSION,
+    CloudFormationSnapshot, CloudFormationState, RegionalAccounts, SharedCloudFormationState,
+    Stack, StackResource, CLOUDFORMATION_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::template;
 use crate::xml_responses;
@@ -728,6 +728,7 @@ struct CreateStackContext {
     snapshot_hooks: BTreeMap<&'static str, SnapshotHook>,
     provisioner: ResourceProvisioner,
     account_id: String,
+    region: String,
     stack_name: String,
     stack_id: String,
     template_body: String,
@@ -1584,18 +1585,19 @@ impl CloudFormationService {
         }
     }
 
-    /// Build a Fn::ImportValue lookup map from the account-level
-    /// `state.exports` registry. `skip_stack` removes any export owned by
-    /// the named stack — used during update so a stack doesn't import its
-    /// own previous-revision export.
+    /// Build a Fn::ImportValue lookup map from the `state.exports` registry
+    /// of one account and region: exports never resolve across regions.
+    /// `skip_stack` removes any export owned by the named stack — used during
+    /// update so a stack doesn't import its own previous-revision export.
     pub(crate) fn collect_account_imports(
         state: &SharedCloudFormationState,
         account_id: &str,
+        region: &str,
         skip_stack: Option<&str>,
     ) -> BTreeMap<String, String> {
         let mut imports = BTreeMap::new();
         let accounts = state.read();
-        let Some(state) = accounts.get(account_id) else {
+        let Some(state) = accounts.regional(account_id, region) else {
             return imports;
         };
         for (name, export) in &state.exports {
@@ -1620,6 +1622,7 @@ impl CloudFormationService {
     fn validate_import_values(
         state: &SharedCloudFormationState,
         account_id: &str,
+        region: &str,
         stack_name: &str,
         template_body: &str,
         parameters: &BTreeMap<String, String>,
@@ -1628,7 +1631,7 @@ impl CloudFormationService {
             return Ok(Vec::new());
         };
         let names = template::collect_import_value_names(&value, parameters);
-        let known = Self::collect_account_imports(state, account_id, Some(stack_name));
+        let known = Self::collect_account_imports(state, account_id, region, Some(stack_name));
         for n in &names {
             if !known.contains_key(n) {
                 // CreateStack and UpdateStack both declare
@@ -1702,6 +1705,8 @@ impl CloudFormationService {
         parameters: &BTreeMap<String, String>,
         resources: &[StackResource],
         state: &SharedCloudFormationState,
+        account_id: &str,
+        region: &str,
     ) -> Vec<state::StackOutput> {
         let Ok(value) = fakecloud_core::cfn_template::parse_template_body(template_body) else {
             return Vec::new();
@@ -1719,18 +1724,9 @@ impl CloudFormationService {
             attributes.insert(r.logical_id.clone(), r.attributes.clone());
         }
 
-        let imports = {
-            let accounts = state.read();
-            let mut out = BTreeMap::new();
-            // Walk every account so cross-stack imports work even if
-            // future use-cases serve mixed accounts.
-            for (_account, st) in accounts.iter() {
-                for (name, export) in &st.exports {
-                    out.insert(name.clone(), export.value.clone());
-                }
-            }
-            out
-        };
+        // `Fn::ImportValue` in an output resolves against the exports of the
+        // stack's own account and region, as everywhere else in a template.
+        let imports = Self::collect_account_imports(state, account_id, region, None);
 
         let parsed = match template::parse_outputs(
             &value,
@@ -1760,10 +1756,11 @@ impl CloudFormationService {
     fn ensure_export_uniqueness(
         state: &SharedCloudFormationState,
         account_id: &str,
+        region: &str,
         stack_name: &str,
         outputs: &[state::StackOutput],
     ) -> Result<(), AwsServiceError> {
-        let existing = Self::collect_account_imports(state, account_id, Some(stack_name));
+        let existing = Self::collect_account_imports(state, account_id, region, Some(stack_name));
         for o in outputs {
             if let Some(export) = &o.export_name {
                 if existing.contains_key(export) {
@@ -1803,7 +1800,9 @@ impl CloudFormationService {
         {
             let accounts = self.state.read();
             let empty = CloudFormationState::new(&req.account_id, &req.region);
-            let state = accounts.get(&req.account_id).unwrap_or(&empty);
+            let state = accounts
+                .regional(&req.account_id, &req.region)
+                .unwrap_or(&empty);
             if let Some(existing) = state.stacks.get(stack_name.as_str()) {
                 if existing.status != "DELETE_COMPLETE" {
                     return Err(AwsServiceError::aws_error(
@@ -1954,6 +1953,7 @@ impl CloudFormationService {
         let imported_names = Self::validate_import_values(
             &self.state,
             &req.account_id,
+            &req.region,
             stack_name,
             template_body,
             &parameters,
@@ -1967,7 +1967,7 @@ impl CloudFormationService {
         // already happened above and still surfaces as a synchronous error.
         {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             state.stacks.insert(
                 stack_name.clone(),
                 Stack {
@@ -2004,6 +2004,7 @@ impl CloudFormationService {
             snapshot_hooks: self.snapshot_hooks.clone(),
             provisioner: self.provisioner(&stack_id, &req.account_id, &req.region),
             account_id: req.account_id.clone(),
+            region: req.region.clone(),
             stack_name: stack_name.clone(),
             stack_id: stack_id.clone(),
             template_body: template_body.clone(),
@@ -2075,6 +2076,7 @@ impl CloudFormationService {
             snapshot_hooks,
             provisioner,
             account_id,
+            region,
             stack_name,
             stack_id,
             template_body,
@@ -2100,7 +2102,8 @@ impl CloudFormationService {
             // Cross-stack exports this account already published, so a resource
             // property using `Fn::ImportValue` resolves to the real value
             // instead of an empty string (bug-audit 2026-06-20, 1.5).
-            let imports = Self::collect_account_imports(&state, &account_id, Some(&stack_name));
+            let imports =
+                Self::collect_account_imports(&state, &account_id, &region, Some(&stack_name));
             tokio::task::spawn_blocking(move || {
                 provision_stack_resources(
                     &provisioner,
@@ -2128,6 +2131,7 @@ impl CloudFormationService {
                     &state,
                     &delivery,
                     &account_id,
+                    &region,
                     &stack_name,
                     &stack_id,
                     &notification_arns,
@@ -2145,17 +2149,25 @@ impl CloudFormationService {
         // container is up (the #1539/#1730 timeout lesson).
         backing_handles.spawn_container_intents(std::mem::take(&mut *container_spawns.lock()));
 
-        let outputs =
-            Self::resolve_template_outputs(&template_body, &parameters, &resources, &state);
+        let outputs = Self::resolve_template_outputs(
+            &template_body,
+            &parameters,
+            &resources,
+            &state,
+            &account_id,
+            &region,
+        );
 
         // Export-name collisions surface as a failed create (the stack is
         // already inserted, so this can no longer be a synchronous error).
-        if let Err(err) = Self::ensure_export_uniqueness(&state, &account_id, &stack_name, &outputs)
+        if let Err(err) =
+            Self::ensure_export_uniqueness(&state, &account_id, &region, &stack_name, &outputs)
         {
             Self::mark_create_failed(
                 &state,
                 &delivery,
                 &account_id,
+                &region,
                 &stack_name,
                 &stack_id,
                 &notification_arns,
@@ -2167,7 +2179,7 @@ impl CloudFormationService {
 
         {
             let mut accounts = state.write();
-            let st = accounts.get_or_create(&account_id);
+            let st = accounts.regional_mut(&account_id, &region);
             if let Some(stack) = st.stacks.get_mut(&stack_name) {
                 stack.status = "CREATE_COMPLETE".to_string();
                 stack.status_reason = None;
@@ -2210,7 +2222,7 @@ impl CloudFormationService {
         // inserted into `state` during provisioning, so they are visible here.
         let touched_types: Vec<String> = {
             let accounts = state.read();
-            let cfn_state = accounts.get(&account_id);
+            let cfn_state = accounts.regional(&account_id, &region);
             let mut types = Vec::new();
             if let Some(cfn_state) = cfn_state {
                 for r in &resources {
@@ -2239,10 +2251,12 @@ impl CloudFormationService {
     /// Roll a stack into CREATE_FAILED, record the lifecycle event, and
     /// notify subscribers. Used by the async provisioning task on a
     /// provisioning error or export collision.
+    #[allow(clippy::too_many_arguments)]
     fn mark_create_failed(
         state: &SharedCloudFormationState,
         delivery: &DeliveryBus,
         account_id: &str,
+        region: &str,
         stack_name: &str,
         stack_id: &str,
         notification_arns: &[String],
@@ -2251,7 +2265,7 @@ impl CloudFormationService {
         tracing::warn!(%stack_name, %reason, "CreateStack provisioning failed");
         {
             let mut accounts = state.write();
-            let st = accounts.get_or_create(account_id);
+            let st = accounts.regional_mut(account_id, region);
             if let Some(stack) = st.stacks.get_mut(stack_name) {
                 stack.status = "CREATE_FAILED".to_string();
                 stack.status_reason = Some(reason.to_string());
@@ -2294,7 +2308,7 @@ impl CloudFormationService {
         let mut deleted_types: Vec<String> = Vec::new();
         {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
 
             // Find stack by name or stack ID
             let stack = state.stacks.values_mut().find(|s| {
@@ -2403,7 +2417,7 @@ impl CloudFormationService {
 
                 // Re-acquire the write lock to update stack status
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&req.account_id);
+                let state = accounts.regional_mut(&req.account_id, &req.region);
                 if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id) {
                     stack.status = "DELETE_COMPLETE".to_string();
                     // The reason belonged to the previous status (a failed
@@ -2461,7 +2475,9 @@ impl CloudFormationService {
 
         let accounts = self.state.read();
         let empty = CloudFormationState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let stacks: Vec<Stack> = if let Some(ref name) = stack_name {
             state
                 .stacks
@@ -2509,7 +2525,9 @@ impl CloudFormationService {
     fn list_stacks(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
         let empty = CloudFormationState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let stacks: Vec<Stack> = state.stacks.values().cloned().collect();
 
         Ok(AwsResponse::xml(
@@ -2534,7 +2552,9 @@ impl CloudFormationService {
 
         let accounts = self.state.read();
         let empty = CloudFormationState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let resources = state
             .stacks
             .values()
@@ -2557,7 +2577,9 @@ impl CloudFormationService {
 
         let accounts = self.state.read();
         let empty = CloudFormationState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let (resources, resolved_name) = state
             .stacks
             .values()
@@ -2587,7 +2609,9 @@ impl CloudFormationService {
         let (found_stack_id, resolved_stack_name, previous_template, previous_parameters) = {
             let accounts = self.state.read();
             let empty = CloudFormationState::new(&req.account_id, &req.region);
-            let state = accounts.get(&req.account_id).unwrap_or(&empty);
+            let state = accounts
+                .regional(&req.account_id, &req.region)
+                .unwrap_or(&empty);
             state
                 .stacks
                 .values()
@@ -2695,11 +2719,13 @@ impl CloudFormationService {
         // report UPDATE_* where it owes CREATE_*.
         let in_review = !found_stack_id.is_empty() && {
             let accounts = self.state.read();
-            accounts.get(&req.account_id).is_some_and(|s| {
-                s.stacks
-                    .values()
-                    .any(|st| st.stack_id == found_stack_id && st.status == "REVIEW_IN_PROGRESS")
-            })
+            accounts
+                .regional(&req.account_id, &req.region)
+                .is_some_and(|s| {
+                    s.stacks.values().any(|st| {
+                        st.stack_id == found_stack_id && st.status == "REVIEW_IN_PROGRESS"
+                    })
+                })
         };
         if in_review {
             // Skipping the metadata branch is not enough: the normal path
@@ -2725,16 +2751,18 @@ impl CloudFormationService {
         // are exactly the states this is meant to exclude.
         let completed = {
             let accounts = self.state.read();
-            accounts.get(&req.account_id).is_some_and(|s| {
-                s.stacks.values().any(|st| {
-                    st.stack_id == found_stack_id
-                        && matches!(st.status.as_str(), "CREATE_COMPLETE" | "UPDATE_COMPLETE")
+            accounts
+                .regional(&req.account_id, &req.region)
+                .is_some_and(|s| {
+                    s.stacks.values().any(|st| {
+                        st.stack_id == found_stack_id
+                            && matches!(st.status.as_str(), "CREATE_COMPLETE" | "UPDATE_COMPLETE")
+                    })
                 })
-            })
         };
         if input.template_body.trim().is_empty() && !found_stack_id.is_empty() && completed {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if let Some(stack) = state
                 .stacks
                 .values_mut()
@@ -2848,7 +2876,7 @@ impl CloudFormationService {
             let existing: Vec<String> = {
                 let accounts = self.state.read();
                 accounts
-                    .get(&req.account_id)
+                    .regional(&req.account_id, &req.region)
                     .and_then(|s| {
                         s.stacks
                             .values()
@@ -2904,6 +2932,7 @@ impl CloudFormationService {
         let imported_names = Self::validate_import_values(
             &self.state,
             &req.account_id,
+            &req.region,
             &input.stack_name,
             &input.template_body,
             &input.parameters,
@@ -2922,10 +2951,13 @@ impl CloudFormationService {
                 &input.parameters,
                 &[],
                 &self.state,
+                &req.account_id,
+                &req.region,
             );
             Self::ensure_export_uniqueness(
                 &self.state,
                 &req.account_id,
+                &req.region,
                 &export_owner_name,
                 &pre_outputs,
             )?;
@@ -2941,8 +2973,12 @@ impl CloudFormationService {
         // Cross-stack exports for `Fn::ImportValue` in resource properties (1.5).
         // Computed before the write lock (collect_account_imports takes a read
         // lock and returns an owned map).
-        let imports =
-            Self::collect_account_imports(&self.state, &req.account_id, Some(&input.stack_name));
+        let imports = Self::collect_account_imports(
+            &self.state,
+            &req.account_id,
+            &req.region,
+            Some(&input.stack_name),
+        );
 
         // All `RwLockWriteGuard` work happens inside this block so the (non-Send)
         // guard is released before the persist `.await` below, keeping the
@@ -2950,7 +2986,7 @@ impl CloudFormationService {
         // needs, including the resource types touched by the update.
         let (touched_types, stack_id, stack_name_for_notif, notification_arns, resources_snapshot) = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             // UpdateStack declares only `InsufficientCapabilitiesException` and
             // `TokenAlreadyExistsException` -- neither describes a missing stack.
             // Real AWS returns `ValidationError` for this case, but that wire
@@ -3140,6 +3176,8 @@ impl CloudFormationService {
             &input.parameters,
             &resources_snapshot,
             &self.state,
+            &req.account_id,
+            &req.region,
         );
         // The stack was already flipped to UPDATE_COMPLETE above, so a
         // collision here would leave it reporting success with no reason while
@@ -3153,13 +3191,14 @@ impl CloudFormationService {
         if let Err(err) = Self::ensure_export_uniqueness(
             &self.state,
             &req.account_id,
+            &req.region,
             &export_owner_name,
             &outputs,
         ) {
             let reason = err.message();
             {
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&req.account_id);
+                let state = accounts.regional_mut(&req.account_id, &req.region);
                 if let Some(stack) = state
                     .stacks
                     .values_mut()
@@ -3203,7 +3242,7 @@ impl CloudFormationService {
         }
         {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if let Some(stack) = state
                 .stacks
                 .values_mut()
@@ -3244,7 +3283,9 @@ impl CloudFormationService {
 
         let accounts = self.state.read();
         let empty = CloudFormationState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         // Stack-not-found has no declared shape on GetTemplate
         // (`ChangeSetNotFoundException` is the only declared error). Return
         // an empty template body rather than emit an undeclared
@@ -3991,15 +4032,13 @@ mod tests {
         // its own export and report "already exported by another stack" for a
         // valid no-op update.
         let state: SharedCloudFormationState = Arc::new(RwLock::new(
-            fakecloud_core::multi_account::MultiAccountState::<CloudFormationState>::new(
-                "123456789012",
-                "us-east-1",
-                "",
-            ),
+            fakecloud_core::multi_account::MultiAccountState::<
+                crate::state::CloudFormationAccountState,
+            >::new("123456789012", "us-east-1", ""),
         ));
         {
             let mut accounts = state.write();
-            let st = accounts.get_or_create("123456789012");
+            let st = accounts.regional_mut("123456789012", "us-east-1");
             st.exports.insert(
                 "shared-arn".to_string(),
                 crate::state::StackExport {
@@ -4015,6 +4054,7 @@ mod tests {
         assert!(CloudFormationService::collect_account_imports(
             &state,
             "123456789012",
+            "us-east-1",
             Some("other")
         )
         .contains_key("shared-arn"));
@@ -4024,8 +4064,13 @@ mod tests {
             "arn:aws:cloudformation:us-east-1:123456789012:stack/s/abc",
         ] {
             assert!(
-                !CloudFormationService::collect_account_imports(&state, "123456789012", Some(own))
-                    .contains_key("shared-arn"),
+                !CloudFormationService::collect_account_imports(
+                    &state,
+                    "123456789012",
+                    "us-east-1",
+                    Some(own)
+                )
+                .contains_key("shared-arn"),
                 "a stack must skip its own export when addressed as {own}"
             );
         }
@@ -4514,7 +4559,7 @@ mod tests {
         // terminal status real CloudFormation lands on after a failed
         // update attempt that gets rolled back.
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").unwrap();
+        let state = accounts.regional("123456789012", "us-east-1").unwrap();
         let stack = state.stacks.get("test-stack").unwrap();
         assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
     }
@@ -4550,7 +4595,7 @@ mod tests {
 
         // Verify both resources were created
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").unwrap();
+        let state = accounts.regional("123456789012", "us-east-1").unwrap();
         let stack = state.stacks.get("ref-stack").unwrap();
         assert_eq!(stack.resources.len(), 2);
         assert_eq!(stack.status, "CREATE_COMPLETE");
@@ -4606,7 +4651,7 @@ mod tests {
         {
             let accounts = svc.state.read();
             let stack = accounts
-                .get("123456789012")
+                .regional("123456789012", "us-east-1")
                 .unwrap()
                 .stacks
                 .get("async-stack")
@@ -4625,7 +4670,7 @@ mod tests {
             {
                 let accounts = svc.state.read();
                 if let Some(stack) = accounts
-                    .get("123456789012")
+                    .regional("123456789012", "us-east-1")
                     .and_then(|s| s.stacks.get("async-stack"))
                 {
                     status = stack.status.clone();
@@ -4643,7 +4688,7 @@ mod tests {
 
         let accounts = svc.state.read();
         let stack = accounts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .stacks
             .get("async-stack")
@@ -4680,7 +4725,7 @@ mod tests {
             {
                 let accounts = svc.state.read();
                 if let Some(stack) = accounts
-                    .get("123456789012")
+                    .regional("123456789012", "us-east-1")
                     .and_then(|s| s.stacks.get("out-stack"))
                 {
                     if stack.status != "CREATE_IN_PROGRESS" {
@@ -4761,7 +4806,7 @@ mod tests {
         let (stack_id, output) = {
             let accounts = svc.state.read();
             let stack = accounts
-                .get("123456789012")
+                .regional("123456789012", "cn-north-1")
                 .unwrap()
                 .stacks
                 .get("cn-stack")
@@ -4956,7 +5001,7 @@ mod tests {
 
         let accounts = svc.state.read();
         let stack = accounts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .stacks
             .get("outs")
@@ -4996,14 +5041,17 @@ mod tests {
             .expect("CreateStack returns StackId even when provisioning fails");
         let accounts = svc.state.read();
         let stack = accounts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .stacks
             .get("second")
             .expect("second stack recorded");
         assert_eq!(stack.status, "CREATE_FAILED");
         // The first stack keeps the export.
-        let exports = &accounts.get("123456789012").unwrap().exports;
+        let exports = &accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .exports;
         assert_eq!(
             exports
                 .get("DupExport")
@@ -5040,7 +5088,7 @@ mod tests {
 
         let accounts = svc.state.read();
         let prod_url = accounts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .stacks
             .get("producer")
@@ -5049,12 +5097,233 @@ mod tests {
             .value
             .clone();
         let cons = accounts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .stacks
             .get("consumer")
             .unwrap();
         assert_eq!(cons.outputs[0].value, prod_url);
+    }
+
+    fn request_in(action: &str, region: &str, params: &[(&str, &str)]) -> AwsRequest {
+        let mut req = make_request(
+            action,
+            params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        req.region = region.to_string();
+        req
+    }
+
+    fn body_of(resp: AwsResponse) -> String {
+        String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+    }
+
+    const HANDLE_TEMPLATE: &str =
+        r#"{"Resources":{"H":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}"#;
+
+    #[tokio::test]
+    async fn the_same_stack_name_lives_independently_in_two_regions() {
+        let svc = make_service();
+        let mut ids = Vec::new();
+        for region in ["us-east-1", "eu-west-1"] {
+            let resp = svc
+                .create_stack(&request_in(
+                    "CreateStack",
+                    region,
+                    &[("StackName", "app"), ("TemplateBody", HANDLE_TEMPLATE)],
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("CreateStack in {region}: {}", e.message()));
+            let body = body_of(resp);
+            let id = body
+                .split("<StackId>")
+                .nth(1)
+                .and_then(|r| r.split("</StackId>").next())
+                .unwrap()
+                .to_string();
+            assert!(
+                id.starts_with(&format!(
+                    "arn:aws:cloudformation:{region}:123456789012:stack/app/"
+                )),
+                "{id}"
+            );
+            ids.push(id);
+        }
+
+        // A second create of the name in a region that has it is still refused.
+        let dup = svc
+            .create_stack(&request_in(
+                "CreateStack",
+                "eu-west-1",
+                &[("StackName", "app"), ("TemplateBody", HANDLE_TEMPLATE)],
+            ))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("duplicate in the same region"));
+        assert_eq!(dup.code(), "AlreadyExistsException");
+
+        // Each region describes and lists only its own stack.
+        for (region, id) in ["us-east-1", "eu-west-1"].iter().zip(&ids) {
+            let described = body_of(
+                svc.describe_stacks(&request_in(
+                    "DescribeStacks",
+                    region,
+                    &[("StackName", "app")],
+                ))
+                .unwrap(),
+            );
+            assert!(described.contains(id.as_str()), "{described}");
+            assert_eq!(described.matches("<StackId>").count(), 1, "{described}");
+            let listed = body_of(
+                svc.list_stacks(&request_in("ListStacks", region, &[]))
+                    .unwrap(),
+            );
+            assert_eq!(listed.matches("<StackId>").count(), 1, "{listed}");
+            assert!(listed.contains(id.as_str()), "{listed}");
+        }
+        // Nothing in a third region.
+        let listed = body_of(
+            svc.list_stacks(&request_in("ListStacks", "ap-south-1", &[]))
+                .unwrap(),
+        );
+        assert_eq!(listed.matches("<StackId>").count(), 0, "{listed}");
+
+        // A stack ARN only resolves in its own region.
+        let e = svc
+            .describe_stacks(&request_in(
+                "DescribeStacks",
+                "us-east-1",
+                &[("StackName", ids[1].as_str())],
+            ))
+            .err()
+            .unwrap_or_else(|| panic!("eu-west-1 stack id from us-east-1"));
+        assert_eq!(e.code(), "ValidationError");
+        assert_eq!(
+            e.message(),
+            format!("Stack with id {} does not exist", ids[1])
+        );
+
+        // Deleting one leaves the other.
+        svc.delete_stack(&request_in(
+            "DeleteStack",
+            "us-east-1",
+            &[("StackName", "app")],
+        ))
+        .await
+        .unwrap();
+        assert!(svc
+            .describe_stacks(&request_in(
+                "DescribeStacks",
+                "us-east-1",
+                &[("StackName", "app")],
+            ))
+            .is_err());
+        let described = body_of(
+            svc.describe_stacks(&request_in(
+                "DescribeStacks",
+                "eu-west-1",
+                &[("StackName", "app")],
+            ))
+            .unwrap(),
+        );
+        assert!(described.contains(ids[1].as_str()), "{described}");
+        assert!(described.contains("CREATE_COMPLETE"), "{described}");
+    }
+
+    #[tokio::test]
+    async fn exports_and_import_value_are_regional() {
+        let svc = make_service();
+        let producer = r#"{
+            "Resources": {"H":{"Type":"AWS::CloudFormation::WaitConditionHandle"}},
+            "Outputs": {"Out":{"Value":"from-REGION","Export":{"Name":"Shared"}}}
+        }"#;
+        // The same export name in two regions is not a collision.
+        for region in ["us-east-1", "eu-west-1"] {
+            let template = producer.replace("REGION", region);
+            svc.create_stack(&request_in(
+                "CreateStack",
+                region,
+                &[("StackName", "producer"), ("TemplateBody", &template)],
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("producer in {region}: {}", e.message()));
+        }
+
+        // An import resolves the export of the importing stack's region.
+        let consumer = r#"{
+            "Resources": {"H":{"Type":"AWS::CloudFormation::WaitConditionHandle"}},
+            "Outputs": {"Imp":{"Value":{"Fn::ImportValue":"Shared"}}}
+        }"#;
+        svc.create_stack(&request_in(
+            "CreateStack",
+            "eu-west-1",
+            &[("StackName", "consumer"), ("TemplateBody", consumer)],
+        ))
+        .await
+        .unwrap();
+        {
+            let accounts = svc.state.read();
+            let eu = accounts.regional("123456789012", "eu-west-1").unwrap();
+            assert_eq!(eu.stacks["consumer"].outputs[0].value, "from-eu-west-1");
+            assert_eq!(eu.imports["Shared"], vec!["consumer".to_string()]);
+            let us = accounts.regional("123456789012", "us-east-1").unwrap();
+            assert_eq!(us.exports["Shared"].value, "from-us-east-1");
+            assert!(us.imports.is_empty(), "{:?}", us.imports);
+        }
+
+        // An export that exists only in another region is not found.
+        let only_us = r#"{
+            "Resources": {"H":{"Type":"AWS::CloudFormation::WaitConditionHandle"}},
+            "Outputs": {"Out":{"Value":"v","Export":{"Name":"UsOnly"}}}
+        }"#;
+        svc.create_stack(&request_in(
+            "CreateStack",
+            "us-east-1",
+            &[("StackName", "us-only"), ("TemplateBody", only_us)],
+        ))
+        .await
+        .unwrap();
+        let importer = r#"{
+            "Resources": {"H":{"Type":"AWS::CloudFormation::WaitConditionHandle"}},
+            "Outputs": {"Imp":{"Value":{"Fn::ImportValue":"UsOnly"}}}
+        }"#;
+        let e = svc
+            .create_stack(&request_in(
+                "CreateStack",
+                "eu-west-1",
+                &[("StackName", "importer"), ("TemplateBody", importer)],
+            ))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("export of another region"));
+        assert_eq!(e.message(), "No export named UsOnly found.");
+
+        // The us-east-1 producer is deletable: the eu-west-1 import of the
+        // same name pins only the eu-west-1 export.
+        svc.delete_stack(&request_in(
+            "DeleteStack",
+            "us-east-1",
+            &[("StackName", "producer")],
+        ))
+        .await
+        .unwrap();
+        let e = svc
+            .delete_stack(&request_in(
+                "DeleteStack",
+                "eu-west-1",
+                &[("StackName", "producer")],
+            ))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("eu-west-1 export is still imported"));
+        assert!(
+            e.message().contains("in use by consumer"),
+            "{}",
+            e.message()
+        );
     }
 
     #[tokio::test]
@@ -5072,7 +5341,7 @@ mod tests {
             .expect("create");
 
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").unwrap();
+        let state = accounts.regional("123456789012", "us-east-1").unwrap();
         let export = state
             .exports
             .get("reg-url")
@@ -5156,7 +5425,7 @@ mod tests {
             .expect("producer delete after consumer gone");
 
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").unwrap();
+        let state = accounts.regional("123456789012", "us-east-1").unwrap();
         assert!(state.exports.is_empty(), "exports cleared after delete");
         assert!(state.imports.is_empty(), "imports cleared after delete");
     }
@@ -5449,7 +5718,7 @@ mod tests {
         {
             let accounts = svc.state.read();
             let stack = accounts
-                .get("123456789012")
+                .regional("123456789012", "us-east-1")
                 .unwrap()
                 .stacks
                 .get("rs")
