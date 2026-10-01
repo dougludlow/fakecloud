@@ -54,8 +54,166 @@ pub(crate) struct ResetState {
     pub ec2_runtime: Option<Arc<fakecloud_ec2::runtime::Ec2Runtime>>,
 }
 
+// A reset snapshots the reset rows' incarnation ids and volumes and clears
+// the state under one write lock, then tears down by those ids. Runtime
+// records are keyed by incarnation, so a resource created after the reset
+// (even under a reset one's identifier) is never reached, and a start still in
+// flight for a reset incarnation reaps itself once it finds its row gone.
+
+/// `(DbiResourceId, data volume)` of every RDS instance in an account.
+fn rds_incarnations(state: &fakecloud_rds::RdsState) -> Vec<(String, String)> {
+    let tag = fakecloud_core::data_volume::current_scope().tag();
+    state
+        .instances
+        .values()
+        .map(|inst| {
+            (
+                inst.dbi_resource_id.clone(),
+                inst.data_volume_name(tag, &state.account_id),
+            )
+        })
+        .collect()
+}
+
+/// `(account, instance id)` of every EC2 instance in an account, whose
+/// containers and data volumes a reset removes (stopped ones included).
+fn ec2_instances(state: &fakecloud_ec2::Ec2State) -> Vec<(String, String)> {
+    state
+        .instances
+        .keys()
+        .map(|id| (state.account_id.clone(), id.clone()))
+        .collect()
+}
+
+/// `(incarnation, data volume)` of every cache cluster, replication group and
+/// serverless cache in an account (no volume for memcached).
+fn elasticache_incarnations(
+    state: &fakecloud_elasticache::ElastiCacheState,
+) -> Vec<(String, Option<String>)> {
+    let tag = fakecloud_core::data_volume::current_scope().tag();
+    let account = &state.account_id;
+    let clusters = state.cache_clusters.values().map(|c| {
+        (
+            c.incarnation(),
+            (c.engine != "memcached").then(|| c.data_volume_name(tag, account)),
+        )
+    });
+    let groups = state.replication_groups.values().map(|g| {
+        (
+            g.incarnation(),
+            (g.engine != "memcached").then(|| g.data_volume_name(tag, account)),
+        )
+    });
+    let serverless = state
+        .serverless_caches
+        .values()
+        .map(|c| (c.incarnation(), Some(c.data_volume_name(tag, account))));
+    clusters.chain(groups).chain(serverless).collect()
+}
+
+/// How long a reset response waits for its container teardown.
+const TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Container and data-volume teardown a reset queued. The reset handlers
+/// await it before replying, so once a reset returns, a resource recreated
+/// under a reset one's identifier can't race the teardown and mount the old
+/// data volume (or have its new container stopped).
+#[derive(Default)]
+pub(crate) struct Teardown(Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>);
+
+impl Teardown {
+    fn push(&mut self, f: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.0.push(Box::pin(f));
+    }
+
+    /// Run the teardown on its own task (a client that hangs up mid-reset
+    /// can't cancel it half way, leaving containers untracked and volumes
+    /// behind) and wait for it, bounded so a wedged daemon can't hang the
+    /// reset response; past the bound it keeps running in the background.
+    pub(crate) async fn run(self) {
+        // Each service's teardown runs on its own task, concurrently, so a
+        // slow one can't eat the others' share of the wait.
+        let tasks: Vec<_> = self.0.into_iter().map(tokio::spawn).collect();
+        let deadline = tokio::time::Instant::now() + TEARDOWN_WAIT;
+        for task in tasks {
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::error!(%err, "reset teardown failed; containers or volumes may be left behind");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "reset teardown still running after {}s; continuing in the background",
+                        TEARDOWN_WAIT.as_secs()
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl ResetState {
-    pub(crate) fn reset_service(&self, service: &str) -> Result<(), String> {
+    /// Reset RDS in every account, stopping the backing containers and
+    /// dropping the instances' data volumes: the instances are gone for good,
+    /// so one recreated under the same identifier must start clean (the
+    /// volumes would otherwise outlive the state, #2630).
+    fn reset_rds(&self, teardown: &mut Teardown) {
+        let gone: Vec<(String, String)> = {
+            let mut mas = self.rds.write();
+            let gone = mas.iter().flat_map(|(_, s)| rds_incarnations(s)).collect();
+            mas.reset();
+            gone
+        };
+        if let Some(rt) = self.rds_runtime.clone() {
+            teardown.push(async move {
+                for (incarnation, volume) in gone {
+                    rt.stop(&incarnation).await;
+                    rt.remove_data_volume_named(&volume).await;
+                }
+            });
+        }
+    }
+
+    /// Reset ElastiCache in every account, stopping the backing containers
+    /// and dropping the resources' data volumes (see [`Self::reset_rds`]).
+    fn reset_elasticache(&self, teardown: &mut Teardown) {
+        let gone: Vec<(String, Option<String>)> = {
+            let mut mas = self.elasticache.write();
+            let gone = mas
+                .iter()
+                .flat_map(|(_, s)| elasticache_incarnations(s))
+                .collect();
+            mas.reset();
+            gone
+        };
+        if let Some(rt) = self.elasticache_runtime.clone() {
+            teardown.push(async move {
+                for (incarnation, volume) in gone {
+                    rt.stop(&incarnation).await;
+                    if let Some(volume) = volume {
+                        rt.remove_data_volume_named(&volume).await;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Reset EC2 in every account, tearing down every instance's container
+    /// and data volume by instance id (see [`Self::reset_rds`]).
+    fn reset_ec2(&self, teardown: &mut Teardown) {
+        let gone: Vec<(String, String)> = {
+            let mut mas = self.ec2.write();
+            let gone = mas.iter().flat_map(|(_, s)| ec2_instances(s)).collect();
+            mas.reset();
+            gone
+        };
+        if let Some(rt) = self.ec2_runtime.clone() {
+            teardown.push(async move { rt.remove_instances(gone).await });
+        }
+    }
+
+    pub(crate) fn reset_service(&self, service: &str) -> Result<Teardown, String> {
+        let mut teardown = Teardown::default();
         match service {
             "iam" | "sts" => {
                 // The reset drops the execution-role sessions warm Lambda
@@ -129,27 +287,9 @@ impl ResetState {
             "kinesis" => {
                 self.kinesis.write().reset();
             }
-            "rds" => {
-                self.rds.write().reset();
-                if let Some(ref rt) = self.rds_runtime {
-                    let rt = rt.clone();
-                    tokio::spawn(async move { rt.stop_all().await });
-                }
-            }
-            "elasticache" => {
-                self.elasticache.write().reset();
-                if let Some(ref rt) = self.elasticache_runtime {
-                    let rt = rt.clone();
-                    tokio::spawn(async move { rt.stop_all().await });
-                }
-            }
-            "ec2" => {
-                self.ec2.write().reset();
-                if let Some(ref rt) = self.ec2_runtime {
-                    let rt = rt.clone();
-                    tokio::spawn(async move { rt.stop_all().await });
-                }
-            }
+            "rds" => self.reset_rds(&mut teardown),
+            "elasticache" => self.reset_elasticache(&mut teardown),
+            "ec2" => self.reset_ec2(&mut teardown),
             "ecr" => {
                 self.ecr.write().reset();
             }
@@ -234,7 +374,7 @@ impl ResetState {
             }
         }
         tracing::info!(service = %service, "service state reset via per-service reset API");
-        Ok(())
+        Ok(teardown)
     }
 
     /// Reset a single service's state for a specific account only.
@@ -242,7 +382,8 @@ impl ResetState {
         &self,
         service: &str,
         account_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Teardown, String> {
+        let mut teardown = Teardown::default();
         match service {
             "iam" | "sts" => {
                 if let Some(ref rt) = self.container_runtime {
@@ -348,13 +489,37 @@ impl ResetState {
             "rds" => {
                 let mut mas = self.rds.write();
                 if let Some(state) = mas.get_mut(account_id) {
+                    let gone = rds_incarnations(state);
                     state.reset();
+                    // The account's instances are gone: stop their containers
+                    // and drop their data volumes by incarnation, so an
+                    // instance recreated under the same identifier (or another
+                    // account's same-named one) is never reached.
+                    if let Some(rt) = self.rds_runtime.clone() {
+                        teardown.push(async move {
+                            for (incarnation, volume) in gone {
+                                rt.stop(&incarnation).await;
+                                rt.remove_data_volume_named(&volume).await;
+                            }
+                        });
+                    }
                 }
             }
             "elasticache" => {
                 let mut mas = self.elasticache.write();
                 if let Some(state) = mas.get_mut(account_id) {
+                    let gone = elasticache_incarnations(state);
                     state.reset();
+                    if let Some(rt) = self.elasticache_runtime.clone() {
+                        teardown.push(async move {
+                            for (incarnation, volume) in gone {
+                                rt.stop(&incarnation).await;
+                                if let Some(volume) = volume {
+                                    rt.remove_data_volume_named(&volume).await;
+                                }
+                            }
+                        });
+                    }
                 }
             }
             "ecr" => {
@@ -474,10 +639,11 @@ impl ResetState {
             }
         }
         tracing::info!(service = %service, account_id = %account_id, "service state reset for account via per-account reset API");
-        Ok(())
+        Ok(teardown)
     }
 
-    pub(crate) fn reset(&self) -> axum::Json<types::ResetResponse> {
+    pub(crate) fn reset(&self) -> (axum::Json<types::ResetResponse>, Teardown) {
+        let mut teardown = Teardown::default();
         self.iam.write().reset();
         self.sqs.write().reset();
         {
@@ -515,16 +681,9 @@ impl ResetState {
         self.ses.write().reset();
         self.cognito.write().reset();
         self.kinesis.write().reset();
-        self.rds.write().reset();
-        if let Some(ref rt) = self.rds_runtime {
-            let rt = rt.clone();
-            tokio::spawn(async move { rt.stop_all().await });
-        }
-        self.elasticache.write().reset();
-        if let Some(ref rt) = self.elasticache_runtime {
-            let rt = rt.clone();
-            tokio::spawn(async move { rt.stop_all().await });
-        }
+        self.reset_rds(&mut teardown);
+        self.reset_elasticache(&mut teardown);
+        self.reset_ec2(&mut teardown);
         self.ecr.write().reset();
         self.ecs.write().reset();
         if let Some(ref rt) = self.ecs_runtime {
@@ -556,9 +715,12 @@ impl ResetState {
         // with none, matching the no-in-use default state.
         self.organizations.write().clear();
         tracing::info!("state reset via reset API");
-        axum::Json(types::ResetResponse {
-            status: "ok".to_string(),
-        })
+        (
+            axum::Json(types::ResetResponse {
+                status: "ok".to_string(),
+            }),
+            teardown,
+        )
     }
 }
 
@@ -738,6 +900,7 @@ mod tests {
                 master_user_password: "secret123".to_string(),
                 container_id: "container-id".to_string(),
                 host_port: 15432,
+                data_volume: None,
                 tags: Vec::new(),
                 read_replica_source_db_instance_identifier: None,
                 read_replica_db_instance_identifiers: Vec::new(),

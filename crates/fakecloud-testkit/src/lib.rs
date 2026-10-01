@@ -629,7 +629,9 @@ fn find_binary() -> String {
 /// `DOCKER_HOST`, Docker Desktop mid start, a broken socket) can leave the CLI
 /// blocked on connect *forever*, and without that bound a conformance `*_probe`
 /// that only calls `TestServer::start()` would never return.
-fn detect_container_cli() -> String {
+/// The container CLI test servers drive when `FAKECLOUD_CONTAINER_CLI` is unset:
+/// docker if it answers, else podman.
+pub fn detect_container_cli() -> String {
     if cli_available("docker") {
         "docker".to_string()
     } else if cli_available("podman") {

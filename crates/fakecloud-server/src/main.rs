@@ -275,6 +275,20 @@ async fn main() {
                     data_path.display()
                 )),
             }
+            // Name container data volumes after this data dir, so the same
+            // dir reattaches them across restarts and no other dir (or other
+            // fakecloud on this daemon) ever mounts them. Must run before the
+            // runtimes are built (without it volumes are process-scoped) and
+            // after the version check, which refuses a non-empty dir lacking
+            // a version file.
+            match fakecloud_core::data_volume::init_data_dir_scope(data_path) {
+                Ok(scope) => tracing::debug!(scope = scope.tag(), "container data volume scope"),
+                Err(err) => fatal_exit(format_args!(
+                    "container data volume scope at {}/{}: {err}",
+                    data_path.display(),
+                    fakecloud_core::data_volume::SCOPE_FILE
+                )),
+            }
         }
     }
     // Bind early so we know the actual port before initialising service state.
@@ -7435,7 +7449,11 @@ async fn main() {
             "/_reset",
             axum::routing::post({
                 let s = reset_state.clone();
-                move || async move { s.reset() }
+                move || async move {
+                    let (response, teardown) = s.reset();
+                    teardown.run().await;
+                    response
+                }
             }),
         )
         .route(
@@ -11324,12 +11342,15 @@ async fn main() {
                 let s = reset_state.clone();
                 move |axum::extract::Path(service): axum::extract::Path<String>| async move {
                     match s.reset_service(&service) {
-                        Ok(()) => (
-                            axum::http::StatusCode::OK,
-                            axum::Json(serde_json::json!(types::ResetServiceResponse {
-                                reset: service
-                            })),
-                        ),
+                        Ok(teardown) => {
+                            teardown.run().await;
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!(types::ResetServiceResponse {
+                                    reset: service
+                                })),
+                            )
+                        }
                         Err(msg) => (
                             axum::http::StatusCode::NOT_FOUND,
                             axum::Json(serde_json::json!({ "error": msg })),
@@ -11344,12 +11365,15 @@ async fn main() {
                 let s = reset_state.clone();
                 move |axum::extract::Path((service, account_id)): axum::extract::Path<(String, String)>| async move {
                     match s.reset_service_for_account(&service, &account_id) {
-                        Ok(()) => (
-                            axum::http::StatusCode::OK,
-                            axum::Json(serde_json::json!(types::ResetServiceResponse {
-                                reset: format!("{service}/{account_id}")
-                            })),
-                        ),
+                        Ok(teardown) => {
+                            teardown.run().await;
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!(types::ResetServiceResponse {
+                                    reset: format!("{service}/{account_id}")
+                                })),
+                            )
+                        }
                         Err(msg) => (
                             axum::http::StatusCode::NOT_FOUND,
                             axum::Json(serde_json::json!({ "error": msg })),
@@ -12202,6 +12226,12 @@ async fn main() {
     }
     if let Some(rt) = ec2_runtime {
         rt.stop_all().await;
+    }
+    // Memory mode: the data volumes those containers mounted belong to this
+    // process alone, so drop them now that nothing can reattach them.
+    // Persistent mode keeps them for the next start on the same data dir.
+    if let Some(cli) = fakecloud_core::container_net::detect_container_cli() {
+        fakecloud_core::data_volume::remove_process_volumes(&cli).await;
     }
 }
 

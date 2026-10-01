@@ -199,6 +199,7 @@ impl ElastiCacheService {
             endpoint_port: 0,
             container_id: String::new(),
             host_port: 0,
+            data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
             replication_group_id: replication_group_id.clone(),
             cache_parameter_group_name: cache_parameter_group_name.clone(),
             security_group_ids,
@@ -273,35 +274,69 @@ impl ElastiCacheService {
             // Pod, from the create-time tags (ignored on the Docker backend).
             let pod_tags: std::collections::BTreeMap<String, String> =
                 tags.iter().cloned().collect();
+            // This incarnation's id and volume, pinned now: a delete and a
+            // recreate under the same id is a different incarnation, which
+            // this task's container, bookkeeping and cleanup never reach.
+            let (incarnation, volume) = {
+                let accounts = self.state.read();
+                match accounts
+                    .get(&account_id)
+                    .and_then(|s| s.cache_clusters.get(&id))
+                {
+                    Some(c) => (
+                        c.incarnation(),
+                        c.data_volume_name(
+                            fakecloud_core::data_volume::current_scope().tag(),
+                            &account_id,
+                        ),
+                    ),
+                    None => (String::new(), String::new()),
+                }
+            };
             tokio::spawn(async move {
+                if incarnation.is_empty() {
+                    return;
+                }
                 let result = if is_memcached {
-                    runtime.ensure_memcached(&id, &pod_tags).await
+                    runtime
+                        .ensure_memcached(&incarnation, &account_id, &id, &pod_tags)
+                        .await
                 } else {
                     runtime
-                        .ensure_redis(&id, rdb_path.as_deref(), &pod_tags)
+                        .ensure_redis(
+                            &incarnation,
+                            &account_id,
+                            &id,
+                            &volume,
+                            rdb_path.as_deref(),
+                            &pod_tags,
+                        )
                         .await
                 };
                 let mut stop_container = false;
                 {
                     let mut accounts = state.write();
                     if let Some(s) = accounts.get_mut(&account_id) {
-                        let deleted = s.take_cache_cluster_delete_request(&id);
                         match &result {
-                            Ok(running) if !deleted => {
-                                if let Some(c) = s.cache_clusters.get_mut(&id) {
-                                    c.cache_cluster_status = "available".to_string();
-                                    c.endpoint_address = running.endpoint_address.clone();
-                                    c.endpoint_port = running.endpoint_port;
-                                    c.host_port = running.host_port;
-                                    c.container_id = running.container_id.clone();
+                            Ok(running) => {
+                                // Post-start presence check by incarnation: if
+                                // this cluster was deleted (or reset) while it
+                                // booted, its row is gone (or is a new
+                                // incarnation's) and the container is reaped.
+                                match s
+                                    .cache_clusters
+                                    .get_mut(&id)
+                                    .filter(|c| c.incarnation() == incarnation)
+                                {
+                                    Some(c) => {
+                                        c.cache_cluster_status = "available".to_string();
+                                        c.endpoint_address = running.endpoint_address.clone();
+                                        c.endpoint_port = running.endpoint_port;
+                                        c.host_port = running.host_port;
+                                        c.container_id = running.container_id.clone();
+                                    }
+                                    None => stop_container = true,
                                 }
-                            }
-                            Ok(_) => {
-                                // Deleted while creating: drop it, reap the
-                                // container after the lock is released.
-                                s.cancel_cache_cluster_creation(&id);
-                                s.cache_clusters.remove(&id);
-                                stop_container = true;
                             }
                             Err(error) => {
                                 tracing::error!(
@@ -309,15 +344,35 @@ impl ElastiCacheService {
                                     cache_cluster_id = %id,
                                     "failed to start elasticache cache cluster container",
                                 );
-                                if let Some(c) = s.cache_clusters.get_mut(&id) {
-                                    c.cache_cluster_status = "incompatible-network".to_string();
+                                match s
+                                    .cache_clusters
+                                    .get_mut(&id)
+                                    .filter(|c| c.incarnation() == incarnation)
+                                {
+                                    Some(c) => {
+                                        c.cache_cluster_status = "incompatible-network".to_string()
+                                    }
+                                    // Deleted while starting: the failed start may still
+                                    // have created this incarnation's volume.
+                                    None => stop_container = true,
                                 }
                             }
                         }
+                    } else {
+                        // Whole account reset meanwhile.
+                        stop_container = true;
                     }
                 }
                 if stop_container {
-                    runtime.stop_container(&id).await;
+                    // Deleted (or reset) while it was starting: reap this
+                    // incarnation's container and the volume the delete
+                    // couldn't remove while it was still mounted.
+                    super::reap_gone_start(
+                        &runtime,
+                        &incarnation,
+                        (!is_memcached).then_some(&*volume),
+                    )
+                    .await;
                 }
                 save_snapshot_static(state, snapshot_store, snapshot_lock).await;
             });
@@ -430,12 +485,20 @@ impl ElastiCacheService {
             }
         };
 
-        if let Some(ref runtime) = self.runtime {
-            runtime.stop_container(&cache_cluster_id).await;
-            // Drop the persisted data volume so a later cluster reusing this id
-            // starts clean instead of reloading deleted data (bug-audit
-            // 2026-06-20, 4.2).
-            runtime.remove_data_volume(&cache_cluster_id).await;
+        if let (Some(runtime), Some(cluster)) = (self.runtime.as_ref(), removed.as_ref()) {
+            // Stop this incarnation's container and drop its data volume, so a
+            // later cluster reusing this id starts clean instead of reloading
+            // deleted data (bug-audit 2026-06-20, 4.2). A cluster deleted while
+            // still starting is reaped by its create task instead.
+            runtime.stop(&cluster.incarnation()).await;
+            if cluster.engine != ENGINE_MEMCACHED {
+                runtime
+                    .remove_data_volume_named(&cluster.data_volume_name(
+                        fakecloud_core::data_volume::current_scope().tag(),
+                        &request.account_id,
+                    ))
+                    .await;
+            }
         }
 
         let xml = match removed {
@@ -535,7 +598,7 @@ impl ElastiCacheService {
         request: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = required_query_param(request, "CacheClusterId")?;
-        let (xml, pod_tags) = {
+        let (xml, pod_tags, incarnation) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
             let cluster = state.cache_clusters.get_mut(&id).ok_or_else(|| {
@@ -555,7 +618,7 @@ impl ElastiCacheService {
                 .get(&arn)
                 .map(|t| t.iter().cloned().collect())
                 .unwrap_or_default();
-            (xml, pod_tags)
+            (xml, pod_tags, cluster.incarnation())
         };
         // Restart the underlying engine container in the BACKGROUND so a real
         // client observes the reboot without the request blocking on it. The
@@ -570,7 +633,7 @@ impl ElastiCacheService {
             let account_id = request.account_id.clone();
             let id = id.clone();
             tokio::spawn(async move {
-                if let Err(error) = runtime.restart_container(&id, &pod_tags).await {
+                if let Err(error) = runtime.restart(&incarnation, &id, &pod_tags).await {
                     tracing::warn!(
                         cluster_id = %id,
                         %error,
@@ -580,7 +643,11 @@ impl ElastiCacheService {
                 }
                 let mut accounts = state_handle.write();
                 let state = accounts.get_or_create(&account_id);
-                if let Some(cluster) = state.cache_clusters.get_mut(&id) {
+                if let Some(cluster) = state
+                    .cache_clusters
+                    .get_mut(&id)
+                    .filter(|c| c.incarnation() == incarnation)
+                {
                     cluster.cache_cluster_status = "available".to_string();
                 }
             });

@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
+
+use fakecloud_core::data_volume::DataVolumeBinding;
 use std::sync::Arc;
 
 use fakecloud_aws::arn::Arn;
@@ -104,6 +106,13 @@ pub struct CacheCluster {
     pub endpoint_port: u16,
     pub container_id: String,
     pub host_port: u16,
+    /// Which data volume the resource mounts (see
+    /// `fakecloud_core::data_volume`). Resources created by this build are
+    /// bound to their data-dir scoped volume; `None` only for one persisted
+    /// before volumes were scoped (or never resolved since), which
+    /// [`ElastiCacheState::resolve_data_volumes`] binds against the daemon.
+    #[serde(default)]
+    pub data_volume: Option<DataVolumeBinding>,
     pub replication_group_id: Option<String>,
     /// `CacheParameterGroup.CacheParameterGroupName` — group bound at
     /// create / modify time. Real AWS always emits this membership;
@@ -222,6 +231,13 @@ pub struct ReplicationGroup {
     pub created_at: String,
     pub container_id: String,
     pub host_port: u16,
+    /// Which data volume the resource mounts (see
+    /// `fakecloud_core::data_volume`). Resources created by this build are
+    /// bound to their data-dir scoped volume; `None` only for one persisted
+    /// before volumes were scoped (or never resolved since), which
+    /// [`ElastiCacheState::resolve_data_volumes`] binds against the daemon.
+    #[serde(default)]
+    pub data_volume: Option<DataVolumeBinding>,
     pub member_clusters: Vec<String>,
     pub snapshot_retention_limit: i32,
     pub snapshot_window: String,
@@ -416,6 +432,13 @@ pub struct CacheSnapshot {
     /// Path to the dumped RDB file on the local disk, if the runtime was
     /// available at snapshot-create time.
     pub rdb_path: Option<String>,
+    /// Incarnation of the replication group the snapshot was taken from,
+    /// pinned at create time: a group deleted and recreated under the id
+    /// before the (background) dump runs is another group, whose data must
+    /// not land in this snapshot. `None` for snapshots persisted before it
+    /// was recorded.
+    #[serde(default)]
+    pub source_incarnation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -464,6 +487,13 @@ pub struct ServerlessCache {
     pub daily_snapshot_time: Option<String>,
     pub container_id: String,
     pub host_port: u16,
+    /// Which data volume the resource mounts (see
+    /// `fakecloud_core::data_volume`). Resources created by this build are
+    /// bound to their data-dir scoped volume; `None` only for one persisted
+    /// before volumes were scoped (or never resolved since), which
+    /// [`ElastiCacheState::resolve_data_volumes`] binds against the daemon.
+    #[serde(default)]
+    pub data_volume: Option<DataVolumeBinding>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -608,7 +638,200 @@ pub struct ElastiCacheState {
     pub update_actions: BTreeMap<String, UpdateAction>,
 }
 
+/// A cache cluster's, replication group's or serverless cache's incarnation
+/// id: derived from its ARN and creation timestamp, both fixed for the life of
+/// the row, so a delete and a recreate under the same id differ (and rows
+/// persisted before incarnation ids existed get one too). Every runtime
+/// record, container/Pod name and data volume hangs off it.
+pub fn cache_incarnation(arn: &str, created_at: &str) -> String {
+    fakecloud_core::data_volume::incarnation_id(&[arn, created_at])
+}
+
+/// The data volume a Redis/Valkey resource incarnation mounts: an adopted
+/// legacy volume, or the one scoped to the data dir, account, id and
+/// incarnation.
+pub fn cache_data_volume_name(
+    binding: &Option<DataVolumeBinding>,
+    scope_tag: &str,
+    account_id: &str,
+    resource_id: &str,
+    incarnation: &str,
+) -> String {
+    match binding {
+        Some(DataVolumeBinding::Legacy(name)) => name.clone(),
+        _ => {
+            crate::runtime::scoped_data_volume_name(scope_tag, account_id, resource_id, incarnation)
+        }
+    }
+}
+
+impl CacheCluster {
+    pub fn incarnation(&self) -> String {
+        cache_incarnation(&self.arn, &self.created_at)
+    }
+
+    pub fn data_volume_name(&self, scope_tag: &str, account_id: &str) -> String {
+        cache_data_volume_name(
+            &self.data_volume,
+            scope_tag,
+            account_id,
+            &self.cache_cluster_id,
+            &self.incarnation(),
+        )
+    }
+}
+
+impl ReplicationGroup {
+    pub fn incarnation(&self) -> String {
+        cache_incarnation(&self.arn, &self.created_at)
+    }
+
+    pub fn data_volume_name(&self, scope_tag: &str, account_id: &str) -> String {
+        cache_data_volume_name(
+            &self.data_volume,
+            scope_tag,
+            account_id,
+            &self.replication_group_id,
+            &self.incarnation(),
+        )
+    }
+}
+
+impl ServerlessCache {
+    pub fn incarnation(&self) -> String {
+        cache_incarnation(&self.arn, &self.created_at)
+    }
+
+    pub fn data_volume_name(&self, scope_tag: &str, account_id: &str) -> String {
+        cache_data_volume_name(
+            &self.data_volume,
+            scope_tag,
+            account_id,
+            &self.serverless_cache_name,
+            &self.incarnation(),
+        )
+    }
+}
+
 impl ElastiCacheState {
+    /// Bind every cache cluster, replication group, and serverless cache
+    /// persisted without a data-volume binding (state written before volumes
+    /// were scoped to the data dir) against the daemon's volumes
+    /// (`existing`): its scoped volume if that exists, else the legacy
+    /// (unscoped) volume its id named, else a new scoped one. Resources
+    /// created by this build are bound at creation, so a fresh data dir never
+    /// reloads another one's legacy volume (#2630). Memcached has no volume
+    /// and is bound to the scoped name, which it never mounts. Returns whether
+    /// anything was bound.
+    ///
+    /// `contested` lists ids that unbound resources in more than one account
+    /// share: pre-scoping builds gave all of them the one unscoped volume, so
+    /// whose data it holds is unknowable. None of them adopts it (each starts
+    /// on its own account-scoped volume) rather than keep two accounts on one
+    /// volume.
+    pub fn resolve_data_volumes(
+        &mut self,
+        scope_tag: &str,
+        existing: &HashSet<String>,
+        contested: &HashSet<String>,
+    ) -> bool {
+        let bind = |id: &str, incarnation: &str, memcached: bool| {
+            if memcached || contested.contains(id) {
+                return DataVolumeBinding::Scoped;
+            }
+            fakecloud_core::data_volume::resolve_binding(
+                &crate::runtime::scoped_data_volume_name(
+                    scope_tag,
+                    &self.account_id,
+                    id,
+                    incarnation,
+                ),
+                &crate::runtime::legacy_data_volume_name(id),
+                existing,
+            )
+        };
+        let mut changed = false;
+        for (id, c) in self.cache_clusters.iter_mut() {
+            if c.data_volume.is_none() {
+                let incarnation = c.incarnation();
+                c.data_volume = Some(bind(id, &incarnation, c.engine == "memcached"));
+                changed = true;
+            }
+        }
+        for (id, rg) in self.replication_groups.iter_mut() {
+            if rg.data_volume.is_none() {
+                let incarnation = rg.incarnation();
+                rg.data_volume = Some(bind(id, &incarnation, rg.engine == "memcached"));
+                changed = true;
+            }
+        }
+        for (name, sc) in self.serverless_caches.iter_mut() {
+            if sc.data_volume.is_none() {
+                let incarnation = sc.incarnation();
+                sc.data_volume = Some(bind(name, &incarnation, false));
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Ids of the unbound resources that could own a pre-scoping data
+    /// volume: Redis/Valkey ones only, since memcached never mounted one.
+    pub fn unbound_volume_ids(&self) -> Vec<String> {
+        let clusters = self
+            .cache_clusters
+            .iter()
+            .filter(|(_, c)| c.data_volume.is_none() && c.engine != "memcached")
+            .map(|(id, _)| id.clone());
+        let groups = self
+            .replication_groups
+            .iter()
+            .filter(|(_, r)| r.data_volume.is_none() && r.engine != "memcached")
+            .map(|(id, _)| id.clone());
+        let serverless = self
+            .serverless_caches
+            .iter()
+            .filter(|(_, s)| s.data_volume.is_none())
+            .map(|(id, _)| id.clone());
+        clusters.chain(groups).chain(serverless).collect()
+    }
+
+    /// Whether any resource still lacks a data-volume binding.
+    pub fn has_unbound_data_volumes(&self) -> bool {
+        self.cache_clusters
+            .values()
+            .any(|c| c.data_volume.is_none())
+            || self
+                .replication_groups
+                .values()
+                .any(|r| r.data_volume.is_none())
+            || self
+                .serverless_caches
+                .values()
+                .any(|s| s.data_volume.is_none())
+    }
+
+    /// Every resource bound to a legacy data volume, as `(id, volume)`.
+    pub fn legacy_data_volumes(&self) -> Vec<(String, String)> {
+        let legacy = |b: &Option<DataVolumeBinding>| match b {
+            Some(DataVolumeBinding::Legacy(v)) => Some(v.clone()),
+            _ => None,
+        };
+        let clusters = self
+            .cache_clusters
+            .iter()
+            .filter_map(|(id, c)| Some((id.clone(), legacy(&c.data_volume)?)));
+        let groups = self
+            .replication_groups
+            .iter()
+            .filter_map(|(id, rg)| Some((id.clone(), legacy(&rg.data_volume)?)));
+        let serverless = self
+            .serverless_caches
+            .iter()
+            .filter_map(|(id, sc)| Some((id.clone(), legacy(&sc.data_volume)?)));
+        clusters.chain(groups).chain(serverless).collect()
+    }
+
     pub fn new(account_id: &str, region: &str) -> Self {
         let parameter_groups = default_parameter_groups(account_id, region);
         let subnet_groups = default_subnet_groups(account_id, region);
@@ -1190,7 +1413,7 @@ pub struct ElastiCacheSnapshot {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1365,6 +1588,7 @@ mod tests {
             daily_snapshot_time: None,
             container_id: "cid".to_string(),
             host_port: 6379,
+            data_volume: None,
         };
 
         state.finish_serverless_cache_creation(cache.clone());
@@ -1449,6 +1673,7 @@ mod tests {
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 snapshot_source: "manual".to_string(),
                 rdb_path: None,
+                source_incarnation: None,
             },
         );
         assert_eq!(state.snapshots.len(), 1);
@@ -1479,6 +1704,7 @@ mod tests {
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 container_id: "abc123".to_string(),
                 host_port: 12345,
+                data_volume: None,
                 member_clusters: vec!["my-group-001".to_string()],
                 snapshot_retention_limit: 0,
                 snapshot_window: "05:00-09:00".to_string(),
@@ -1570,6 +1796,7 @@ mod tests {
                 endpoint_port: 6379,
                 container_id: "abc123".to_string(),
                 host_port: 12345,
+                data_volume: None,
                 replication_group_id: None,
                 cache_parameter_group_name: None,
                 security_group_ids: Vec::new(),
@@ -1602,6 +1829,168 @@ mod tests {
         assert_eq!(state.cache_clusters.len(), 1);
         state.reset();
         assert!(state.cache_clusters.is_empty());
+    }
+
+    pub(crate) fn fixture_cluster(id: &str, engine: &str) -> CacheCluster {
+        CacheCluster {
+            cache_cluster_id: id.to_string(),
+            cache_node_type: "cache.t3.micro".to_string(),
+            engine: engine.to_string(),
+            engine_version: "7.1".to_string(),
+            cache_cluster_status: "available".to_string(),
+            num_cache_nodes: 1,
+            preferred_availability_zone: "us-east-1a".to_string(),
+            cache_subnet_group_name: Some("default".to_string()),
+            auto_minor_version_upgrade: true,
+            arn: format!("arn:aws:elasticache:us-east-1:123456789012:cluster:{id}"),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            endpoint_address: "127.0.0.1".to_string(),
+            endpoint_port: 6379,
+            container_id: "abc123".to_string(),
+            host_port: 12345,
+            data_volume: None,
+            replication_group_id: None,
+            cache_parameter_group_name: None,
+            security_group_ids: Vec::new(),
+            log_delivery_configurations: Vec::new(),
+            transit_encryption_enabled: false,
+            at_rest_encryption_enabled: false,
+            auth_token_enabled: false,
+            port: 6379,
+            preferred_maintenance_window: None,
+            preferred_availability_zones: Vec::new(),
+            notification_topic_arn: None,
+            cache_security_group_names: Vec::new(),
+            snapshot_arns: Vec::new(),
+            snapshot_name: None,
+            snapshot_retention_limit: 0,
+            snapshot_window: None,
+            outpost_mode: None,
+            preferred_outpost_arn: None,
+            network_type: None,
+            ip_discovery: None,
+            az_mode: None,
+            auth_token: None,
+            kms_key_id: None,
+            transit_encryption_mode: None,
+            data_tiering_enabled: None,
+            cluster_mode: None,
+            preferred_outpost_arns: Vec::new(),
+        }
+    }
+
+    /// A delete and a recreate under the same id are different incarnations
+    /// (different creation time), with different data volumes.
+    #[test]
+    fn recreated_cluster_is_a_new_incarnation_with_its_own_volume() {
+        let old = fixture_cluster("c1", "redis");
+        let mut new = fixture_cluster("c1", "redis");
+        new.created_at = "2024-01-01T00:00:01.5Z".to_string();
+        assert_ne!(old.incarnation(), new.incarnation());
+        assert_ne!(
+            old.data_volume_name("dtag", "123456789012"),
+            new.data_volume_name("dtag", "123456789012")
+        );
+        // Stable for one incarnation.
+        assert_eq!(
+            old.incarnation(),
+            fixture_cluster("c1", "redis").incarnation()
+        );
+        // An adopted legacy volume keeps its name.
+        let mut legacy = fixture_cluster("c1", "redis");
+        legacy.data_volume = Some(DataVolumeBinding::Legacy(
+            "fakecloud-elasticache-data-c1".to_string(),
+        ));
+        assert_eq!(
+            legacy.data_volume_name("dtag", "123456789012"),
+            "fakecloud-elasticache-data-c1"
+        );
+    }
+
+    #[test]
+    fn unbound_resources_resolve_scoped_first_then_legacy() {
+        let mut existing = HashSet::new();
+        existing.insert("fakecloud-elasticache-data-old-redis".to_string());
+        existing.insert("fakecloud-elasticache-data-old-memcached".to_string());
+        existing.insert("fakecloud-elasticache-data-used".to_string());
+        existing.insert(crate::runtime::scoped_data_volume_name(
+            "dtag",
+            "123456789012",
+            "used",
+            &fixture_cluster("used", "redis").incarnation(),
+        ));
+        existing.insert("fakecloud-elasticache-data-new".to_string());
+
+        let mut state = ElastiCacheState::new("123456789012", "us-east-1");
+        for (id, engine) in [
+            ("old-redis", "redis"),
+            ("old-memcached", "memcached"),
+            ("no-vol", "redis"),
+            ("used", "redis"),
+        ] {
+            state
+                .cache_clusters
+                .insert(id.to_string(), fixture_cluster(id, engine));
+        }
+        // Created by this build: bound at creation, never re-resolved.
+        let mut new = fixture_cluster("new", "redis");
+        new.data_volume = Some(DataVolumeBinding::Scoped);
+        state.cache_clusters.insert("new".to_string(), new);
+        assert!(state.has_unbound_data_volumes());
+
+        assert!(state.resolve_data_volumes("dtag", &existing, &HashSet::new()));
+        assert!(!state.has_unbound_data_volumes());
+        let binding = |id: &str| state.cache_clusters[id].data_volume.clone();
+        assert_eq!(
+            binding("old-redis"),
+            Some(DataVolumeBinding::Legacy(
+                "fakecloud-elasticache-data-old-redis".to_string()
+            ))
+        );
+        // memcached never had a volume to keep.
+        assert_eq!(binding("old-memcached"), Some(DataVolumeBinding::Scoped));
+        assert_eq!(binding("no-vol"), Some(DataVolumeBinding::Scoped));
+        // Already writing to its scoped volume: stays there.
+        assert_eq!(binding("used"), Some(DataVolumeBinding::Scoped));
+        // Bound at creation: a same-named legacy volume is ignored.
+        assert_eq!(binding("new"), Some(DataVolumeBinding::Scoped));
+        assert_eq!(
+            state.legacy_data_volumes(),
+            vec![(
+                "old-redis".to_string(),
+                "fakecloud-elasticache-data-old-redis".to_string()
+            )]
+        );
+        assert!(!state.resolve_data_volumes("dtag", &existing, &HashSet::new()));
+    }
+
+    #[test]
+    fn contested_legacy_volume_is_adopted_by_no_account() {
+        let mut existing = HashSet::new();
+        existing.insert("fakecloud-elasticache-data-shared".to_string());
+        let mut state = ElastiCacheState::new("123456789012", "us-east-1");
+        state
+            .cache_clusters
+            .insert("shared".to_string(), fixture_cluster("shared", "redis"));
+        let contested: HashSet<String> = ["shared".to_string()].into();
+        assert_eq!(state.unbound_volume_ids(), vec!["shared".to_string()]);
+        assert!(state.resolve_data_volumes("dtag", &existing, &contested));
+        assert_eq!(
+            state.cache_clusters["shared"].data_volume,
+            Some(DataVolumeBinding::Scoped)
+        );
+        assert!(state.unbound_volume_ids().is_empty());
+    }
+
+    #[test]
+    fn memcached_never_contests_a_legacy_volume() {
+        let mut state = ElastiCacheState::new("123456789012", "us-east-1");
+        state
+            .cache_clusters
+            .insert("c".to_string(), fixture_cluster("c", "memcached"));
+        // Unbound, but it never had a volume, so it can't share one.
+        assert!(state.has_unbound_data_volumes());
+        assert!(state.unbound_volume_ids().is_empty());
     }
 
     #[test]
@@ -1666,6 +2055,7 @@ mod tests {
                 daily_snapshot_time: None,
                 container_id: "cid".to_string(),
                 host_port: 6379,
+                data_volume: None,
             },
         );
         state.serverless_cache_snapshots.insert(

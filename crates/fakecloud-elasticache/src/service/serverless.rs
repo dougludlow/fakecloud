@@ -118,6 +118,7 @@ impl ElastiCacheService {
             daily_snapshot_time,
             container_id: String::new(),
             host_port: 0,
+            data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
         };
 
         let xml = serverless_cache_xml(&cache);
@@ -142,15 +143,42 @@ impl ElastiCacheService {
             // request (ignored on the Docker backend).
             let pod_tags: std::collections::BTreeMap<String, String> =
                 tags.iter().cloned().collect();
+            // This incarnation's id and volume, pinned now (see
+            // CreateCacheCluster).
+            let (incarnation, volume) = {
+                let accounts = self.state.read();
+                match accounts
+                    .get(&account_id)
+                    .and_then(|s| s.serverless_caches.get(&name))
+                {
+                    Some(c) => (
+                        c.incarnation(),
+                        c.data_volume_name(
+                            fakecloud_core::data_volume::current_scope().tag(),
+                            &account_id,
+                        ),
+                    ),
+                    None => (String::new(), String::new()),
+                }
+            };
             tokio::spawn(async move {
-                let result = runtime.ensure_redis(&name, None, &pod_tags).await;
+                if incarnation.is_empty() {
+                    return;
+                }
+                let result = runtime
+                    .ensure_redis(&incarnation, &account_id, &name, &volume, None, &pod_tags)
+                    .await;
                 let mut stop_container = false;
                 {
                     let mut accounts = state.write();
                     if let Some(s) = accounts.get_mut(&account_id) {
                         match &result {
                             Ok(running) => {
-                                if let Some(c) = s.serverless_caches.get_mut(&name) {
+                                if let Some(c) = s
+                                    .serverless_caches
+                                    .get_mut(&name)
+                                    .filter(|c| c.incarnation() == incarnation)
+                                {
                                     c.status = "available".to_string();
                                     c.endpoint.address = running.endpoint_address.clone();
                                     c.endpoint.port = running.endpoint_port;
@@ -171,17 +199,26 @@ impl ElastiCacheService {
                                     serverless_cache_name = %name,
                                     "failed to start elasticache serverless cache container",
                                 );
-                                if let Some(c) = s.serverless_caches.get_mut(&name) {
-                                    c.status = "create-failed".to_string();
+                                match s
+                                    .serverless_caches
+                                    .get_mut(&name)
+                                    .filter(|c| c.incarnation() == incarnation)
+                                {
+                                    Some(c) => c.status = "create-failed".to_string(),
+                                    // Deleted while starting: the failed start may still
+                                    // have created this incarnation's volume.
+                                    None => stop_container = true,
                                 }
                             }
                         }
                     } else {
-                        stop_container = result.is_ok();
+                        stop_container = true;
                     }
                 }
                 if stop_container {
-                    runtime.stop_container(&name).await;
+                    // Deleted (or reset) while it was starting: reap this
+                    // incarnation's container and its volume.
+                    super::reap_gone_start(&runtime, &incarnation, Some(&volume)).await;
                 }
                 save_snapshot_static(state, snapshot_store, snapshot_lock).await;
             });
@@ -270,7 +307,16 @@ impl ElastiCacheService {
         };
 
         if let Some(ref runtime) = self.runtime {
-            runtime.stop_container(&serverless_cache_name).await;
+            // Serverless caches run on a durable Redis volume too: stop this
+            // incarnation and drop its volume so a later cache reusing this
+            // name starts clean instead of reloading the deleted one's data.
+            runtime.stop(&cache.incarnation()).await;
+            runtime
+                .remove_data_volume_named(&cache.data_volume_name(
+                    fakecloud_core::data_volume::current_scope().tag(),
+                    &request.account_id,
+                ))
+                .await;
         }
 
         let mut deleted = cache;

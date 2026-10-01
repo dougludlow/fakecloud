@@ -54,15 +54,21 @@ pub async fn cfn_ensure_instance_container(
                     inst.master_user_password.clone(),
                     db_name,
                     inst.tags.clone(),
+                    inst.dbi_resource_id.clone(),
+                    inst.data_volume_name(
+                        fakecloud_core::data_volume::current_scope().tag(),
+                        &account_id,
+                    ),
                 )
             }
             None => return,
         }
     };
-    let (engine, engine_version, username, password, db_name, tags) = params;
+    let (engine, engine_version, username, password, db_name, tags, incarnation, volume) = params;
 
     match runtime
         .ensure_postgres(
+            &incarnation,
             &identifier,
             &engine,
             &engine_version,
@@ -72,6 +78,7 @@ pub async fn cfn_ensure_instance_container(
             &account_id,
             &region,
             &tags,
+            &volume,
         )
         .await
     {
@@ -81,7 +88,7 @@ pub async fn cfn_ensure_instance_container(
             let present = {
                 let mut accounts = state.write();
                 let st = accounts.get_or_create(&account_id);
-                if let Some(inst) = st.instances.get_mut(&identifier) {
+                if let Some(inst) = st.instance_by_incarnation_mut(&incarnation) {
                     inst.db_instance_status = "available".to_string();
                     inst.endpoint_address = running.endpoint_address;
                     inst.port = i32::from(running.endpoint_port);
@@ -93,8 +100,9 @@ pub async fn cfn_ensure_instance_container(
                 }
             };
             if !present {
-                // Deleted mid-boot: reap the orphaned container.
-                runtime.stop_container(&identifier).await;
+                // Deleted (or reset) mid-boot: reap the orphaned container and
+                // its volume, by incarnation.
+                crate::service::reap_gone_start(&runtime, &incarnation, &volume).await;
             }
         }
         Err(error) => {
@@ -103,10 +111,21 @@ pub async fn cfn_ensure_instance_container(
                 db_instance_identifier = %identifier,
                 "CFN-provisioned RDS instance failed to start its container",
             );
-            let mut accounts = state.write();
-            let st = accounts.get_or_create(&account_id);
-            if let Some(inst) = st.instances.get_mut(&identifier) {
-                inst.db_instance_status = "failed".to_string();
+            let present = {
+                let mut accounts = state.write();
+                let st = accounts.get_or_create(&account_id);
+                match st.instance_by_incarnation_mut(&incarnation) {
+                    Some(inst) => {
+                        inst.db_instance_status = "failed".to_string();
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if !present {
+                // Deleted mid-boot: the failed start may have created the
+                // volume after the delete's teardown ran.
+                crate::service::reap_gone_start(&runtime, &incarnation, &volume).await;
             }
         }
     }
@@ -118,12 +137,16 @@ pub async fn cfn_ensure_instance_container(
 /// `remove_data_volume`) so a stack delete does not leak the running Postgres /
 /// MySQL container or its persisted data volume. Intended to be `tokio::spawn`ed
 /// by the CloudFormation delete drain after the in-memory record has already
-/// been removed.
+/// been removed. `incarnation` (the deleted row's `DbiResourceId`) and
+/// `data_volume` were captured at delete time, so a replacement instance
+/// reusing the identifier is never touched.
 pub async fn cfn_teardown_instance_container(
     runtime: Arc<RdsRuntime>,
-    identifier: String,
-    account_id: String,
+    incarnation: String,
+    data_volume: Option<String>,
 ) {
-    runtime.stop_container(&identifier).await;
-    runtime.remove_data_volume(&account_id, &identifier).await;
+    runtime.stop(&incarnation).await;
+    if let Some(volume) = data_volume {
+        runtime.remove_data_volume_named(&volume).await;
+    }
 }

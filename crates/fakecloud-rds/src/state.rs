@@ -1,3 +1,4 @@
+use fakecloud_core::data_volume::DataVolumeBinding;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -137,6 +138,14 @@ pub struct DbInstance {
     pub master_user_password: String,
     pub container_id: String,
     pub host_port: u16,
+    /// Which data volume the instance mounts (see
+    /// `fakecloud_core::data_volume` and [`DbInstance::data_volume_name`]).
+    /// Instances created by this build are bound to their data-dir scoped
+    /// volume; `None` only for an instance persisted before volumes were
+    /// scoped (or never resolved since), which
+    /// [`RdsState::resolve_data_volumes`] binds against the daemon's volumes.
+    #[serde(default)]
+    pub data_volume: Option<DataVolumeBinding>,
     pub tags: Vec<RdsTag>,
     pub read_replica_source_db_instance_identifier: Option<String>,
     pub read_replica_db_instance_identifiers: Vec<String>,
@@ -396,6 +405,11 @@ pub struct DbRole {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbSnapshot {
+    /// For a final snapshot taken on DeleteDBInstance: the deleted instance's
+    /// data volume, which the snapshot's deferred teardown removes. `None`
+    /// for every other snapshot.
+    #[serde(default)]
+    pub source_data_volume: Option<String>,
     pub db_snapshot_identifier: String,
     pub db_snapshot_arn: String,
     /// The ARN of the snapshot this one was copied from, when it is a
@@ -708,7 +722,37 @@ const MARIADB_DEFAULT_PARAMETERS: &[EngineDefaultParameter] = &[
     },
 ];
 
+impl DbInstance {
+    /// The data volume this instance mounts: an adopted legacy volume, or the
+    /// one scoped to the data dir and keyed by the immutable `DbiResourceId`
+    /// (not the identifier), so a `NewDBInstanceIdentifier` rename keeps its
+    /// data and a new instance reusing the old identifier never inherits it.
+    pub fn data_volume_name(&self, scope_tag: &str, account_id: &str) -> String {
+        match &self.data_volume {
+            Some(DataVolumeBinding::Legacy(name)) => name.clone(),
+            _ => crate::runtime::scoped_data_volume_name(
+                scope_tag,
+                account_id,
+                &self.dbi_resource_id,
+            ),
+        }
+    }
+}
+
 impl RdsState {
+    /// The instance row of incarnation `dbi_resource_id` (its immutable
+    /// `DbiResourceId`), whatever identifier it goes by now. A background
+    /// start task finds its instance this way: by identifier it could hit a
+    /// replacement created after a delete, or miss its own after a rename.
+    pub fn instance_by_incarnation_mut(
+        &mut self,
+        dbi_resource_id: &str,
+    ) -> Option<&mut DbInstance> {
+        self.instances
+            .values_mut()
+            .find(|i| i.dbi_resource_id == dbi_resource_id)
+    }
+
     pub fn new(account_id: &str, region: &str) -> Self {
         Self {
             account_id: account_id.to_string(),
@@ -747,6 +791,32 @@ impl RdsState {
                 snapshot.snapshot_type = "manual".to_string();
             }
         }
+    }
+
+    /// Bind every instance persisted without a data-volume binding (state
+    /// written before volumes were scoped to the data dir) against the
+    /// daemon's volumes (`existing`): its scoped volume if that exists, else
+    /// the legacy (unscoped) volume its identifier named, else a new scoped
+    /// one. Instances created by this build are bound at creation, so a
+    /// fresh data dir never adopts another one's legacy volume (#2630).
+    /// Returns whether any instance was bound.
+    pub fn resolve_data_volumes(&mut self, scope_tag: &str, existing: &HashSet<String>) -> bool {
+        let mut changed = false;
+        for (id, inst) in self.instances.iter_mut() {
+            if inst.data_volume.is_none() {
+                inst.data_volume = Some(fakecloud_core::data_volume::resolve_binding(
+                    &crate::runtime::scoped_data_volume_name(
+                        scope_tag,
+                        &self.account_id,
+                        &inst.dbi_resource_id,
+                    ),
+                    &crate::runtime::legacy_data_volume_name(&self.account_id, id),
+                    existing,
+                ));
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn reset(&mut self) {
@@ -1084,7 +1154,7 @@ mod tests {
 
     use super::{
         default_engine_versions, default_orderable_options, default_parameter_groups, Arn,
-        DbInstance, RdsState, SUPPORTED_INSTANCE_CLASSES,
+        DataVolumeBinding, DbInstance, RdsState, SUPPORTED_INSTANCE_CLASSES,
     };
 
     #[test]
@@ -1123,6 +1193,7 @@ mod tests {
                 master_user_password: "secret123".to_string(),
                 container_id: "container-id".to_string(),
                 host_port: 15432,
+                data_volume: None,
                 tags: Vec::new(),
                 read_replica_source_db_instance_identifier: None,
                 read_replica_db_instance_identifiers: Vec::new(),
@@ -1291,6 +1362,7 @@ mod tests {
             master_user_password: "p".to_string(),
             container_id: "c".to_string(),
             host_port: 0,
+            data_volume: None,
             tags: Vec::new(),
             read_replica_source_db_instance_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
@@ -1339,6 +1411,103 @@ mod tests {
             db_cluster_identifier: None,
             activity_stream: None,
         }
+    }
+
+    /// A start task finds its instance by incarnation: after a rename it
+    /// still finds it, and after a delete + recreate under the same
+    /// identifier it finds nothing (and so reaps its own container).
+    #[test]
+    fn instance_by_incarnation_follows_renames_not_identifiers() {
+        let mut state = RdsState::new("123", "us-east-1");
+        let mut old = make_instance("db");
+        old.dbi_resource_id = "db-OLD".to_string();
+        state.instances.insert("db".to_string(), old);
+        // Rename db -> db2: same incarnation.
+        let mut moved = state.instances.remove("db").unwrap();
+        moved.db_instance_identifier = "db2".to_string();
+        state.instances.insert("db2".to_string(), moved);
+        assert_eq!(
+            state
+                .instance_by_incarnation_mut("db-OLD")
+                .map(|i| i.db_instance_identifier.clone()),
+            Some("db2".to_string())
+        );
+        // Delete db2 and recreate under the old identifier: a new incarnation.
+        state.instances.remove("db2");
+        let mut new = make_instance("db");
+        new.dbi_resource_id = "db-NEW".to_string();
+        state.instances.insert("db".to_string(), new);
+        assert!(state.instance_by_incarnation_mut("db-OLD").is_none());
+        assert!(state.instance_by_incarnation_mut("db-NEW").is_some());
+    }
+
+    #[test]
+    fn unbound_instances_resolve_scoped_first_then_legacy() {
+        let scoped =
+            |id: &str| crate::runtime::scoped_data_volume_name("dtag", "123", &format!("dbi-{id}"));
+        let mut existing = std::collections::HashSet::new();
+        existing.insert("fakecloud-rds-data-123-old-db".to_string());
+        existing.insert("fakecloud-rds-data-123-used-db".to_string());
+        existing.insert(scoped("used-db"));
+        existing.insert("fakecloud-rds-data-123-new-db".to_string());
+
+        let mut state = RdsState::new("123", "us-east-1");
+        let with_dbi = |id: &str| {
+            let mut inst = make_instance(id);
+            inst.dbi_resource_id = format!("dbi-{id}");
+            inst
+        };
+        for id in ["old-db", "no-vol", "used-db"] {
+            state.instances.insert(id.to_string(), with_dbi(id));
+        }
+        // Created by this build: bound at creation, never re-resolved.
+        let mut new_db = with_dbi("new-db");
+        new_db.data_volume = Some(DataVolumeBinding::Scoped);
+        state.instances.insert("new-db".to_string(), new_db);
+
+        // State written before the field existed deserializes unbound.
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["instances"]["old-db"]
+            .as_object_mut()
+            .unwrap()
+            .remove("data_volume");
+        let mut loaded: RdsState = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.instances["old-db"].data_volume, None);
+
+        assert!(loaded.resolve_data_volumes("dtag", &existing));
+        // Its legacy volume exists: kept.
+        assert_eq!(
+            loaded.instances["old-db"].data_volume,
+            Some(DataVolumeBinding::Legacy(
+                "fakecloud-rds-data-123-old-db".to_string()
+            ))
+        );
+        // Nothing to keep: scoped.
+        assert_eq!(
+            loaded.instances["no-vol"].data_volume,
+            Some(DataVolumeBinding::Scoped)
+        );
+        // Already writing to its scoped volume: stays there.
+        assert_eq!(
+            loaded.instances["used-db"].data_volume,
+            Some(DataVolumeBinding::Scoped)
+        );
+        // Bound at creation: a same-named legacy volume is ignored.
+        assert_eq!(
+            loaded.instances["new-db"].data_volume,
+            Some(DataVolumeBinding::Scoped)
+        );
+        // Resolution is idempotent.
+        assert!(!loaded.resolve_data_volumes("dtag", &existing));
+        // Named after the resource id, or the adopted legacy volume.
+        assert_eq!(
+            loaded.instances["used-db"].data_volume_name("dtag", "123"),
+            scoped("used-db")
+        );
+        assert_eq!(
+            loaded.instances["old-db"].data_volume_name("dtag", "123"),
+            "fakecloud-rds-data-123-old-db"
+        );
     }
 
     #[test]

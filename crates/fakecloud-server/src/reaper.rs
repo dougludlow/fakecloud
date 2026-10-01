@@ -11,6 +11,11 @@
 //! `fakecloud-instance` label, parse the owning PID out of the label value,
 //! and remove any whose owner is no longer alive. Objects owned by the
 //! currently-running fakecloud process are always skipped.
+//!
+//! Memory-mode data volumes (see `fakecloud_core::data_volume`) carry the same
+//! label and are reaped the same way, after the containers that mount them.
+//! Durable data-dir volumes carry no ownership label, so they are never
+//! touched here.
 
 /// Reap orphaned fakecloud-owned containers whose server PID is no longer alive.
 ///
@@ -41,6 +46,59 @@ pub fn reap_stale_containers() {
     if reaped_networks > 0 {
         tracing::info!(count = reaped_networks, "reaped orphaned backing networks");
     }
+
+    // Process-scoped data volumes outlive a killed memory-mode server just like
+    // its containers. Containers go first: a volume still mounted by one can't
+    // be removed.
+    let reaped_volumes = reap_orphan_volumes(&cli);
+    if reaped_volumes > 0 {
+        tracing::info!(count = reaped_volumes, "reaped orphaned data volumes");
+    }
+}
+
+/// Remove volumes labelled `fakecloud-instance=<owner>` whose owner is gone.
+/// `volume ls` can't print one label portably (docker formats `.Label`,
+/// podman only has the `.Labels` map), so the owner is read per volume with
+/// `volume inspect`, whose `.Labels` is a map on both engines.
+fn reap_orphan_volumes(cli: &str) -> usize {
+    let Some(listing) = fakecloud_core::container_net::bounded_output(
+        cli,
+        &[
+            "volume",
+            "ls",
+            "--filter",
+            "label=fakecloud-instance",
+            "--format",
+            "{{.Name}}",
+        ],
+    ) else {
+        return 0;
+    };
+    let mut reaped = 0usize;
+    for name in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some(owner) = fakecloud_core::container_net::bounded_output(
+            cli,
+            &[
+                "volume",
+                "inspect",
+                "--format",
+                "{{index .Labels \"fakecloud-instance\"}}",
+                name,
+            ],
+        ) else {
+            continue;
+        };
+        if !fakecloud_core::container_net::owned_by_dead_process(
+            owner.trim(),
+            fakecloud_core::container_net::pid_alive,
+        ) {
+            continue;
+        }
+        if fakecloud_core::container_net::bounded_status(cli, &["volume", "rm", name]) {
+            reaped += 1;
+        }
+    }
+    reaped
 }
 
 /// List objects carrying the `fakecloud-instance` label via

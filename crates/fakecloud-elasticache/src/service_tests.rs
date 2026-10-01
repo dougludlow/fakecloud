@@ -146,6 +146,7 @@ fn cache_cluster_xml_contains_expected_fields() {
         endpoint_port: 6379,
         container_id: "abc123".to_string(),
         host_port: 6379,
+        data_volume: None,
         replication_group_id: Some("rg-1".to_string()),
         cache_parameter_group_name: None,
         security_group_ids: Vec::new(),
@@ -717,6 +718,7 @@ fn service_with_cache_cluster(cluster_id: &str) -> ElastiCacheService {
                 endpoint_port: 6379,
                 container_id: "abc123".to_string(),
                 host_port: 6379,
+                data_volume: None,
                 replication_group_id: None,
                 cache_parameter_group_name: None,
                 security_group_ids: Vec::new(),
@@ -776,6 +778,7 @@ fn describe_cache_clusters_returns_all() {
                 endpoint_port: 6380,
                 container_id: "def456".to_string(),
                 host_port: 6380,
+                data_volume: None,
                 replication_group_id: None,
                 cache_parameter_group_name: None,
                 security_group_ids: Vec::new(),
@@ -976,6 +979,7 @@ fn add_cluster_to_replication_group_updates_members_and_count() {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             container_id: "abc123".to_string(),
             host_port: 6379,
+            data_volume: None,
             member_clusters: vec!["rg-1-001".to_string()],
             snapshot_retention_limit: 0,
             snapshot_window: "05:00-09:00".to_string(),
@@ -1049,6 +1053,7 @@ async fn delete_cache_cluster_removes_cluster_from_replication_group() {
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 container_id: "abc123".to_string(),
                 host_port: 6379,
+                data_volume: None,
                 member_clusters: vec!["delete-rg-001".to_string(), "delete-rg-cluster".to_string()],
                 snapshot_retention_limit: 0,
                 snapshot_window: "05:00-09:00".to_string(),
@@ -1147,6 +1152,7 @@ fn service_with_replication_group(group_id: &str, num_clusters: i32) -> ElastiCa
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 container_id: "abc123".to_string(),
                 host_port: 6379,
+                data_volume: None,
                 member_clusters,
                 snapshot_retention_limit: 0,
                 snapshot_window: "05:00-09:00".to_string(),
@@ -1233,6 +1239,7 @@ fn service_with_serverless_cache(cache_name: &str) -> ElastiCacheService {
                 daily_snapshot_time: Some("03:00".to_string()),
                 container_id: "cid".to_string(),
                 host_port: 6379,
+                data_volume: None,
             },
         );
     }
@@ -1522,6 +1529,7 @@ fn replication_group_xml_emits_dynamic_encryption_and_kms() {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             container_id: "c".to_string(),
             host_port: 6379,
+            data_volume: None,
             member_clusters: vec!["enc-rg-001".to_string()],
             snapshot_retention_limit: 5,
             snapshot_window: "05:00-09:00".to_string(),
@@ -2019,6 +2027,7 @@ fn describe_serverless_caches_returns_all() {
                 daily_snapshot_time: None,
                 container_id: "cid".to_string(),
                 host_port: 6380,
+                data_volume: None,
             },
         );
     }
@@ -2804,6 +2813,7 @@ fn snapshot_xml_contains_all_fields() {
         created_at: "2024-01-01T00:00:00Z".to_string(),
         snapshot_source: "manual".to_string(),
         rdb_path: None,
+        source_incarnation: None,
     };
     let xml = snapshot_xml(&snap);
     assert!(xml.contains("<SnapshotName>test-snap</SnapshotName>"));
@@ -3448,6 +3458,7 @@ fn replication_group_from_request(req: &AwsRequest) -> crate::state::Replication
         created_at: "2024-01-01T00:00:00Z".to_string(),
         container_id: "test-container".to_string(),
         host_port: port,
+        data_volume: None,
         member_clusters: (1..=num_cache_clusters)
             .map(|i| format!("{id}-{i:03}"))
             .collect(),
@@ -4176,6 +4187,7 @@ async fn reboot_cache_cluster_marks_rebooting_when_no_runtime() {
                 endpoint_port: 6379,
                 container_id: "abc123".to_string(),
                 host_port: 6379,
+                data_volume: None,
                 replication_group_id: None,
                 cache_parameter_group_name: None,
                 security_group_ids: Vec::new(),
@@ -4352,6 +4364,7 @@ fn insert_test_cluster(svc: &ElastiCacheService, id: &str) {
             endpoint_port: 6379,
             container_id: "abc123".to_string(),
             host_port: 6379,
+            data_volume: None,
             replication_group_id: None,
             cache_parameter_group_name: None,
             security_group_ids: Vec::new(),
@@ -4658,6 +4671,7 @@ fn cache_cluster_from_request(req: &AwsRequest) -> crate::state::CacheCluster {
         endpoint_port: port,
         container_id: "test-container".to_string(),
         host_port: port,
+        data_volume: None,
         replication_group_id: None,
         cache_parameter_group_name,
         security_group_ids,
@@ -5263,6 +5277,7 @@ async fn create_cache_cluster_with_existing_snapshot_creates_metadata_only() {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 snapshot_source: "manual".to_string(),
                 rdb_path: Some("/tmp/fake.rdb".to_string()),
+                source_incarnation: None,
             },
         );
     }
@@ -5306,6 +5321,7 @@ async fn create_replication_group_with_existing_snapshot_creates_metadata_only()
                 created_at: chrono::Utc::now().to_rfc3339(),
                 snapshot_source: "manual".to_string(),
                 rdb_path: Some("/tmp/fake.rdb".to_string()),
+                source_incarnation: None,
             },
         );
     }
@@ -5558,6 +5574,7 @@ fn insert_creating_snapshot(svc: &ElastiCacheService, name: &str, group_id: &str
             created_at: chrono::Utc::now().to_rfc3339(),
             snapshot_source: "manual".to_string(),
             rdb_path: None,
+            source_incarnation: None,
         },
     );
 }
@@ -5583,9 +5600,29 @@ fn reconcile_rearms_creating_snapshot_when_group_present() {
     let rearm = svc.plan_snapshot_recovery(true);
     assert_eq!(rearm.len(), 1);
     assert_eq!(rearm[0].snapshot_name, "snap1");
-    assert_eq!(rearm[0].group_id, "rg-1");
+    let group_incarnation = svc.state.read().default_ref().replication_groups["rg-1"].incarnation();
+    assert_eq!(rearm[0].incarnation, group_incarnation);
     // Left `creating`; the re-armed dump flips it to `available`.
     assert_eq!(ec_snapshot_status(&svc, "snap1"), "creating");
+}
+
+#[test]
+fn reconcile_fails_creating_snapshot_when_group_was_recreated() {
+    // The snapshot pinned the incarnation of the group it was taken from; a
+    // group recreated under the same id is another group, whose data must
+    // not be dumped into it.
+    let svc = service_with_replication_group("rg-1", 1);
+    insert_creating_snapshot(&svc, "snap1", "rg-1");
+    svc.state
+        .write()
+        .default_mut()
+        .snapshots
+        .get_mut("snap1")
+        .unwrap()
+        .source_incarnation = Some("deleted-incarnation".to_string());
+    let rearm = svc.plan_snapshot_recovery(true);
+    assert!(rearm.is_empty());
+    assert_eq!(ec_snapshot_status(&svc, "snap1"), "failed");
 }
 
 #[test]
@@ -5625,4 +5662,42 @@ fn reconcile_ignores_available_snapshots() {
     let rearm = svc.plan_snapshot_recovery(true);
     assert!(rearm.is_empty());
     assert_eq!(ec_snapshot_status(&svc, "snap1"), "available");
+}
+
+/// If the daemon can't list volumes at startup, an unbound (pre-scoping)
+/// Redis cluster isn't recovered onto a guessed volume, and stops claiming to
+/// be `available`; an unbound memcached cluster, which never had a volume,
+/// recovers as usual.
+#[tokio::test]
+async fn unresolvable_volume_skips_redis_recovery_but_not_memcached() {
+    let shared: crate::state::SharedElastiCacheState =
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+    {
+        let mut accounts = shared.write();
+        let state = accounts.default_mut();
+        for (id, engine) in [("redis-c", "redis"), ("mem-c", "memcached")] {
+            let mut c = crate::state::tests::fixture_cluster(id, engine);
+            c.data_volume = None;
+            state.cache_clusters.insert(id.to_string(), c);
+        }
+    }
+    let service = ElastiCacheService::new(shared.clone()).with_runtime(std::sync::Arc::new(
+        crate::runtime::ElastiCacheRuntime::new_stub_with_cli("false"),
+    ));
+    service.recover_persisted_containers().await;
+    let accounts = shared.read();
+    let state = accounts.default_ref();
+    assert_eq!(
+        state.cache_clusters["redis-c"].cache_cluster_status,
+        "incompatible-network"
+    );
+    assert_eq!(state.cache_clusters["redis-c"].data_volume, None);
+    // Queued for recovery (set synchronously; the spawned start hasn't run
+    // on this single-threaded test runtime yet).
+    assert_eq!(
+        state.cache_clusters["mem-c"].cache_cluster_status,
+        "starting"
+    );
 }

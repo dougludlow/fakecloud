@@ -175,6 +175,7 @@ fn db_instance_xml_renders_endpoint_and_status() {
         master_user_password: "secret123".to_string(),
         container_id: "container".to_string(),
         host_port: 15432,
+        data_volume: None,
         tags: Vec::new(),
         read_replica_source_db_instance_identifier: None,
         read_replica_db_instance_identifiers: Vec::new(),
@@ -301,6 +302,7 @@ fn db_snapshot_xml_emits_extended_fields() {
         master_username: "admin".to_string(),
         db_name: Some("appdb".to_string()),
         dbi_resource_id: "db-rid".to_string(),
+        source_data_volume: None,
         snapshot_type: "manual".to_string(),
         master_user_password: "secret".to_string(),
         tags: Vec::new(),
@@ -362,6 +364,7 @@ fn make_instance_with_defaults(id: &str) -> DbInstance {
         master_user_password: "p".to_string(),
         container_id: "c".to_string(),
         host_port: 0,
+        data_volume: None,
         tags: Vec::new(),
         read_replica_source_db_instance_identifier: None,
         read_replica_db_instance_identifiers: Vec::new(),
@@ -643,6 +646,7 @@ fn seed_instance(svc: &RdsService, identifier: &str) -> String {
             master_user_password: "secret".to_string(),
             container_id: "container".to_string(),
             host_port: 15432,
+            data_volume: None,
             tags: Vec::new(),
             read_replica_source_db_instance_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
@@ -2273,6 +2277,7 @@ fn other_account_snapshot(snapshot_id: &str) -> crate::state::DbSnapshot {
         master_username: "admin".to_string(),
         db_name: Some("appdb".to_string()),
         dbi_resource_id: format!("db-{}", Uuid::new_v4().simple()),
+        source_data_volume: None,
         snapshot_type: "manual".to_string(),
         master_user_password: "secret".to_string(),
         tags: Vec::new(),
@@ -2298,6 +2303,12 @@ fn seed_snapshot(svc: &RdsService, snapshot_id: &str, instance_id: &str) {
     let mut __a = svc.state.write();
     let state = __a.default_mut();
     let arn = state.db_snapshot_arn(&state.region, snapshot_id);
+    // A snapshot of a seeded instance carries that instance's incarnation.
+    let dbi_resource_id = state
+        .instances
+        .get(instance_id)
+        .map(|i| i.dbi_resource_id.clone())
+        .unwrap_or_else(|| format!("db-{}", Uuid::new_v4().simple()));
     state.snapshots.insert(
         snapshot_id.to_string(),
         crate::state::DbSnapshot {
@@ -2313,7 +2324,8 @@ fn seed_snapshot(svc: &RdsService, snapshot_id: &str, instance_id: &str) {
             port: 5432,
             master_username: "admin".to_string(),
             db_name: Some("appdb".to_string()),
-            dbi_resource_id: format!("db-{}", Uuid::new_v4().simple()),
+            dbi_resource_id,
+            source_data_volume: None,
             snapshot_type: "manual".to_string(),
             master_user_password: "secret".to_string(),
             tags: Vec::new(),
@@ -4324,6 +4336,31 @@ fn reconcile_fails_and_reaps_creating_snapshot_when_source_gone() {
 }
 
 #[test]
+fn reconcile_fails_creating_snapshot_when_identifier_was_recreated() {
+    // The snapshot's source was deleted and a new instance recreated under
+    // the same identifier: the new incarnation must not be dumped into the
+    // old snapshot, and the deleted incarnation's volume is reaped.
+    let svc = make_service();
+    seed_instance(&svc, "db1");
+    seed_snapshot(&svc, "snap1", "db1");
+    set_snapshot_creating(&svc, "snap1");
+    {
+        let mut accounts = svc.state.write();
+        let snap = accounts.default_mut().snapshots.get_mut("snap1").unwrap();
+        snap.dbi_resource_id = "db-OLDINCARNATION".to_string();
+        snap.source_data_volume = Some("old-volume".to_string());
+    }
+    let (rearm, reap) = svc.plan_snapshot_recovery(true);
+    assert!(rearm.is_empty());
+    assert_eq!(reap.len(), 1);
+    assert_eq!(reap[0].dbi_resource_id, "db-OLDINCARNATION");
+    assert_eq!(reap[0].data_volume.as_deref(), Some("old-volume"));
+    assert_eq!(snapshot_status(&svc, "snap1"), "failed");
+    // The live instance under the same identifier is untouched.
+    assert!(svc.state.read().default_ref().instances.contains_key("db1"));
+}
+
+#[test]
 fn reconcile_fails_creating_snapshot_without_runtime() {
     // 0.1: no runtime on restart means the dump can never complete, so a
     // source-present `creating` snapshot is marked terminal `failed` rather
@@ -5226,6 +5263,42 @@ fn modify_db_instance_renames_instance_and_arn() {
     );
 }
 
+/// A rename moves the instance's container, so it's refused while a
+/// background task (create, start, reboot, a final snapshot's teardown) still
+/// owns the container under the old identifier; nothing is modified.
+#[test]
+fn modify_db_instance_refuses_rename_while_a_task_owns_the_container() {
+    for status in ["creating", "starting", "rebooting", "deleting"] {
+        let svc = make_service();
+        seed_instance(&svc, "db-busy");
+        svc.state
+            .write()
+            .default_mut()
+            .instances
+            .get_mut("db-busy")
+            .unwrap()
+            .db_instance_status = status.to_string();
+        let req = request(
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", "db-busy"),
+                ("NewDBInstanceIdentifier", "db-moved"),
+                ("AllocatedStorage", "500"),
+                ("ApplyImmediately", "true"),
+            ],
+        );
+        let Err(err) = svc.modify_db_instance(&req) else {
+            panic!("{status}: rename must be refused");
+        };
+        assert_eq!(err.code(), "InvalidDBInstanceState", "{status}");
+        let accounts = svc.state.read();
+        let state = accounts.default_ref();
+        let inst = state.instances.get("db-busy").expect("not renamed");
+        assert_ne!(inst.allocated_storage, 500, "{status}: nothing modified");
+        assert!(!state.instances.contains_key("db-moved"));
+    }
+}
+
 #[test]
 fn modify_db_instance_rename_rejects_existing_target() {
     let svc = make_service();
@@ -5815,6 +5888,7 @@ async fn restore_db_instance_from_db_snapshot_persists_tags() {
         master_username: "admin".to_string(),
         db_name: Some("appdb".to_string()),
         dbi_resource_id: "db-rid".to_string(),
+        source_data_volume: None,
         snapshot_type: "manual".to_string(),
         master_user_password: "secret".to_string(),
         tags: Vec::new(),
@@ -6344,6 +6418,7 @@ async fn save_snapshot_static_persists_status_flip_from_bg_task() {
             master_user_password: "secret123".to_string(),
             container_id: String::new(),
             host_port: 0,
+            data_volume: None,
             tags: Vec::new(),
             read_replica_source_db_instance_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
@@ -6506,7 +6581,8 @@ async fn create_db_snapshot_requires_runtime() {
 /// the captured bytes and full progress; a failed dump flips to `failed`.
 #[test]
 fn apply_snapshot_dump_result_transitions_status() {
-    fn seed_creating(state: &SharedRdsState, id: &str) {
+    fn seed_creating(state: &SharedRdsState, id: &str) -> chrono::DateTime<Utc> {
+        let created = Utc::now();
         let mut accounts = state.write();
         let s = accounts.get_or_create("123456789012");
         s.snapshots.insert(
@@ -6516,7 +6592,7 @@ fn apply_snapshot_dump_result_transitions_status() {
                 db_snapshot_arn: format!("arn:aws:rds:us-east-1:123456789012:snapshot:{id}"),
                 source_db_snapshot_arn: None,
                 db_instance_identifier: "src".to_string(),
-                snapshot_create_time: Utc::now(),
+                snapshot_create_time: created,
                 engine: "postgres".to_string(),
                 engine_version: "16.3".to_string(),
                 allocated_storage: 20,
@@ -6525,6 +6601,7 @@ fn apply_snapshot_dump_result_transitions_status() {
                 master_username: "admin".to_string(),
                 db_name: Some("appdb".to_string()),
                 dbi_resource_id: "db-rid".to_string(),
+                source_data_volume: None,
                 snapshot_type: "manual".to_string(),
                 master_user_password: "secret".to_string(),
                 tags: Vec::new(),
@@ -6545,6 +6622,7 @@ fn apply_snapshot_dump_result_transitions_status() {
                 snapshot_attributes: std::collections::BTreeMap::new(),
             },
         );
+        created
     }
 
     let state: SharedRdsState = Arc::new(RwLock::new(
@@ -6552,8 +6630,14 @@ fn apply_snapshot_dump_result_transitions_status() {
     ));
 
     // Success path.
-    seed_creating(&state, "ok");
-    apply_snapshot_dump_result(&state, "123456789012", "ok", Ok(b"DUMP-BYTES".to_vec()));
+    let created = seed_creating(&state, "ok");
+    apply_snapshot_dump_result(
+        &state,
+        "123456789012",
+        "ok",
+        created,
+        Ok(b"DUMP-BYTES".to_vec()),
+    );
     {
         let accounts = state.read();
         let snap = &accounts.get("123456789012").unwrap().snapshots["ok"];
@@ -6563,11 +6647,12 @@ fn apply_snapshot_dump_result_transitions_status() {
     }
 
     // Failure path.
-    seed_creating(&state, "bad");
+    let created = seed_creating(&state, "bad");
     apply_snapshot_dump_result(
         &state,
         "123456789012",
         "bad",
+        created,
         Err(crate::runtime::RuntimeError::Unavailable),
     );
     {
@@ -6578,7 +6663,33 @@ fn apply_snapshot_dump_result_transitions_status() {
     }
 
     // A snapshot deleted mid-dump is a no-op, not a panic.
-    apply_snapshot_dump_result(&state, "123456789012", "ghost", Ok(vec![1, 2, 3]));
+    apply_snapshot_dump_result(
+        &state,
+        "123456789012",
+        "ghost",
+        Utc::now(),
+        Ok(vec![1, 2, 3]),
+    );
+
+    // A snapshot deleted and recreated under the same id during the dump is
+    // another row: the old dump must not complete it.
+    let old = seed_creating(&state, "reused");
+    seed_creating(&state, "reused");
+    // The replacement row is a distinct snapshot: its own creation time.
+    state
+        .write()
+        .get_or_create("123456789012")
+        .snapshots
+        .get_mut("reused")
+        .unwrap()
+        .snapshot_create_time = old + chrono::Duration::seconds(1);
+    apply_snapshot_dump_result(&state, "123456789012", "reused", old, Ok(b"OLD".to_vec()));
+    {
+        let accounts = state.read();
+        let snap = &accounts.get("123456789012").unwrap().snapshots["reused"];
+        assert_eq!(snap.status, "creating");
+        assert!(snap.dump_data.is_empty());
+    }
 }
 
 /// Memory mode: no store wired, save is a no-op. Guards against
@@ -7271,4 +7382,71 @@ fn modify_db_subnet_group_applies_description() {
         body.contains("<DBSubnetGroupDescription>updated desc</DBSubnetGroupDescription>"),
         "{body}"
     );
+}
+
+#[test]
+fn start_target_mounts_the_binding_resolved_after_the_lookup() {
+    // StartDBInstance on an instance whose legacy volume is bound lazily: the
+    // volume must come from the row as it is after the resolution, not from
+    // the copy taken before it (which would name an empty scoped volume).
+    let svc = make_service();
+    seed_instance(&svc, "db1");
+    let stale = {
+        let mut accounts = svc.state.write();
+        let inst = accounts.default_mut().instances.get_mut("db1").unwrap();
+        inst.data_volume = None;
+        inst.clone()
+    };
+    // The lazy resolution adopts the pre-scoping volume.
+    svc.state
+        .write()
+        .default_mut()
+        .instances
+        .get_mut("db1")
+        .unwrap()
+        .data_volume = Some(fakecloud_core::data_volume::DataVolumeBinding::Legacy(
+        "fakecloud-rds-data-123456789012-db1".to_string(),
+    ));
+    let (inst, volume) = super::start_target(
+        &svc.state.read(),
+        "123456789012",
+        &stale.dbi_resource_id,
+        "dtag",
+    )
+    .expect("instance present");
+    assert_eq!(volume, "fakecloud-rds-data-123456789012-db1");
+    assert_ne!(stale.data_volume_name("dtag", "123456789012"), volume);
+    assert!(inst.data_volume.is_some());
+    // Gone (deleted while resolving): nothing to start.
+    svc.state.write().default_mut().instances.remove("db1");
+    assert!(super::start_target(
+        &svc.state.read(),
+        "123456789012",
+        &stale.dbi_resource_id,
+        "dtag"
+    )
+    .is_none());
+}
+
+#[tokio::test]
+async fn final_snapshot_refuses_a_replacement_incarnation() {
+    // DeleteDBInstance validated one incarnation; a replacement created under
+    // the identifier since must be neither snapshotted nor marked deleting.
+    let svc = make_service().with_runtime(Arc::new(crate::runtime::RdsRuntime::new_stub()));
+    seed_instance(&svc, "db1");
+    let err = svc
+        .create_final_db_snapshot(
+            "db1",
+            "db-DELETEDINCARNATION",
+            "final",
+            "123456789012",
+            "us-east-1",
+        )
+        .await
+        .expect_err("mismatched incarnation refused");
+    assert!(format!("{err:?}").contains("DBInstanceNotFound"));
+    let accounts = svc.state.read();
+    let state = accounts.default_ref();
+    assert_ne!(state.instances["db1"].db_instance_status, "deleting");
+    assert!(!state.snapshots.contains_key("final"));
 }

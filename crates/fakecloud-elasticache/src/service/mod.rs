@@ -175,7 +175,10 @@ pub(crate) fn is_recoverable_status(status: &str) -> bool {
 pub(crate) struct SnapshotRearm {
     pub(crate) account_id: String,
     pub(crate) snapshot_name: String,
-    pub(crate) group_id: String,
+    /// The snapshot row's creation time: which row of that name to complete.
+    pub(crate) snapshot_created: String,
+    /// The source replication group's incarnation, whose container to dump.
+    pub(crate) incarnation: String,
 }
 
 pub struct ElastiCacheService {
@@ -268,6 +271,75 @@ impl ElastiCacheService {
         }))
     }
 
+    /// Settle which data volume each persisted resource mounts before any
+    /// container is recreated. Resources persisted without a binding (state
+    /// written before volumes were scoped to the data dir) are bound against
+    /// the daemon's volumes, keeping a legacy volume when one exists, and the
+    /// bindings are persisted; every legacy binding is then registered with
+    /// the runtime. If the daemon can't list volumes, the unbound resources
+    /// stay unbound until a start where it can.
+    async fn resolve_data_volumes(&self, runtime: &ElastiCacheRuntime) {
+        let unbound = self
+            .state
+            .read()
+            .iter()
+            .any(|(_, s)| s.has_unbound_data_volumes());
+        if unbound {
+            if let Some(existing) = runtime.list_volumes().await {
+                let tag = fakecloud_core::data_volume::current_scope().tag();
+                let changed = {
+                    let mut accounts = self.state.write();
+                    // Pre-scoping builds keyed the volume by id alone, so an
+                    // id unbound in two accounts names one shared volume.
+                    let mut seen = std::collections::HashSet::new();
+                    let mut contested = std::collections::HashSet::new();
+                    for (_, state) in accounts.iter() {
+                        // Once per account: a cluster and a group sharing an id
+                        // in one account aren't a cross-account conflict.
+                        let ids: std::collections::BTreeSet<String> =
+                            state.unbound_volume_ids().into_iter().collect();
+                        for id in ids {
+                            if !seen.insert(id.clone()) {
+                                contested.insert(id);
+                            }
+                        }
+                    }
+                    for id in &contested {
+                        tracing::warn!(
+                            resource_id = %id,
+                            volume = %crate::runtime::legacy_data_volume_name(id),
+                            "pre-scoping elasticache volume is shared by several accounts; \
+                             none adopts it, each starts on its own volume",
+                        );
+                    }
+                    let mut changed = false;
+                    for (_, state) in accounts.iter_mut() {
+                        changed |= state.resolve_data_volumes(tag, &existing, &contested);
+                    }
+                    changed
+                };
+                if changed {
+                    save_snapshot_static(
+                        self.state.clone(),
+                        self.snapshot_store.clone(),
+                        self.snapshot_lock.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
+        let accounts = self.state.read();
+        for (_, state) in accounts.iter() {
+            for (id, volume) in state.legacy_data_volumes() {
+                tracing::info!(
+                    resource_id = %id,
+                    volume = %volume,
+                    "elasticache resource keeps its pre-scoping data volume",
+                );
+            }
+        }
+    }
+
     /// Recreate the backing Docker/Podman containers for persisted cache
     /// clusters, replication groups, and serverless caches after a
     /// fakecloud restart. Same bug class as RDS #1338 — without this,
@@ -277,20 +349,30 @@ impl ElastiCacheService {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        self.resolve_data_volumes(&runtime).await;
+        // On k8s there are no Docker volumes, so an unbound resource has
+        // nothing to shadow and recovers as usual.
+        let uses_volumes = runtime.has_data_volumes();
 
         struct PendingCluster {
             account_id: String,
             id: String,
             engine: String,
+            incarnation: String,
+            volume: String,
         }
         struct PendingReplication {
             account_id: String,
             id: String,
             engine: String,
+            incarnation: String,
+            volume: String,
         }
         struct PendingServerless {
             account_id: String,
             name: String,
+            incarnation: String,
+            volume: String,
         }
 
         let (clusters, replications, serverless) = {
@@ -306,31 +388,75 @@ impl ElastiCacheService {
                     // mid-transition (creating/modifying/rebooting) was never
                     // re-spawned and stayed stuck forever (bug-audit 2026-06-20,
                     // 4.5).
-                    if is_recoverable_status(&cluster.cache_cluster_status) {
+                    // An unbound cluster's data volume couldn't be resolved
+                    // (the daemon couldn't list volumes): mounting now would
+                    // shadow a pre-scoping volume with an empty scoped one.
+                    let bound = cluster.data_volume.is_some()
+                        || cluster.engine == "memcached"
+                        || !uses_volumes;
+                    if is_recoverable_status(&cluster.cache_cluster_status) && !bound {
+                        // No container comes back: don't keep advertising a
+                        // live endpoint.
+                        cluster.cache_cluster_status = "incompatible-network".to_string();
+                        tracing::warn!(
+                            cache_cluster_id = %id,
+                            "not recovering cache cluster: its data volume could not be resolved",
+                        );
+                    } else if is_recoverable_status(&cluster.cache_cluster_status) {
                         cluster.cache_cluster_status = "starting".to_string();
                         clusters.push(PendingCluster {
                             account_id: account_id.clone(),
                             id: id.clone(),
                             engine: cluster.engine.clone(),
+                            incarnation: cluster.incarnation(),
+                            volume: cluster.data_volume_name(
+                                fakecloud_core::data_volume::current_scope().tag(),
+                                &account_id,
+                            ),
                         });
                     }
                 }
                 for (id, rg) in state.replication_groups.iter_mut() {
-                    if is_recoverable_status(&rg.status) {
+                    let bound =
+                        rg.data_volume.is_some() || rg.engine == "memcached" || !uses_volumes;
+                    if is_recoverable_status(&rg.status) && !bound {
+                        rg.status = "incompatible-network".to_string();
+                        tracing::warn!(
+                            replication_group_id = %id,
+                            "not recovering replication group: its data volume could not be resolved",
+                        );
+                    } else if is_recoverable_status(&rg.status) {
                         rg.status = "starting".to_string();
                         replications.push(PendingReplication {
                             account_id: account_id.clone(),
                             id: id.clone(),
                             engine: rg.engine.clone(),
+                            incarnation: rg.incarnation(),
+                            volume: rg.data_volume_name(
+                                fakecloud_core::data_volume::current_scope().tag(),
+                                &account_id,
+                            ),
                         });
                     }
                 }
                 for (name, sc) in state.serverless_caches.iter_mut() {
-                    if is_recoverable_status(&sc.status) {
+                    let bound = sc.data_volume.is_some() || !uses_volumes;
+                    if is_recoverable_status(&sc.status) && !bound {
+                        sc.status = "create-failed".to_string();
+                        tracing::warn!(
+                            serverless_cache_name = %name,
+                            "not recovering serverless cache: its data volume could not be resolved",
+                        );
+                    } else if is_recoverable_status(&sc.status) {
                         sc.status = "creating".to_string();
                         serverless.push(PendingServerless {
                             account_id: account_id.clone(),
                             name: name.clone(),
+                            incarnation: sc.incarnation(),
+                            volume: sc.data_volume_name(
+                                fakecloud_core::data_volume::current_scope().tag(),
+                                &account_id,
+                            ),
                         });
                     }
                 }
@@ -363,29 +489,57 @@ impl ElastiCacheService {
                         .and_then(|s| {
                             s.cache_clusters
                                 .get(&c.id)
+                                .filter(|cl| cl.incarnation() == c.incarnation)
                                 .and_then(|cl| s.tags.get(&cl.arn))
                         })
                         .map(|t| t.iter().cloned().collect())
                         .unwrap_or_default()
                 };
-                let result = if c.engine == "memcached" {
-                    runtime.ensure_memcached(&c.id, &pod_tags).await
+                let is_memcached = c.engine == "memcached";
+                let result = if is_memcached {
+                    runtime
+                        .ensure_memcached(&c.incarnation, &c.account_id, &c.id, &pod_tags)
+                        .await
                 } else {
-                    runtime.ensure_redis(&c.id, None, &pod_tags).await
+                    runtime
+                        .ensure_redis(
+                            &c.incarnation,
+                            &c.account_id,
+                            &c.id,
+                            &c.volume,
+                            None,
+                            &pod_tags,
+                        )
+                        .await
                 };
                 match result {
                     Ok(running) => {
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(s) = accounts.get_mut(&c.account_id) {
-                                if let Some(cluster) = s.cache_clusters.get_mut(&c.id) {
+                            match accounts.get_mut(&c.account_id).and_then(|s| {
+                                s.cache_clusters
+                                    .get_mut(&c.id)
+                                    .filter(|cl| cl.incarnation() == c.incarnation)
+                            }) {
+                                Some(cluster) => {
                                     cluster.cache_cluster_status = "available".to_string();
                                     cluster.endpoint_address = running.endpoint_address.clone();
                                     cluster.endpoint_port = running.endpoint_port;
                                     cluster.host_port = running.host_port;
                                     cluster.container_id = running.container_id;
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            // Deleted (or reset) while recovering.
+                            reap_gone_start(
+                                &runtime,
+                                &c.incarnation,
+                                (!is_memcached).then_some(&*c.volume),
+                            )
+                            .await;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -395,14 +549,30 @@ impl ElastiCacheService {
                             cache_cluster_id = %c.id,
                             "failed to recover elasticache cache cluster after restart",
                         );
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(s) = accounts.get_mut(&c.account_id) {
-                                if let Some(cluster) = s.cache_clusters.get_mut(&c.id) {
+                            match accounts.get_mut(&c.account_id).and_then(|s| {
+                                s.cache_clusters
+                                    .get_mut(&c.id)
+                                    .filter(|cl| cl.incarnation() == c.incarnation)
+                            }) {
+                                Some(cluster) => {
                                     cluster.cache_cluster_status =
                                         "incompatible-network".to_string();
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            // Deleted while recovering: the failed start may
+                            // still have created this incarnation's volume.
+                            reap_gone_start(
+                                &runtime,
+                                &c.incarnation,
+                                (!is_memcached).then_some(&*c.volume),
+                            )
+                            .await;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -425,29 +595,56 @@ impl ElastiCacheService {
                         .and_then(|s| {
                             s.replication_groups
                                 .get(&r.id)
+                                .filter(|rg| rg.incarnation() == r.incarnation)
                                 .and_then(|rg| s.tags.get(&rg.arn))
                         })
                         .map(|t| t.iter().cloned().collect())
                         .unwrap_or_default()
                 };
-                let result = if r.engine == "memcached" {
-                    runtime.ensure_memcached(&r.id, &pod_tags).await
+                let is_memcached = r.engine == "memcached";
+                let result = if is_memcached {
+                    runtime
+                        .ensure_memcached(&r.incarnation, &r.account_id, &r.id, &pod_tags)
+                        .await
                 } else {
-                    runtime.ensure_redis(&r.id, None, &pod_tags).await
+                    runtime
+                        .ensure_redis(
+                            &r.incarnation,
+                            &r.account_id,
+                            &r.id,
+                            &r.volume,
+                            None,
+                            &pod_tags,
+                        )
+                        .await
                 };
                 match result {
                     Ok(running) => {
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(s) = accounts.get_mut(&r.account_id) {
-                                if let Some(rg) = s.replication_groups.get_mut(&r.id) {
+                            match accounts.get_mut(&r.account_id).and_then(|s| {
+                                s.replication_groups
+                                    .get_mut(&r.id)
+                                    .filter(|g| g.incarnation() == r.incarnation)
+                            }) {
+                                Some(rg) => {
                                     rg.status = "available".to_string();
                                     rg.endpoint_address = running.endpoint_address.clone();
                                     rg.endpoint_port = running.endpoint_port;
                                     rg.host_port = running.host_port;
                                     rg.container_id = running.container_id;
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            reap_gone_start(
+                                &runtime,
+                                &r.incarnation,
+                                (!is_memcached).then_some(&*r.volume),
+                            )
+                            .await;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -457,13 +654,29 @@ impl ElastiCacheService {
                             replication_group_id = %r.id,
                             "failed to recover elasticache replication group after restart",
                         );
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(s) = accounts.get_mut(&r.account_id) {
-                                if let Some(rg) = s.replication_groups.get_mut(&r.id) {
+                            match accounts.get_mut(&r.account_id).and_then(|s| {
+                                s.replication_groups
+                                    .get_mut(&r.id)
+                                    .filter(|g| g.incarnation() == r.incarnation)
+                            }) {
+                                Some(rg) => {
                                     rg.status = "incompatible-network".to_string();
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            // Deleted while recovering: the failed start may
+                            // still have created this incarnation's volume.
+                            reap_gone_start(
+                                &runtime,
+                                &r.incarnation,
+                                (!is_memcached).then_some(&*r.volume),
+                            )
+                            .await;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -486,17 +699,32 @@ impl ElastiCacheService {
                         .and_then(|st| {
                             st.serverless_caches
                                 .get(&s.name)
+                                .filter(|c| c.incarnation() == s.incarnation)
                                 .and_then(|c| st.tags.get(&c.arn))
                         })
                         .map(|t| t.iter().cloned().collect())
                         .unwrap_or_default()
                 };
-                match runtime.ensure_redis(&s.name, None, &pod_tags).await {
+                match runtime
+                    .ensure_redis(
+                        &s.incarnation,
+                        &s.account_id,
+                        &s.name,
+                        &s.volume,
+                        None,
+                        &pod_tags,
+                    )
+                    .await
+                {
                     Ok(running) => {
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(st) = accounts.get_mut(&s.account_id) {
-                                if let Some(cache) = st.serverless_caches.get_mut(&s.name) {
+                            match accounts.get_mut(&s.account_id).and_then(|st| {
+                                st.serverless_caches
+                                    .get_mut(&s.name)
+                                    .filter(|c| c.incarnation() == s.incarnation)
+                            }) {
+                                Some(cache) => {
                                     cache.status = "available".to_string();
                                     cache.endpoint.address = running.endpoint_address.clone();
                                     cache.endpoint.port = running.endpoint_port;
@@ -505,8 +733,13 @@ impl ElastiCacheService {
                                     cache.reader_endpoint.port = running.endpoint_port;
                                     cache.host_port = running.host_port;
                                     cache.container_id = running.container_id;
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            reap_gone_start(&runtime, &s.incarnation, Some(&s.volume)).await;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -516,13 +749,24 @@ impl ElastiCacheService {
                             serverless_cache_name = %s.name,
                             "failed to recover elasticache serverless cache after restart",
                         );
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(st) = accounts.get_mut(&s.account_id) {
-                                if let Some(cache) = st.serverless_caches.get_mut(&s.name) {
+                            match accounts.get_mut(&s.account_id).and_then(|st| {
+                                st.serverless_caches
+                                    .get_mut(&s.name)
+                                    .filter(|c| c.incarnation() == s.incarnation)
+                            }) {
+                                Some(cache) => {
                                     cache.status = "create-failed".to_string();
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            // Deleted while recovering: the failed start may
+                            // still have created this incarnation's volume.
+                            reap_gone_start(&runtime, &s.incarnation, Some(&s.volume)).await;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -550,7 +794,8 @@ impl ElastiCacheService {
                     runtime.clone(),
                     r.account_id,
                     r.snapshot_name,
-                    r.group_id,
+                    r.snapshot_created,
+                    r.incarnation,
                 );
             }
         }
@@ -570,17 +815,28 @@ impl ElastiCacheService {
             let account_id = state.account_id.clone();
             // Snapshot the present group ids so the immutable borrow ends
             // before we mutate `state.snapshots` below.
-            let groups: std::collections::HashSet<String> =
-                state.replication_groups.keys().cloned().collect();
+            let groups: std::collections::HashMap<String, String> = state
+                .replication_groups
+                .iter()
+                .map(|(id, g)| (id.clone(), g.incarnation()))
+                .collect();
             for (name, snap) in state.snapshots.iter_mut() {
                 if snap.snapshot_status != "creating" {
                     continue;
                 }
-                if has_runtime && groups.contains(&snap.replication_group_id) {
+                // Re-armed only against the group incarnation it was taken
+                // from (any, for snapshots persisted before that was pinned).
+                let source = groups.get(&snap.replication_group_id).filter(|inc| {
+                    snap.source_incarnation
+                        .as_ref()
+                        .is_none_or(|pinned| pinned == *inc)
+                });
+                if let (true, Some(incarnation)) = (has_runtime, source) {
                     rearm.push(SnapshotRearm {
                         account_id: account_id.clone(),
                         snapshot_name: name.clone(),
-                        group_id: snap.replication_group_id.clone(),
+                        snapshot_created: snap.created_at.clone(),
+                        incarnation: incarnation.clone(),
                     });
                 } else {
                     snap.snapshot_status = "failed".to_string();
@@ -588,6 +844,22 @@ impl ElastiCacheService {
             }
         }
         rearm
+    }
+}
+
+/// A start task's container came up, but the resource incarnation it was
+/// started for is gone (deleted or reset while it booted): remove the
+/// container and the data volume it may have (re)created, which the delete
+/// couldn't remove while it was mounted. Keyed by incarnation, so a new
+/// resource reusing the id is never reached.
+pub(crate) async fn reap_gone_start(
+    runtime: &ElastiCacheRuntime,
+    incarnation: &str,
+    volume: Option<&str>,
+) {
+    runtime.stop(incarnation).await;
+    if let Some(volume) = volume {
+        runtime.remove_data_volume_named(volume).await;
     }
 }
 
@@ -883,14 +1155,14 @@ impl ElastiCacheService {
                 if c.cache_parameter_group_name.as_deref() == Some(param_group_name)
                     && (c.engine == ENGINE_REDIS || c.engine == ENGINE_VALKEY)
                 {
-                    target_ids.push(c.cache_cluster_id.clone());
+                    target_ids.push((c.cache_cluster_id.clone(), c.incarnation()));
                 }
             }
             for g in state.replication_groups.values() {
                 if g.cache_parameter_group_name.as_deref() == Some(param_group_name)
                     && (g.engine == ENGINE_REDIS || g.engine == ENGINE_VALKEY)
                 {
-                    target_ids.push(g.replication_group_id.clone());
+                    target_ids.push((g.replication_group_id.clone(), g.incarnation()));
                 }
             }
             let params = state
@@ -900,7 +1172,7 @@ impl ElastiCacheService {
                 .unwrap_or_default();
             (target_ids, params)
         };
-        for id in target_ids {
+        for (id, incarnation) in target_ids {
             for param in &params {
                 if !param.is_modifiable {
                     continue;
@@ -911,7 +1183,7 @@ impl ElastiCacheService {
                     param.parameter_name.clone(),
                     param.parameter_value.clone(),
                 ];
-                match runtime.exec_redis(&id, &args).await {
+                match runtime.exec_redis(&incarnation, &args).await {
                     Ok(output) if !output.success => {
                         tracing::warn!(
                             resource_id = %id,

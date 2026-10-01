@@ -54,6 +54,11 @@ pub struct RunningDbContainer {
 
 pub struct RdsRuntime {
     cli: String,
+    /// Backing containers by the instance's incarnation id (its immutable
+    /// `DbiResourceId`), never by the reusable identifier: a delete and a
+    /// recreate under the same identifier, a rename or a blue/green
+    /// switchover can't make one instance's start, stop or teardown reach
+    /// another's container.
     containers: RwLock<HashMap<String, RunningDbContainer>>,
     instance_id: String,
     /// Container-to-host networking resolved from the shared
@@ -175,8 +180,12 @@ impl RdsRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Start (or replace) the backing container of the instance incarnation
+    /// `incarnation` (its `DbiResourceId`), mounting `data_volume` (named
+    /// from the instance row: `DbInstance::data_volume_name`).
     pub async fn ensure_postgres(
         &self,
+        incarnation: &str,
         db_instance_identifier: &str,
         engine: &str,
         engine_version: &str,
@@ -186,7 +195,9 @@ impl RdsRuntime {
         account_id: &str,
         region: &str,
         tags: &[crate::state::RdsTag],
+        data_volume: &str,
     ) -> Result<RunningDbContainer, RuntimeError> {
+        let key = incarnation.to_string();
         if let Some(k) = &self.k8s {
             // Per-instance Pod scheduling overrides come from the
             // resource's reserved `fakecloud-k8s/*` tags. Ignored on the
@@ -197,6 +208,7 @@ impl RdsRuntime {
                 .collect();
             let running = k
                 .ensure(
+                    &key,
                     db_instance_identifier,
                     engine,
                     engine_version,
@@ -208,12 +220,10 @@ impl RdsRuntime {
                     &tag_map,
                 )
                 .await?;
-            self.containers
-                .write()
-                .insert(db_instance_identifier.to_string(), running.clone());
+            self.containers.write().insert(key, running.clone());
             return Ok(running);
         }
-        self.stop_container(db_instance_identifier).await;
+        self.stop(&key).await;
 
         // Determine Docker image and port based on engine. Postgres,
         // MySQL, and MariaDB all use prebuilt fakecloud-* images that
@@ -348,6 +358,10 @@ impl RdsRuntime {
             "--label".to_string(),
             format!("fakecloud-rds={db_instance_identifier}"),
             "--label".to_string(),
+            format!("fakecloud-account={account_id}"),
+            "--label".to_string(),
+            format!("fakecloud-rds-resource={incarnation}"),
+            "--label".to_string(),
             format!("fakecloud-instance={}", self.instance_id),
         ];
 
@@ -355,22 +369,26 @@ impl RdsRuntime {
             args.push("--privileged".to_string());
         }
 
-        // Optionally persist the data directory in a named volume keyed to the
-        // instance so a container recreated after a fakecloud restart reattaches
-        // the same data instead of coming back empty (bug-audit 2026-06-20, 4.2).
-        // OFF by default: a process-stable volume name persists on the host
-        // across instances/test cases, so a later instance reusing an
-        // identifier (e.g. restore-from-snapshot) would inherit stale data
-        // (`relation already exists`). Opt in with FAKECLOUD_PERSIST_DB_VOLUMES=1
-        // for a long-lived dev server. Only the official-image engines with a
-        // well-known, volume-friendly data dir.
+        // Optionally persist the data directory in a named volume so a
+        // container recreated after a fakecloud restart reattaches the same
+        // data instead of coming back empty (bug-audit 2026-06-20, 4.2). The
+        // name is scoped to the data dir (memory mode: to this process), so a
+        // different data dir or fakecloud reusing the identifier starts clean
+        // (#2630). On by default in persistent mode, off in memory mode;
+        // FAKECLOUD_PERSIST_DB_VOLUMES overrides. Only the official-image
+        // engines with a well-known, volume-friendly data dir.
         if db_volumes_enabled() {
             if let Some(data_dir) = engine_data_dir(engine) {
+                let volume = data_volume.to_string();
+                fakecloud_core::data_volume::ensure_volume(
+                    &self.cli,
+                    &volume,
+                    fakecloud_core::data_volume::current_scope(),
+                    &[format!("fakecloud-rds={db_instance_identifier}")],
+                )
+                .await;
                 args.push("-v".to_string());
-                args.push(format!(
-                    "{}:{data_dir}",
-                    data_volume_name(account_id, db_instance_identifier)
-                ));
+                args.push(format!("{volume}:{data_dir}"));
             }
         }
 
@@ -460,14 +478,13 @@ impl RdsRuntime {
             endpoint_address: self.net.sibling_host.clone(),
             endpoint_port: host_port,
         };
-        self.containers
-            .write()
-            .insert(db_instance_identifier.to_string(), running.clone());
+        self.containers.write().insert(key, running.clone());
         Ok(running)
     }
 
-    pub async fn stop_container(&self, db_instance_identifier: &str) {
-        let container = self.containers.write().remove(db_instance_identifier);
+    /// Stop and remove the backing container of incarnation `incarnation`.
+    pub async fn stop(&self, incarnation: &str) {
+        let container = self.containers.write().remove(incarnation);
         if let Some(container) = container {
             if let Some(k) = &self.k8s {
                 k.delete_pod(&container.container_id).await;
@@ -477,9 +494,9 @@ impl RdsRuntime {
         }
     }
 
-    pub async fn restart_container(
+    pub async fn restart(
         &self,
-        db_instance_identifier: &str,
+        incarnation: &str,
         engine: &str,
         username: &str,
         password: &str,
@@ -487,17 +504,20 @@ impl RdsRuntime {
     ) -> Result<RunningDbContainer, RuntimeError> {
         if let Some(k) = &self.k8s {
             let running = k
-                .restart(db_instance_identifier, engine, username, password, db_name)
+                .restart(incarnation, engine, username, password, db_name)
                 .await?;
-            self.containers
-                .write()
-                .insert(db_instance_identifier.to_string(), running.clone());
+            if !self.retrack(incarnation, &running) {
+                // Stopped (deleted or reset) during the restart: the Pod just
+                // recreated belongs to nothing any more.
+                k.delete_pod(&running.container_id).await;
+                return Err(RuntimeError::Unavailable);
+            }
             return Ok(running);
         }
         let running = self
             .containers
             .read()
-            .get(db_instance_identifier)
+            .get(incarnation)
             .cloned()
             .ok_or(RuntimeError::Unavailable)?;
 
@@ -554,10 +574,27 @@ impl RdsRuntime {
             endpoint_address: self.net.sibling_host.clone(),
             endpoint_port: host_port,
         };
-        self.containers
-            .write()
-            .insert(db_instance_identifier.to_string(), running.clone());
+        if !self.retrack(incarnation, &running) {
+            // Stopped (deleted or reset) during the restart.
+            self.remove_container(&running.container_id).await;
+            return Err(RuntimeError::Unavailable);
+        }
         Ok(running)
+    }
+
+    /// Record a restarted container, but only while its incarnation is still
+    /// tracked. A `stop` that ran during the restart removed the entry, and
+    /// re-inserting it would track a deleted instance's container forever.
+    /// Returns whether it was recorded.
+    fn retrack(&self, incarnation: &str, running: &RunningDbContainer) -> bool {
+        let mut containers = self.containers.write();
+        match containers.get_mut(incarnation) {
+            Some(entry) => {
+                *entry = running.clone();
+                true
+            }
+            None => false,
+        }
     }
 
     pub async fn stop_all(&self) {
@@ -760,20 +797,31 @@ impl RdsRuntime {
             .await;
     }
 
-    /// Remove the persisted data volume for an instance. Called on
-    /// DeleteDBInstance so a later instance reusing the same identifier starts
-    /// clean rather than inheriting the deleted instance's data. A no-op on the
-    /// k8s backend (PVC lifecycle is handled there) and for engines without a
-    /// managed volume.
-    pub async fn remove_data_volume(&self, account_id: &str, db_instance_identifier: &str) {
+    /// Remove a data volume by name. Every teardown names the volume from the
+    /// deleted instance's row, captured when it was deleted: looking the
+    /// identifier up again later could find a new instance that reuses it and
+    /// remove that one's volume instead.
+    pub async fn remove_data_volume_named(&self, name: &str) {
         if self.k8s.is_some() || !db_volumes_enabled() {
             return;
         }
-        let name = data_volume_name(account_id, db_instance_identifier);
-        let _ = tokio::process::Command::new(&self.cli)
-            .args(["volume", "rm", "-f", &name])
-            .output()
-            .await;
+        fakecloud_core::data_volume::remove_volume(&self.cli, name).await;
+    }
+
+    /// Whether this backend mounts named Docker volumes (not k8s), i.e.
+    /// whether an instance's volume binding matters to recovery.
+    pub fn has_data_volumes(&self) -> bool {
+        self.k8s.is_none() && db_volumes_enabled()
+    }
+
+    /// The daemon's volume names, for resolving legacy volumes at startup.
+    /// `None` on the k8s backend (no Docker volumes there) or when the daemon
+    /// can't answer.
+    pub async fn list_volumes(&self) -> Option<std::collections::HashSet<String>> {
+        if self.k8s.is_some() {
+            return None;
+        }
+        fakecloud_core::data_volume::list_volumes(&self.cli).await
     }
 
     /// Build (or reuse) the fakecloud-postgres image for a given major
@@ -1016,7 +1064,7 @@ impl RdsRuntime {
         Ok(())
     }
 
-    pub async fn dump_database(
+    pub async fn dump(
         &self,
         db_instance_identifier: &str,
         engine: &str,
@@ -1098,7 +1146,7 @@ impl RdsRuntime {
     /// instance has no live container; returns `ContainerStartFailed`
     /// when the file is missing or unreadable. Callers map those to the
     /// AWS-shaped responses.
-    pub async fn read_log_file(
+    pub async fn read_log(
         &self,
         db_instance_identifier: &str,
         container_path: &str,
@@ -1130,7 +1178,7 @@ impl RdsRuntime {
         Ok(output.stdout)
     }
 
-    pub async fn restore_database(
+    pub async fn restore(
         &self,
         db_instance_identifier: &str,
         engine: &str,
@@ -1229,10 +1277,10 @@ impl RdsRuntime {
     }
 }
 
-/// Whether DB data should survive a fakecloud restart via a named Docker
-/// volume. OFF by default (ephemeral, matching pre-#1826 behavior and keeping
-/// restore-from-snapshot / repeated-identifier flows clean); opt in with
-/// `FAKECLOUD_PERSIST_DB_VOLUMES=1` on a long-lived dev server.
+/// Whether DB data should survive a container being recreated via a named
+/// Docker volume. The server defaults `FAKECLOUD_PERSIST_DB_VOLUMES` on in
+/// persistent mode (volumes scoped to the data dir); unset means off, as in
+/// memory mode, where an explicit opt-in gets process-scoped volumes.
 fn db_volumes_enabled() -> bool {
     std::env::var("FAKECLOUD_PERSIST_DB_VOLUMES")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
@@ -1250,27 +1298,25 @@ fn engine_data_dir(engine: &str) -> Option<&'static str> {
     }
 }
 
-/// Deterministic Docker volume name for an instance's data dir. Keyed only on
-/// account + instance id (NOT the per-process fakecloud instance id) so the
-/// same volume reattaches after a fakecloud restart. Characters outside
-/// Docker's `[a-zA-Z0-9_.-]` volume-name set are replaced with `-`.
-fn data_volume_name(account_id: &str, db_instance_identifier: &str) -> String {
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
-    };
-    format!(
-        "fakecloud-rds-data-{}-{}",
-        sanitize(account_id),
-        sanitize(db_instance_identifier)
+/// Docker volume name for an instance's data dir in a volume scope
+/// (`fakecloud_core::data_volume`): stable for the same data dir across
+/// restarts, so the recovered container reattaches it, and distinct for any
+/// other data dir or memory-mode process.
+pub fn scoped_data_volume_name(
+    scope_tag: &str,
+    account_id: &str,
+    db_instance_identifier: &str,
+) -> String {
+    fakecloud_core::data_volume::scoped_volume_name(
+        "rds",
+        scope_tag,
+        &[account_id, db_instance_identifier],
     )
+}
+
+/// The unscoped name builds before #2630 gave an instance's data volume.
+pub fn legacy_data_volume_name(account_id: &str, db_instance_identifier: &str) -> String {
+    fakecloud_core::data_volume::legacy_volume_name("rds", &[account_id, db_instance_identifier])
 }
 
 /// Build the prebuilt-image reference for a given engine + major
@@ -1322,18 +1368,74 @@ mod tests {
     }
 
     #[test]
-    fn data_volume_name_is_stable_and_sanitized() {
-        // Stable across calls (so recovery reattaches the same volume) and
-        // keyed on account + instance id, not the per-process instance id.
+    fn data_volume_name_is_scoped_stable_and_sanitized() {
+        // Stable for a scope (so recovery reattaches the same volume) and
+        // keyed on account + instance id.
         assert_eq!(
-            data_volume_name("123456789012", "my-db"),
-            "fakecloud-rds-data-123456789012-my-db"
+            scoped_data_volume_name("d0123456789ab", "123456789012", "my-db"),
+            "fakecloud-rds-data-d0123456789ab-123456789012-my-db"
+        );
+        // Two data dirs never share a volume for the same identifier.
+        assert_ne!(
+            scoped_data_volume_name("d0123456789ab", "123456789012", "my-db"),
+            scoped_data_volume_name("dba9876543210", "123456789012", "my-db")
         );
         // Characters outside Docker's volume-name set become '-'.
         assert_eq!(
-            data_volume_name("123456789012", "weird/name:1"),
-            "fakecloud-rds-data-123456789012-weird-name-1"
+            scoped_data_volume_name("d0", "123456789012", "weird/name:1"),
+            "fakecloud-rds-data-d0-123456789012-weird-name-1"
         );
+        // The legacy name is exactly what pre-scoping builds created.
+        assert_eq!(
+            legacy_data_volume_name("123456789012", "my-db"),
+            "fakecloud-rds-data-123456789012-my-db"
+        );
+    }
+
+    /// A delete and a recreate under the same identifier are different
+    /// incarnations: stopping the old one never reaches the new one's
+    /// container.
+    #[tokio::test]
+    async fn containers_are_tracked_by_incarnation() {
+        let rt = RdsRuntime::new_stub();
+        rt.containers
+            .write()
+            .insert("db-OLD".to_string(), running("c-old"));
+        rt.containers
+            .write()
+            .insert("db-NEW".to_string(), running("c-new"));
+        rt.stop("db-OLD").await;
+        let left: Vec<(String, String)> = rt
+            .containers
+            .read()
+            .iter()
+            .map(|(k, c)| (k.clone(), c.container_id.clone()))
+            .collect();
+        assert_eq!(left, vec![("db-NEW".to_string(), "c-new".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_retrack_a_stopped_incarnation() {
+        let rt = RdsRuntime::new_stub();
+        rt.containers
+            .write()
+            .insert("db-A".to_string(), running("c-a"));
+        // Still tracked: the restarted container replaces the entry.
+        assert!(rt.retrack("db-A", &running("c-a2")));
+        assert_eq!(rt.containers.read()["db-A"].container_id, "c-a2");
+        // Stopped while the restart ran: nothing is re-inserted.
+        rt.stop("db-A").await;
+        assert!(!rt.retrack("db-A", &running("c-a3")));
+        assert!(rt.containers.read().is_empty());
+    }
+
+    fn running(id: &str) -> RunningDbContainer {
+        RunningDbContainer {
+            container_id: id.to_string(),
+            host_port: 0,
+            endpoint_address: "127.0.0.1".to_string(),
+            endpoint_port: 5432,
+        }
     }
 
     /// Exercises the pure tag builder with explicit registries so the cases
@@ -1409,7 +1511,7 @@ mod tests {
         let rt = RdsRuntime::new_stub();
 
         // Delete arrives first: container not registered yet -> no-op.
-        rt.stop_container("db-1").await;
+        rt.stop("db-1").await;
         assert!(
             rt.containers.read().is_empty(),
             "nothing registered yet, stop is a no-op",
@@ -1446,7 +1548,7 @@ mod tests {
             .insert("db-1".to_string(), running_stub("container-abc"));
 
         // The instance-gone branch reaps it.
-        rt.stop_container("db-1").await;
+        rt.stop("db-1").await;
 
         assert!(
             rt.containers.read().is_empty(),

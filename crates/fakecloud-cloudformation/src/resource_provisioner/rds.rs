@@ -483,6 +483,7 @@ impl ResourceProvisioner {
             master_user_password,
             container_id: String::new(),
             host_port: 0,
+            data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
             tags,
             read_replica_source_db_instance_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
@@ -755,19 +756,25 @@ impl ResourceProvisioner {
     }
 
     pub(super) fn delete_rds_db_instance(&self, physical_id: &str) -> Result<(), String> {
-        {
+        let removed = {
             let mut accounts = self.rds_state.write();
             let state = accounts.get_or_create(&self.account_id);
-            state.instances.remove(physical_id);
-        }
+            state.instances.remove(physical_id)
+        };
         // Queue the REAL container teardown when a runtime is wired, so the stack
         // delete drain stops + removes the Postgres/MySQL container and its data
         // volume instead of leaking it (the create-side #2031 hardening for the
-        // delete path).
-        if self.rds_runtime.is_some() {
+        // delete path). The deleted row's resource id and volume travel with
+        // the intent, so the teardown never reaches a replacement instance
+        // that reuses the identifier.
+        if let (Some(_), Some(inst)) = (self.rds_runtime.as_ref(), removed) {
             self.pending_container_teardowns.lock().push(
                 super::ContainerTeardownIntent::RdsInstance {
-                    identifier: physical_id.to_string(),
+                    incarnation: inst.dbi_resource_id.clone(),
+                    data_volume: Some(inst.data_volume_name(
+                        fakecloud_core::data_volume::current_scope().tag(),
+                        &self.account_id,
+                    )),
                 },
             );
         }

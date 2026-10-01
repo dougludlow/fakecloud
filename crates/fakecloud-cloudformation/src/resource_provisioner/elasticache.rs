@@ -504,6 +504,7 @@ impl ResourceProvisioner {
             endpoint_port: port,
             container_id: String::new(),
             host_port: 0,
+            data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
             replication_group_id: None,
             cache_parameter_group_name,
             security_group_ids,
@@ -641,15 +642,24 @@ impl ResourceProvisioner {
     }
 
     pub(crate) fn delete_ec_cache_cluster(&self, physical_id: &str) -> Result<(), String> {
-        {
+        let removed = {
             let mut accounts = self.elasticache_state.write();
             let state = accounts.get_or_create(&self.account_id);
-            state.cache_clusters.remove(physical_id);
-        }
-        if self.elasticache_runtime.is_some() {
+            state.cache_clusters.remove(physical_id)
+        };
+        // Name the container and volume from the removed row's incarnation:
+        // the teardown runs later and must never reach a replacement cluster
+        // reusing the id.
+        if let (Some(_), Some(cluster)) = (self.elasticache_runtime.as_ref(), removed) {
             self.pending_container_teardowns.lock().push(
                 ContainerTeardownIntent::ElastiCacheCluster {
-                    cache_cluster_id: physical_id.to_string(),
+                    incarnation: cluster.incarnation(),
+                    volume: (cluster.engine != "memcached").then(|| {
+                        cluster.data_volume_name(
+                            fakecloud_core::data_volume::current_scope().tag(),
+                            &self.account_id,
+                        )
+                    }),
                 },
             );
         }
@@ -801,6 +811,7 @@ impl ResourceProvisioner {
             created_at: Utc::now().to_rfc3339(),
             container_id: String::new(),
             host_port: 0,
+            data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
             member_clusters: Vec::new(),
             snapshot_retention_limit,
             snapshot_window,
@@ -1014,15 +1025,19 @@ impl ResourceProvisioner {
     }
 
     pub(crate) fn delete_ec_replication_group(&self, physical_id: &str) -> Result<(), String> {
-        {
+        let removed = {
             let mut accounts = self.elasticache_state.write();
             let state = accounts.get_or_create(&self.account_id);
-            state.replication_groups.remove(physical_id);
-        }
-        if self.elasticache_runtime.is_some() {
+            state.replication_groups.remove(physical_id)
+        };
+        if let (Some(_), Some(group)) = (self.elasticache_runtime.as_ref(), removed) {
             self.pending_container_teardowns.lock().push(
                 ContainerTeardownIntent::ElastiCacheReplicationGroup {
-                    replication_group_id: physical_id.to_string(),
+                    incarnation: group.incarnation(),
+                    volume: Some(group.data_volume_name(
+                        fakecloud_core::data_volume::current_scope().tag(),
+                        &self.account_id,
+                    )),
                 },
             );
         }

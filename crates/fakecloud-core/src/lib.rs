@@ -3,6 +3,7 @@ pub mod auth_message;
 pub mod cfn_template;
 pub mod container_image;
 pub mod container_net;
+pub mod data_volume;
 pub mod delivery;
 pub mod dispatch;
 pub mod ecr_uri;

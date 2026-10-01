@@ -1107,15 +1107,27 @@ pub enum ContainerSpawnIntent {
 /// [`ContainerSpawnIntent`] for teardown.
 #[derive(Debug, Clone)]
 pub enum ContainerTeardownIntent {
-    /// `AWS::RDS::DBInstance` -- stop + remove the Postgres/MySQL container and
-    /// its persisted data volume.
-    RdsInstance { identifier: String },
+    /// `AWS::RDS::DBInstance` -- stop + remove the Postgres/MySQL container
+    /// (keyed by the deleted row's incarnation) and its persisted data volume
+    /// (named from the deleted row).
+    RdsInstance {
+        /// The removed row's `DbiResourceId`.
+        incarnation: String,
+        data_volume: Option<String>,
+    },
     /// `AWS::ElastiCache::CacheCluster` -- stop + remove the Redis/Memcached
     /// container and its data volume.
-    ElastiCacheCluster { cache_cluster_id: String },
+    ElastiCacheCluster {
+        /// The removed row's incarnation id and data volume.
+        incarnation: String,
+        volume: Option<String>,
+    },
     /// `AWS::ElastiCache::ReplicationGroup` -- stop + remove the Redis container
     /// and its data volume.
-    ElastiCacheReplicationGroup { replication_group_id: String },
+    ElastiCacheReplicationGroup {
+        incarnation: String,
+        volume: Option<String>,
+    },
     /// `AWS::ECS::Service` -- stop the REAL tasks (containers) the service was
     /// running. The cluster + service name locate the orphaned task records.
     EcsService {

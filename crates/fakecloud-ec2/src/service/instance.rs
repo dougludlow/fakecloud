@@ -364,8 +364,14 @@ fn boot_launched(svc: &Ec2Service, account_id: &str, launched: &Launched) {
     let snapshot_hook = svc.snapshot_hook();
     tokio::spawn(async move {
         for id in &ids {
-            let running = if let Some(rt) = &runtime {
-                match rt
+            // Serialized with every other lifecycle op on the instance, and
+            // converging to the row's state once the lock is held: an
+            // instance stopped, terminated or deleted before its boot got
+            // here starts nothing, and one that goes away while booting has
+            // what the boot created reaped (`settle_started`).
+            let _lifecycle = lock_lifecycle(runtime.as_ref(), id).await;
+            let running = match &runtime {
+                Some(rt) if wants_container(&svc_state, &account_id, id) => match rt
                     .run_instance(
                         &account_id,
                         id,
@@ -380,11 +386,11 @@ fn boot_launched(svc: &Ec2Service, account_id: &str, launched: &Launched) {
                         tracing::warn!(instance_id = %id, error = %e, "EC2 instance container failed to start; serving metadata-only");
                         None
                     }
-                }
-            } else {
-                None
+                },
+                _ => None,
             };
-            reconcile_started(&svc_state, &account_id, id, running);
+            let post = reconcile_started(&svc_state, &account_id, id, running);
+            settle_started(runtime.as_ref(), &account_id, id, post).await;
         }
         // Persist the reconciled (`running`) state so a restart restores
         // running instances rather than resurrecting them as pending.
@@ -1161,22 +1167,42 @@ fn attach_secondary_network_interfaces(
 /// container is up. Re-acquires the lock and re-checks the instance still
 /// exists and hasn't been terminated by a concurrent op before writing the
 /// container handle / IP (bug-hunt 2026-06-15 finding 0.4).
+///
+/// Returns what to do with the container that was just started: if the
+/// instance is gone (deleted, reset) or terminated meanwhile, or stopped, the
+/// container came up after the op that should have removed or stopped it, so
+/// the caller reaps or stops it ([`settle_started`]). A gone or terminated
+/// instance is reaped even when no container started: a failed boot may still
+/// have created its volume, which nothing else would remove. Instance ids are
+/// unique per instance, so this never reaches another instance's container.
+///
+/// Callers hold the instance's lifecycle lock (`lock_lifecycle`) across the
+/// boot and this reconcile, so the decision can't be overtaken by a later
+/// Start/Stop before [`settle_started`] applies it.
 fn reconcile_started(
     state: &crate::state::SharedEc2State,
     account_id: &str,
     id: &str,
     running: Option<crate::runtime::RunningInstance>,
-) {
+) -> PostStart {
+    let started = running.is_some();
     let mut accounts = state.write();
-    let Some(s) = accounts.get_mut(account_id) else {
-        return;
-    };
-    let Some(inst) = s.instances.get_mut(id) else {
-        return;
+    let Some(inst) = accounts
+        .get_mut(account_id)
+        .and_then(|s| s.instances.get_mut(id))
+    else {
+        return PostStart::Reap;
     };
     // A concurrent Terminate (code 48) or Stop wins: don't resurrect it.
-    if inst.state_code == 48 || inst.state_code == 80 {
-        return;
+    if inst.state_code == 48 {
+        return PostStart::Reap;
+    }
+    if inst.state_code == 80 {
+        return if started {
+            PostStart::Stop
+        } else {
+            PostStart::Keep
+        };
     }
     inst.state_code = 16;
     inst.state_name = "running".to_string();
@@ -1184,6 +1210,69 @@ fn reconcile_started(
         inst.private_ip = r.private_ip;
         inst.container_id = Some(r.container_id);
     }
+    PostStart::Keep
+}
+
+/// What a boot task does with the container it just started, decided by
+/// [`reconcile_started`] once the container is up.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PostStart {
+    Keep,
+    /// The instance is gone or terminated: remove the container (and volume).
+    Reap,
+    /// The instance was stopped meanwhile: stop the container.
+    Stop,
+}
+
+/// Apply a [`PostStart`] decision.
+pub(crate) async fn settle_started(
+    runtime: Option<&std::sync::Arc<crate::runtime::Ec2Runtime>>,
+    account_id: &str,
+    id: &str,
+    post: PostStart,
+) {
+    let Some(rt) = runtime else {
+        return;
+    };
+    match post {
+        PostStart::Keep => {}
+        PostStart::Reap => rt.terminate_instance(account_id, id).await,
+        PostStart::Stop => rt.stop_instance(id).await,
+    }
+}
+
+/// Take the instance's lifecycle lock when a runtime is wired; see
+/// `Ec2Runtime::lock_lifecycle`.
+pub(crate) async fn lock_lifecycle(
+    runtime: Option<&std::sync::Arc<crate::runtime::Ec2Runtime>>,
+    id: &str,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    match runtime {
+        Some(rt) => Some(rt.lock_lifecycle(id).await),
+        None => None,
+    }
+}
+
+/// The instance's current state code, read under the lifecycle lock so a
+/// lifecycle task converges to the latest request, not the one it was
+/// spawned for. `None` if the instance is gone.
+fn current_state_code(
+    state: &crate::state::SharedEc2State,
+    account_id: &str,
+    id: &str,
+) -> Option<i64> {
+    state
+        .read()
+        .get(account_id)
+        .and_then(|s| s.instances.get(id))
+        .map(|i| i.state_code)
+}
+
+/// Whether the instance still wants a running container (`pending` or
+/// `running`): a boot or start for one that was stopped, terminated or
+/// deleted before the task got its lock does not start one.
+fn wants_container(state: &crate::state::SharedEc2State, account_id: &str, id: &str) -> bool {
+    matches!(current_state_code(state, account_id, id), Some(0 | 16))
 }
 
 /// The inputs [`crate::runtime::Ec2Runtime::run_instance`] needs to boot a
@@ -1454,8 +1543,9 @@ pub(crate) async fn cfn_boot_instance(svc: &Ec2Service, account_id: &str, id: &s
         return;
     };
 
-    let running = if let Some(rt) = &svc.runtime {
-        match rt
+    let lifecycle = lock_lifecycle(svc.runtime.as_ref(), id).await;
+    let running = match &svc.runtime {
+        Some(rt) if wants_container(&svc.state, account_id, id) => match rt
             .run_instance(
                 account_id,
                 id,
@@ -1470,11 +1560,12 @@ pub(crate) async fn cfn_boot_instance(svc: &Ec2Service, account_id: &str, id: &s
                 tracing::warn!(instance_id = %id, error = %e, "CFN EC2 instance container failed to start; serving metadata-only");
                 None
             }
-        }
-    } else {
-        None
+        },
+        _ => None,
     };
-    reconcile_started(&svc.state, account_id, id, running);
+    let post = reconcile_started(&svc.state, account_id, id, running);
+    settle_started(svc.runtime.as_ref(), account_id, id, post).await;
+    drop(lifecycle);
 
     if let Some(rt) = &svc.runtime {
         if rt.network_isolation_enforced() {
@@ -1705,9 +1796,17 @@ async fn change_state(
         let account_id = req.account_id.clone();
         tokio::spawn(async move {
             for id in &affected {
+                // Serialized per instance, and each arm converges to the state
+                // the instance has once the lock is held: a Start and a Stop
+                // racing on one instance can't leave it `running` with its
+                // container stopped (or the reverse).
+                let _lifecycle = lock_lifecycle(runtime.as_ref(), id).await;
                 match new_code {
                     16 => {
                         let running = match &runtime {
+                            // Stopped, terminated or deleted again before this
+                            // task got the lock: start nothing.
+                            Some(_) if !wants_container(&svc_state, &account_id, id) => None,
                             // The runtime holds a backing record for this
                             // instance: reattach/restart the existing container.
                             Some(rt) if rt.is_registered(id) => rt.start_instance(id).await,
@@ -1743,16 +1842,23 @@ async fn change_state(
                             },
                             None => None,
                         };
-                        reconcile_started(&svc_state, &account_id, id, running);
+                        let post = reconcile_started(&svc_state, &account_id, id, running);
+                        settle_started(runtime.as_ref(), &account_id, id, post).await;
                     }
                     80 => {
-                        if let Some(rt) = &runtime {
+                        // Started again before this task got the lock: the
+                        // later StartInstances owns the container now.
+                        let still_stopped = matches!(
+                            current_state_code(&svc_state, &account_id, id),
+                            Some(64 | 80)
+                        );
+                        if let (Some(rt), true) = (&runtime, still_stopped) {
                             rt.stop_instance(id).await;
                         }
                     }
                     48 => {
                         if let Some(rt) = &runtime {
-                            rt.terminate_instance(id).await;
+                            rt.terminate_instance(&account_id, id).await;
                         }
                     }
                     _ => {}
@@ -1834,19 +1940,35 @@ pub(crate) async fn reboot_instances(
                 return;
             };
             for id in &backed {
+                let _lifecycle = rt.lock_lifecycle(id).await;
+                // Stopped or terminated before this task got the lock: there
+                // is no running container to reboot.
+                if current_state_code(&svc_state, &account_id, id) != Some(16) {
+                    continue;
+                }
                 // k8s reboot recreates the Pod under a new name/IP; persist them
                 // so describe/introspection stay accurate (Docker returns None).
                 if let Some(running) = rt.reboot_instance(id).await {
-                    let mut accounts = svc_state.write();
-                    if let Some(state) = accounts.get_mut(&account_id) {
-                        if let Some(inst) = state.instances.get_mut(id) {
+                    let gone = {
+                        let mut accounts = svc_state.write();
+                        match accounts
+                            .get_mut(&account_id)
+                            .and_then(|state| state.instances.get_mut(id))
+                        {
                             // Don't clobber an instance a concurrent op
                             // terminated mid-reboot.
-                            if inst.state_code != 48 {
+                            Some(inst) if inst.state_code != 48 => {
                                 inst.private_ip = running.private_ip;
                                 inst.container_id = Some(running.container_id);
+                                false
                             }
+                            _ => true,
                         }
+                    };
+                    if gone {
+                        // Deleted, reset or terminated while the Pod was
+                        // recreated: the new Pod belongs to nothing.
+                        rt.terminate_instance(&account_id, id).await;
                     }
                 }
             }
@@ -4548,5 +4670,101 @@ mod modify_tests {
         };
         drop(accounts);
         assert!(cfn_create_instance(&svc, "000000000000", "us-east-1", &bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod post_start_tests {
+    use super::*;
+    use crate::test_support::seed_instance;
+
+    fn started() -> Option<crate::runtime::RunningInstance> {
+        Some(crate::runtime::RunningInstance {
+            container_id: "c-1".into(),
+            private_ip: "10.0.0.9".into(),
+            network: None,
+        })
+    }
+
+    fn set_state(svc: &Ec2Service, id: &str, code: i64) {
+        let mut accounts = svc.state.write();
+        let inst = accounts
+            .get_or_create("000000000000")
+            .instances
+            .get_mut(id)
+            .unwrap();
+        inst.state_code = code;
+    }
+
+    /// A container that comes up after its instance was deleted (or reset),
+    /// terminated or stopped is reaped or stopped by the boot task itself.
+    #[tokio::test]
+    async fn lifecycle_tasks_converge_to_the_state_held_under_the_lock() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-1");
+        set_state(&svc, "i-1", 80);
+        // A Start decided earlier finds the row stopped again: start nothing.
+        assert!(!wants_container(&svc.state, "000000000000", "i-1"));
+        set_state(&svc, "i-1", 0);
+        assert!(wants_container(&svc.state, "000000000000", "i-1"));
+        assert_eq!(
+            current_state_code(&svc.state, "000000000000", "i-1"),
+            Some(0)
+        );
+        assert_eq!(
+            current_state_code(&svc.state, "000000000000", "i-gone"),
+            None
+        );
+        // The lock serializes: a second holder waits for the first.
+        if let Some(rt) = crate::runtime::Ec2Runtime::new() {
+            let rt = std::sync::Arc::new(rt);
+            let first = rt.lock_lifecycle("i-1").await;
+            let rt2 = rt.clone();
+            let second = tokio::spawn(async move { rt2.lock_lifecycle("i-1").await });
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished());
+            // Another instance is not blocked.
+            let _other = rt.lock_lifecycle("i-2").await;
+            drop(first);
+            second.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn late_start_is_reaped_or_stopped() {
+        let svc = Ec2Service::new();
+        // Gone (deleted / reset while booting).
+        assert_eq!(
+            reconcile_started(&svc.state, "000000000000", "i-gone", started()),
+            PostStart::Reap
+        );
+        seed_instance(&svc, "i-1");
+        set_state(&svc, "i-1", 48);
+        assert_eq!(
+            reconcile_started(&svc.state, "000000000000", "i-1", started()),
+            PostStart::Reap
+        );
+        set_state(&svc, "i-1", 80);
+        assert_eq!(
+            reconcile_started(&svc.state, "000000000000", "i-1", started()),
+            PostStart::Stop
+        );
+        set_state(&svc, "i-1", 0);
+        assert_eq!(
+            reconcile_started(&svc.state, "000000000000", "i-1", started()),
+            PostStart::Keep
+        );
+        // No container started, instance gone: still reaped, since the
+        // failed boot may have created the volume.
+        assert_eq!(
+            reconcile_started(&svc.state, "000000000000", "i-gone", None),
+            PostStart::Reap
+        );
+        // No container started, instance stopped: nothing to stop.
+        set_state(&svc, "i-1", 80);
+        assert_eq!(
+            reconcile_started(&svc.state, "000000000000", "i-1", None),
+            PostStart::Keep
+        );
     }
 }

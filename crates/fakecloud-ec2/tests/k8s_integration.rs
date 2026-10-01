@@ -202,7 +202,7 @@ async fn instance_lifecycle_boots_pod_runs_user_data_and_recreates_on_start() {
     );
 
     // TerminateInstances removes the (current) Pod for good.
-    rt.terminate_instance(instance_id).await;
+    rt.terminate_instance("123456789012", instance_id).await;
     let removed = poll_until(120, || pod_absent(&api, &new_pod)).await;
     assert!(removed, "Pod should be gone after TerminateInstances");
 }

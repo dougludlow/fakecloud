@@ -74,6 +74,11 @@ impl RdsService {
             ));
         }
 
+        // The cluster's incarnation, pinned across the dump below: a cluster
+        // deleted and recreated under the id meanwhile is another cluster,
+        // whose snapshot must not carry the old writer's data.
+        let cluster_incarnation =
+            cluster_resource_id(&self.state.read(), &request.account_id, &cluster_id);
         let writer_info = {
             let accounts = self.state.read();
             accounts.get(&request.account_id).and_then(|state| {
@@ -96,7 +101,8 @@ impl RdsService {
                     })?;
                 let inst = state.instances.get(&writer_id)?;
                 Some((
-                    inst.db_instance_identifier.clone(),
+                    // The writer's incarnation: its container key.
+                    inst.dbi_resource_id.clone(),
                     inst.engine.clone(),
                     inst.master_username.clone(),
                     inst.master_user_password.clone(),
@@ -112,7 +118,7 @@ impl RdsService {
         // with these credentials and database, and its engine is the
         // container engine (`postgres` / `mysql`), not the cluster's
         // `aurora-*` family which no runtime can start.
-        let writer_source = writer_info
+        let mut writer_source = writer_info
             .as_ref()
             .map(|(_, eng, user, pass, db, version)| {
                 (
@@ -123,9 +129,9 @@ impl RdsService {
                     version.clone(),
                 )
             });
-        let dump_b64 = if let Some((wid, eng, user, pass, db, _version)) = writer_info {
+        let mut dump_b64 = if let Some((wid, eng, user, pass, db, _version)) = writer_info {
             if let Some(runtime) = self.runtime_ref() {
-                match runtime.dump_database(&wid, &eng, &user, &pass, &db).await {
+                match runtime.dump(&wid, &eng, &user, &pass, &db).await {
                     Ok(data) => {
                         use base64::Engine;
                         Some(base64::engine::general_purpose::STANDARD.encode(&data))
@@ -165,6 +171,11 @@ impl RdsService {
                         format!("DBCluster {cluster_id} not found."),
                     )
                 })?;
+            if entry_resource_id(&entry) != cluster_incarnation {
+                // Recreated during the dump: that dump is the old cluster's.
+                dump_b64 = None;
+                writer_source = None;
+            }
             if state
                 .extras
                 .get("cluster_snapshots")
@@ -478,7 +489,13 @@ impl RdsService {
             })?;
         let arn = rds_arn(&request.region, &request.account_id, "cluster", &target);
 
-        let writer_info = {
+        // The source cluster's incarnation, read with its writer below and
+        // re-validated against the entry the restore copies under the write
+        // lock: a source recreated in between is another cluster, whose
+        // metadata must not be combined with the old writer's dump.
+        let source_incarnation =
+            cluster_resource_id(&self.state.read(), &request.account_id, &source);
+        let mut writer_info = {
             let accounts = self.state.read();
             accounts.get(&request.account_id).and_then(|state| {
                 let cluster_entry = state.extras.get("clusters")?.get(&source)?;
@@ -500,7 +517,8 @@ impl RdsService {
                     })?;
                 let inst = state.instances.get(&writer_id)?;
                 Some((
-                    inst.db_instance_identifier.clone(),
+                    // The writer's incarnation: its container key.
+                    inst.dbi_resource_id.clone(),
                     inst.engine.clone(),
                     inst.master_username.clone(),
                     inst.master_user_password.clone(),
@@ -552,6 +570,11 @@ impl RdsService {
                     format!("DBCluster {source} not found."),
                 )
             })?;
+        if entry_resource_id(&entry) != source_incarnation {
+            // Recreated since the writer was read: that writer's dump belongs
+            // to the old cluster. Restore metadata-only from this one.
+            writer_info = None;
+        }
 
         // A `copy-on-write` restore clones the source: both clusters join
         // one clone group, so stamp the source with a group id if it
@@ -641,6 +664,7 @@ impl RdsService {
             }
             apply_restore_kms_key(obj, restore_key);
         }
+        let target_incarnation = entry_resource_id(&entry);
         state
             .extras
             .entry("clusters".to_string())
@@ -662,17 +686,21 @@ impl RdsService {
             let target = target.clone();
             let source = source.clone();
             tokio::spawn(async move {
-                match runtime.dump_database(&wid, &eng, &user, &pass, &db).await {
+                match runtime.dump(&wid, &eng, &user, &pass, &db).await {
                     Ok(data) => {
                         use base64::Engine;
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                         {
                             let mut accounts = state_handle.write();
                             let state = accounts.get_or_create(&account_id);
+                            // Only onto the cluster this restore created: one
+                            // recreated under the target id meanwhile is not
+                            // a restore of this source.
                             if let Some(entry) = state
                                 .extras
                                 .get_mut("clusters")
                                 .and_then(|m| m.get_mut(&target))
+                                .filter(|e| entry_resource_id(e) == target_incarnation)
                                 .and_then(|e| e.as_object_mut())
                             {
                                 entry.insert("PendingRestoreDumpB64".to_string(), json!(b64));
@@ -712,4 +740,27 @@ impl RdsService {
             ),
         ))
     }
+}
+
+/// A cluster entry's immutable `DbClusterResourceId`: which incarnation of
+/// the (reusable) cluster identifier it is.
+pub(crate) fn entry_resource_id(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("DbClusterResourceId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// The current `DbClusterResourceId` of `cluster_id`, if the cluster exists.
+fn cluster_resource_id(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::RdsState>,
+    account_id: &str,
+    cluster_id: &str,
+) -> Option<String> {
+    accounts
+        .get(account_id)?
+        .extras
+        .get("clusters")?
+        .get(cluster_id)
+        .and_then(entry_resource_id)
 }
