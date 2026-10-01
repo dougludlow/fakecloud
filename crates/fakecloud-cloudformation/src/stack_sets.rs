@@ -1585,6 +1585,7 @@ impl CloudFormationService {
         // ImportStacksToStackSet adoption starts.
         let (template_body, mut parameters) = match params.get("StackId") {
             Some(stack_id) => {
+                crate::service::resolve_stack_ref(stack_id, &admin, &req.region)?;
                 let accounts = self.state.read();
                 let stack = accounts
                     .regional(&admin, &req.region)

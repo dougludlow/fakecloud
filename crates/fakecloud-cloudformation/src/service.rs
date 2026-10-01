@@ -27,6 +27,51 @@ use crate::state::{
 use crate::template;
 use crate::xml_responses;
 
+/// How a `StackName` (or `StackId`) parameter addresses a stack. CloudFormation
+/// accepts a stack's name or its unique id, the stack ARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StackRef<'a> {
+    /// A stack name, looked up among the request region's stacks.
+    Name(&'a str),
+    /// A stack ARN in the request's own account and region.
+    Id(&'a str),
+}
+
+/// AWS's answer for a stack reference that addresses no stack.
+pub(crate) fn stack_does_not_exist(stack_ref: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationError",
+        format!("Stack with id {stack_ref} does not exist"),
+    )
+}
+
+/// Resolve a stack reference against the account and region a request is
+/// addressed to. Stacks are regional, so a stack ARN that names another region
+/// (or another account) addresses no stack this request can see: AWS answers
+/// `ValidationError: Stack with id <ref> does not exist`, whatever the
+/// operation. Callers must never fall back to treating such an ARN as a name.
+pub(crate) fn resolve_stack_ref<'a>(
+    stack_ref: &'a str,
+    account_id: &str,
+    region: &str,
+) -> Result<StackRef<'a>, AwsServiceError> {
+    let Some(resource) = fakecloud_aws::arn::arn_resource(stack_ref, "cloudformation") else {
+        return Ok(StackRef::Name(stack_ref));
+    };
+    let local = resource.split_once(':').is_some_and(|(arn_region, rest)| {
+        arn_region == region
+            && rest
+                .split_once(':')
+                .is_some_and(|(account, res)| account == account_id && res.starts_with("stack/"))
+    });
+    if local {
+        Ok(StackRef::Id(stack_ref))
+    } else {
+        Err(stack_does_not_exist(stack_ref))
+    }
+}
+
 /// Canonical `Fn::GetAtt` attribute names per resource type. Used to
 /// supplement the eagerly-captured `ProvisionResult::attributes` with
 /// live-state lookups via `ResourceProvisioner::get_att`. Resources not
@@ -3343,7 +3388,15 @@ impl AwsService for CloudFormationService {
         // catches length / range / enum violations uniformly so every
         // operation returns a `ValidationError` instead of `200 OK` on
         // malformed scalars.
-        crate::input_constraints::validate_input(action, &Self::get_all_params(&req))?;
+        let params = Self::get_all_params(&req);
+        crate::input_constraints::validate_input(action, &params)?;
+        // Every operation that takes a stack reference resolves it against the
+        // request's account and region before its handler runs, so a stack ARN
+        // from another region is refused uniformly instead of each handler
+        // treating it as an unknown local stack.
+        if let Some(stack_ref) = params.get("StackName") {
+            resolve_stack_ref(stack_ref, &req.account_id, &req.region)?;
+        }
 
         // Only ops whose handlers actually write to per-account state
         // need to trigger snapshot persistence. Pass-through ops that
@@ -5253,6 +5306,126 @@ mod tests {
         );
         assert!(described.contains(ids[1].as_str()), "{described}");
         assert!(described.contains("CREATE_COMPLETE"), "{described}");
+    }
+
+    #[test]
+    fn resolve_stack_ref_accepts_names_and_local_ids_only() {
+        let local = "arn:aws:cloudformation:us-east-1:123456789012:stack/app/1";
+        assert_eq!(
+            resolve_stack_ref("app", "123456789012", "us-east-1").unwrap(),
+            StackRef::Name("app")
+        );
+        assert_eq!(
+            resolve_stack_ref(local, "123456789012", "us-east-1").unwrap(),
+            StackRef::Id(local)
+        );
+        // China partition ids resolve in their own region.
+        let cn = "arn:aws-cn:cloudformation:cn-north-1:123456789012:stack/app/1";
+        assert_eq!(
+            resolve_stack_ref(cn, "123456789012", "cn-north-1").unwrap(),
+            StackRef::Id(cn)
+        );
+        for foreign in [
+            // Another region.
+            "arn:aws:cloudformation:eu-west-1:123456789012:stack/app/1",
+            // Another account.
+            "arn:aws:cloudformation:us-east-1:210987654321:stack/app/1",
+            // Not a stack.
+            "arn:aws:cloudformation:us-east-1:123456789012:changeSet/cs/1",
+        ] {
+            let err = resolve_stack_ref(foreign, "123456789012", "us-east-1")
+                .err()
+                .unwrap_or_else(|| panic!("{foreign} resolved"));
+            assert_eq!(err.code(), "ValidationError");
+            assert_eq!(
+                err.message(),
+                format!("Stack with id {foreign} does not exist")
+            );
+        }
+    }
+
+    /// A stack ARN from another region addresses no stack: every stack-taking
+    /// operation refuses it, and nothing is deleted, updated or created.
+    #[tokio::test]
+    async fn a_cross_region_stack_id_is_refused_by_every_stack_op() {
+        use fakecloud_core::service::AwsService;
+        let svc = make_service();
+        let resp = svc
+            .create_stack(&request_in(
+                "CreateStack",
+                "eu-west-1",
+                &[("StackName", "app"), ("TemplateBody", HANDLE_TEMPLATE)],
+            ))
+            .await
+            .unwrap();
+        let body = body_of(resp);
+        let west_id = body
+            .split("<StackId>")
+            .nth(1)
+            .and_then(|r| r.split("</StackId>").next())
+            .unwrap()
+            .to_string();
+        // A same-named stack in us-east-1 must not be touched either.
+        svc.create_stack(&request_in(
+            "CreateStack",
+            "us-east-1",
+            &[("StackName", "app"), ("TemplateBody", HANDLE_TEMPLATE)],
+        ))
+        .await
+        .unwrap();
+        let calls: &[(&str, &[(&str, &str)])] = &[
+            ("DeleteStack", &[]),
+            ("UpdateStack", &[("TemplateBody", HANDLE_TEMPLATE)]),
+            (
+                "CreateChangeSet",
+                &[("ChangeSetName", "cs"), ("TemplateBody", HANDLE_TEMPLATE)],
+            ),
+            (
+                "CreateChangeSet",
+                &[
+                    ("ChangeSetName", "cs"),
+                    ("ChangeSetType", "CREATE"),
+                    ("TemplateBody", HANDLE_TEMPLATE),
+                ],
+            ),
+            ("DescribeStacks", &[]),
+            ("DescribeStackEvents", &[]),
+            ("DescribeStackResources", &[]),
+            ("ListStackResources", &[]),
+            ("GetTemplate", &[]),
+            ("GetTemplateSummary", &[]),
+            ("SetStackPolicy", &[("StackPolicyBody", "{}")]),
+            ("GetStackPolicy", &[]),
+            (
+                "UpdateTerminationProtection",
+                &[("EnableTerminationProtection", "true")],
+            ),
+            ("DetectStackDrift", &[]),
+            ("ListChangeSets", &[]),
+        ];
+        for (action, extra) in calls {
+            let mut params = vec![("StackName", west_id.as_str())];
+            params.extend_from_slice(extra);
+            let err = svc
+                .handle(request_in(action, "us-east-1", &params))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{action} accepted another region's stack id"));
+            assert_eq!(err.code(), "ValidationError", "{action}");
+            assert_eq!(
+                err.message(),
+                format!("Stack with id {west_id} does not exist"),
+                "{action}"
+            );
+        }
+        let accounts = svc.state.read();
+        for region in ["us-east-1", "eu-west-1"] {
+            let state = accounts.regional("123456789012", region).unwrap();
+            assert_eq!(state.stacks.len(), 1, "{region}");
+            assert_eq!(state.stacks["app"].status, "CREATE_COMPLETE", "{region}");
+            assert!(state.extras.is_empty(), "{region}: {:?}", state.extras);
+            assert!(state.stack_policies.is_empty(), "{region}");
+        }
     }
 
     /// Calls that only read, or that miss, must not leave an (empty) region

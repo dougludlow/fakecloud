@@ -307,3 +307,76 @@ async fn wait_for_operation(cfn: &aws_sdk_cloudformation::Client, set: &str, op_
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+/// A stack id (ARN) only addresses a stack in its own region. Sent to another
+/// region, `DeleteStack`, `UpdateStack` and `CreateChangeSet` all answer that
+/// the stack does not exist, and touch neither region's stacks.
+#[tokio::test]
+async fn a_stack_id_from_another_region_is_refused() {
+    let server = TestServer::start().await;
+    let east = cfn_in(&server, EAST).await;
+    let west = cfn_in(&server, WEST).await;
+    let template = handle_template(r#""Region": {"Value": {"Ref": "AWS::Region"}}"#);
+    let west_id = create(&west, "app", &template).await;
+    let east_id = create(&east, "app", &template).await;
+    let not_found = format!("Stack with id {west_id} does not exist");
+
+    let e = east
+        .delete_stack()
+        .stack_name(&west_id)
+        .send()
+        .await
+        .expect_err("DeleteStack with an eu-west-1 id in us-east-1");
+    assert_eq!(e.code(), Some("ValidationError"));
+    assert_eq!(e.message(), Some(not_found.as_str()));
+
+    let e = east
+        .update_stack()
+        .stack_name(&west_id)
+        .template_body(&template)
+        .send()
+        .await
+        .expect_err("UpdateStack with an eu-west-1 id in us-east-1");
+    assert_eq!(e.code(), Some("ValidationError"));
+    assert_eq!(e.message(), Some(not_found.as_str()));
+
+    for change_set_type in [
+        aws_sdk_cloudformation::types::ChangeSetType::Update,
+        aws_sdk_cloudformation::types::ChangeSetType::Create,
+    ] {
+        let e = east
+            .create_change_set()
+            .stack_name(&west_id)
+            .change_set_name("cs")
+            .change_set_type(change_set_type.clone())
+            .template_body(&template)
+            .send()
+            .await
+            .expect_err("CreateChangeSet with an eu-west-1 id in us-east-1");
+        assert_eq!(e.code(), Some("ValidationError"), "{change_set_type:?}");
+        assert_eq!(e.message(), Some(not_found.as_str()));
+    }
+
+    // Both stacks are untouched, and no change set or extra stack appeared.
+    assert_eq!(stack_ids(&east).await, vec![east_id]);
+    assert_eq!(stack_ids(&west).await, vec![west_id]);
+    for cfn in [&east, &west] {
+        let change_sets = cfn
+            .list_change_sets()
+            .stack_name("app")
+            .send()
+            .await
+            .unwrap();
+        assert!(change_sets.summaries().is_empty());
+        let stack = cfn
+            .describe_stacks()
+            .stack_name("app")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            stack.stacks()[0].stack_status(),
+            Some(&StackStatus::CreateComplete)
+        );
+    }
+}

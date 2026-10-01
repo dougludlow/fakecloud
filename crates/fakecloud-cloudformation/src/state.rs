@@ -336,15 +336,39 @@ fn cloudformation_arn_region(arn: &str) -> Option<String> {
     fakecloud_aws::arn::region_of(arn).map(str::to_string)
 }
 
-/// The region a generic `extras` record belongs to: the region of the first
-/// CloudFormation ARN among its fields (`ChangeSetId`, `StackId`, `Arn`,
-/// `TypeArn`, ...).
+/// Fields an `extras` record names its owner by, most specific first: the
+/// stack a record belongs to decides its region before the record's own id.
+const EXTRAS_ARN_FIELDS: &[&str] = &[
+    "StackId",
+    "ChangeSetId",
+    "Id",
+    "StackSetARN",
+    "Arn",
+    "TypeArn",
+    "GeneratedTemplateId",
+    "ResourceScanId",
+];
+
+/// The region a generic `extras` record belongs to. A record is attributed to
+/// a single region: the one its first CloudFormation ARN names, taken in the
+/// stable order of [`EXTRAS_ARN_FIELDS`] and then any other field by name, so
+/// the result never depends on how the record's keys happen to be ordered.
 fn extras_record_region(record: &serde_json::Value) -> Option<String> {
-    record
-        .as_object()?
-        .values()
-        .filter_map(serde_json::Value::as_str)
-        .find_map(cloudformation_arn_region)
+    let fields = record.as_object()?;
+    let field_region = |key: &str| {
+        fields
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(cloudformation_arn_region)
+    };
+    EXTRAS_ARN_FIELDS
+        .iter()
+        .find_map(|key| field_region(key))
+        .or_else(|| {
+            let mut keys: Vec<&String> = fields.keys().collect();
+            keys.sort();
+            keys.into_iter().find_map(|key| field_region(key))
+        })
 }
 
 /// Split one account's pre-regional state into per-region states. Every record
@@ -421,7 +445,17 @@ fn split_into_regions(legacy: &LegacyCloudFormationState) -> CloudFormationAccou
     }
     for (category, records) in &state.extras {
         for (id, record) in records {
-            let region = extras_record_region(record).unwrap_or_else(|| default_region.clone());
+            // A record without an ARN follows the stack it names.
+            let region = extras_record_region(record)
+                .or_else(|| {
+                    ["StackName", "StackId"].into_iter().find_map(|field| {
+                        record
+                            .get(field)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|stack| stack_regions.get(stack).cloned())
+                    })
+                })
+                .unwrap_or_else(|| default_region.clone());
             account
                 .region_mut(&region)
                 .extras
@@ -537,6 +571,16 @@ mod tests {
                     },
                 },
                 "hooks": {"My::Hook::Hook": {"TypeName": "My::Hook::Hook"}},
+                // No ARN: follows the stack it names.
+                "drift_detection": {"d1": {"StackName": "west", "Status": "DETECTION_COMPLETE"}},
+                // ARNs naming two regions: the stack's decides, whatever the
+                // key order.
+                "hook_results": {
+                    "h1": {
+                        "Arn": "arn:aws:cloudformation:us-east-1:111111111111:hook/1",
+                        "StackId": west_id,
+                    },
+                },
             },
             "stack_sets": {
                 "set:4": {
@@ -588,6 +632,8 @@ mod tests {
         assert_eq!(west.exports["WestExport"].value, "v");
         assert_eq!(west.imports["WestExport"], ["west-consumer"]);
         assert!(west.extras["change_sets"].contains_key("cs"));
+        assert!(west.extras["drift_detection"].contains_key("d1"));
+        assert!(west.extras["hook_results"].contains_key("h1"));
 
         let south = account.region("ap-south-1").unwrap();
         assert!(south.stack_sets.contains_key("set:4"));

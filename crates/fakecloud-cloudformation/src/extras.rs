@@ -235,18 +235,6 @@ fn retire_sibling_change_sets(
     change_sets.retain(|id, v| id == executed || v["StackId"].as_str() != Some(stack_id));
 }
 
-/// The stack name a `StackName` parameter refers to: the name itself, or the
-/// name segment of a stack ARN (`arn:...:stack/<name>/<uuid>`).
-fn stack_name_from_ref(stack: &str) -> &str {
-    if !stack.starts_with("arn:") {
-        return stack;
-    }
-    stack
-        .split_once(":stack/")
-        .and_then(|(_, rest)| rest.split('/').next())
-        .unwrap_or(stack)
-}
-
 fn missing(name: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -750,6 +738,15 @@ impl CloudFormationService {
                             .map(|st| (st.template.clone(), st.parameters.clone()))
                     })
                 };
+                // A stack id names an existing stack; with none behind it there
+                // is nothing to change, and no new stack is made out of it.
+                if previous.is_none() {
+                    if let crate::service::StackRef::Id(id) =
+                        crate::service::resolve_stack_ref(&stack_name, &aid, &region)?
+                    {
+                        return Err(crate::service::stack_does_not_exist(id));
+                    }
+                }
                 let template_body = {
                     let inline = params.get("TemplateBody").cloned().unwrap_or_default();
                     if !inline.trim().is_empty() {
@@ -1003,16 +1000,20 @@ impl CloudFormationService {
                 let (stack_id_str, stack_name) = match &live {
                     Some((sid, name, _)) => (sid.clone(), name.clone()),
                     None => {
-                        let name = stack_name_from_ref(&stack_name).to_string();
-                        // No live stack. A stack ARN names its own id.
-                        // For a plain name, change sets already aimed at the
-                        // same missing stack share one id, so the
-                        // name-uniqueness check below and every by-stack
-                        // filter treat them as one stack; the first gets a
-                        // fresh id.
-                        let sid = if name != stack_name {
-                            stack_name.clone()
-                        } else {
+                        // No live stack. A stack id addresses an existing
+                        // stack only: it is never cut down to its name to
+                        // create one.
+                        if let crate::service::StackRef::Id(id) =
+                            crate::service::resolve_stack_ref(&stack_name, &aid, &region)?
+                        {
+                            return Err(crate::service::stack_does_not_exist(id));
+                        }
+                        let name = stack_name.clone();
+                        // Change sets already aimed at the same missing stack
+                        // share one id, so the name-uniqueness check below and
+                        // every by-stack filter treat them as one stack; the
+                        // first gets a fresh id.
+                        let sid = {
                             state
                                 .extras
                                 .get("change_sets")
@@ -3701,38 +3702,30 @@ pub(crate) mod tests {
         xml[start..end].to_string()
     }
 
-    /// A stack ARN for a stack that does not exist yet is used as the stack
-    /// id as given, not nested inside a freshly minted one.
+    /// A stack ARN addresses an existing stack only. One with no stack behind
+    /// it is refused, never cut down to its name to make a new stack.
     #[test]
-    fn change_set_on_missing_stack_arn_keeps_that_arn() {
+    fn change_set_on_missing_stack_arn_is_refused() {
         let svc = svc();
         let arn = "arn:aws:cloudformation:us-east-1:000000000000:stack/ghost/abc-123";
-        let created = body_str(
-            &svc.handle_extra_action(&req(
-                "CreateChangeSet",
-                &[("StackName", arn), ("ChangeSetName", "cs")],
-            ))
-            .expect("CreateChangeSet"),
-        );
-        assert_eq!(xml_field(&created, "StackId"), arn);
-        let described = body_str(
-            &svc.handle_extra_action(&req(
-                "DescribeChangeSet",
-                &[("StackName", arn), ("ChangeSetName", "cs")],
-            ))
-            .expect("DescribeChangeSet by the original ARN"),
-        );
-        assert_eq!(xml_field(&described, "StackName"), "ghost");
-        for filter in [arn, "ghost"] {
-            let xml = body_str(
-                &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", filter)]))
-                    .expect("ListChangeSets"),
-            );
-            assert!(
-                xml.contains("<ChangeSetName>cs</ChangeSetName>"),
-                "{filter}: {xml}"
-            );
+        for change_set_type in ["UPDATE", "CREATE"] {
+            let err = svc
+                .handle_extra_action(&req(
+                    "CreateChangeSet",
+                    &[
+                        ("StackName", arn),
+                        ("ChangeSetName", "cs"),
+                        ("ChangeSetType", change_set_type),
+                    ],
+                ))
+                .err()
+                .expect("CreateChangeSet on a missing stack id");
+            assert_eq!(err.code(), "ValidationError");
+            assert_eq!(err.message(), format!("Stack with id {arn} does not exist"));
         }
+        let accounts = svc.state.read();
+        let state = accounts.regional("000000000000", "us-east-1");
+        assert!(state.is_none_or(|s| s.stacks.is_empty() && s.extras.is_empty()));
     }
 
     /// UPDATE-type change sets aimed at the same missing stack share its id,
@@ -3819,17 +3812,6 @@ pub(crate) mod tests {
                 .expect("ListChangeSets"),
         );
         assert!(!xml.contains("<ChangeSetName>"), "{xml}");
-    }
-
-    #[test]
-    fn stack_name_from_ref_takes_the_arn_name_segment() {
-        assert_eq!(super::stack_name_from_ref("plain"), "plain");
-        assert_eq!(
-            super::stack_name_from_ref(
-                "arn:aws:cloudformation:us-east-1:123456789012:stack/my-stack/abc-123"
-            ),
-            "my-stack"
-        );
     }
 
     /// Concurrent CREATE change sets for one new stack all attach to the
