@@ -136,6 +136,31 @@ impl CloudFormationState {
         }
     }
 
+    /// The live stack a `StackName` parameter addresses: a stack id (ARN)
+    /// matches the stack with that id, anything else the stack of that name.
+    /// The one lookup every handler uses, under its own lock, so a stack
+    /// deleted and re-created under the same name is never reached through
+    /// the old stack's id. The dispatcher has already refused ids of other
+    /// regions and accounts (`service::resolve_stack_ref`).
+    pub fn live_stack(&self, stack_ref: &str) -> Option<&Stack> {
+        let found = if stack_ref.starts_with("arn:") {
+            self.stacks.values().find(|s| s.stack_id == stack_ref)
+        } else {
+            self.stacks.get(stack_ref)
+        };
+        found.filter(|s| s.status != "DELETE_COMPLETE")
+    }
+
+    /// Mutable [`Self::live_stack`].
+    pub fn live_stack_mut(&mut self, stack_ref: &str) -> Option<&mut Stack> {
+        let found = if stack_ref.starts_with("arn:") {
+            self.stacks.values_mut().find(|s| s.stack_id == stack_ref)
+        } else {
+            self.stacks.get_mut(stack_ref)
+        };
+        found.filter(|s| s.status != "DELETE_COMPLETE")
+    }
+
     pub fn reset(&mut self) {
         self.stacks.clear();
         self.extras.clear();

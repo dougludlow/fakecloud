@@ -729,12 +729,7 @@ impl CloudFormationService {
                 let previous: Option<(String, BTreeMap<String, String>)> = {
                     let accounts = self.state.read();
                     accounts.regional(&aid, &region).and_then(|s| {
-                        s.stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
+                        s.live_stack(&stack_name)
                             .map(|st| (st.template.clone(), st.parameters.clone()))
                     })
                 };
@@ -821,12 +816,7 @@ impl CloudFormationService {
                 let stack_lookup: Option<(String, Vec<crate::state::StackResource>)> = {
                     let accounts = self.state.read();
                     accounts.regional(&aid, &region).and_then(|s| {
-                        s.stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
+                        s.live_stack(&stack_name)
                             .map(|st| (st.stack_id.clone(), st.resources.clone()))
                     })
                 };
@@ -990,12 +980,7 @@ impl CloudFormationService {
                 // the one minted speculatively. Store the stack's real name
                 // too, so a later name-or-ARN filter matches either way.
                 let live = state
-                    .stacks
-                    .values()
-                    .find(|s| {
-                        (s.name == stack_name || s.stack_id == stack_name)
-                            && s.status != "DELETE_COMPLETE"
-                    })
+                    .live_stack(&stack_name)
                     .map(|s| (s.stack_id.clone(), s.name.clone(), s.status.clone()));
                 let (stack_id_str, stack_name) = match &live {
                     Some((sid, name, _)) => (sid.clone(), name.clone()),
@@ -1317,15 +1302,9 @@ impl CloudFormationService {
 
                 let found: Option<String> = {
                     let accounts = self.state.read();
-                    accounts.regional(&aid, &region).and_then(|s| {
-                        s.stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
-                            .map(|st| st.stack_id.clone())
-                    })
+                    accounts
+                        .regional(&aid, &region)
+                        .and_then(|s| s.live_stack(&stack_name).map(|st| st.stack_id.clone()))
                 };
 
                 // Empty change set: nothing to provision. Finalize a
@@ -2081,12 +2060,9 @@ impl CloudFormationService {
 
                 let resources: Vec<StackResource> = {
                     let accounts = self.state.read();
-                    let stack = accounts.regional(&aid, &region).and_then(|s| {
-                        s.stacks.values().find(|st| {
-                            (st.name == stack_name || st.stack_id == stack_name)
-                                && st.status != "DELETE_COMPLETE"
-                        })
-                    });
+                    let stack = accounts
+                        .regional(&aid, &region)
+                        .and_then(|s| s.live_stack(&stack_name));
                     stack.map(|s| s.resources.clone()).unwrap_or_default()
                 };
 
@@ -2146,12 +2122,7 @@ impl CloudFormationService {
                 let accounts = self.state.read();
                 let resource_drift = accounts
                     .regional(&aid, &region)
-                    .and_then(|s| {
-                        s.stacks.values().find(|st| {
-                            (st.name == stack_name || st.stack_id == stack_name)
-                                && st.status != "DELETE_COMPLETE"
-                        })
-                    })
+                    .and_then(|s| s.live_stack(&stack_name))
                     .and_then(|stack| stack.resources.iter().find(|r| r.logical_id == logical))
                     .map(|resource| {
                         let exists = self.resource_exists(&aid, resource).unwrap_or(true);
@@ -2233,14 +2204,7 @@ impl CloudFormationService {
                 let drifted: Vec<Value> = accounts
                     .regional(&aid, &region)
                     .and_then(|s| {
-                        let found = s
-                            .stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
-                            .is_some();
+                        let found = s.live_stack(&stack_name).is_some();
                         if !found {
                             return None;
                         }
@@ -2282,9 +2246,16 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("LogicalResourceId"))?
                     .clone();
                 let accounts = self.state.read();
-                let detail = accounts
+                let stack = accounts
                     .regional(&aid, &region)
-                    .and_then(|s| s.stacks.get(&stack_name))
+                    .and_then(|s| s.live_stack(&stack_name));
+                // The stack's own name and `StackId` whenever the stack is
+                // real, however the caller addressed it.
+                let shown_name = stack.map_or(stack_name.as_str(), |s| s.name.as_str());
+                let stack_id_el = stack
+                    .map(|s| format!("\n      <StackId>{}</StackId>", xml_escape(&s.stack_id)))
+                    .unwrap_or_default();
+                let detail = stack
                     .and_then(|s| s.resources.iter().find(|r| r.logical_id == logical))
                     .map(|r| {
                         (
@@ -2301,8 +2272,9 @@ impl CloudFormationService {
                         )
                     });
                 let inner = format!(
-                    "    <StackResourceDetail>\n      <StackName>{}</StackName>\n      <LogicalResourceId>{}</LogicalResourceId>\n      <PhysicalResourceId>{}</PhysicalResourceId>\n      <ResourceType>{}</ResourceType>\n      <ResourceStatus>{}</ResourceStatus>\n      <LastUpdatedTimestamp>{}</LastUpdatedTimestamp>\n    </StackResourceDetail>",
-                    xml_escape(&stack_name),
+                    "    <StackResourceDetail>\n      <StackName>{}</StackName>{}\n      <LogicalResourceId>{}</LogicalResourceId>\n      <PhysicalResourceId>{}</PhysicalResourceId>\n      <ResourceType>{}</ResourceType>\n      <ResourceStatus>{}</ResourceStatus>\n      <LastUpdatedTimestamp>{}</LastUpdatedTimestamp>\n    </StackResourceDetail>",
+                    xml_escape(shown_name),
+                    stack_id_el,
                     xml_escape(&logical),
                     xml_escape(&detail.0),
                     xml_escape(&detail.1),
@@ -2546,7 +2518,12 @@ impl CloudFormationService {
                     .clone();
                 let accounts = self.state.read();
                 let body = accounts.regional(&aid, &region)
-                    .and_then(|s| s.stack_policies.get(&stack))
+                    .and_then(|s| {
+                        // Policies are kept under the stack's name; a stack id
+                        // finds the same stack's policy.
+                        let name = s.live_stack(&stack).map_or(stack.as_str(), |st| st.name.as_str());
+                        s.stack_policies.get(name)
+                    })
                     .cloned()
                     .unwrap_or_else(|| r#"{"Statement":[{"Effect":"Allow","Action":"Update:*","Principal":"*","Resource":"*"}]}"#.to_string());
                 let inner = format!(
@@ -2571,11 +2548,8 @@ impl CloudFormationService {
                 // stack that never existed.
                 let mut accounts = self.state.write();
                 if let Some(state) = accounts.regional_get_mut(&aid, &region) {
-                    let live = state.stacks.values().any(|s| {
-                        (s.name == stack || s.stack_id == stack) && s.status != "DELETE_COMPLETE"
-                    });
-                    if live {
-                        state.stack_policies.insert(stack, body);
+                    if let Some(name) = state.live_stack(&stack).map(|s| s.name.clone()) {
+                        state.stack_policies.insert(name, body);
                     }
                 }
                 Ok(xml_response_no_result("SetStackPolicy", &rid))
@@ -2596,12 +2570,9 @@ impl CloudFormationService {
                     // Toggle the flag on the stack itself (the single source of
                     // truth). Look up by name or stack id, skipping deleted
                     // stacks, so DeleteStack/DescribeStacks observe it.
-                    let target = accounts.regional_get_mut(&aid, &region).and_then(|state| {
-                        state.stacks.values_mut().find(|s| {
-                            (s.name == stack || s.stack_id == stack)
-                                && s.status != "DELETE_COMPLETE"
-                        })
-                    });
+                    let target = accounts
+                        .regional_get_mut(&aid, &region)
+                        .and_then(|state| state.live_stack_mut(&stack));
                     match target {
                         Some(s) => {
                             s.enable_termination_protection = enabled;
@@ -2712,7 +2683,7 @@ impl CloudFormationService {
                     let accounts = self.state.read();
                     accounts
                         .regional(&aid, &region)
-                        .and_then(|s| s.stacks.get(&stack))
+                        .and_then(|s| s.live_stack(&stack))
                         .map(|s| s.stack_id.clone())
                         .unwrap_or_else(|| stack.clone())
                 };
@@ -3549,8 +3520,22 @@ pub(crate) mod tests {
     /// call depends on state an earlier one created. `ok` builds a fresh
     /// service per call, so anything that must EXIST by the time it is used
     /// belongs here instead.
+    /// Run `action` the way the service dispatcher does: the stack reference
+    /// is checked against the request's account and region first.
+    fn dispatch(
+        svc: &CloudFormationService,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let request = req(action, params);
+        if let Some(stack_ref) = params.iter().find(|(k, _)| *k == "StackName") {
+            crate::service::resolve_stack_ref(stack_ref.1, &request.account_id, &request.region)?;
+        }
+        call(svc, &request)
+    }
+
     fn ok_on(svc: &CloudFormationService, action: &str, params: &[(&str, &str)]) {
-        match call(svc, &req(action, params)) {
+        match dispatch(svc, action, params) {
             Ok(resp) => assert!(resp.status.is_success(), "{action} status: {}", resp.status),
             Err(e) => panic!("{action} failed: {e:?}"),
         }
@@ -3783,7 +3768,7 @@ pub(crate) mod tests {
 
         for filter in ["s", stack_arn.as_str()] {
             let xml = body_str(
-                &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", filter)]))
+                &dispatch(&svc, "ListChangeSets", &[("StackName", filter)])
                     .expect("ListChangeSets"),
             );
             assert!(
@@ -3808,8 +3793,7 @@ pub(crate) mod tests {
             &[("StackName", &stack_arn), ("ChangeSetName", "by-name")],
         );
         let xml = body_str(
-            &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", "s")]))
-                .expect("ListChangeSets"),
+            &dispatch(&svc, "ListChangeSets", &[("StackName", "s")]).expect("ListChangeSets"),
         );
         assert!(!xml.contains("<ChangeSetName>"), "{xml}");
     }
