@@ -2308,7 +2308,15 @@ impl CloudFormationService {
         let mut deleted_types: Vec<String> = Vec::new();
         {
             let mut accounts = self.state.write();
-            let state = accounts.regional_mut(&req.account_id, &req.region);
+            // DeleteStack on a stack that does not exist succeeds without
+            // doing anything, as in AWS. A region that holds nothing has no
+            // stack to delete.
+            let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) else {
+                return Ok(AwsResponse::xml(
+                    StatusCode::OK,
+                    xml_responses::delete_stack_response(&req.request_id),
+                ));
+            };
 
             // Find stack by name or stack ID
             let stack = state.stacks.values_mut().find(|s| {
@@ -2417,35 +2425,37 @@ impl CloudFormationService {
 
                 // Re-acquire the write lock to update stack status
                 let mut accounts = self.state.write();
-                let state = accounts.regional_mut(&req.account_id, &req.region);
-                if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id) {
-                    stack.status = "DELETE_COMPLETE".to_string();
-                    // The reason belonged to the previous status (a failed
-                    // create/update); carrying it into DELETE_COMPLETE would
-                    // report a stale failure on a cleanly deleted stack.
-                    stack.status_reason = None;
-                    stack.resources.clear();
-                    stack.outputs.clear();
-                }
-                // Drop this stack's exports + import-consumer entries.
-                let stale_exports: Vec<String> = state
-                    .exports
-                    .iter()
-                    .filter(|(_, e)| e.exporting_stack_name == stack_name_for_notif)
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for k in stale_exports {
-                    state.exports.remove(&k);
-                }
-                for entries in state.imports.values_mut() {
-                    entries.retain(|s| s != &stack_name_for_notif);
-                }
-                state.imports.retain(|_, v| !v.is_empty());
-                // A stack's change sets go with it. Left behind, they would
-                // still answer DescribeChangeSet, and a re-created stack of
-                // the same name would find them by name.
-                if let Some(change_sets) = state.extras.get_mut("change_sets") {
-                    change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id.as_str()));
+                if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+                    if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id)
+                    {
+                        stack.status = "DELETE_COMPLETE".to_string();
+                        // The reason belonged to the previous status (a failed
+                        // create/update); carrying it into DELETE_COMPLETE would
+                        // report a stale failure on a cleanly deleted stack.
+                        stack.status_reason = None;
+                        stack.resources.clear();
+                        stack.outputs.clear();
+                    }
+                    // Drop this stack's exports + import-consumer entries.
+                    let stale_exports: Vec<String> = state
+                        .exports
+                        .iter()
+                        .filter(|(_, e)| e.exporting_stack_name == stack_name_for_notif)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in stale_exports {
+                        state.exports.remove(&k);
+                    }
+                    for entries in state.imports.values_mut() {
+                        entries.retain(|s| s != &stack_name_for_notif);
+                    }
+                    state.imports.retain(|_, v| !v.is_empty());
+                    // A stack's change sets go with it. Left behind, they would
+                    // still answer DescribeChangeSet, and a re-created stack of
+                    // the same name would find them by name.
+                    if let Some(change_sets) = state.extras.get_mut("change_sets") {
+                        change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id.as_str()));
+                    }
                 }
                 drop(accounts);
 
@@ -2762,7 +2772,15 @@ impl CloudFormationService {
         };
         if input.template_body.trim().is_empty() && !found_stack_id.is_empty() && completed {
             let mut accounts = self.state.write();
-            let state = accounts.regional_mut(&req.account_id, &req.region);
+            let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) else {
+                // `completed` saw the stack a moment ago; a concurrent delete
+                // or reset has since taken the region's state with it.
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationError",
+                    format!("Stack [{}] does not exist", input.stack_name),
+                ));
+            };
             if let Some(stack) = state
                 .stacks
                 .values_mut()
@@ -2986,7 +3004,7 @@ impl CloudFormationService {
         // needs, including the resource types touched by the update.
         let (touched_types, stack_id, stack_name_for_notif, notification_arns, resources_snapshot) = {
             let mut accounts = self.state.write();
-            let state = accounts.regional_mut(&req.account_id, &req.region);
+            let state = accounts.regional_get_mut(&req.account_id, &req.region);
             // UpdateStack declares only `InsufficientCapabilitiesException` and
             // `TokenAlreadyExistsException` -- neither describes a missing stack.
             // Real AWS returns `ValidationError` for this case, but that wire
@@ -2995,11 +3013,13 @@ impl CloudFormationService {
             // at no real stack, so degrade to a synthetic-success response
             // (echoing a generated StackId) rather than emit an undeclared
             // error. Real callers always create the stack first.
-            let stack_exists = state.stacks.values().any(|s| {
-                (s.name == input.stack_name || s.stack_id == input.stack_name)
-                    && s.status != "DELETE_COMPLETE"
+            let stack_exists = state.as_ref().is_some_and(|state| {
+                state.stacks.values().any(|s| {
+                    (s.name == input.stack_name || s.stack_id == input.stack_name)
+                        && s.status != "DELETE_COMPLETE"
+                })
             });
-            if !stack_exists {
+            let Some(state) = state.filter(|_| stack_exists) else {
                 let stack_id = if found_stack_id.is_empty() {
                     format!(
                         "arn:{}:cloudformation:{}:{}:stack/{}/{}",
@@ -3016,7 +3036,7 @@ impl CloudFormationService {
                     StatusCode::OK,
                     xml_responses::update_stack_response(&stack_id, &req.request_id),
                 ));
-            }
+            };
             let (update_result, stack_id, stack_name_owned, resources_snapshot, notification_arns) = {
                 let stack = state
                     .stacks
@@ -3198,65 +3218,67 @@ impl CloudFormationService {
             let reason = err.message();
             {
                 let mut accounts = self.state.write();
-                let state = accounts.regional_mut(&req.account_id, &req.region);
-                if let Some(stack) = state
-                    .stacks
-                    .values_mut()
-                    .find(|s| s.stack_id == stack_id && s.status != "DELETE_COMPLETE")
-                {
-                    stack.status = "UPDATE_ROLLBACK_COMPLETE".to_string();
-                    stack.status_reason = Some(reason.clone());
-                    // The update already overwrote these ~130 lines up. A
-                    // stack reporting a rollback while holding the new
-                    // template would hand `GetTemplate` the template that
-                    // supposedly rolled back, so put the previous ones back --
-                    // including the resource list, which otherwise described
-                    // the NEW template's resources while `GetTemplate`
-                    // returned the old one. A later
-                    // `update-stack --use-previous-template` diffed that
-                    // mismatch and deleted them.
-                    //
-                    // Physical resources this update already provisioned are
-                    // NOT unwound (that needs a real provisioner rollback), so
-                    // any it created are left orphaned rather than tracked.
-                    // Recording them under a template that does not declare
-                    // them is the worse of the two.
-                    stack.template = previous_template.clone();
-                    stack.parameters = previous_parameters.clone();
-                    stack.resources = resources_before_update.clone();
+                if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+                    if let Some(stack) = state
+                        .stacks
+                        .values_mut()
+                        .find(|s| s.stack_id == stack_id && s.status != "DELETE_COMPLETE")
+                    {
+                        stack.status = "UPDATE_ROLLBACK_COMPLETE".to_string();
+                        stack.status_reason = Some(reason.clone());
+                        // The update already overwrote these ~130 lines up. A
+                        // stack reporting a rollback while holding the new
+                        // template would hand `GetTemplate` the template that
+                        // supposedly rolled back, so put the previous ones back --
+                        // including the resource list, which otherwise described
+                        // the NEW template's resources while `GetTemplate`
+                        // returned the old one. A later
+                        // `update-stack --use-previous-template` diffed that
+                        // mismatch and deleted them.
+                        //
+                        // Physical resources this update already provisioned are
+                        // NOT unwound (that needs a real provisioner rollback), so
+                        // any it created are left orphaned rather than tracked.
+                        // Recording them under a template that does not declare
+                        // them is the worse of the two.
+                        stack.template = previous_template.clone();
+                        stack.parameters = previous_parameters.clone();
+                        stack.resources = resources_before_update.clone();
+                    }
+                    // The canonical name, not the caller's spelling: `StackName`
+                    // on a StackEvent must match what every other event for this
+                    // stack carries, or DescribeStackEvents interleaves an ARN
+                    // among the names.
+                    record_stack_status_event_with_reason(
+                        state,
+                        &stack_id,
+                        &export_owner_name,
+                        "AWS::CloudFormation::Stack",
+                        "UPDATE_ROLLBACK_COMPLETE",
+                        Some(&reason),
+                    );
                 }
-                // The canonical name, not the caller's spelling: `StackName`
-                // on a StackEvent must match what every other event for this
-                // stack carries, or DescribeStackEvents interleaves an ARN
-                // among the names.
-                record_stack_status_event_with_reason(
-                    state,
-                    &stack_id,
-                    &export_owner_name,
-                    "AWS::CloudFormation::Stack",
-                    "UPDATE_ROLLBACK_COMPLETE",
-                    Some(&reason),
-                );
             }
             return Err(err);
         }
         {
             let mut accounts = self.state.write();
-            let state = accounts.regional_mut(&req.account_id, &req.region);
-            if let Some(stack) = state
-                .stacks
-                .values_mut()
-                .find(|s| s.stack_id == stack_id && s.status != "DELETE_COMPLETE")
-            {
-                stack.outputs = outputs.clone();
+            if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+                if let Some(stack) = state
+                    .stacks
+                    .values_mut()
+                    .find(|s| s.stack_id == stack_id && s.status != "DELETE_COMPLETE")
+                {
+                    stack.outputs = outputs.clone();
+                }
+                Self::sync_exports_imports(
+                    state,
+                    &stack_id,
+                    &export_owner_name,
+                    &outputs,
+                    &imported_names,
+                );
             }
-            Self::sync_exports_imports(
-                state,
-                &stack_id,
-                &export_owner_name,
-                &outputs,
-                &imported_names,
-            );
         }
 
         Self::send_stack_notification(
@@ -5231,6 +5253,99 @@ mod tests {
         );
         assert!(described.contains(ids[1].as_str()), "{described}");
         assert!(described.contains("CREATE_COMPLETE"), "{described}");
+    }
+
+    /// Calls that only read, or that miss, must not leave an (empty) region
+    /// entry behind: it would be persisted and survive every restart.
+    #[tokio::test]
+    async fn a_miss_leaves_no_region_entry() {
+        use fakecloud_core::service::AwsService;
+        let svc = make_service();
+        let regions = |svc: &CloudFormationService| -> Vec<String> {
+            svc.state
+                .read()
+                .get("123456789012")
+                .map(|a| a.regions.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let calls: &[(&str, &[(&str, &str)])] = &[
+            ("DeleteStack", &[("StackName", "ghost")]),
+            ("DescribeStacks", &[("StackName", "ghost")]),
+            ("ListStacks", &[]),
+            (
+                "UpdateStack",
+                &[("StackName", "ghost"), ("TemplateBody", HANDLE_TEMPLATE)],
+            ),
+            (
+                "SetStackPolicy",
+                &[("StackName", "ghost"), ("StackPolicyBody", "{}")],
+            ),
+            ("GetStackPolicy", &[("StackName", "ghost")]),
+            (
+                "UpdateTerminationProtection",
+                &[
+                    ("StackName", "ghost"),
+                    ("EnableTerminationProtection", "true"),
+                ],
+            ),
+            (
+                "DeleteChangeSet",
+                &[("ChangeSetName", "cs"), ("StackName", "ghost")],
+            ),
+            (
+                "ExecuteChangeSet",
+                &[("ChangeSetName", "cs"), ("StackName", "ghost")],
+            ),
+            (
+                "DescribeChangeSet",
+                &[("ChangeSetName", "cs"), ("StackName", "ghost")],
+            ),
+            ("DeleteGeneratedTemplate", &[("GeneratedTemplateName", "t")]),
+            ("ListExports", &[]),
+            ("DeleteStackSet", &[("StackSetName", "ghost")]),
+            ("DescribeStackSet", &[("StackSetName", "ghost")]),
+            ("DeactivateOrganizationsAccess", &[]),
+        ];
+        for (action, params) in calls {
+            // Success or AWS's error alike: only the side effect is checked.
+            let _ = svc.handle(request_in(action, "eu-west-1", params)).await;
+            assert!(
+                !regions(&svc).contains(&"eu-west-1".to_string()),
+                "{action} created a region entry"
+            );
+        }
+
+        // In a region that does hold state, a policy for a stack that does not
+        // exist is not recorded either.
+        svc.create_stack(&request_in(
+            "CreateStack",
+            "eu-west-1",
+            &[("StackName", "real"), ("TemplateBody", HANDLE_TEMPLATE)],
+        ))
+        .await
+        .unwrap();
+        for stack in ["ghost", "real"] {
+            svc.handle(request_in(
+                "SetStackPolicy",
+                "eu-west-1",
+                &[
+                    ("StackName", stack),
+                    ("StackPolicyBody", r#"{"Statement":[]}"#),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        let policies: Vec<String> = svc
+            .state
+            .read()
+            .regional("123456789012", "eu-west-1")
+            .unwrap()
+            .stack_policies
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(policies, ["real"]);
     }
 
     #[tokio::test]

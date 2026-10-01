@@ -259,23 +259,24 @@ impl ResourceProvisioner {
 
             {
                 let mut accounts = self.cloudformation_state.write();
-                let state = accounts.regional_mut(&self.account_id, &self.region);
-                state.stacks.remove(&stack_name);
+                if let Some(state) = accounts.regional_get_mut(&self.account_id, &self.region) {
+                    state.stacks.remove(&stack_name);
 
-                crate::service::record_stack_status_event(
-                    state,
-                    &stack_id,
-                    &stack_name,
-                    "AWS::CloudFormation::Stack",
-                    "DELETE_IN_PROGRESS",
-                );
-                crate::service::record_stack_status_event(
-                    state,
-                    &stack_id,
-                    &stack_name,
-                    "AWS::CloudFormation::Stack",
-                    "DELETE_COMPLETE",
-                );
+                    crate::service::record_stack_status_event(
+                        state,
+                        &stack_id,
+                        &stack_name,
+                        "AWS::CloudFormation::Stack",
+                        "DELETE_IN_PROGRESS",
+                    );
+                    crate::service::record_stack_status_event(
+                        state,
+                        &stack_id,
+                        &stack_name,
+                        "AWS::CloudFormation::Stack",
+                        "DELETE_COMPLETE",
+                    );
+                }
             }
         }
 

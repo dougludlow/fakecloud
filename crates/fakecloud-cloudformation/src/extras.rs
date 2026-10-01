@@ -1254,8 +1254,10 @@ impl CloudFormationService {
                 // ExecuteChangeSet would then fail with ChangeSetNotFound.
                 let stack_filter = params.get("StackName").cloned();
                 let mut accounts = self.state.write();
-                let state = accounts.regional_mut(&aid, &region);
-                if let Some(m) = state.extras.get_mut("change_sets") {
+                if let Some(m) = accounts
+                    .regional_get_mut(&aid, &region)
+                    .and_then(|state| state.extras.get_mut("change_sets"))
+                {
                     m.retain(|_, v| !change_set_matches(v, &cs, stack_filter.as_deref()));
                 }
                 Ok(xml_response("DeleteChangeSet", String::new(), &rid))
@@ -1333,7 +1335,12 @@ impl CloudFormationService {
                 // stack.
                 if template_body.trim().is_empty() {
                     let mut accounts = self.state.write();
-                    let state = accounts.regional_mut(&aid, &region);
+                    // The change set was found in this region, so the region
+                    // holds state; it is only gone if a concurrent delete
+                    // took the change set with it.
+                    let Some(state) = accounts.regional_get_mut(&aid, &region) else {
+                        return Err(change_set_not_found(&cs));
+                    };
                     if let Some(sid) = &found {
                         if let Some(stack) = state.stacks.values_mut().find(|s| &s.stack_id == sid)
                         {
@@ -1433,8 +1440,17 @@ impl CloudFormationService {
                     None,
                 );
 
+                let stack_missing = || {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationError",
+                        format!("Stack [{stack_name}] does not exist"),
+                    )
+                };
                 let mut accounts = self.state.write();
-                let state = accounts.regional_mut(&aid, &region);
+                let Some(state) = accounts.regional_get_mut(&aid, &region) else {
+                    return Err(stack_missing());
+                };
 
                 // A stack still in `REVIEW_IN_PROGRESS` was minted by a
                 // `CREATE` change set and has no resources yet — executing the
@@ -1447,13 +1463,7 @@ impl CloudFormationService {
                         .stacks
                         .values_mut()
                         .find(|st| st.stack_id == found_stack_id && st.status != "DELETE_COMPLETE")
-                        .ok_or_else(|| {
-                            AwsServiceError::aws_error(
-                                StatusCode::BAD_REQUEST,
-                                "ValidationError",
-                                format!("Stack [{stack_name}] does not exist"),
-                            )
-                        })?;
+                        .ok_or_else(stack_missing)?;
                     let was_review = stack.status == "REVIEW_IN_PROGRESS";
                     stack.status = if was_review {
                         "CREATE_IN_PROGRESS"
@@ -1619,9 +1629,8 @@ impl CloudFormationService {
                     &aid,
                     &region,
                 );
-                {
-                    let mut accounts = self.state.write();
-                    let state = accounts.regional_mut(&aid, &region);
+                let mut accounts = self.state.write();
+                if let Some(state) = accounts.regional_get_mut(&aid, &region) {
                     if let Some(stack) = state
                         .stacks
                         .values_mut()
@@ -1639,6 +1648,7 @@ impl CloudFormationService {
                         &[],
                     );
                 }
+                drop(accounts);
 
                 Ok(xml_response("ExecuteChangeSet", String::new(), &rid))
             }
@@ -1998,8 +2008,10 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("GeneratedTemplateName"))?
                     .clone();
                 let mut accounts = self.state.write();
-                let state = accounts.regional_mut(&aid, &region);
-                if let Some(m) = state.extras.get_mut("generated_templates") {
+                if let Some(m) = accounts
+                    .regional_get_mut(&aid, &region)
+                    .and_then(|state| state.extras.get_mut("generated_templates"))
+                {
                     m.remove(&name);
                 }
                 Ok(xml_response("DeleteGeneratedTemplate", String::new(), &rid))
@@ -2548,9 +2560,23 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("StackName"))?
                     .clone();
                 let body = params.get("StackPolicyBody").cloned().unwrap_or_default();
+                // A policy attaches to a live stack of this region. AWS answers
+                // `ValidationError` for an unknown one, but SetStackPolicy
+                // declares no errors and the conformance probe's success
+                // variants name a placeholder stack, so an unknown stack stays
+                // a no-op success, as GetTemplateSummary and
+                // UpdateTerminationProtection treat it. Nothing is recorded for
+                // it, so a later GetStackPolicy does not report a policy on a
+                // stack that never existed.
                 let mut accounts = self.state.write();
-                let state = accounts.regional_mut(&aid, &region);
-                state.stack_policies.insert(stack, body);
+                if let Some(state) = accounts.regional_get_mut(&aid, &region) {
+                    let live = state.stacks.values().any(|s| {
+                        (s.name == stack || s.stack_id == stack) && s.status != "DELETE_COMPLETE"
+                    });
+                    if live {
+                        state.stack_policies.insert(stack, body);
+                    }
+                }
                 Ok(xml_response_no_result("SetStackPolicy", &rid))
             }
 
@@ -2566,12 +2592,14 @@ impl CloudFormationService {
                 let enabled = enabled_raw.eq_ignore_ascii_case("true");
                 let stack_id = {
                     let mut accounts = self.state.write();
-                    let state = accounts.regional_mut(&aid, &region);
                     // Toggle the flag on the stack itself (the single source of
                     // truth). Look up by name or stack id, skipping deleted
                     // stacks, so DeleteStack/DescribeStacks observe it.
-                    let target = state.stacks.values_mut().find(|s| {
-                        (s.name == stack || s.stack_id == stack) && s.status != "DELETE_COMPLETE"
+                    let target = accounts.regional_get_mut(&aid, &region).and_then(|state| {
+                        state.stacks.values_mut().find(|s| {
+                            (s.name == stack || s.stack_id == stack)
+                                && s.status != "DELETE_COMPLETE"
+                        })
                     });
                     match target {
                         Some(s) => {
@@ -2611,9 +2639,9 @@ impl CloudFormationService {
                 ))
             }
             "DeactivateOrganizationsAccess" => {
-                let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                state.orgs_access_enabled = false;
+                if let Some(state) = self.state.write().get_mut(&aid) {
+                    state.orgs_access_enabled = false;
+                }
                 Ok(xml_response(
                     "DeactivateOrganizationsAccess",
                     String::new(),
