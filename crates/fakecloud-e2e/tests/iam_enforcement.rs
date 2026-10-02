@@ -232,6 +232,109 @@ async fn deny_with_negated_condition_applies_when_key_absent() {
     assert!(format!("{err:?}").contains("AccessDenied"), "{err:?}");
 }
 
+fn path_style_s3(cfg: &aws_config::SdkConfig) -> aws_sdk_s3::Client {
+    aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Builder::from(cfg)
+            .force_path_style(true)
+            .build(),
+    )
+}
+
+/// The AWS-documented `DenyIncorrectEncryptionHeader` bucket policy. Its
+/// `StringNotEquals` is true when the header is absent (as on AWS), so it
+/// only works if fakecloud populates `s3:x-amz-server-side-encryption` from
+/// the request: a compliant PutObject must succeed, a plain one is denied.
+#[tokio::test]
+async fn deny_incorrect_encryption_header_allows_compliant_put() {
+    let server = start_strict().await;
+    let boot = sdk_config_with(&server, "test", "test").await;
+    let root_s3 = path_style_s3(&boot);
+    root_s3
+        .create_bucket()
+        .bucket("enc-bucket")
+        .send()
+        .await
+        .unwrap();
+    root_s3
+        .put_bucket_policy()
+        .bucket("enc-bucket")
+        .policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Sid":"DenyIncorrectEncryptionHeader",
+                "Effect":"Deny","Principal":"*","Action":"s3:PutObject",
+                "Resource":"arn:aws:s3:::enc-bucket/*",
+                "Condition":{"StringNotEquals":{"s3:x-amz-server-side-encryption":"AES256"}}}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let (akid, secret) = bootstrap_user(&server, "writer").await;
+    attach_inline_policy(
+        &server,
+        "writer",
+        "s3-all",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#,
+    )
+    .await;
+    let s3 = path_style_s3(&sdk_config_with(&server, &akid, &secret).await);
+    s3.put_object()
+        .bucket("enc-bucket")
+        .key("ok.txt")
+        .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect("PutObject with x-amz-server-side-encryption: AES256 is compliant");
+    let err = s3
+        .put_object()
+        .bucket("enc-bucket")
+        .key("plain.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect_err("PutObject without the header is denied, as on AWS");
+    assert!(format!("{err:?}").contains("AccessDenied"), "{err:?}");
+}
+
+/// A resource-perimeter guardrail (`Deny` unless `aws:ResourceAccount` is the
+/// caller's own account) must not block requests to the caller's own
+/// resources: fakecloud populates `aws:ResourceAccount`.
+#[tokio::test]
+async fn resource_account_perimeter_allows_own_account_requests() {
+    let server = start_strict().await;
+    let boot = sdk_config_with(&server, "test", "test").await;
+    path_style_s3(&boot)
+        .create_bucket()
+        .bucket("own-bucket")
+        .send()
+        .await
+        .unwrap();
+    let (akid, secret) = bootstrap_user(&server, "perimeter").await;
+    attach_inline_policy(
+        &server,
+        "perimeter",
+        "perimeter",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:*","Resource":"*"},
+            {"Effect":"Deny","Action":"s3:*","Resource":"*",
+             "Condition":{"StringNotEquals":{"aws:ResourceAccount":"123456789012"}}}
+        ]}"#,
+    )
+    .await;
+    let s3 = path_style_s3(&sdk_config_with(&server, &akid, &secret).await);
+    s3.put_object()
+        .bucket("own-bucket")
+        .key("k")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect("own-account bucket is inside the perimeter");
+    s3.list_objects_v2()
+        .bucket("own-bucket")
+        .send()
+        .await
+        .expect("own-account ListObjectsV2 is inside the perimeter");
+}
+
 #[tokio::test]
 async fn sts_get_caller_identity_allowed_with_explicit_policy() {
     let server = start_strict().await;

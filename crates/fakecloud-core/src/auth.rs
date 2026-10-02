@@ -675,6 +675,14 @@ impl InternalCaller {
 /// gate that must allow (intersection), matching AWS SCP semantics.
 pub trait ScpResolver: Send + Sync {
     fn scps_for(&self, principal: &Principal) -> Option<Vec<String>>;
+
+    /// `aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` for a principal in
+    /// `account_id`: the organization ID and the account's path
+    /// (`o-xxx/r-xxx/ou-xxx/.../`), or `None` when the account belongs to no
+    /// organization (AWS then omits both keys).
+    fn principal_org(&self, _account_id: &str) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// Abstraction over "does the organization topology permit `caller_account` to

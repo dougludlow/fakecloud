@@ -765,6 +765,17 @@ pub async fn dispatch(
                                 .scp_resolver
                                 .as_ref()
                                 .and_then(|r| r.scps_for(principal));
+                            // Global keys AWS sets on every request, which
+                            // perimeter guardrails gate on (`Deny ...
+                            // StringNotEquals aws:PrincipalOrgID` /
+                            // `aws:ResourceAccount`): absent, those negated
+                            // conditions would deny everyone.
+                            add_global_request_keys(
+                                &mut condition_context,
+                                principal,
+                                &resource_account_id,
+                                config.scp_resolver.as_deref(),
+                            );
                             let decision = evaluator.evaluate_with_resource_policy(
                                 principal,
                                 iam_action,
@@ -933,6 +944,21 @@ pub async fn dispatch(
                         };
                         condition_context.service_keys =
                             service.iam_condition_keys_for(&aws_request, iam_action);
+                        // `aws:ResourceAccount` is set for anonymous requests
+                        // too: the target resource's owner.
+                        if let Some(owner) = config
+                            .resource_policy_provider
+                            .as_ref()
+                            .and_then(|p| {
+                                p.resource_owner_account(&detected.service, &iam_action.resource)
+                            })
+                            .or_else(|| parse_account_from_arn(&iam_action.resource))
+                        {
+                            condition_context
+                                .service_keys
+                                .entry("aws:resourceaccount".to_string())
+                                .or_insert_with(|| vec![owner]);
+                        }
                         let resource_policy_json =
                             config.resource_policy_provider.as_ref().and_then(|p| {
                                 p.resource_policy(&detected.service, &iam_action.resource)
@@ -1637,6 +1663,32 @@ fn sha256_hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Populate `aws:ResourceAccount` (the account owning the target resource)
+/// and, when the principal's account is in an organization,
+/// `aws:PrincipalOrgID` / `aws:PrincipalOrgPaths`. A value the service
+/// already supplied wins.
+fn add_global_request_keys(
+    ctx: &mut ConditionContext,
+    principal: &Principal,
+    resource_account_id: &str,
+    scp_resolver: Option<&dyn crate::auth::ScpResolver>,
+) {
+    if !resource_account_id.is_empty() {
+        ctx.service_keys
+            .entry("aws:resourceaccount".to_string())
+            .or_insert_with(|| vec![resource_account_id.to_string()]);
+    }
+    if let Some((org_id, path)) = scp_resolver.and_then(|r| r.principal_org(&principal.account_id))
+    {
+        ctx.service_keys
+            .entry("aws:principalorgid".to_string())
+            .or_insert_with(|| vec![org_id]);
+        ctx.service_keys
+            .entry("aws:principalorgpaths".to_string())
+            .or_insert_with(|| vec![path]);
+    }
+}
+
 /// The AWS error for a request whose access key resolves to no identity:
 /// `ExpiredToken` for a temporary credential that has expired, otherwise
 /// `InvalidClientTokenId` (unknown or deactivated key, revoked session).
@@ -1759,6 +1811,12 @@ fn authorize_internal_caller(
         };
         context.service_keys = service.iam_condition_keys_for(aws_request, iam_action);
         context.service_keys.extend(caller.condition_keys());
+        // `aws:ResourceAccount`: the account the service works in for this
+        // request (for S3, the addressed bucket's owner).
+        context
+            .service_keys
+            .entry("aws:resourceaccount".to_string())
+            .or_insert_with(|| vec![aws_request.account_id.clone()]);
         let resource_policy_json = config
             .resource_policy_provider
             .as_ref()
@@ -2104,6 +2162,57 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(sha256_hex_lower(b"abc").len(), 64);
+    }
+
+    #[test]
+    fn global_request_keys_cover_resource_account_and_org() {
+        struct Org;
+        impl crate::auth::ScpResolver for Org {
+            fn scps_for(&self, _: &Principal) -> Option<Vec<String>> {
+                None
+            }
+            fn principal_org(&self, account: &str) -> Option<(String, String)> {
+                (account == "111111111111")
+                    .then(|| ("o-abc".to_string(), "o-abc/r-1/ou-2/".to_string()))
+            }
+        }
+        let principal = |account: &str| Principal {
+            arn: format!("arn:aws:iam::{account}:user/u"),
+            user_id: "AIDAU".into(),
+            account_id: account.into(),
+            principal_type: PrincipalType::User,
+            source_identity: None,
+            tags: None,
+        };
+        let mut ctx = ConditionContext::default();
+        add_global_request_keys(
+            &mut ctx,
+            &principal("111111111111"),
+            "222222222222",
+            Some(&Org),
+        );
+        assert_eq!(
+            ctx.lookup("aws:ResourceAccount"),
+            Some(vec!["222222222222".into()])
+        );
+        assert_eq!(ctx.lookup("aws:PrincipalOrgID"), Some(vec!["o-abc".into()]));
+        assert_eq!(
+            ctx.lookup("aws:PrincipalOrgPaths"),
+            Some(vec!["o-abc/r-1/ou-2/".into()])
+        );
+        // A principal in no organization gets no org keys (AWS omits them).
+        let mut ctx = ConditionContext::default();
+        add_global_request_keys(
+            &mut ctx,
+            &principal("333333333333"),
+            "333333333333",
+            Some(&Org),
+        );
+        assert_eq!(ctx.lookup("aws:PrincipalOrgID"), None);
+        assert_eq!(
+            ctx.lookup("aws:ResourceAccount"),
+            Some(vec!["333333333333".into()])
+        );
     }
 
     #[test]

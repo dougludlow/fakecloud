@@ -34,6 +34,12 @@ impl IamCredentialResolver {
 impl CredentialResolver for IamCredentialResolver {
     fn resolve(&self, access_key_id: &str) -> Option<ResolvedCredential> {
         let mut states = self.state.write();
+        // Sweep STS credentials long past expiry while the write lock is
+        // held, so the table stays bounded without a separate task.
+        let now = chrono::Utc::now();
+        for (_, account_state) in states.iter_mut() {
+            account_state.prune_expired_sts_credentials(now);
+        }
         // Search ALL accounts' credentials — a full scan is fine for a
         // testing tool with a small number of accounts.
         for (_, account_state) in states.iter_mut() {

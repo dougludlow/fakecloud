@@ -1442,10 +1442,7 @@ mod tests {
                 c.name
             );
             assert_eq!(env_of(c, "AWS_CONTAINER_CREDENTIALS_FULL_URI"), None);
-            assert_eq!(
-                env_of(c, "AWS_CONTAINER_AUTHORIZATION_TOKEN"),
-                Some(crate::runtime::task_credentials_token("task-1").as_str())
-            );
+            assert_eq!(env_of(c, "AWS_CONTAINER_AUTHORIZATION_TOKEN"), None);
         }
     }
 
@@ -1468,6 +1465,10 @@ mod tests {
             Some("http://fakecloud.fc.svc:4566/_fakecloud/ecs/creds/task-1")
         );
         assert_eq!(env_of(c, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"), None);
+        assert_eq!(
+            env_of(c, "AWS_CONTAINER_AUTHORIZATION_TOKEN"),
+            Some(crate::runtime::task_credentials_token("task-1").as_str())
+        );
     }
 
     #[test]

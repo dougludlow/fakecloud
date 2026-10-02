@@ -119,11 +119,10 @@ pub(crate) fn relative_uri(task_id: &str) -> String {
 /// URI alike).
 pub const AUTHORIZATION_TOKEN_ENV: &str = "AWS_CONTAINER_AUTHORIZATION_TOKEN";
 
-/// The authorization token injected into task `task_id`'s containers as
-/// [`AUTHORIZATION_TOKEN_ENV`]. Under `--iam strict` the credentials
-/// endpoints only hand out a task's role credentials to a request presenting
-/// it, so knowing (or guessing) a task ID is not enough, the way only the
-/// task's own network can reach the agent on ECS.
+/// The authorization token injected as [`AUTHORIZATION_TOKEN_ENV`] into task
+/// `task_id`'s containers that get the full credentials URI. Under
+/// `--iam strict` that endpoint only hands out a task's role credentials to a
+/// request presenting it, so knowing (or guessing) a task ID is not enough.
 ///
 /// Derived as HMAC-SHA256 of the task ID under a key drawn at random once per
 /// process: stable for the life of the task without storing anything, and
@@ -149,31 +148,32 @@ pub fn task_credentials_token(task_id: &str) -> String {
 
 /// The credentials env vars a task container gets: the agent's relative URI
 /// when `169.254.170.2` reaches fakecloud inside the container, else the full
-/// URI of fakecloud's endpoint at `fakecloud_base` (no trailing slash), plus
-/// the task's [`AUTHORIZATION_TOKEN_ENV`].
+/// URI of fakecloud's endpoint at `fakecloud_base` (no trailing slash) plus
+/// the task's [`AUTHORIZATION_TOKEN_ENV`], which the full-URI endpoint
+/// requires under `--iam strict`. As on ECS, the relative URI comes with no
+/// token: only the task's own network reaches the agent address.
 pub(crate) fn credentials_env(
     task_id: &str,
     link_local: bool,
     fakecloud_base: &str,
-) -> [(String, String); 2] {
-    let uri = if link_local {
-        (
+) -> Vec<(String, String)> {
+    if link_local {
+        vec![(
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".into(),
             relative_uri(task_id),
-        )
+        )]
     } else {
-        (
-            "AWS_CONTAINER_CREDENTIALS_FULL_URI".into(),
-            format!("{fakecloud_base}/_fakecloud/ecs/creds/{task_id}"),
-        )
-    };
-    [
-        uri,
-        (
-            AUTHORIZATION_TOKEN_ENV.into(),
-            task_credentials_token(task_id),
-        ),
-    ]
+        vec![
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI".into(),
+                format!("{fakecloud_base}/_fakecloud/ecs/creds/{task_id}"),
+            ),
+            (
+                AUTHORIZATION_TOKEN_ENV.into(),
+                task_credentials_token(task_id),
+            ),
+        ]
+    }
 }
 
 /// The operator's helper image override, if set.
@@ -540,30 +540,26 @@ mod tests {
 
     #[test]
     fn credentials_env_prefers_the_agents_relative_uri() {
-        let [uri, token] = credentials_env("abc", true, "http://host.docker.internal:4566");
         assert_eq!(
-            uri,
-            (
+            credentials_env("abc", true, "http://host.docker.internal:4566"),
+            vec![(
                 "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".to_string(),
                 "/v2/credentials/abc".to_string()
-            )
+            )]
         );
         assert_eq!(
-            token,
-            (
-                "AWS_CONTAINER_AUTHORIZATION_TOKEN".to_string(),
-                task_credentials_token("abc")
-            )
+            credentials_env("abc", false, "http://host.docker.internal:4566"),
+            vec![
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI".to_string(),
+                    "http://host.docker.internal:4566/_fakecloud/ecs/creds/abc".to_string()
+                ),
+                (
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN".to_string(),
+                    task_credentials_token("abc")
+                ),
+            ]
         );
-        let [uri, token] = credentials_env("abc", false, "http://host.docker.internal:4566");
-        assert_eq!(
-            uri,
-            (
-                "AWS_CONTAINER_CREDENTIALS_FULL_URI".to_string(),
-                "http://host.docker.internal:4566/_fakecloud/ecs/creds/abc".to_string()
-            )
-        );
-        assert_eq!(token.1, task_credentials_token("abc"));
     }
 
     #[test]

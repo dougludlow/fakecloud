@@ -233,12 +233,21 @@ impl EcsTaskCredentials {
             .is_some_and(|got| constant_time_eq(got.trim().as_bytes(), expected.as_bytes()))
     }
 
-    /// The endpoint response for `task_id`, given the request's
-    /// `Authorization` header.
+    /// The full-URI endpoint's response for `task_id`, given the request's
+    /// `Authorization` header (required under `--iam strict`).
     pub fn respond(&self, task_id: &str, authorization: Option<&str>) -> Response {
         if !task_id.is_empty() && !self.authorized(task_id, authorization) {
             return CredentialsError::Unauthorized.into_response();
         }
+        self.respond_relative(task_id)
+    }
+
+    /// The agent's relative-URI (`169.254.170.2/v2/credentials/<id>`)
+    /// response for `task_id`. As on ECS it takes no authorization token:
+    /// the address is only routed from inside the task's own network
+    /// namespace, and several SDKs (JS v2, Java v1) never send the token
+    /// with a relative URI.
+    pub fn respond_relative(&self, task_id: &str) -> Response {
         match self.credentials(task_id) {
             Ok(creds) => (StatusCode::OK, axum::Json(creds.to_container_json())).into_response(),
             Err(e) => e.into_response(),
@@ -276,7 +285,6 @@ fn respond_link_local(
     creds: &EcsTaskCredentials,
     method: &axum::http::Method,
     path: &str,
-    authorization: Option<&str>,
 ) -> Response {
     let Some(rest) = path.strip_prefix(V2_CREDENTIALS_PATH) else {
         return (StatusCode::NOT_FOUND, "404 page not found\n").into_response();
@@ -291,13 +299,13 @@ fn respond_link_local(
     };
     if method == axum::http::Method::HEAD {
         // Same status and headers as GET, no body.
-        let (parts, _) = creds.respond(task_id, authorization).into_parts();
+        let (parts, _) = creds.respond_relative(task_id).into_parts();
         return Response::from_parts(parts, axum::body::Body::empty());
     }
     if method != axum::http::Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    creds.respond(task_id, authorization)
+    creds.respond_relative(task_id)
 }
 
 /// The `Authorization` header of a credentials request, where the AWS SDKs
@@ -324,12 +332,7 @@ pub async fn link_local_host_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     if is_link_local_host(req.headers()) {
-        return respond_link_local(
-            &creds,
-            req.method(),
-            req.uri().path(),
-            authorization_header(req.headers()),
-        );
+        return respond_link_local(&creds, req.method(), req.uri().path());
     }
     next.run(req).await
 }
@@ -576,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_mode_requires_the_tasks_authorization_token() {
+    async fn strict_mode_requires_the_tasks_token_on_the_full_uri_only() {
         let (ecs, iam, _) = setup();
         let endpoint = EcsTaskCredentials::with_authorization(ecs.clone(), iam, ACCOUNT, true);
         add_task(&ecs, ACCOUNT, "t", Some(ROLE));
@@ -601,21 +604,16 @@ mod tests {
         // The task's own token: served.
         assert_eq!(endpoint.respond("t", Some(&token)).status(), StatusCode::OK);
 
-        // The link-local surface enforces it too.
+        // The agent's relative-URI surface takes no token, as on ECS: it is
+        // only reachable from the task's own network namespace.
         let app = app(endpoint);
         use tower::ServiceExt;
-        let req = |auth: Option<&str>| {
-            let mut b = axum::http::Request::builder()
-                .uri("/v2/credentials/t")
-                .header(axum::http::header::HOST, LINK_LOCAL_HOST);
-            if let Some(a) = auth {
-                b = b.header(axum::http::header::AUTHORIZATION, a);
-            }
-            b.body(axum::body::Body::empty()).unwrap()
-        };
-        let resp = app.clone().oneshot(req(None)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let resp = app.clone().oneshot(req(Some(&token))).await.unwrap();
+        let req = axum::http::Request::builder()
+            .uri("/v2/credentials/t")
+            .header(axum::http::header::HOST, LINK_LOCAL_HOST)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -695,7 +693,7 @@ mod tests {
             add_task(&ecs, ACCOUNT, "t", Some(ROLE));
             endpoint
         };
-        let head = respond_link_local(&creds, &axum::http::Method::HEAD, "/v2/credentials/t", None);
+        let head = respond_link_local(&creds, &axum::http::Method::HEAD, "/v2/credentials/t");
         assert!(head
             .headers()
             .get(axum::http::header::CONTENT_LENGTH)

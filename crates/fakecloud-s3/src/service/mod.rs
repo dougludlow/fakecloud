@@ -1913,6 +1913,28 @@ fn s3_condition_keys(
             vec![value.to_string()],
         );
     }
+    // Request headers AWS exposes as `s3:` condition keys on the writes that
+    // accept them. Encryption guardrails (`DenyIncorrectEncryptionHeader`:
+    // `Deny PutObject when s3:x-amz-server-side-encryption != AES256`) and
+    // storage-class / copy restrictions read these; since a negated operator
+    // is true on an absent key, leaving them unpopulated would deny every
+    // write, compliant ones included.
+    for header in [
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-storage-class",
+        "x-amz-metadata-directive",
+        "x-amz-copy-source",
+    ] {
+        if let Some(value) = headers
+            .get(header)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.trim().is_empty())
+        {
+            out.insert(format!("s3:{header}"), vec![value.to_string()]);
+        }
+    }
     if matches!(action, "ListObjects" | "ListObjectsV2") {
         // Both list variants share the same query param shape.
         if let Some(prefix) = query.get("prefix") {

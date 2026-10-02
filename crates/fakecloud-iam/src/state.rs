@@ -5,6 +5,11 @@ use std::collections::BTreeMap;
 
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
+/// How long an expired STS temporary credential is remembered, so requests
+/// signed with it are answered `ExpiredToken` rather than
+/// `InvalidClientTokenId`. Older entries are pruned.
+pub const EXPIRED_STS_RETENTION: chrono::Duration = chrono::Duration::hours(24);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IamUser {
     pub user_name: String,
@@ -602,11 +607,35 @@ impl IamState {
                     federated_provider: temp.federated_provider.clone(),
                 });
             }
-            // Keep the expired entry: a later request with it must be told
-            // `ExpiredToken` (see [`IamState::sts_credential_expired`]), not
-            // `InvalidClientTokenId` as for a key that never existed.
+            // Keep the expired entry for a while: a later request with it must
+            // be told `ExpiredToken` (see [`IamState::sts_credential_expired`]),
+            // not `InvalidClientTokenId` as for a key that never existed.
+            // Past the retention window it is dropped.
+            if temp.expiration <= now - EXPIRED_STS_RETENTION {
+                self.sts_temp_credentials.remove(access_key_id);
+                self.credential_identities.remove(access_key_id);
+            }
         }
         None
+    }
+
+    /// Drop STS temporary credentials (and their caller identities) that
+    /// expired more than [`EXPIRED_STS_RETENTION`] ago. Within that window an
+    /// expired key is kept so requests using it get `ExpiredToken`; past it
+    /// the entry only costs memory and snapshot size, and the key then reads
+    /// as unknown (`InvalidClientTokenId`).
+    pub fn prune_expired_sts_credentials(&mut self, now: DateTime<Utc>) {
+        let cutoff = now - EXPIRED_STS_RETENTION;
+        let stale: Vec<String> = self
+            .sts_temp_credentials
+            .iter()
+            .filter(|(_, t)| t.expiration <= cutoff)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            self.sts_temp_credentials.remove(&key);
+            self.credential_identities.remove(&key);
+        }
     }
 
     /// True when `access_key_id` names an STS temporary credential that has
@@ -831,6 +860,64 @@ mod tests {
         assert!(state.credential_secret("FSIAOLD").is_none());
         assert!(state.sts_credential_expired("FSIAOLD"));
         assert!(!state.sts_credential_expired("FSIANEVER"));
+    }
+
+    fn temp_cred(key: &str, expiration: DateTime<Utc>) -> StsTempCredential {
+        StsTempCredential {
+            access_key_id: key.to_string(),
+            secret_access_key: "s".to_string(),
+            session_token: "t".to_string(),
+            principal_arn: "arn".to_string(),
+            user_id: "id".to_string(),
+            account_id: "123456789012".to_string(),
+            expiration,
+            session_policies: Vec::new(),
+            mfa_present: false,
+            issued_at: Utc::now(),
+            federated_provider: None,
+        }
+    }
+
+    #[test]
+    fn expired_sts_credentials_are_pruned_after_the_retention_window() {
+        let mut state = IamState::new("123456789012");
+        let now = Utc::now();
+        for (key, exp) in [
+            ("FSIALIVE", now + chrono::Duration::hours(1)),
+            ("FSIARECENT", now - chrono::Duration::hours(1)),
+            ("FSIAANCIENT", now - chrono::Duration::hours(25)),
+        ] {
+            state
+                .sts_temp_credentials
+                .insert(key.to_string(), temp_cred(key, exp));
+            state.credential_identities.insert(
+                key.to_string(),
+                CredentialIdentity {
+                    arn: "arn".into(),
+                    user_id: "id".into(),
+                    account_id: "123456789012".into(),
+                },
+            );
+        }
+        state.prune_expired_sts_credentials(now);
+        assert!(state.credential_secret("FSIALIVE").is_some());
+        // Within the window: still reported as expired.
+        assert!(state.sts_credential_expired("FSIARECENT"));
+        // Past it: gone from both maps, so it reads as unknown.
+        assert!(!state.sts_credential_expired("FSIAANCIENT"));
+        assert!(!state.sts_temp_credentials.contains_key("FSIAANCIENT"));
+        assert!(!state.credential_identities.contains_key("FSIAANCIENT"));
+    }
+
+    #[test]
+    fn lookup_drops_an_entry_past_the_retention_window() {
+        let mut state = IamState::new("123456789012");
+        state.sts_temp_credentials.insert(
+            "FSIAOLD".into(),
+            temp_cred("FSIAOLD", Utc::now() - chrono::Duration::hours(30)),
+        );
+        assert!(state.credential_secret("FSIAOLD").is_none());
+        assert!(!state.sts_temp_credentials.contains_key("FSIAOLD"));
     }
 
     #[test]

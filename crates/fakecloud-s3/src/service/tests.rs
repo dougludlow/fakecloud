@@ -13,6 +13,43 @@ fn s3_condition_keys_emits_list_params() {
 }
 
 #[test]
+fn s3_condition_keys_emit_request_header_keys() {
+    let mut h = HeaderMap::new();
+    h.insert("x-amz-server-side-encryption", "aws:kms".parse().unwrap());
+    h.insert(
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "arn:aws:kms:us-east-1:123456789012:key/k".parse().unwrap(),
+    );
+    h.insert("x-amz-storage-class", "STANDARD_IA".parse().unwrap());
+    h.insert("x-amz-metadata-directive", "REPLACE".parse().unwrap());
+    h.insert("x-amz-copy-source", "/src/key".parse().unwrap());
+    h.insert(
+        "x-amz-server-side-encryption-customer-algorithm",
+        " ".parse().unwrap(),
+    );
+    let keys = s3_condition_keys("PutObject", &std::collections::HashMap::new(), &h);
+    assert_eq!(
+        keys["s3:x-amz-server-side-encryption"],
+        vec!["aws:kms".to_string()]
+    );
+    assert_eq!(
+        keys["s3:x-amz-server-side-encryption-aws-kms-key-id"],
+        vec!["arn:aws:kms:us-east-1:123456789012:key/k".to_string()]
+    );
+    assert_eq!(
+        keys["s3:x-amz-storage-class"],
+        vec!["STANDARD_IA".to_string()]
+    );
+    assert_eq!(
+        keys["s3:x-amz-metadata-directive"],
+        vec!["REPLACE".to_string()]
+    );
+    assert_eq!(keys["s3:x-amz-copy-source"], vec!["/src/key".to_string()]);
+    // A blank header names no value and is not emitted.
+    assert!(!keys.contains_key("s3:x-amz-server-side-encryption-customer-algorithm"));
+}
+
+#[test]
 fn s3_condition_keys_omits_absent_params() {
     let q = std::collections::HashMap::new();
     let keys = s3_condition_keys("ListObjectsV2", &q, &HeaderMap::new());

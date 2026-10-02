@@ -142,6 +142,9 @@ Every operator supports the `...IfExists` suffix (missing key evaluates to `true
 | `aws:EpochTime` | Same moment as `aws:CurrentTime`, in seconds since the Unix epoch |
 | `aws:SecureTransport` | `true` iff the request carries `x-forwarded-proto: https` (the fakecloud server itself speaks HTTP; set this header from an upstream TLS terminator to test) |
 | `aws:RequestedRegion` | Region extracted from SigV4 / config |
+| `aws:ResourceAccount` | Account that owns the target resource (an S3 bucket's owner, the account in any other ARN) |
+| `aws:PrincipalOrgID` / `aws:PrincipalOrgPaths` | The caller's organization ID and the account's path (`o-xxx/r-xxx/ou-xxx/.../`); absent when the caller's account is in no organization, as on AWS |
+| `aws:SourceArn` / `aws:SourceAccount` | Set on requests fakecloud makes as an AWS service principal (see below) |
 
 **Supported service-specific condition keys:**
 
@@ -153,6 +156,7 @@ Every operator supports the `...IfExists` suffix (missing key evaluates to `true
 | `s3:x-amz-acl` | any request carrying the header (`CreateBucket`, `PutObject`, `CopyObject`, `CreateMultipartUpload`, `PutBucketAcl`, `PutObjectAcl`) | `x-amz-acl` header |
 | `s3:x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp`, `-full-control` | any request carrying the header | matching `x-amz-grant-*` header |
 | `s3:x-amz-object-ownership` | any request carrying the header, which in practice is `CreateBucket` | `x-amz-object-ownership` header. AWS defines this key for `CreateBucket` only; `PutBucketOwnershipControls` carries the value in its XML body rather than a header, so no key is populated there |
+| `s3:x-amz-server-side-encryption`, `s3:x-amz-server-side-encryption-aws-kms-key-id`, `s3:x-amz-server-side-encryption-customer-algorithm`, `s3:x-amz-storage-class`, `s3:x-amz-metadata-directive`, `s3:x-amz-copy-source` | any request carrying the header (`PutObject`, `CopyObject`, `CreateMultipartUpload`) | matching request header, so guardrails like `DenyIncorrectEncryptionHeader` admit compliant writes |
 | `sns:Protocol` | `sns:Subscribe` | `Protocol` request parameter |
 | `sns:Endpoint` | `sns:Subscribe` | `Endpoint` request parameter |
 | `lambda:FunctionArn` | `lambda:AddPermission` | Target function ARN resolved from the path |
