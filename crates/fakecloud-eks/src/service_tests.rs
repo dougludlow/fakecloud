@@ -2868,6 +2868,7 @@ async fn create_cluster_creates_cluster_security_group_in_ec2() {
             .collect();
         assert!(tags.contains(&("aws:eks:cluster-name".into(), "demo".into())));
         assert!(tags.contains(&("kubernetes.io/cluster/demo".into(), "owned".into())));
+        assert!(tags.contains(&("Name".into(), sg.group_name.clone())));
     }
 
     // A VPC-config update keeps the cluster's VPC and security group and
@@ -2914,4 +2915,53 @@ async fn create_cluster_with_unknown_subnets_still_creates_security_group() {
     let accounts = ec2.read();
     let sg = &accounts.get("111122223333").unwrap().security_groups[sg_id];
     assert_eq!(cfg["vpcId"], sg.vpc_id.as_str());
+}
+
+#[tokio::test]
+async fn restore_recreates_security_group_for_clusters_saved_without_one() {
+    // A cluster created without EC2 wiring carries a group id with no EC2
+    // record behind it, like clusters persisted before EKS created the group.
+    let eks = make_state();
+    let svc = EksService::new(eks.clone());
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters",
+            &create_body("legacy"),
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let cfg = &v["cluster"]["resourcesVpcConfig"];
+    let sg_id = cfg["clusterSecurityGroupId"].as_str().unwrap().to_string();
+    let vpc_id = cfg["vpcId"].as_str().unwrap().to_string();
+
+    let ec2 = make_ec2_state();
+    assert_eq!(crate::restore_cluster_security_groups(&eks, &ec2), 1);
+    {
+        let accounts = ec2.read();
+        let state = accounts.get("111122223333").unwrap();
+        let sg = state.security_groups.get(&sg_id).expect("group recreated");
+        assert_eq!(sg.vpc_id, vpc_id);
+        assert!(sg.group_name.starts_with("eks-cluster-sg-legacy-"));
+        let tags: Vec<(String, String)> = state
+            .tags_for(&sg_id)
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
+            .collect();
+        assert!(tags.contains(&("aws:eks:cluster-name".into(), "legacy".into())));
+        assert!(tags.contains(&("kubernetes.io/cluster/legacy".into(), "owned".into())));
+    }
+
+    // Already-backed groups are left alone.
+    assert_eq!(crate::restore_cluster_security_groups(&eks, &ec2), 0);
+
+    // The recreated group is the cluster's, so DeleteCluster removes it.
+    let svc = EksService::new(eks.clone()).with_ec2_state(ec2.clone());
+    svc.handle(make_request(Method::DELETE, "/clusters/legacy", ""))
+        .await
+        .unwrap();
+    let accounts = ec2.read();
+    let state = accounts.get("111122223333").unwrap();
+    assert!(!state.security_groups.contains_key(&sg_id));
 }

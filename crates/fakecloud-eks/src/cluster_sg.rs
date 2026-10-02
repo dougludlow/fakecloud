@@ -28,7 +28,7 @@ pub struct ClusterNetwork {
 /// still resolves through `DescribeSecurityGroups` / `CreateTags`.
 ///
 /// The group mirrors what EKS creates: named `eks-cluster-sg-<cluster>-<id>`,
-/// tagged `aws:eks:cluster-name` and `kubernetes.io/cluster/<cluster>=owned`,
+/// tagged `Name`, `aws:eks:cluster-name` and `kubernetes.io/cluster/<cluster>=owned`,
 /// with an all-traffic ingress rule from itself and an all-traffic egress rule.
 pub fn create_cluster_security_group(
     ec2: &SharedEc2State,
@@ -45,10 +45,29 @@ pub fn create_cluster_security_group(
         .unwrap_or_else(|| fallback_vpc_id.to_string());
 
     let group_id = fakecloud_ec2::service_helpers::gen_id("sg");
+    insert_cluster_security_group(state, account_id, cluster_name, &group_id, &vpc_id);
+    ClusterNetwork {
+        vpc_id,
+        cluster_security_group_id: group_id,
+    }
+}
+
+/// Record the cluster security group `group_id` for `cluster_name` in one
+/// account's EC2 state: named `eks-cluster-sg-<cluster>-<id>` and tagged
+/// `Name`, `aws:eks:cluster-name` and `kubernetes.io/cluster/<cluster>=owned`,
+/// with an all-traffic ingress rule from itself and an all-traffic egress rule.
+fn insert_cluster_security_group(
+    state: &mut fakecloud_ec2::state::Ec2State,
+    account_id: &str,
+    cluster_name: &str,
+    group_id: &str,
+    vpc_id: &str,
+) {
     let suffix = uuid::Uuid::new_v4().as_u128() % 10_000_000_000;
+    let group_name = format!("eks-cluster-sg-{cluster_name}-{suffix:010}");
     let all_traffic = |is_egress: bool| SecurityGroupRule {
         rule_id: fakecloud_ec2::service_helpers::gen_id("sgr"),
-        group_id: group_id.clone(),
+        group_id: group_id.to_string(),
         is_egress,
         ip_protocol: "-1".to_string(),
         from_port: -1,
@@ -56,25 +75,29 @@ pub fn create_cluster_security_group(
         cidr_ipv4: is_egress.then(|| "0.0.0.0/0".to_string()),
         cidr_ipv6: None,
         prefix_list_id: None,
-        referenced_group_id: (!is_egress).then(|| group_id.clone()),
+        referenced_group_id: (!is_egress).then(|| group_id.to_string()),
         referenced_group_name: None,
         referenced_user_id: (!is_egress).then(|| account_id.to_string()),
         description: String::new(),
     };
     let rules = vec![all_traffic(false), all_traffic(true)];
     state.security_groups.insert(
-        group_id.clone(),
+        group_id.to_string(),
         SecurityGroup {
-            group_id: group_id.clone(),
-            group_name: format!("eks-cluster-sg-{cluster_name}-{suffix:010}"),
+            group_id: group_id.to_string(),
+            group_name: group_name.clone(),
             description: CLUSTER_SECURITY_GROUP_DESCRIPTION.to_string(),
-            vpc_id: vpc_id.clone(),
+            vpc_id: vpc_id.to_string(),
             rules,
         },
     );
     state.tags.insert(
-        group_id.clone(),
+        group_id.to_string(),
         vec![
+            Tag {
+                key: "Name".to_string(),
+                value: group_name,
+            },
             Tag {
                 key: "aws:eks:cluster-name".to_string(),
                 value: cluster_name.to_string(),
@@ -85,10 +108,38 @@ pub fn create_cluster_security_group(
             },
         ],
     );
-    ClusterNetwork {
-        vpc_id,
-        cluster_security_group_id: group_id,
+}
+
+/// Back the cluster security group of every restored cluster with an EC2
+/// record. Clusters persisted before EKS created the group in EC2 carry a
+/// group id with nothing behind it; recreate the group under that same id so
+/// `DescribeSecurityGroups` / `CreateTags` resolve it. Returns how many groups
+/// were recreated.
+pub fn restore_cluster_security_groups(eks: &crate::SharedEksState, ec2: &SharedEc2State) -> usize {
+    let eks = eks.read();
+    let mut accounts = ec2.write();
+    let mut restored = 0;
+    for (account_id, eks_state) in eks.iter() {
+        for cluster in eks_state.clusters.values() {
+            if cluster.connector_config.is_some() {
+                continue;
+            }
+            let vpc = &cluster.resources_vpc_config;
+            let (Some(group_id), Some(vpc_id)) = (
+                vpc["clusterSecurityGroupId"].as_str(),
+                vpc["vpcId"].as_str(),
+            ) else {
+                continue;
+            };
+            let state = accounts.get_or_create(account_id);
+            if state.security_groups.contains_key(group_id) {
+                continue;
+            }
+            insert_cluster_security_group(state, account_id, &cluster.name, group_id, vpc_id);
+            restored += 1;
+        }
     }
+    restored
 }
 
 /// Delete the cluster security group EKS created for `cluster_name`. Only a

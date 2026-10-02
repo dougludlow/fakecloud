@@ -7,8 +7,8 @@ pub(crate) mod service;
 pub(crate) mod state;
 
 pub use cluster_sg::{
-    create_cluster_security_group, delete_cluster_security_group, ClusterNetwork,
-    CLUSTER_SECURITY_GROUP_DESCRIPTION,
+    create_cluster_security_group, delete_cluster_security_group, restore_cluster_security_groups,
+    ClusterNetwork, CLUSTER_SECURITY_GROUP_DESCRIPTION,
 };
 pub use service::{EksService, EKS_ACTIONS};
 pub use state::{EksSnapshot, EksState, SharedEksState, EKS_SNAPSHOT_SCHEMA_VERSION};

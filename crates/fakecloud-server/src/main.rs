@@ -5853,6 +5853,14 @@ async fn main() {
             match fakecloud_eks::persistence::load_into(&store, &eks_state) {
                 Ok(fakecloud_eks::persistence::LoadOutcome::Loaded(accounts)) => {
                     tracing::info!(accounts, "loaded eks persistence snapshot");
+                    let restored =
+                        fakecloud_eks::restore_cluster_security_groups(&eks_state, &ec2_state);
+                    if restored > 0 {
+                        tracing::info!(restored, "recreated eks cluster security groups in ec2");
+                        if let Some(hook) = cfn_snapshot_hooks.get("ec2") {
+                            hook().await;
+                        }
+                    }
                 }
                 Ok(fakecloud_eks::persistence::LoadOutcome::Empty) => {
                     tracing::info!("no eks persistence snapshot found; starting empty");
