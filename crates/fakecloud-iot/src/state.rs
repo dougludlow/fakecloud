@@ -116,6 +116,30 @@ impl IotData {
     /// keyed by the record's own IoT ARN member (the `*Arn` naming this
     /// resource's primary name). Tags already in the store win on conflict.
     pub fn migrate_inline_tags(&mut self) {
+        // Package versions used to be minted as `package/<ver>`, shared by every
+        // package with that version name. Rewrite each stored version to its
+        // real `package/<pkg>/version/<ver>` ARN first, so its inline tags move
+        // under its own ARN rather than a shared one.
+        if let Some(versions) = self.resources.get_mut("packages/versions") {
+            for (key, rec) in versions.iter_mut() {
+                let Some((pkg, ver)) = key.split_once('/') else {
+                    continue;
+                };
+                let Some(obj) = rec.as_object_mut() else {
+                    continue;
+                };
+                let Some(old) = obj.get("packageVersionArn").and_then(Value::as_str) else {
+                    continue;
+                };
+                // Keep the old ARN's partition / region / account prefix.
+                let parts: Vec<&str> = old.splitn(6, ':').collect();
+                if parts.len() != 6 {
+                    continue;
+                }
+                let arn = format!("{}:package/{pkg}/version/{ver}", parts[..5].join(":"));
+                obj.insert("packageVersionArn".to_string(), Value::String(arn));
+            }
+        }
         let mut moved: Vec<(String, Value)> = Vec::new();
         for records in self.resources.values_mut() {
             for (key, rec) in records.iter_mut() {

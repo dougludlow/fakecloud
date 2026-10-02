@@ -1849,3 +1849,34 @@ fn static_and_dynamic_thing_groups_share_one_namespace() {
     ));
     assert!(is_code(&err, "ResourceAlreadyExistsException"));
 }
+
+#[test]
+fn legacy_package_versions_migrate_to_distinct_arns_and_tags() {
+    let mut d = crate::state::IotData::default();
+    let versions = d.resources.entry("packages/versions".into()).or_default();
+    for (pkg, owner) in [("fw-a", "a"), ("fw-b", "b")] {
+        versions.insert(
+            format!("{pkg}/1.0"),
+            json!({
+                "packageName": pkg,
+                "versionName": "1.0",
+                "packageVersionArn": "arn:aws:iot:us-east-1:000000000000:package/1.0",
+                "tags": {"owner": owner},
+            }),
+        );
+    }
+    d.migrate_inline_tags();
+    for (pkg, owner) in [("fw-a", "a"), ("fw-b", "b")] {
+        let arn = format!("arn:aws:iot:us-east-1:000000000000:package/{pkg}/version/1.0");
+        let rec = d
+            .get_resource("packages/versions", &format!("{pkg}/1.0"))
+            .unwrap();
+        assert_eq!(rec["packageVersionArn"], arn.as_str());
+        assert!(rec.get("tags").is_none());
+        assert_eq!(d.tags[&arn].len(), 1, "{pkg}: {:?}", d.tags[&arn]);
+        assert_eq!(d.tags[&arn]["owner"], owner);
+    }
+    assert!(!d
+        .tags
+        .contains_key("arn:aws:iot:us-east-1:000000000000:package/1.0"));
+}
