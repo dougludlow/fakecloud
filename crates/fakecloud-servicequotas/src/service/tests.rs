@@ -1,0 +1,615 @@
+use super::*;
+use bytes::Bytes;
+use fakecloud_core::multi_account::MultiAccountState;
+use fakecloud_organizations::{MemberAccount, OrganizationState, OrganizationsRegistry};
+use http::{HeaderMap, Method};
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+
+const MGMT: &str = "111111111111";
+const MEMBER: &str = "222222222222";
+
+fn orgs() -> SharedOrganizationsState {
+    Arc::new(RwLock::new(OrganizationsRegistry::default()))
+}
+
+fn svc_with(orgs: SharedOrganizationsState) -> ServiceQuotasService {
+    ServiceQuotasService::new(
+        Arc::new(RwLock::new(MultiAccountState::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        ))),
+        orgs,
+    )
+}
+
+fn svc() -> ServiceQuotasService {
+    svc_with(orgs())
+}
+
+fn req_in(account: &str, region: &str, action: &str, body: Value) -> AwsRequest {
+    AwsRequest {
+        service: "servicequotas".into(),
+        action: action.into(),
+        region: region.into(),
+        account_id: account.into(),
+        request_id: "req".into(),
+        headers: HeaderMap::new(),
+        query_params: HashMap::new(),
+        body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+        body_stream: Mutex::new(None),
+        path_segments: vec![],
+        raw_path: String::new(),
+        raw_query: String::new(),
+        method: Method::POST,
+        is_query_protocol: false,
+        access_key_id: None,
+        principal: None,
+    }
+}
+
+fn run(
+    s: &ServiceQuotasService,
+    account: &str,
+    action: &str,
+    body: Value,
+) -> Result<Value, AwsServiceError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(s.handle(req_in(account, "us-east-1", action, body)))
+        .map(|resp| serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+}
+
+fn call(s: &ServiceQuotasService, action: &str, body: Value) -> Value {
+    run(s, "000000000000", action, body).expect("op ok")
+}
+
+fn call_err(s: &ServiceQuotasService, action: &str, body: Value) -> AwsServiceError {
+    run(s, "000000000000", action, body).expect_err("op should fail")
+}
+
+fn sg_quota(code: &str) -> Value {
+    json!({ "ServiceCode": "vpc", "QuotaCode": code })
+}
+
+#[test]
+fn default_and_applied_quota_shapes() {
+    let s = svc();
+    let def = call(&s, "GetAWSDefaultServiceQuota", sg_quota("L-2AFB9258"));
+    assert_eq!(def["Quota"]["Value"], 5.0);
+    assert_eq!(
+        def["Quota"]["QuotaName"],
+        "Security groups per network interface"
+    );
+    assert_eq!(
+        def["Quota"]["QuotaArn"],
+        "arn:aws:servicequotas:us-east-1::vpc/L-2AFB9258"
+    );
+    let applied = call(&s, "GetServiceQuota", sg_quota("L-2AFB9258"));
+    assert_eq!(
+        applied["Quota"]["QuotaArn"],
+        "arn:aws:servicequotas:us-east-1:000000000000:vpc/L-2AFB9258"
+    );
+    assert_eq!(applied["Quota"]["Adjustable"], true);
+    assert_eq!(applied["Quota"]["GlobalQuota"], false);
+
+    let iam = call(
+        &s,
+        "GetServiceQuota",
+        json!({ "ServiceCode": "iam", "QuotaCode": "L-FE177D64" }),
+    );
+    assert_eq!(
+        iam["Quota"]["QuotaArn"],
+        "arn:aws:servicequotas::000000000000:iam/L-FE177D64"
+    );
+    assert_eq!(iam["Quota"]["GlobalQuota"], true);
+
+    let vcpu = call(
+        &s,
+        "GetServiceQuota",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-1216C47A" }),
+    );
+    assert_eq!(vcpu["Quota"]["UsageMetric"]["MetricNamespace"], "AWS/Usage");
+    assert_eq!(
+        vcpu["Quota"]["UsageMetric"]["MetricDimensions"]["Class"],
+        "Standard/OnDemand"
+    );
+}
+
+#[test]
+fn unknown_service_and_quota_are_no_such_resource() {
+    let s = svc();
+    let e = call_err(&s, "ListServiceQuotas", json!({ "ServiceCode": "nope" }));
+    assert_eq!(e.code(), "NoSuchResourceException");
+    assert_eq!(e.status(), StatusCode::NOT_FOUND);
+    let e = call_err(&s, "GetServiceQuota", sg_quota("L-00000000"));
+    assert_eq!(e.code(), "NoSuchResourceException");
+    let e = call_err(&s, "GetServiceQuota", json!({ "ServiceCode": "vpc" }));
+    assert_eq!(e.code(), "IllegalArgumentException");
+}
+
+#[test]
+fn approved_increase_raises_applied_value_and_is_in_history() {
+    let s = svc();
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(10.0);
+    let resp = call(&s, "RequestServiceQuotaIncrease", body);
+    assert_eq!(resp["RequestedQuota"]["Status"], "PENDING");
+    let id = resp["RequestedQuota"]["Id"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 40);
+
+    let got = call(
+        &s,
+        "GetRequestedServiceQuotaChange",
+        json!({ "RequestId": id }),
+    );
+    assert_eq!(got["RequestedQuota"]["Status"], "APPROVED");
+    let requester: Value =
+        serde_json::from_str(got["RequestedQuota"]["Requester"].as_str().unwrap()).unwrap();
+    assert_eq!(requester["accountId"], "000000000000");
+
+    let applied = call(&s, "GetServiceQuota", sg_quota("L-2AFB9258"));
+    assert_eq!(applied["Quota"]["Value"], 10.0);
+    // The AWS default is unchanged.
+    let def = call(&s, "GetAWSDefaultServiceQuota", sg_quota("L-2AFB9258"));
+    assert_eq!(def["Quota"]["Value"], 5.0);
+
+    let hist = call(
+        &s,
+        "ListRequestedServiceQuotaChangeHistoryByQuota",
+        sg_quota("L-2AFB9258"),
+    );
+    assert_eq!(hist["RequestedQuotas"].as_array().unwrap().len(), 1);
+    let none = call(
+        &s,
+        "ListRequestedServiceQuotaChangeHistory",
+        json!({ "Status": "PENDING" }),
+    );
+    assert!(none["RequestedQuotas"].as_array().unwrap().is_empty());
+
+    // Requests are regional: another region sees neither the request nor the
+    // raised value.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let other: Value = rt
+        .block_on(s.handle(req_in(
+            "000000000000",
+            "eu-west-1",
+            "GetServiceQuota",
+            sg_quota("L-2AFB9258"),
+        )))
+        .map(|r| serde_json::from_slice(r.body.expect_bytes()).unwrap())
+        .unwrap();
+    assert_eq!(other["Quota"]["Value"], 5.0);
+}
+
+#[test]
+fn increase_must_exceed_current_value_and_quota_must_be_adjustable() {
+    let s = svc();
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(5.0);
+    assert_eq!(
+        call_err(&s, "RequestServiceQuotaIncrease", body).code(),
+        "IllegalArgumentException"
+    );
+    let mut fixed = sg_quota("L-8312C5BB");
+    fixed["DesiredValue"] = json!(200.0);
+    assert_eq!(
+        call_err(&s, "RequestServiceQuotaIncrease", fixed).code(),
+        "IllegalArgumentException"
+    );
+}
+
+#[test]
+fn security_group_product_limit_is_not_approved() {
+    let s = svc();
+    // 16 groups x 60 rules = 960 <= 1000: approved.
+    let mut groups = sg_quota("L-2AFB9258");
+    groups["DesiredValue"] = json!(16.0);
+    call(&s, "RequestServiceQuotaIncrease", groups);
+    // 16 x 100 = 1600 > 1000: not approved, value unchanged.
+    let mut rules = sg_quota("L-0EA8095F");
+    rules["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", rules)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let got = call(
+        &s,
+        "GetRequestedServiceQuotaChange",
+        json!({ "RequestId": id }),
+    );
+    assert_eq!(got["RequestedQuota"]["Status"], "NOT_APPROVED");
+    let applied = call(&s, "GetServiceQuota", sg_quota("L-0EA8095F"));
+    assert_eq!(applied["Quota"]["Value"], 60.0);
+    // Above the documented maximum of 16 groups: not approved.
+    let s = svc();
+    let mut groups = sg_quota("L-2AFB9258");
+    groups["DesiredValue"] = json!(17.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", groups)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let got = call(
+        &s,
+        "GetRequestedServiceQuotaChange",
+        json!({ "RequestId": id }),
+    );
+    assert_eq!(got["RequestedQuota"]["Status"], "NOT_APPROVED");
+}
+
+#[test]
+fn support_case_only_for_pending_requests() {
+    let s = svc();
+    let e = call_err(&s, "CreateSupportCase", json!({ "RequestId": "abc123" }));
+    assert_eq!(e.code(), "NoSuchResourceException");
+    let mut body = sg_quota("L-F678F1CE");
+    body["DesiredValue"] = json!(10.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = call_err(&s, "CreateSupportCase", json!({ "RequestId": id }));
+    assert_eq!(e.code(), "InvalidResourceStateException");
+    assert_eq!(e.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[test]
+fn list_paginates_with_checked_tokens() {
+    let s = svc();
+    let first = call(
+        &s,
+        "ListAWSDefaultServiceQuotas",
+        json!({ "ServiceCode": "vpc", "MaxResults": 10 }),
+    );
+    assert_eq!(first["Quotas"].as_array().unwrap().len(), 10);
+    let token = first["NextToken"].as_str().unwrap().to_string();
+    let second = call(
+        &s,
+        "ListAWSDefaultServiceQuotas",
+        json!({ "ServiceCode": "vpc", "MaxResults": 100, "NextToken": token }),
+    );
+    assert_eq!(
+        second["Quotas"].as_array().unwrap().len(),
+        catalog::quotas_of("vpc").len() - 10
+    );
+    assert!(second.get("NextToken").is_none());
+    let e = call_err(&s, "ListServices", json!({ "NextToken": "garbage" }));
+    assert_eq!(e.code(), "InvalidPaginationTokenException");
+    let resource_level = call(
+        &s,
+        "ListServiceQuotas",
+        json!({ "ServiceCode": "vpc", "QuotaAppliedAtLevel": "RESOURCE" }),
+    );
+    assert!(resource_level["Quotas"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn tags_on_applied_quotas() {
+    let s = svc();
+    let arn = "arn:aws:servicequotas:us-east-1:000000000000:vpc/L-2AFB9258";
+    call(
+        &s,
+        "TagResource",
+        json!({ "ResourceARN": arn, "Tags": [{ "Key": "team", "Value": "net" }, { "Key": "env", "Value": "dev" }] }),
+    );
+    call(
+        &s,
+        "UntagResource",
+        json!({ "ResourceARN": arn, "TagKeys": ["env"] }),
+    );
+    let tags = call(&s, "ListTagsForResource", json!({ "ResourceARN": arn }));
+    assert_eq!(tags["Tags"], json!([{ "Key": "team", "Value": "net" }]));
+
+    let foreign = "arn:aws:servicequotas:us-east-1:999999999999:vpc/L-2AFB9258";
+    let e = call_err(&s, "ListTagsForResource", json!({ "ResourceARN": foreign }));
+    assert_eq!(e.code(), "NoSuchResourceException");
+    let e = call_err(
+        &s,
+        "TagResource",
+        json!({ "ResourceARN": arn, "Tags": [{ "Key": "aws:x", "Value": "y" }] }),
+    );
+    assert_eq!(e.code(), "IllegalArgumentException");
+    let many: Vec<Value> = (0..51)
+        .map(|i| json!({ "Key": format!("k{i}"), "Value": "v" }))
+        .collect();
+    let e = call_err(
+        &s,
+        "TagResource",
+        json!({ "ResourceARN": arn, "Tags": many }),
+    );
+    assert_eq!(e.code(), "TooManyTagsException");
+}
+
+#[test]
+fn auto_management_lifecycle() {
+    let s = svc();
+    assert_eq!(
+        call(&s, "GetAutoManagementConfiguration", json!({}))["OptInStatus"],
+        "DISABLED"
+    );
+    assert_eq!(
+        call_err(
+            &s,
+            "UpdateAutoManagement",
+            json!({ "OptInType": "NotifyOnly" })
+        )
+        .code(),
+        "NoSuchResourceException"
+    );
+    call(
+        &s,
+        "StartAutoManagement",
+        json!({ "OptInLevel": "ACCOUNT", "OptInType": "NotifyOnly", "ExclusionList": { "vpc": ["L-2AFB9258"] } }),
+    );
+    call(
+        &s,
+        "UpdateAutoManagement",
+        json!({ "OptInType": "NotifyAndAdjust" }),
+    );
+    let cfg = call(&s, "GetAutoManagementConfiguration", json!({}));
+    assert_eq!(cfg["OptInStatus"], "ENABLED");
+    assert_eq!(cfg["OptInType"], "NotifyAndAdjust");
+    assert_eq!(
+        cfg["ExclusionList"]["vpc"][0]["QuotaName"],
+        "Security groups per network interface"
+    );
+    call(&s, "StopAutoManagement", json!({}));
+    assert_eq!(
+        call(&s, "GetAutoManagementConfiguration", json!({}))["OptInStatus"],
+        "DISABLED"
+    );
+    assert_eq!(
+        call_err(
+            &s,
+            "StartAutoManagement",
+            json!({ "OptInLevel": "ACCOUNT", "OptInType": "NotifyOnly", "ExclusionList": { "vpc": ["L-00000000"] } }),
+        )
+        .code(),
+        "NoSuchResourceException"
+    );
+}
+
+struct FixedUsage;
+
+impl QuotaUsageSource for FixedUsage {
+    fn service_codes(&self) -> &[&str] {
+        &["vpc"]
+    }
+    fn usage(&self, _: &str, _: &str, _: &str, quota_code: &str) -> Option<f64> {
+        (quota_code == "L-F678F1CE").then_some(2.0)
+    }
+}
+
+#[test]
+fn utilization_report_uses_measured_usage() {
+    let s = svc().with_usage_source(Arc::new(FixedUsage));
+    let started = call(&s, "StartQuotaUtilizationReport", json!({}));
+    let id = started["ReportId"].as_str().unwrap().to_string();
+    let report = call(&s, "GetQuotaUtilizationReport", json!({ "ReportId": id }));
+    assert_eq!(report["Status"], "COMPLETED");
+    assert_eq!(report["TotalCount"], 1);
+    assert_eq!(report["Quotas"][0]["QuotaCode"], "L-F678F1CE");
+    assert_eq!(report["Quotas"][0]["Utilization"], 40.0);
+    let e = call_err(
+        &s,
+        "GetQuotaUtilizationReport",
+        json!({ "ReportId": "missing1" }),
+    );
+    assert_eq!(e.code(), "NoSuchResourceException");
+}
+
+fn org_with_member(joined_offset_secs: i64) -> SharedOrganizationsState {
+    let o = orgs();
+    let mut org = OrganizationState::bootstrap_in("us-east-1", MGMT);
+    let joined = Utc::now() + chrono::Duration::seconds(joined_offset_secs);
+    org.accounts.insert(
+        MEMBER.to_string(),
+        MemberAccount {
+            id: MEMBER.to_string(),
+            arn: org.account_arn(MEMBER),
+            email: format!("{MEMBER}@example.com"),
+            name: "member".into(),
+            status: "ACTIVE".into(),
+            joined_method: "CREATED".into(),
+            joined_timestamp: joined,
+            parent_id: org.root_id.clone(),
+            gov_cloud_mirror: false,
+        },
+    );
+    o.write().insert(org);
+    o
+}
+
+#[test]
+fn template_requires_management_account_in_us_east_1() {
+    let s = svc();
+    let e = call_err(&s, "AssociateServiceQuotaTemplate", json!({}));
+    assert_eq!(e.code(), "NoAvailableOrganizationException");
+
+    let o = org_with_member(0);
+    let s = svc_with(o);
+    let e = run(&s, MEMBER, "AssociateServiceQuotaTemplate", json!({})).unwrap_err();
+    assert_eq!(e.code(), "AccessDeniedException");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let Err(e) = rt.block_on(s.handle(req_in(
+        MGMT,
+        "eu-west-1",
+        "AssociateServiceQuotaTemplate",
+        json!({}),
+    ))) else {
+        panic!("template ops are us-east-1 only");
+    };
+    assert_eq!(e.code(), "TemplatesNotAvailableInRegionException");
+    let e = run(&s, MGMT, "GetAssociationForServiceQuotaTemplate", json!({})).unwrap_err();
+    assert_eq!(e.code(), "ServiceQuotaTemplateNotInUseException");
+}
+
+#[test]
+fn template_entries_crud_and_limit() {
+    let o = org_with_member(0);
+    let s = svc_with(o);
+    let entry = |code: &str| json!({ "ServiceCode": "vpc", "QuotaCode": code, "AwsRegion": "us-east-1", "DesiredValue": 10.0 });
+    let put = run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        entry("L-2AFB9258"),
+    )
+    .unwrap();
+    assert_eq!(
+        put["ServiceQuotaIncreaseRequestInTemplate"]["QuotaName"],
+        "Security groups per network interface"
+    );
+    let key = json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1" });
+    let got = run(
+        &s,
+        MGMT,
+        "GetServiceQuotaIncreaseRequestFromTemplate",
+        key.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        got["ServiceQuotaIncreaseRequestInTemplate"]["DesiredValue"],
+        10.0
+    );
+    let codes: Vec<&str> = catalog::quotas_of("vpc")
+        .iter()
+        .filter(|d| d.adjustable && d.quota_code != "L-2AFB9258")
+        .map(|d| d.quota_code)
+        .take(9)
+        .collect();
+    for c in &codes {
+        run(
+            &s,
+            MGMT,
+            "PutServiceQuotaIncreaseRequestIntoTemplate",
+            entry(c),
+        )
+        .unwrap();
+    }
+    let list = run(
+        &s,
+        MGMT,
+        "ListServiceQuotaIncreaseRequestsInTemplate",
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(
+        list["ServiceQuotaIncreaseRequestInTemplateList"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let e = run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-0263D0A3", "AwsRegion": "us-east-1", "DesiredValue": 10.0 }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), "QuotaExceededException");
+    run(
+        &s,
+        MGMT,
+        "DeleteServiceQuotaIncreaseRequestFromTemplate",
+        key.clone(),
+    )
+    .unwrap();
+    let e = run(&s, MGMT, "GetServiceQuotaIncreaseRequestFromTemplate", key).unwrap_err();
+    assert_eq!(e.code(), "NoSuchResourceException");
+}
+
+#[test]
+fn associated_template_applies_to_accounts_created_afterwards() {
+    // The member joined an hour after the association below.
+    let o = org_with_member(3600);
+    let s = svc_with(o.clone());
+    run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1", "DesiredValue": 8.0 }),
+    )
+    .unwrap();
+    run(&s, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    assert_eq!(
+        run(&s, MGMT, "GetAssociationForServiceQuotaTemplate", json!({})).unwrap()
+            ["ServiceQuotaTemplateAssociationStatus"],
+        "ASSOCIATED"
+    );
+    let org_id = o.read().org_of_account(MGMT).unwrap().org_id.clone();
+    assert!(o
+        .read()
+        .org_by_id(&org_id)
+        .unwrap()
+        .trusted_services
+        .contains_key("servicequotas.amazonaws.com"));
+
+    let member_quota = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(member_quota["Quota"]["Value"], 8.0);
+    let hist = run(
+        &s,
+        MEMBER,
+        "ListRequestedServiceQuotaChangeHistory",
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(hist["RequestedQuotas"][0]["Status"], "APPROVED");
+    // The management account's own quota is untouched.
+    let mgmt_quota = run(&s, MGMT, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(mgmt_quota["Quota"]["Value"], 5.0);
+
+    run(&s, MGMT, "DisassociateServiceQuotaTemplate", json!({})).unwrap();
+    assert_eq!(
+        run(&s, MGMT, "GetAssociationForServiceQuotaTemplate", json!({})).unwrap()
+            ["ServiceQuotaTemplateAssociationStatus"],
+        "DISASSOCIATED"
+    );
+    let e = run(&s, MGMT, "DisassociateServiceQuotaTemplate", json!({})).unwrap_err();
+    assert_eq!(e.code(), "ServiceQuotaTemplateNotInUseException");
+}
+
+#[test]
+fn template_skips_accounts_that_joined_before_association() {
+    let o = org_with_member(-3600);
+    let s = svc_with(o);
+    run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1", "DesiredValue": 8.0 }),
+    )
+    .unwrap();
+    run(&s, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    let member_quota = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(member_quota["Quota"]["Value"], 5.0);
+}
+
+#[test]
+fn provider_reports_applied_values() {
+    use fakecloud_core::quota::QuotaProvider;
+    let s = svc();
+    let mut body = sg_quota("L-0EA8095F");
+    body["DesiredValue"] = json!(100.0);
+    call(&s, "RequestServiceQuotaIncrease", body);
+    let p = crate::ServiceQuotasProvider::new(s.state.clone(), s.orgs.clone());
+    assert_eq!(
+        p.applied_value("000000000000", "us-east-1", "vpc", "L-0EA8095F"),
+        Some(100.0)
+    );
+    assert_eq!(
+        p.applied_value("000000000000", "us-east-1", "vpc", "L-2AFB9258"),
+        Some(5.0)
+    );
+    assert_eq!(
+        p.applied_value("000000000000", "us-east-1", "vpc", "L-0"),
+        None
+    );
+}

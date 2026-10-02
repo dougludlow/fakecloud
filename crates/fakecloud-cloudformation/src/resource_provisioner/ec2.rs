@@ -253,8 +253,9 @@ impl ResourceProvisioner {
         action: &str,
         params: HashMap<String, String>,
     ) -> Result<String, String> {
-        let svc =
-            Ec2Service::with_state(self.ec2_state.clone()).with_kms_hook(self.kms_hook.clone());
+        let svc = Ec2Service::with_state(self.ec2_state.clone())
+            .with_kms_hook(self.kms_hook.clone())
+            .with_quota_provider(self.quota_provider.clone());
         let req = self.ec2_request(action, params);
         let resp = svc
             .provision_sync(&req)
@@ -683,6 +684,7 @@ impl ResourceProvisioner {
         let attrs = fakecloud_ec2::cfn_provision::cfn_create(
             self.ec2_state.clone(),
             self.kms_hook.clone(),
+            self.quota_provider.clone(),
             &self.account_id,
             &self.region,
             &spec,

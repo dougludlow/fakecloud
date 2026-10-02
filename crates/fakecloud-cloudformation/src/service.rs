@@ -664,6 +664,9 @@ pub struct CloudFormationService {
     /// The server's KMS hook (persisting minted keys), used by provisioners
     /// that report an AWS-managed key for a default-encrypted resource.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// Service Quotas, so EC2 resources a stack provisions are held to the
+    /// account's applied quotas like direct API calls.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
     /// Whole-state snapshot persist hooks keyed by service name (see
     /// `service_key_for_type`). After a stack op the handler invokes the hook
     /// for each touched service so a CFN-provisioned (or CFN-deleted) resource
@@ -819,6 +822,8 @@ pub(crate) struct ContainerBackingHandles {
     /// KMS hook an Auto Scaling reconcile's EC2 launches resolve encrypted
     /// block-device volumes' keys through.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// Service Quotas for those launches' security-group quotas.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 impl ContainerBackingHandles {
@@ -842,6 +847,7 @@ impl ContainerBackingHandles {
             autoscaling_snapshot_hook: None,
             ec2_snapshot_hook: None,
             kms_hook: p.kms_hook.clone(),
+            quota_provider: p.quota_provider.clone(),
         }
     }
 
@@ -893,7 +899,10 @@ impl ContainerBackingHandles {
                         autoscaling: self.autoscaling_snapshot_hook.clone(),
                         ec2: self.ec2_snapshot_hook.clone(),
                     };
-                    let kms_hook = self.kms_hook.clone();
+                    let hooks = fakecloud_autoscaling::cfn_provision::CfnLaunchHooks {
+                        kms_hook: self.kms_hook.clone(),
+                        quota_provider: self.quota_provider.clone(),
+                    };
                     tokio::spawn(async move {
                         fakecloud_autoscaling::cfn_provision::cfn_reconcile_capacity(
                             asg_state,
@@ -903,7 +912,7 @@ impl ContainerBackingHandles {
                             account,
                             region,
                             persist,
-                            kms_hook,
+                            hooks,
                         )
                         .await;
                     });
@@ -1172,6 +1181,7 @@ impl CloudFormationService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
             kms_hook: None,
+            quota_provider: None,
             snapshot_hooks: BTreeMap::new(),
             auto_deployment_gate: Arc::new(parking_lot::Mutex::new(AutoDeploymentGate::default())),
             auto_deployment_retries: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
@@ -1194,6 +1204,16 @@ impl CloudFormationService {
     /// report (and persist) the same AWS-managed key as the service APIs.
     pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
         self.kms_hook = Some(hook);
+        self
+    }
+
+    /// Wire Service Quotas so stack-provisioned EC2 resources are held to the
+    /// account's applied quotas.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Arc<dyn fakecloud_core::quota::QuotaProvider>,
+    ) -> Self {
+        self.quota_provider = Some(provider);
         self
     }
 
@@ -1318,6 +1338,7 @@ impl CloudFormationService {
             defer_custom_invokes: false,
             s3_store: self.s3_store.clone(),
             kms_hook: self.kms_hook.clone(),
+            quota_provider: self.quota_provider.clone(),
             account_id: account_id.to_string(),
             region: region.to_string(),
             stack_id: stack_id.to_string(),

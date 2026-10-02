@@ -21,6 +21,7 @@ mod lgw;
 mod meta;
 mod nacl;
 mod ni;
+pub mod quota;
 mod reserved;
 mod rest;
 mod routing;
@@ -927,6 +928,9 @@ pub struct Ec2Service {
     /// ARN (the account's EBS default key, the AWS-managed `aws/ebs` key
     /// unless customized) and a named key reports its ARN.
     pub(crate) kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// Service Quotas, for the applied values of the quotas EC2 enforces.
+    /// `None` enforces the AWS defaults.
+    pub(crate) quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 impl Ec2Service {
@@ -942,6 +946,7 @@ impl Ec2Service {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             kms_hook: None,
+            quota_provider: None,
         }
     }
 
@@ -954,6 +959,7 @@ impl Ec2Service {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             kms_hook: None,
+            quota_provider: None,
         }
     }
 
@@ -1017,6 +1023,16 @@ impl Ec2Service {
         hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     ) -> Self {
         self.kms_hook = hook;
+        self
+    }
+
+    /// Attach Service Quotas so the quotas EC2 enforces follow their applied
+    /// values.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
         self
     }
 

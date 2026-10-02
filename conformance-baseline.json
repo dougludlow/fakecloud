@@ -1,6 +1,6 @@
 {
-  "variants_passed": 248557,
-  "total_variants": 248557,
+  "variants_passed": 249449,
+  "total_variants": 249449,
   "per_service": {
     "account": {
       "passed": 412,
@@ -349,6 +349,10 @@
     "servicediscovery": {
       "passed": 1062,
       "total": 1062
+    },
+    "servicequotas": {
+      "passed": 892,
+      "total": 892
     },
     "ses": {
       "passed": 2864,

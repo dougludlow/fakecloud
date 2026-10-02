@@ -823,6 +823,20 @@ async fn main() {
             &endpoint_url,
         )),
     );
+    let servicequotas_state: fakecloud_servicequotas::SharedServiceQuotasState = Arc::new(
+        parking_lot::RwLock::new(fakecloud_core::multi_account::MultiAccountState::new(
+            &cli.account_id,
+            &cli.region,
+            &endpoint_url,
+        )),
+    );
+    // Applied quota values, for the services that enforce a quota (EC2's
+    // security groups per interface and rules per group).
+    let quota_provider: Arc<dyn fakecloud_core::quota::QuotaProvider> =
+        Arc::new(fakecloud_servicequotas::ServiceQuotasProvider::new(
+            servicequotas_state.clone(),
+            organizations_state.clone(),
+        ));
     let support_state: fakecloud_support::SharedSupportState = Arc::new(parking_lot::RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new(
             &cli.account_id,
@@ -2504,7 +2518,8 @@ async fn main() {
         };
     let mut ec2_service = Ec2Service::with_state(ec2_state.clone())
         .with_runtime(ec2_runtime.clone())
-        .with_kms_hook(Some(kms_hook_for_services.clone()));
+        .with_kms_hook(Some(kms_hook_for_services.clone()))
+        .with_quota_provider(Some(quota_provider.clone()));
     if let Some(store) = ec2_snapshot_store.clone() {
         ec2_service = ec2_service.with_snapshot_store(store);
     }
@@ -4409,6 +4424,44 @@ async fn main() {
     }
     registry.register(Arc::new(comprehend_service));
 
+    // Service Quotas (servicequotas): awsJson1.1 quota catalog, increase
+    // requests, the Organizations quota request template, tags, automatic
+    // management and utilization reports (usage counted from EC2 state).
+    let servicequotas_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
+        if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
+            let data_path = persistence_config
+                .data_path
+                .as_ref()
+                .expect("validated above")
+                .clone();
+            let path = data_path.join("servicequotas").join("snapshot.json");
+            let store = fakecloud_persistence::DiskSnapshotStore::new(path);
+            match fakecloud_servicequotas::persistence::load_into(&store, &servicequotas_state) {
+                Ok(fakecloud_servicequotas::persistence::LoadOutcome::Loaded(accounts)) => {
+                    tracing::info!(accounts, "loaded servicequotas persistence snapshot");
+                }
+                Ok(fakecloud_servicequotas::persistence::LoadOutcome::Empty) => {
+                    tracing::info!("no servicequotas persistence snapshot found; starting empty");
+                }
+                Err(err) => fatal_exit(format_args!("{err}")),
+            }
+            Some(Arc::new(store) as Arc<dyn fakecloud_persistence::SnapshotStore>)
+        } else {
+            None
+        };
+    let mut servicequotas_service = fakecloud_servicequotas::ServiceQuotasService::new(
+        servicequotas_state.clone(),
+        organizations_state.clone(),
+    )
+    .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()));
+    if let Some(store) = servicequotas_snapshot_store {
+        servicequotas_service = servicequotas_service.with_snapshot_store(store);
+    }
+    if let Some(h) = servicequotas_service.snapshot_hook() {
+        cfn_snapshot_hooks.insert("servicequotas", h);
+    }
+    registry.register(Arc::new(servicequotas_service));
+
     // AWS Support (support): awsJson1.1 support-cases + Trusted Advisor control
     // plane (cases, communications, attachment sets, severity levels, the
     // Trusted Advisor check catalogue + refresh state machine).
@@ -4623,6 +4676,7 @@ async fn main() {
             // Encrypted block-device volumes on ASG-launched instances get the
             // key EC2 resolves (the region's `aws/ebs` key by default).
             .with_kms_hook(Some(kms_hook_for_services.clone()))
+            .with_quota_provider(Some(quota_provider.clone()))
             // ASG capacity reconciliation launches REAL EC2 instances through a
             // bare Ec2Service; without the EC2 snapshot hook those records live
             // only in memory and leak their containers on restart (the EC2
@@ -6987,6 +7041,7 @@ async fn main() {
     let cloudformation_service = cloudformation_service
         .with_s3_store(s3_store.clone())
         .with_kms_hook(kms_hook_for_services.clone())
+        .with_quota_provider(quota_provider.clone())
         .with_snapshot_hooks(cfn_snapshot_hooks);
     // Keep a concrete handle: Cloud Control API drives the same resource
     // provisioners one resource at a time via this service.

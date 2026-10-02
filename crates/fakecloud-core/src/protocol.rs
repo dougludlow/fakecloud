@@ -647,6 +647,8 @@ fn parse_amz_target(target: &str) -> Option<DetectedRequest> {
         "CodeBuild_20161006" => "codebuild",
         // AWS CodeCommit: awsJson1.1, target prefix is the dated service shape.
         "CodeCommit_20150413" => "codecommit",
+        // Service Quotas: awsJson1.1, target prefix is the dated service shape.
+        "ServiceQuotasV20190624" => "servicequotas",
         // IAM Identity Center Identity Store: awsJson1.1.
         "AWSIdentityStore" => "identitystore",
         // IAM Identity Center SSO Admin: awsJson1.1.

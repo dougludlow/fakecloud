@@ -415,6 +415,10 @@
     "repo_dir": "swf",
     "service_name": "swf"
   },
+  "servicequotas": {
+    "repo_dir": "service-quotas",
+    "service_name": "servicequotas"
+  },
   "support": {
     "repo_dir": "support",
     "service_name": "support"

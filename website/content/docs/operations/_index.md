@@ -7061,6 +7061,35 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `UpdateTable`
 - `WriteRecords`
 
+## [Service Quotas](@/docs/services/servicequotas.md)
+
+- `AssociateServiceQuotaTemplate`
+- `CreateSupportCase`
+- `DeleteServiceQuotaIncreaseRequestFromTemplate`
+- `DisassociateServiceQuotaTemplate`
+- `GetAWSDefaultServiceQuota`
+- `GetAssociationForServiceQuotaTemplate`
+- `GetAutoManagementConfiguration`
+- `GetQuotaUtilizationReport`
+- `GetRequestedServiceQuotaChange`
+- `GetServiceQuota`
+- `GetServiceQuotaIncreaseRequestFromTemplate`
+- `ListAWSDefaultServiceQuotas`
+- `ListRequestedServiceQuotaChangeHistory`
+- `ListRequestedServiceQuotaChangeHistoryByQuota`
+- `ListServiceQuotaIncreaseRequestsInTemplate`
+- `ListServiceQuotas`
+- `ListServices`
+- `ListTagsForResource`
+- `PutServiceQuotaIncreaseRequestIntoTemplate`
+- `RequestServiceQuotaIncrease`
+- `StartAutoManagement`
+- `StartQuotaUtilizationReport`
+- `StopAutoManagement`
+- `TagResource`
+- `UntagResource`
+- `UpdateAutoManagement`
+
 ## [AWS Support](@/docs/services/support.md)
 
 - `AddAttachmentsToSet`

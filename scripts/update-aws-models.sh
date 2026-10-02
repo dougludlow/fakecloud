@@ -32,6 +32,7 @@ SERVICES=(
     "managedblockchain:managedblockchain"
     "config:config-service"
     "identitystore:identitystore"
+    "servicequotas:service-quotas"
     "ssoadmin:sso-admin"
     "verifiedpermissions:verifiedpermissions"
     "sqs:sqs"
