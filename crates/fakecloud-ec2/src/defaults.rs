@@ -63,20 +63,64 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// AWS-style AZ-id prefix for a region: `us-east-1 -> use1`. Falls back to the
-/// region with dashes stripped for non-`a-b-N` shapes.
-fn az_id_prefix(region: &str) -> String {
+/// AWS's zone-id prefix for a region: the geography code followed by the
+/// abbreviated direction and the number (`us-east-1 -> use1`,
+/// `ap-southeast-2 -> apse2`, `ap-south-1 -> aps1`, `us-gov-west-1 ->
+/// usgw1`). Compound directions keep both letters, which is what keeps
+/// ap-south-1 (`aps1`) and ap-southeast-1 (`apse1`) apart.
+pub(crate) fn az_id_prefix(region: &str) -> String {
     let parts: Vec<&str> = region.split('-').collect();
-    if parts.len() == 3 && !parts[1].is_empty() {
-        format!(
-            "{}{}{}",
-            parts[0],
-            parts[1].chars().next().unwrap_or('x'),
-            parts[2]
-        )
-    } else {
-        region.replace('-', "")
+    if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
+        return region.replace('-', "");
     }
+    let mut out = String::from(parts[0]);
+    for part in &parts[1..parts.len() - 1] {
+        let abbrev = match *part {
+            "east" => "e",
+            "west" => "w",
+            "north" => "n",
+            "south" => "s",
+            "central" => "c",
+            "northeast" => "ne",
+            "northwest" => "nw",
+            "southeast" => "se",
+            "southwest" => "sw",
+            "gov" => "g",
+            other => &other[..1],
+        };
+        out.push_str(abbrev);
+    }
+    out.push_str(parts[parts.len() - 1]);
+    out
+}
+
+/// The zone id of an availability zone name (`us-east-1b -> use1-az2`), using
+/// the same letter-to-number mapping DescribeAvailabilityZones reports.
+pub(crate) fn zone_id_for(zone: &str) -> String {
+    match zone.chars().last() {
+        Some(letter) if letter.is_ascii_lowercase() && zone.len() > 1 => {
+            let region = &zone[..zone.len() - 1];
+            let n = u32::from(letter) - u32::from('a') + 1;
+            format!("{}-az{n}", az_id_prefix(region))
+        }
+        _ => format!("{}-az1", az_id_prefix(zone)),
+    }
+}
+
+/// The availability-zone name a zone id denotes in `region`
+/// (`use1-az2 -> us-east-1b`), or `None` when the id belongs to another
+/// region or is malformed.
+pub(crate) fn zone_name_for_id(region: &str, zone_id: &str) -> Option<String> {
+    let (prefix, n) = zone_id.rsplit_once("-az")?;
+    if prefix != az_id_prefix(region) {
+        return None;
+    }
+    let n: u32 = n.parse().ok()?;
+    if !(1..=26).contains(&n) {
+        return None;
+    }
+    let letter = char::from_u32(u32::from('a') + n - 1)?;
+    Some(format!("{region}{letter}"))
 }
 
 /// The default VPC id for an account (also exposed so request handlers can
@@ -623,9 +667,53 @@ mod tests {
 
     #[test]
     fn az_id_prefix_matches_aws_shape() {
-        assert_eq!(az_id_prefix("us-east-1"), "use1");
-        assert_eq!(az_id_prefix("eu-west-2"), "euw2");
-        assert_eq!(az_id_prefix("ap-southeast-1"), "aps1");
+        for (region, prefix) in [
+            ("us-east-1", "use1"),
+            ("us-east-2", "use2"),
+            ("us-west-1", "usw1"),
+            ("us-west-2", "usw2"),
+            ("eu-west-2", "euw2"),
+            ("eu-central-1", "euc1"),
+            ("eu-north-1", "eun1"),
+            ("eu-south-2", "eus2"),
+            ("ap-south-1", "aps1"),
+            ("ap-south-2", "aps2"),
+            ("ap-southeast-1", "apse1"),
+            ("ap-southeast-2", "apse2"),
+            ("ap-southeast-7", "apse7"),
+            ("ap-northeast-1", "apne1"),
+            ("ap-northeast-3", "apne3"),
+            ("ap-east-1", "ape1"),
+            ("af-south-1", "afs1"),
+            ("ca-central-1", "cac1"),
+            ("ca-west-1", "caw1"),
+            ("sa-east-1", "sae1"),
+            ("me-south-1", "mes1"),
+            ("me-central-1", "mec1"),
+            ("il-central-1", "ilc1"),
+            ("mx-central-1", "mxc1"),
+            ("cn-north-1", "cnn1"),
+            ("cn-northwest-1", "cnnw1"),
+            ("us-gov-west-1", "usgw1"),
+            ("us-gov-east-1", "usge1"),
+        ] {
+            assert_eq!(az_id_prefix(region), prefix, "{region}");
+        }
+    }
+
+    #[test]
+    fn zone_ids_round_trip_through_zone_names() {
+        assert_eq!(zone_id_for("us-east-1a"), "use1-az1");
+        assert_eq!(zone_id_for("ap-southeast-2c"), "apse2-az3");
+        assert_eq!(zone_id_for("ap-south-1b"), "aps1-az2");
+        assert_eq!(
+            zone_name_for_id("ap-southeast-2", "apse2-az3").as_deref(),
+            Some("ap-southeast-2c")
+        );
+        // An id from another region is not a zone of this one.
+        assert_eq!(zone_name_for_id("ap-southeast-1", "aps1-az1"), None);
+        assert_eq!(zone_name_for_id("us-east-1", "use1-az0"), None);
+        assert_eq!(zone_name_for_id("us-east-1", "garbage"), None);
     }
 
     #[test]

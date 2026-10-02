@@ -912,6 +912,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newest_regions_are_known_opt_in_regions() {
+        // ap-southeast-6 (New Zealand) was missing, so GetRegionOptStatus /
+        // EnableRegion answered ValidationException for a real Region.
+        let s = svc();
+        for region in ["ap-southeast-6", "ap-southeast-7", "mx-central-1"] {
+            let v = body_of(&s, "/getRegionOptStatus", json!({"RegionName": region})).await;
+            assert_eq!(v["RegionOptStatus"], "DISABLED", "{region}");
+        }
+        s.handle(req("/enableRegion", json!({"RegionName":"ap-southeast-6"})))
+            .await
+            .unwrap();
+        let v = body_of(&s, "/listRegions", json!({"MaxResults": 50})).await;
+        let listed: Vec<&str> = v["Regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["RegionName"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&"ap-southeast-6"), "{listed:?}");
+    }
+
+    #[tokio::test]
     async fn gov_cloud_account_information() {
         let s = svc();
         let v = body_of(

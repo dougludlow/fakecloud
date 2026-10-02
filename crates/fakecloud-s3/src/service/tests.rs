@@ -7446,3 +7446,97 @@ fn update_bucket_metadata_annotation_table_configuration_round_trips() {
         "NoSuchBucket",
     );
 }
+
+fn create_bucket_in(svc: &S3Service, bucket: &str, endpoint_region: &str, constraint: &str) {
+    let body = format!(
+        "<CreateBucketConfiguration><LocationConstraint>{constraint}</LocationConstraint></CreateBucketConfiguration>"
+    );
+    let mut req = make_request(Method::PUT, &format!("/{bucket}"), &[], body.as_bytes());
+    req.region = endpoint_region.to_string();
+    svc.create_bucket("123456789012", &req, bucket)
+        .unwrap_or_else(|e| panic!("constraint {constraint} rejected: {e:?}"));
+}
+
+fn bucket_location(svc: &S3Service, bucket: &str) -> String {
+    let resp = svc.get_bucket_location("123456789012", bucket).unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes())
+        .unwrap()
+        .to_string();
+    let start = body.find('>').unwrap();
+    let rest = &body[start + 1..];
+    let open = rest.find('>').unwrap();
+    let close = rest.find("</LocationConstraint>").unwrap();
+    rest[open + 1..close].to_string()
+}
+
+#[test]
+fn create_bucket_accepts_recently_launched_regions() {
+    // ap-southeast-5/6/7, ap-east-2 and mx-central-1 are modeled
+    // `BucketLocationConstraint` values AWS accepts; a stale allowlist
+    // answered InvalidLocationConstraint for them.
+    let svc = make_service();
+    for region in [
+        "ap-southeast-5",
+        "ap-southeast-6",
+        "ap-southeast-7",
+        "ap-east-2",
+        "mx-central-1",
+    ] {
+        let bucket = format!("bk-{region}");
+        create_bucket_in(&svc, &bucket, region, region);
+        assert_eq!(bucket_location(&svc, &bucket), region);
+    }
+}
+
+#[test]
+fn create_bucket_legacy_eu_constraint_is_an_eu_west_1_bucket() {
+    let svc = make_service();
+    // Sent to the eu-west-1 endpoint and to the global (us-east-1) one.
+    create_bucket_in(&svc, "eu-legacy-a", "eu-west-1", "EU");
+    create_bucket_in(&svc, "eu-legacy-b", "us-east-1", "EU");
+    for bucket in ["eu-legacy-a", "eu-legacy-b"] {
+        // GetBucketLocation keeps reporting the legacy constraint ...
+        assert_eq!(bucket_location(&svc, bucket), "EU");
+        // ... while the bucket itself lives in eu-west-1.
+        let resp = svc.head_bucket("123456789012", bucket).unwrap();
+        assert_eq!(
+            resp.headers.get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+    }
+    // A regional endpoint other than eu-west-1 refuses it, like any mismatch.
+    let mut req = make_request(
+        Method::PUT,
+        "/eu-legacy-c",
+        &[],
+        b"<CreateBucketConfiguration><LocationConstraint>EU</LocationConstraint></CreateBucketConfiguration>",
+    );
+    req.region = "eu-central-1".to_string();
+    assert_aws_err(
+        svc.create_bucket("123456789012", &req, "eu-legacy-c"),
+        "IllegalLocationConstraintException",
+    );
+    // A plain eu-west-1 bucket still reports its region name.
+    create_bucket_in(&svc, "eu-modern", "eu-west-1", "eu-west-1");
+    assert_eq!(bucket_location(&svc, "eu-modern"), "eu-west-1");
+}
+
+#[test]
+fn bucket_location_constraints_cover_the_model() {
+    // Drift guard: every `BucketLocationConstraint` value in the vendored
+    // Smithy model must be accepted by CreateBucket.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../aws-models/s3.json");
+    let model: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let members = model["shapes"]["com.amazonaws.s3#BucketLocationConstraint"]["members"]
+        .as_object()
+        .unwrap();
+    assert!(!members.is_empty());
+    for member in members.values() {
+        let value = member["traits"]["smithy.api#enumValue"].as_str().unwrap();
+        assert!(
+            is_valid_region(value),
+            "BucketLocationConstraint {value} is modeled but rejected"
+        );
+    }
+}

@@ -7450,3 +7450,128 @@ async fn final_snapshot_refuses_a_replacement_incarnation() {
     assert_ne!(state.instances["db1"].db_instance_status, "deleting");
     assert!(!state.snapshots.contains_key("final"));
 }
+
+fn aurora_instance_request(id: &str, engine: &str, cluster: Option<&str>) -> AwsRequest {
+    let mut params = vec![
+        ("DBInstanceIdentifier", id),
+        ("DBInstanceClass", "db.r6g.large"),
+        ("Engine", engine),
+    ];
+    if let Some(cluster) = cluster {
+        params.push(("DBClusterIdentifier", cluster));
+    }
+    request("CreateDBInstance", &params)
+}
+
+#[tokio::test]
+async fn create_db_instance_accepts_aurora_cluster_members() {
+    // Terraform's aws_rds_cluster_instance (and the console / CLI) create
+    // Aurora members with the cluster's `aurora-*` engine; the engine
+    // allowlist used to answer InsufficientDBInstanceCapacity for them.
+    let svc = make_service().with_runtime(Arc::new(crate::runtime::RdsRuntime::new_stub()));
+    svc.handle_extra_action(&request(
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "pg-cluster"),
+            ("Engine", "aurora-postgresql"),
+            ("EngineVersion", "16.4"),
+        ],
+    ))
+    .expect("CreateDBCluster");
+    svc.handle_extra_action(&request(
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "my-cluster"),
+            ("Engine", "aurora-mysql"),
+        ],
+    ))
+    .expect("CreateDBCluster");
+
+    svc.create_db_instance(&aurora_instance_request(
+        "pg-member",
+        "aurora-postgresql",
+        Some("pg-cluster"),
+    ))
+    .await
+    .expect("aurora-postgresql member");
+    svc.create_db_instance(&aurora_instance_request(
+        "my-member",
+        "aurora-mysql",
+        Some("my-cluster"),
+    ))
+    .await
+    .expect("aurora-mysql member");
+
+    let accounts = svc.state.read();
+    let state = accounts.default_ref();
+    let pg = &state.instances["pg-member"];
+    assert_eq!(pg.engine, "aurora-postgresql");
+    // Members run the cluster's engine version.
+    assert_eq!(pg.engine_version, "16.4");
+    assert_eq!(
+        pg.db_parameter_group_name.as_deref(),
+        Some("default.aurora-postgresql16")
+    );
+    assert_eq!(pg.db_cluster_identifier.as_deref(), Some("pg-cluster"));
+    let my = &state.instances["my-member"];
+    assert_eq!(my.engine, "aurora-mysql");
+    // A version-less aurora-mysql cluster gets an Aurora MySQL version, not
+    // a postgres one.
+    assert_eq!(my.engine_version, "8.0.mysql_aurora.3.04.0");
+    assert_eq!(
+        my.db_parameter_group_name.as_deref(),
+        Some("default.aurora-mysql8.0")
+    );
+}
+
+#[tokio::test]
+async fn create_aurora_instance_requires_a_matching_cluster() {
+    let svc = make_service().with_runtime(Arc::new(crate::runtime::RdsRuntime::new_stub()));
+    let err = svc
+        .create_db_instance(&aurora_instance_request("a", "aurora-postgresql", None))
+        .await
+        .err()
+        .expect("create must fail");
+    assert_eq!(err.code(), "InvalidParameterCombination");
+
+    let err = svc
+        .create_db_instance(&aurora_instance_request(
+            "b",
+            "aurora-postgresql",
+            Some("missing"),
+        ))
+        .await
+        .err()
+        .expect("create must fail");
+    assert_eq!(err.code(), "DBClusterNotFoundFault");
+
+    create_cluster(&svc, "pg-only");
+    let err = svc
+        .create_db_instance(&aurora_instance_request(
+            "c",
+            "aurora-mysql",
+            Some("pg-only"),
+        ))
+        .await
+        .err()
+        .expect("create must fail");
+    assert_eq!(err.code(), "InvalidParameterCombination");
+    assert!(svc.state.read().default_ref().instances.is_empty());
+}
+
+#[test]
+fn aurora_engines_run_on_their_compatible_container_engine() {
+    assert_eq!(
+        crate::runtime::container_engine("aurora-postgresql"),
+        "postgres"
+    );
+    assert_eq!(crate::runtime::container_engine("aurora-mysql"), "mysql");
+    assert_eq!(crate::runtime::container_engine("mariadb"), "mariadb");
+    assert_eq!(crate::runtime::mariadb_major("11.8.3"), "11.8");
+    assert_eq!(crate::runtime::mariadb_major("11.8"), "11.8");
+    assert_eq!(crate::runtime::mariadb_major("11.4.5"), "11.4");
+    assert_eq!(crate::runtime::mariadb_major("10.11.6"), "10.11");
+    assert_eq!(crate::runtime::mariadb_major("10.6.16"), "10.6");
+    // A prefix that is not a dot boundary is not that major.
+    assert_eq!(crate::runtime::mariadb_major("11.80"), "10.6");
+}

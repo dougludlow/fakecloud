@@ -87,7 +87,7 @@ fn build_subnet(vpc_id: String, cidr: String, az: &str, default_for_az: bool) ->
         vpc_id,
         cidr_block: cidr,
         availability_zone: az.to_string(),
-        availability_zone_id: format!("use1-az{}", (az.bytes().last().unwrap_or(b'a') % 6) + 1),
+        availability_zone_id: crate::defaults::zone_id_for(az),
         state: "available".to_string(),
         available_ip_address_count: 251,
         default_for_az,
@@ -111,20 +111,22 @@ fn subnet_ipv6_assoc_id(subnet_id: &str) -> String {
     format!("subnet-cidr-assoc-ipv6-{suffix}")
 }
 
+/// The zone a subnet request targets: `AvailabilityZone`, else the zone an
+/// `AvailabilityZoneId` names in the request's region, else the region's
+/// first zone.
 fn default_az(req: &AwsRequest) -> String {
+    let region = if req.region.is_empty() {
+        "us-east-1"
+    } else {
+        &req.region
+    };
+    if let Some(az) = req.query_params.get("AvailabilityZone") {
+        return az.clone();
+    }
     req.query_params
-        .get("AvailabilityZone")
-        .cloned()
-        .unwrap_or_else(|| {
-            format!(
-                "{}a",
-                if req.region.is_empty() {
-                    "us-east-1"
-                } else {
-                    &req.region
-                }
-            )
-        })
+        .get("AvailabilityZoneId")
+        .and_then(|id| crate::defaults::zone_name_for_id(region, id))
+        .unwrap_or_else(|| format!("{region}a"))
 }
 
 pub(crate) fn create_subnet(
@@ -252,7 +254,7 @@ pub(crate) fn create_secondary_subnet(
         ec2_elem("secondaryNetworkId", &network),
         ec2_elem("ownerId", owner),
         ec2_elem("availabilityZone", &az),
-        ec2_elem("availabilityZoneId", "use1-az1"),
+        ec2_elem("availabilityZoneId", &crate::defaults::zone_id_for(&az)),
         ec2_elem("state", "available"),
         gen_id("token"),
     );

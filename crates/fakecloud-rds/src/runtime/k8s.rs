@@ -541,13 +541,7 @@ fn engine_config(
             readiness: Readiness::Mysql,
         },
         "mariadb" => {
-            let major = if engine_version.starts_with("10.11") {
-                "10.11"
-            } else if engine_version.starts_with("11.4") {
-                "11.4"
-            } else {
-                "10.6"
-            };
+            let major = super::mariadb_major(engine_version);
             EngineCfg {
                 image: bridge_image_tag("fakecloud-mariadb", major),
                 port: 3306,

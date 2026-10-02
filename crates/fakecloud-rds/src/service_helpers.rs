@@ -392,6 +392,9 @@ pub(crate) fn validate_create_request(
         "sqlserver-web",
         "db2-se",
         "db2-ae",
+        // Aurora cluster members: they run on the cluster's engine.
+        "aurora-mysql",
+        "aurora-postgresql",
     ];
     if !supported_engines.contains(&engine) {
         return Err(AwsServiceError::aws_error(
@@ -404,42 +407,7 @@ pub(crate) fn validate_create_request(
         ));
     }
 
-    // Validate engine version. The Oracle/SQL Server/Db2 lists track
-    // the major-minor versions actually shipped by the upstream
-    // dev-edition images (gvenzl/oracle-free 23, mssql-server 2022,
-    // db2_community 11.5). Adding a new version here also requires
-    // wiring the image tag in `RdsRuntime::ensure_postgres`.
-    // Major versions ("8.0", "10.11", ...) are accepted alongside the
-    // full `<major>.<minor>.<patch>` triplets — AWS RDS validates both
-    // forms and the runtime resolves the matching prebuilt image regardless.
-    let supported_versions = match engine {
-        "postgres" => vec![
-            "18", "17", "16", "15", "14", "13", "17.4", "16.3", "15.5", "14.10", "13.13",
-        ],
-        "mysql" => vec!["8.4", "8.0", "8.0.35", "8.0.28", "5.7.44"],
-        "mariadb" => vec!["10.6", "10.11", "11.4", "11.4.5", "10.11.6", "10.6.16"],
-        "oracle-ee" | "oracle-se2" | "oracle-ee-cdb" | "oracle-se2-cdb" => {
-            vec!["23.0.0", "21.0.0", "19.0.0"]
-        }
-        "sqlserver-ee" | "sqlserver-se" | "sqlserver-ex" | "sqlserver-web" => {
-            vec!["16.00.4085.2.v1", "15.00.4322.2.v1"]
-        }
-        "db2-se" | "db2-ae" => vec!["11.5.9.0.sb00000000.r1", "11.5.8.0.sb00000000.r1"],
-        _ => vec![],
-    };
-
-    // Accept any version whose major (or major.minor) prefix is supported: the
-    // runtime resolves the prebuilt image by MAJOR version
-    // (`ensure_postgres_image(engine_version.split('.').next())`, and the
-    // equivalent for mysql/mariadb), so every minor/patch of a supported major
-    // runs the same container. Enumerating every AWS minor in the allowlist is
-    // futile and rots the moment AWS ships a new one (e.g. rejecting the valid
-    // `postgres 17.9`, issue #2391). Matching on a `<prefix>.`/exact boundary
-    // means `17` accepts `17`, `17.4`, `17.9` but never `170.x` or `16.*`.
-    let version_supported = supported_versions
-        .iter()
-        .any(|v| version_matches_supported(engine_version, v));
-    if !version_supported {
+    if !engine_version_supported(engine, engine_version) {
         return Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "InsufficientDBInstanceCapacity",
@@ -450,13 +418,138 @@ pub(crate) fn validate_create_request(
     Ok(())
 }
 
+/// Whether `engine_version` is a version string AWS issues for `engine`,
+/// on a major fakecloud runs.
+///
+/// The majors track what the runtime can start (prebuilt bridge images for
+/// postgres/mysql/mariadb, the upstream dev-edition images for
+/// oracle/mssql/db2). Within a major, every version AWS ships is accepted in
+/// the engine's own grammar rather than enumerated, so a new AWS minor or
+/// patch never turns into a rejection:
+///
+/// * postgres / mariadb: `<major>[.<n>...]` (`17`, `17.9`, `11.8.3`)
+/// * mysql: `<major>[.<n>...][-rds.<yyyymmdd>]` (`5.7.44-rds.20250103`)
+/// * oracle: `<major>.0.0[.0[.ru-<yyyy-mm>.rur-<yyyy-mm>.r<n>]]`
+///   (`19.0.0.0.ru-2025-07.rur-2025-07.r1`)
+/// * sqlserver: `<major>.00[.<build>.<rev>.v<n>]` (`16.00.4195.2.v1`)
+/// * db2: `11.5[.<n>.<n>.sb<8 digits>.r<n>]` (`11.5.9.0.sb00000000.r1`)
+pub(crate) fn engine_version_supported(engine: &str, engine_version: &str) -> bool {
+    match engine {
+        "postgres" | "aurora-postgresql" => ["18", "17", "16", "15", "14", "13"]
+            .iter()
+            .any(|major| version_matches_supported(engine_version, major)),
+        "mysql" => {
+            let base = match engine_version.split_once("-rds.") {
+                Some((base, date)) => {
+                    // The `-rds.<date>` build suffix only follows a full
+                    // `<major>.<minor>.<patch>` version.
+                    if date.len() != 8 || !all_digits(date) || base.split('.').count() != 3 {
+                        return false;
+                    }
+                    base
+                }
+                None => engine_version,
+            };
+            ["8.4", "8.0", "5.7"]
+                .iter()
+                .any(|major| version_matches_supported(base, major))
+        }
+        "mariadb" => ["11.8", "11.4", "10.11", "10.6"]
+            .iter()
+            .any(|major| version_matches_supported(engine_version, major)),
+        "oracle-ee" | "oracle-se2" | "oracle-ee-cdb" | "oracle-se2-cdb" => {
+            ["23", "21", "19"].iter().any(|major| {
+                let Some(rest) = engine_version
+                    .strip_prefix(major)
+                    .and_then(|r| r.strip_prefix(".0.0"))
+                else {
+                    return false;
+                };
+                match rest {
+                    "" | ".0" => true,
+                    _ => rest
+                        .strip_prefix(".0.")
+                        .is_some_and(oracle_release_update_suffix),
+                }
+            })
+        }
+        "sqlserver-ee" | "sqlserver-se" | "sqlserver-ex" | "sqlserver-web" => {
+            ["16.00", "15.00"].iter().any(|major| {
+                let Some(rest) = engine_version.strip_prefix(major) else {
+                    return false;
+                };
+                if rest.is_empty() {
+                    return true;
+                }
+                let parts: Vec<&str> = rest.split('.').collect();
+                // `.<build>.<revision>.v<n>` -> ["", build, revision, "v<n>"]
+                parts.len() == 4
+                    && parts[0].is_empty()
+                    && all_digits(parts[1])
+                    && all_digits(parts[2])
+                    && parts[3].strip_prefix('v').is_some_and(all_digits)
+            })
+        }
+        "db2-se" | "db2-ae" => {
+            let Some(rest) = engine_version.strip_prefix("11.5") else {
+                return false;
+            };
+            if rest.is_empty() {
+                return true;
+            }
+            let parts: Vec<&str> = rest.split('.').collect();
+            // `.<fixpack>.<mod>.sb<8 digits>.r<n>`
+            parts.len() == 5
+                && parts[0].is_empty()
+                && all_digits(parts[1])
+                && all_digits(parts[2])
+                && parts[3]
+                    .strip_prefix("sb")
+                    .is_some_and(|n| n.len() == 8 && all_digits(n))
+                && parts[4].strip_prefix('r').is_some_and(all_digits)
+        }
+        "aurora-mysql" => {
+            // `<mysql major>.mysql_aurora.<aurora version>`, e.g.
+            // `8.0.mysql_aurora.3.04.0` / `5.7.mysql_aurora.2.11.2`, or the
+            // bare MySQL major.
+            ["8.0", "5.7"].iter().any(|major| {
+                let Some(rest) = engine_version.strip_prefix(major) else {
+                    return false;
+                };
+                rest.is_empty()
+                    || rest
+                        .strip_prefix(".mysql_aurora.")
+                        .is_some_and(|v| v.split('.').all(all_digits))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// `ru-<yyyy>-<mm>.rur-<yyyy>-<mm>.r<n>`: an Oracle Release Update, its
+/// revision, and the RDS build.
+fn oracle_release_update_suffix(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    let year_month = |v: &str| {
+        v.split_once('-')
+            .is_some_and(|(y, m)| y.len() == 4 && all_digits(y) && m.len() == 2 && all_digits(m))
+    };
+    parts.len() == 3
+        && parts[0].strip_prefix("ru-").is_some_and(year_month)
+        && parts[1].strip_prefix("rur-").is_some_and(year_month)
+        && parts[2].strip_prefix('r').is_some_and(all_digits)
+}
+
 /// True when `engine_version` is `supported` exactly, or extends it as
 /// `supported.<rest>` where every remaining `.`-separated segment is a
 /// non-empty run of ASCII digits. So a supported major of `17` accepts
 /// `17`, `17.4`, `17.9`, `17.9.1` but rejects `17.foo`, `17.` (trailing
 /// dot), `17.9.garbage`, `17..3` (empty segment), and `170` (not a
-/// boundary match). This tightens the previous bare `starts_with("{v}.")`
-/// prefix test, which over-accepted junk suffixes like `17.foo`.
+/// boundary match).
 fn version_matches_supported(engine_version: &str, supported: &str) -> bool {
     if engine_version == supported {
         return true;
@@ -467,10 +560,7 @@ fn version_matches_supported(engine_version: &str, supported: &str) -> bool {
     else {
         return false;
     };
-    !rest.is_empty()
-        && rest
-            .split('.')
-            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+    rest.split('.').all(all_digits)
 }
 
 /// Known AWS instance-size suffixes. The `<n>xlarge` sizes are matched
@@ -2290,7 +2380,7 @@ pub(crate) fn license_model_for_engine(engine: &str) -> &'static str {
     // free-to-use. Db2 is reported as bring-your-own-license to mirror
     // AWS's RDS for Db2 default.
     match engine {
-        "mysql" | "mariadb" => "general-public-license",
+        "mysql" | "mariadb" | "aurora-mysql" => "general-public-license",
         "oracle-ee" | "oracle-se2" | "oracle-ee-cdb" | "oracle-se2-cdb" => "license-included",
         "sqlserver-ee" | "sqlserver-se" | "sqlserver-ex" | "sqlserver-web" => "license-included",
         "db2-se" | "db2-ae" => "bring-your-own-license",
@@ -2300,7 +2390,7 @@ pub(crate) fn license_model_for_engine(engine: &str) -> &'static str {
 
 pub(crate) fn default_db_name(engine: &str) -> &'static str {
     match engine {
-        "mysql" | "mariadb" => "mysql",
+        "mysql" | "mariadb" | "aurora-mysql" => "mysql",
         // Oracle's gvenzl image creates an `ORACLE_DATABASE` alongside
         // the built-in FREEPDB1 — keep `ORCL` as the default name to
         // match what AWS RDS for Oracle returns when you don't pass
@@ -2320,8 +2410,8 @@ pub(crate) fn default_db_name(engine: &str) -> &'static str {
 /// without an explicit `--port` flag hit the right listener.
 pub fn default_port_for_engine(engine: &str) -> i32 {
     match engine {
-        "postgres" => 5432,
-        "mysql" | "mariadb" => 3306,
+        "postgres" | "aurora-postgresql" => 5432,
+        "mysql" | "mariadb" | "aurora-mysql" => 3306,
         "oracle-ee" | "oracle-se2" | "oracle-ee-cdb" | "oracle-se2-cdb" => 1521,
         "sqlserver-ee" | "sqlserver-se" | "sqlserver-ex" | "sqlserver-web" => 1433,
         "db2-se" | "db2-ae" => 50000,
@@ -2342,6 +2432,8 @@ pub(crate) fn default_engine_version(engine: &str) -> &'static str {
         "oracle-ee" | "oracle-se2" | "oracle-ee-cdb" | "oracle-se2-cdb" => "19.0.0",
         "sqlserver-ee" | "sqlserver-se" | "sqlserver-ex" | "sqlserver-web" => "15.00.4322.2.v1",
         "db2-se" | "db2-ae" => "11.5.9.0.sb00000000.r1",
+        "aurora-postgresql" => "15.3",
+        "aurora-mysql" => "8.0.mysql_aurora.3.04.0",
         _ => "16.3",
     }
 }
@@ -2360,13 +2452,17 @@ pub(crate) fn default_parameter_group(engine: &str, engine_version: &str) -> Str
         "mysql" => {
             let major = if engine_version.starts_with("5.7") {
                 "5.7"
+            } else if engine_version.starts_with("8.4") {
+                "8.4"
             } else {
                 "8.0"
             };
             format!("default.mysql{}", major)
         }
         "mariadb" => {
-            let major = if engine_version.starts_with("11.4") {
+            let major = if engine_version.starts_with("11.8") {
+                "11.8"
+            } else if engine_version.starts_with("11.4") {
                 "11.4"
             } else if engine_version.starts_with("10.11") {
                 "10.11"
@@ -2374,6 +2470,18 @@ pub(crate) fn default_parameter_group(engine: &str, engine_version: &str) -> Str
                 "10.6"
             };
             format!("default.mariadb{}", major)
+        }
+        "aurora-postgresql" => {
+            let major = engine_version.split('.').next().unwrap_or("16");
+            format!("default.aurora-postgresql{major}")
+        }
+        "aurora-mysql" => {
+            let major = if engine_version.starts_with("5.7") {
+                "5.7"
+            } else {
+                "8.0"
+            };
+            format!("default.aurora-mysql{major}")
         }
         "oracle-ee" | "oracle-se2" | "oracle-ee-cdb" | "oracle-se2-cdb" => {
             let major = engine_version.split('.').next().unwrap_or("23");
@@ -2448,6 +2556,110 @@ mod engine_version_tests {
         for v in ["8.4", "8.4.0", "8.4.2"] {
             assert!(create("mysql", v).is_ok(), "mysql {v} should be accepted");
         }
+    }
+
+    #[test]
+    fn accepts_aws_suffixed_version_grammars() {
+        // AWS's real version strings for each engine (bug audit 2026-10-01).
+        for (engine, v) in [
+            ("mysql", "5.7.44-rds.20250103"),
+            ("mysql", "8.0.40"),
+            ("mysql", "8.4.6"),
+            ("oracle-ee", "19.0.0.0.ru-2025-07.rur-2025-07.r1"),
+            ("oracle-se2-cdb", "21.0.0.0.ru-2025-07.rur-2025-07.r1"),
+            ("oracle-ee", "19.0.0"),
+            ("oracle-ee", "19.0.0.0"),
+            ("sqlserver-ee", "16.00.4195.2.v1"),
+            ("sqlserver-web", "15.00.4430.1.v1"),
+            ("sqlserver-ex", "16.00"),
+            ("db2-se", "11.5.9.0.sb00049375.r1"),
+            ("db2-ae", "11.5.8.0.sb00000000.r1"),
+            ("mariadb", "11.8"),
+            ("mariadb", "11.8.3"),
+            ("aurora-postgresql", "16.4"),
+            ("aurora-mysql", "8.0.mysql_aurora.3.04.0"),
+            ("aurora-mysql", "5.7.mysql_aurora.2.11.2"),
+        ] {
+            assert!(create(engine, v).is_ok(), "{engine} {v} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_suffixed_versions() {
+        for (engine, v) in [
+            ("mysql", "5.7.44-rds.2025"),
+            ("mysql", "5.7-rds.20250103"),
+            ("mysql", "5.7.44-rds.2025010x"),
+            ("oracle-ee", "19.0.0.0.ru-2025-7.rur-2025-07.r1"),
+            ("oracle-ee", "19.0.0.0.ru-2025-07.r1"),
+            ("oracle-ee", "12.0.0.0.ru-2025-07.rur-2025-07.r1"),
+            ("sqlserver-ee", "16.00.4195.2"),
+            ("sqlserver-ee", "14.00.3480.1.v1"),
+            ("db2-se", "11.5.9.0.sb123.r1"),
+            ("db2-se", "11.5.9.0"),
+            ("mariadb", "11.9.1"),
+            ("aurora-mysql", "8.0.mysql_aurora.3.x"),
+            ("aurora-postgresql", "9.6"),
+        ] {
+            assert!(
+                create(engine, v).is_err(),
+                "{engine} {v} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn every_listed_engine_version_is_creatable_with_its_default_parameter_group() {
+        // DescribeDBEngineVersions must only advertise versions
+        // CreateDBInstance accepts, and the default parameter group such an
+        // instance gets must exist (else CreateDBInstance answers
+        // DBParameterGroupNotFound for a version AWS lists).
+        let groups = crate::state::default_parameter_groups("123456789012", "us-east-1");
+        for v in crate::state::default_engine_versions() {
+            assert!(
+                engine_version_supported(&v.engine, &v.engine_version),
+                "{} {} is listed but rejected",
+                v.engine,
+                v.engine_version
+            );
+            let group = default_parameter_group(&v.engine, &v.engine_version);
+            assert!(
+                groups.contains_key(&group),
+                "{} {}: default group {group} missing",
+                v.engine,
+                v.engine_version
+            );
+            assert_eq!(
+                groups[&group].db_parameter_group_family, v.db_parameter_group_family,
+                "{} {}",
+                v.engine, v.engine_version
+            );
+        }
+    }
+
+    #[test]
+    fn default_parameter_group_tracks_new_majors() {
+        assert_eq!(
+            default_parameter_group("mysql", "8.4.0"),
+            "default.mysql8.4"
+        );
+        assert_eq!(default_parameter_group("mysql", "8.4"), "default.mysql8.4");
+        assert_eq!(
+            default_parameter_group("mysql", "5.7.44-rds.20250103"),
+            "default.mysql5.7"
+        );
+        assert_eq!(
+            default_parameter_group("mariadb", "11.8.3"),
+            "default.mariadb11.8"
+        );
+        assert_eq!(
+            default_parameter_group("aurora-postgresql", "16.4"),
+            "default.aurora-postgresql16"
+        );
+        assert_eq!(
+            default_parameter_group("aurora-mysql", "8.0.mysql_aurora.3.04.0"),
+            "default.aurora-mysql8.0"
+        );
     }
 
     #[test]

@@ -83,41 +83,7 @@ impl Default for AccountData {
 /// Every AWS Region and whether it is opt-in (disabled by default). Opt-in
 /// regions report `DISABLED` until `EnableRegion` is called; every other region
 /// reports `ENABLED_BY_DEFAULT`.
-pub const REGIONS: &[(&str, bool)] = &[
-    ("us-east-1", false),
-    ("us-east-2", false),
-    ("us-west-1", false),
-    ("us-west-2", false),
-    ("af-south-1", true),
-    ("ap-east-1", true),
-    ("ap-east-2", true),
-    ("ap-south-1", false),
-    ("ap-south-2", true),
-    ("ap-northeast-1", false),
-    ("ap-northeast-2", false),
-    ("ap-northeast-3", false),
-    ("ap-southeast-1", false),
-    ("ap-southeast-2", false),
-    ("ap-southeast-3", true),
-    ("ap-southeast-4", true),
-    ("ap-southeast-5", true),
-    ("ap-southeast-7", true),
-    ("ca-central-1", false),
-    ("ca-west-1", true),
-    ("eu-central-1", false),
-    ("eu-central-2", true),
-    ("eu-west-1", false),
-    ("eu-west-2", false),
-    ("eu-west-3", false),
-    ("eu-north-1", false),
-    ("eu-south-1", true),
-    ("eu-south-2", true),
-    ("il-central-1", true),
-    ("me-central-1", true),
-    ("me-south-1", true),
-    ("mx-central-1", true),
-    ("sa-east-1", false),
-];
+pub const REGIONS: &[(&str, bool)] = fakecloud_aws::regions::COMMERCIAL_REGIONS;
 
 /// The default opt status for `region` (absent an explicit override).
 pub fn default_region_status(region: &str) -> Option<&'static str> {

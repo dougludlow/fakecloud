@@ -4603,3 +4603,61 @@ async fn create_and_update_function_check_both_accounts_roles() {
         .await
         .expect("update to the caller's trusting role accepted");
 }
+
+#[test]
+fn lambda_runtimes_match_the_model() {
+    // Drift guard: the allowlist is exactly the vendored Smithy `Runtime` enum.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../aws-models/lambda.json");
+    let model: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut modeled: Vec<String> = model["shapes"]["com.amazonaws.lambda#Runtime"]["members"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|m| {
+            m["traits"]["smithy.api#enumValue"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    modeled.sort();
+    let mut ours: Vec<String> = super::LAMBDA_RUNTIMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    ours.sort();
+    assert_eq!(ours, modeled);
+}
+
+#[tokio::test]
+async fn create_function_accepts_newly_modeled_runtimes() {
+    let svc = LambdaService::new(make_state());
+    for (i, rt) in [
+        "nodejs26.x",
+        "python3.15",
+        "ruby4.0",
+        "java8.al2023",
+        "java11.al2023",
+        "java17.al2023",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let body = json!({
+            "FunctionName": format!("rt-fn-{i}"),
+            "Runtime": rt,
+            "Role": "arn:aws:iam::123456789012:role/lambda-role",
+            "Handler": "index.handler",
+            "Code": {"ZipFile": ""},
+        })
+        .to_string();
+        let req = make_request(Method::POST, "/2015-03-31/functions", &body);
+        let resp = svc
+            .handle(req)
+            .await
+            .unwrap_or_else(|e| panic!("runtime {rt} rejected: {e:?}"));
+        let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(out["Runtime"], *rt);
+    }
+}

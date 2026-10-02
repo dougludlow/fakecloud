@@ -44,7 +44,7 @@ BINARY_MB=19
 #
 #   grep -cE '^\s*"[^"]+" => \("' crates/fakecloud-lambda/src/runtime/docker.rs
 #
-# (= 23 as of 2026-09-27). When fakecloud-lambda gains/drops a runtime, update
+# (= 31 as of 2026-10-02). When fakecloud-lambda gains/drops a runtime, update
 # this constant, the runtime list in docs/services/lambda.md AND the runtime
 # enumerations in faq.md, and audit every gated page in the same PR.
 #
@@ -52,7 +52,7 @@ BINARY_MB=19
 # longer exists — the recipe silently returned nothing, so this constant could
 # drift unnoticed. A canonical pointer that 404s is the same bug class as a
 # stale count: verify the source resolves before trusting the number it guards.
-LAMBDA_RUNTIMES=23
+LAMBDA_RUNTIMES=31
 
 # Canonical service count = row count in parity.md table.
 parity_services=$(awk '/^\| \[/ {n++} END{print n+0}' "$PARITY")

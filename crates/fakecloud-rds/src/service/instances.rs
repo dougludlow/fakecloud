@@ -45,6 +45,52 @@ fn instance_matches_filters(instance: &DbInstance, filters: &[RdsFilter]) -> boo
 }
 
 impl RdsService {
+    /// For an Aurora engine, the engine version the new instance takes: an
+    /// Aurora instance is a member of a DB cluster and runs the cluster's
+    /// engine version, so the cluster must be named, exist, and be of the
+    /// same engine. `None` for every non-Aurora engine.
+    fn aurora_member_engine_version(
+        &self,
+        request: &AwsRequest,
+        engine: &str,
+    ) -> Result<Option<String>, AwsServiceError> {
+        if !matches!(engine, "aurora-mysql" | "aurora-postgresql") {
+            return Ok(None);
+        }
+        let Some(cluster_id) = optional_query_param(request, "DBClusterIdentifier") else {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                format!(
+                    "DBClusterIdentifier is required to create a DB instance with engine {engine}."
+                ),
+            ));
+        };
+        let accounts = self.state.read();
+        let cluster = accounts
+            .get(&request.account_id)
+            .and_then(|state| state.extras.get("clusters"))
+            .and_then(|clusters| clusters.get(&cluster_id))
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::NOT_FOUND,
+                    "DBClusterNotFoundFault",
+                    format!("DBCluster {cluster_id} not found."),
+                )
+            })?;
+        let cluster_engine = cluster["Engine"].as_str().unwrap_or("aurora-postgresql");
+        if cluster_engine != engine {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                format!(
+                    "The engine {engine} does not match the engine {cluster_engine} of DB cluster {cluster_id}."
+                ),
+            ));
+        }
+        Ok(cluster["EngineVersion"].as_str().map(str::to_string))
+    }
+
     pub(super) async fn create_db_instance(
         &self,
         request: &AwsRequest,
@@ -67,8 +113,11 @@ impl RdsService {
         let master_user_password = optional_query_param(request, "MasterUserPassword")
             .unwrap_or_else(|| "Password1!".to_string());
         let db_name = optional_query_param(request, "DBName");
-        let engine_version = optional_query_param(request, "EngineVersion")
-            .unwrap_or_else(|| default_engine_version(&engine).to_string());
+        let engine_version = match self.aurora_member_engine_version(request, &engine)? {
+            Some(cluster_version) => cluster_version,
+            None => optional_query_param(request, "EngineVersion")
+                .unwrap_or_else(|| default_engine_version(&engine).to_string()),
+        };
         let publicly_accessible =
             parse_optional_bool(optional_query_param(request, "PubliclyAccessible").as_deref())?
                 .unwrap_or(true);

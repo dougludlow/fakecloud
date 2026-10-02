@@ -59,6 +59,7 @@ jobs:
           - { engine: mariadb, version: "10.6", build_arg: "MARIADB_VERSION" }
           - { engine: mariadb, version: "10.11", build_arg: "MARIADB_VERSION" }
           - { engine: mariadb, version: "11.4", build_arg: "MARIADB_VERSION" }
+          - { engine: mariadb, version: "11.8", build_arg: "MARIADB_VERSION" }
         platform:
           - linux/amd64
           - linux/arm64
@@ -141,6 +142,7 @@ jobs:
           - { engine: mariadb, version: "10.6" }
           - { engine: mariadb, version: "10.11" }
           - { engine: mariadb, version: "11.4" }
+          - { engine: mariadb, version: "11.8" }
     env:
       IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/fakecloud-${{ matrix.target.engine }}
 
@@ -233,6 +235,7 @@ jobs:
           - { engine: mariadb, version: "10.6" }
           - { engine: mariadb, version: "10.11" }
           - { engine: mariadb, version: "11.4" }
+          - { engine: mariadb, version: "11.8" }
     env:
       IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/fakecloud-${{ matrix.target.engine }}
 

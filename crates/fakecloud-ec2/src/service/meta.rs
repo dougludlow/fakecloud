@@ -11,36 +11,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use crate::service::Ec2Service;
 use crate::service_helpers::{indexed_list, parse_filters};
 
-/// Standard commercial regions surfaced by `DescribeRegions`.
-const REGIONS: &[&str] = &[
-    "us-east-1",
-    "us-east-2",
-    "us-west-1",
-    "us-west-2",
-    "af-south-1",
-    "ap-east-1",
-    "ap-south-1",
-    "ap-south-2",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ap-northeast-3",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-southeast-3",
-    "ap-southeast-4",
-    "ca-central-1",
-    "eu-central-1",
-    "eu-central-2",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
-    "eu-north-1",
-    "eu-south-1",
-    "eu-south-2",
-    "me-south-1",
-    "me-central-1",
-    "sa-east-1",
-];
+use fakecloud_aws::regions::COMMERCIAL_REGIONS;
 
 pub(crate) fn describe_regions(
     _svc: &Ec2Service,
@@ -55,16 +26,25 @@ pub(crate) fn describe_regions(
         .flat_map(|f| f.values.clone())
         .collect();
 
-    let items: Vec<String> = REGIONS
+    // Every Region accepts requests here, so an opt-in Region behaves like
+    // one the account has enabled: AWS reports those as `opted-in`.
+    let items: Vec<String> = COMMERCIAL_REGIONS
         .iter()
-        .filter(|r| requested.is_empty() || requested.iter().any(|x| x == *r))
-        .filter(|r| name_filter.is_empty() || name_filter.iter().any(|x| x == *r))
-        .map(|r| {
+        .filter(|(r, _)| requested.is_empty() || requested.iter().any(|x| x == r))
+        .filter(|(r, _)| name_filter.is_empty() || name_filter.iter().any(|x| x == r))
+        .map(|(r, opt_in)| {
             format!(
                 "{}{}{}",
                 ec2_elem("regionName", r),
                 ec2_elem("regionEndpoint", &format!("ec2.{r}.amazonaws.com")),
-                ec2_elem("optInStatus", "opt-in-not-required"),
+                ec2_elem(
+                    "optInStatus",
+                    if *opt_in {
+                        "opted-in"
+                    } else {
+                        "opt-in-not-required"
+                    }
+                ),
             )
         })
         .collect();
@@ -105,7 +85,7 @@ pub(crate) fn describe_availability_zones(
         .filter(|(zone, _)| requested.is_empty() || requested.iter().any(|x| x == zone))
         .map(|(zone, idx)| {
             // zoneId uses AWS's `<region-short>-az<N>` convention.
-            let short = region_short_code(region);
+            let short = crate::defaults::az_id_prefix(region);
             format!(
                 "{}{}{}{}{}{}{}",
                 ec2_elem("zoneName", &zone),
@@ -167,25 +147,23 @@ pub(crate) fn describe_account_attributes(
     ))
 }
 
-/// Map a region to AWS's short zone-id prefix (e.g. `us-east-1` -> `use1`).
-fn region_short_code(region: &str) -> String {
-    let parts: Vec<&str> = region.split('-').collect();
-    if parts.len() < 3 {
-        return region.replace('-', "");
-    }
-    let first: String = parts[0].chars().take(2).collect();
-    let middle: String = parts[1].chars().take(1).collect();
-    format!("{first}{middle}{}", parts[2])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn region_short_code_matches_aws_convention() {
-        assert_eq!(region_short_code("us-east-1"), "use1");
-        assert_eq!(region_short_code("ap-southeast-2"), "aps2");
-        assert_eq!(region_short_code("eu-central-1"), "euc1");
+    fn describe_regions_lists_every_commercial_region() {
+        let names: Vec<&str> = COMMERCIAL_REGIONS.iter().map(|(r, _)| *r).collect();
+        for r in [
+            "ap-east-2",
+            "ap-southeast-5",
+            "ap-southeast-6",
+            "ap-southeast-7",
+            "ca-west-1",
+            "il-central-1",
+            "mx-central-1",
+        ] {
+            assert!(names.contains(&r), "{r} missing");
+        }
     }
 }

@@ -34,6 +34,7 @@ pub fn bucket_meta_snapshot(b: &S3Bucket) -> BucketMeta {
         accelerate_status: b.accelerate_status.clone(),
         eventbridge_enabled: b.eventbridge_enabled,
         lifecycle_transition_default_min_size: b.lifecycle_transition_default_min_size.clone(),
+        legacy_eu_location: b.legacy_eu_location,
     }
 }
 
@@ -312,6 +313,7 @@ pub fn s3_bucket_from_snapshot(
         metadata_configuration: None,
         metadata_table_configuration: None,
         annotation_table_config: None,
+        legacy_eu_location: meta.legacy_eu_location,
     };
     for (key, lo) in objects {
         b.objects.insert(key, s3_object_from_loaded(lo));
@@ -510,6 +512,23 @@ pub fn hydrate_s3_state_reporting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_eu_location_survives_a_snapshot_round_trip() {
+        let mut bucket = S3Bucket::new("eu-b", "eu-west-1", "owner");
+        bucket.legacy_eu_location = true;
+        let snap = BucketSnapshot {
+            meta: bucket_meta_snapshot(&bucket),
+            ..Default::default()
+        };
+        let restored = s3_bucket_from_snapshot("eu-b", snap, "us-east-1").unwrap();
+        assert!(restored.legacy_eu_location);
+        assert_eq!(restored.region, "eu-west-1");
+        // Metadata written before the field existed loads as a plain bucket.
+        let old: BucketMeta =
+            serde_json::from_str(r#"{"name":"old","region":"eu-west-1"}"#).unwrap();
+        assert!(!old.legacy_eu_location);
+    }
 
     #[test]
     fn hydrate_bucket_without_acl_sidecar_gets_default_owner_grant() {

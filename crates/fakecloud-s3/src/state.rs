@@ -171,6 +171,10 @@ pub struct S3Bucket {
     pub metadata_configuration: Option<String>,
     /// Bucket-level metadata table configuration (S3 metadata table v1).
     pub metadata_table_configuration: Option<String>,
+    /// Created with the legacy `EU` location constraint. `region` is then
+    /// eu-west-1 (where AWS places the bucket) while GetBucketLocation keeps
+    /// answering `EU`, as it does on AWS.
+    pub legacy_eu_location: bool,
 }
 
 impl S3Bucket {
@@ -217,6 +221,7 @@ impl S3Bucket {
             abac_config: None,
             metadata_configuration: None,
             metadata_table_configuration: None,
+            legacy_eu_location: false,
         }
     }
 }

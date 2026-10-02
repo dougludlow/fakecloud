@@ -519,7 +519,11 @@ impl RdsService {
                     "DBClusterIdentifier": id, "DBClusterArn": arn,
                     "DbClusterResourceId": new_cluster_resource_id(),
                     "Status": "available", "Engine": engine,
-                    "EngineVersion": get_param(req, "EngineVersion").unwrap_or_else(|| "15.3".to_string()),
+                    // A version-less create gets its engine's default, not
+                    // a postgres version on an aurora-mysql cluster.
+                    "EngineVersion": get_param(req, "EngineVersion").unwrap_or_else(|| {
+                        crate::service::service_helpers::default_engine_version(&engine).to_string()
+                    }),
                     "Endpoint": format!("{id}.cluster-xxx.{region}.rds.amazonaws.com"),
                     "ReaderEndpoint": format!("{id}.cluster-ro-xxx.{region}.rds.amazonaws.com"),
                     "Port": port, "MasterUsername": get_param(req, "MasterUsername").unwrap_or_else(|| "postgres".to_string()),

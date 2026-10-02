@@ -455,3 +455,91 @@ async fn associate_address_rejects_unknown_allocation_id() {
         "expected InvalidAllocationID.NotFound, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn describe_regions_and_zone_ids_follow_aws_naming() {
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+
+    let regions = c.describe_regions().send().await.unwrap();
+    let find = |name: &str| {
+        regions
+            .regions()
+            .iter()
+            .find(|r| r.region_name() == Some(name))
+            .cloned()
+    };
+    for name in [
+        "ap-southeast-6",
+        "ap-southeast-7",
+        "mx-central-1",
+        "ap-east-2",
+    ] {
+        let r = find(name).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(r.opt_in_status(), Some("opted-in"), "{name}");
+    }
+    assert_eq!(
+        find("us-east-1").unwrap().opt_in_status(),
+        Some("opt-in-not-required")
+    );
+
+    // Zone ids use AWS's prefixes: ap-southeast-2 is `apse2`, and ap-south-1
+    // (`aps1`) does not collide with ap-southeast-1 (`apse1`).
+    for (region, prefix) in [
+        ("ap-southeast-2", "apse2"),
+        ("ap-south-1", "aps1"),
+        ("ap-southeast-1", "apse1"),
+        ("us-west-2", "usw2"),
+    ] {
+        let rc = aws_sdk_ec2::Client::new(&server.aws_config_in(region).await);
+        let zones = rc.describe_availability_zones().send().await.unwrap();
+        let ids: Vec<&str> = zones
+            .availability_zones()
+            .iter()
+            .filter_map(|z| z.zone_id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                format!("{prefix}-az1"),
+                format!("{prefix}-az2"),
+                format!("{prefix}-az3")
+            ],
+            "{region}"
+        );
+    }
+
+    // A subnet's zone id agrees with DescribeAvailabilityZones, and a subnet
+    // can be placed by zone id.
+    let rc = aws_sdk_ec2::Client::new(&server.aws_config_in("ap-southeast-2").await);
+    let vpc = rc
+        .create_vpc()
+        .cidr_block("10.40.0.0/16")
+        .send()
+        .await
+        .unwrap();
+    let vpc_id = vpc.vpc().unwrap().vpc_id().unwrap();
+    let by_name = rc
+        .create_subnet()
+        .vpc_id(vpc_id)
+        .cidr_block("10.40.1.0/24")
+        .availability_zone("ap-southeast-2b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        by_name.subnet().unwrap().availability_zone_id(),
+        Some("apse2-az2")
+    );
+    let by_id = rc
+        .create_subnet()
+        .vpc_id(vpc_id)
+        .cidr_block("10.40.2.0/24")
+        .availability_zone_id("apse2-az3")
+        .send()
+        .await
+        .unwrap();
+    let s = by_id.subnet().unwrap();
+    assert_eq!(s.availability_zone(), Some("ap-southeast-2c"));
+    assert_eq!(s.availability_zone_id(), Some("apse2-az3"));
+}

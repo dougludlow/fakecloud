@@ -888,7 +888,7 @@ impl RdsState {
 }
 
 pub fn default_engine_versions() -> Vec<EngineVersionInfo> {
-    vec![
+    let mut versions = vec![
         // PostgreSQL versions. The first entry per engine is what
         // `DescribeDBEngineVersions` with `DefaultOnly=true` returns (and what
         // Terraform's `aws_rds_engine_version` data source resolves to), so the
@@ -1000,44 +1000,142 @@ pub fn default_engine_versions() -> Vec<EngineVersionInfo> {
             db_engine_version_description: "MariaDB 10.6.16".to_string(),
             status: "available".to_string(),
         },
-    ]
+    ];
+    // Versions appended after the per-engine defaults above, so `DefaultOnly`
+    // keeps resolving to the established release: AWS's build-suffixed MySQL
+    // (extended support), MariaDB 11.8, and the commercial engines in the
+    // version grammar RDS really reports for them.
+    let appended: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "mysql",
+            "5.7.44-rds.20250103",
+            "mysql5.7",
+            "MySQL Community Edition",
+            "MySQL 5.7.44-rds.20250103",
+        ),
+        (
+            "mariadb",
+            "11.8.3",
+            "mariadb11.8",
+            "MariaDB Community Edition",
+            "MariaDB 11.8.3",
+        ),
+    ];
+    for (engine, version, family, description, version_description) in appended {
+        versions.push(engine_version_info(
+            engine,
+            version,
+            family,
+            description,
+            version_description,
+        ));
+    }
+    const ORACLE_19: &str = "19.0.0.0.ru-2025-07.rur-2025-07.r1";
+    const ORACLE_21: &str = "21.0.0.0.ru-2025-07.rur-2025-07.r1";
+    for (engine, description, majors) in [
+        (
+            "oracle-ee",
+            "Oracle Database Enterprise Edition",
+            &[("19", ORACLE_19)][..],
+        ),
+        (
+            "oracle-se2",
+            "Oracle Database Standard Edition Two",
+            &[("19", ORACLE_19)][..],
+        ),
+        (
+            "oracle-ee-cdb",
+            "Oracle Database Enterprise Edition (CDB)",
+            &[("19", ORACLE_19), ("21", ORACLE_21)][..],
+        ),
+        (
+            "oracle-se2-cdb",
+            "Oracle Database Standard Edition Two (CDB)",
+            &[("19", ORACLE_19), ("21", ORACLE_21)][..],
+        ),
+    ] {
+        for (major, version) in majors {
+            versions.push(engine_version_info(
+                engine,
+                version,
+                &format!("{engine}-{major}"),
+                description,
+                &format!("Oracle {version}"),
+            ));
+        }
+    }
+    for (engine, description) in [
+        ("sqlserver-ee", "Microsoft SQL Server Enterprise Edition"),
+        ("sqlserver-se", "Microsoft SQL Server Standard Edition"),
+        ("sqlserver-ex", "Microsoft SQL Server Express Edition"),
+        ("sqlserver-web", "Microsoft SQL Server Web Edition"),
+    ] {
+        for (major, version, release) in [
+            ("16", "16.00.4195.2.v1", "SQL Server 2022"),
+            ("15", "15.00.4430.1.v1", "SQL Server 2019"),
+        ] {
+            versions.push(engine_version_info(
+                engine,
+                version,
+                &format!("{engine}-{major}"),
+                description,
+                &format!("{release} {version}"),
+            ));
+        }
+    }
+    for (engine, description) in [
+        ("db2-se", "IBM Db2 Standard Edition"),
+        ("db2-ae", "IBM Db2 Advanced Edition"),
+    ] {
+        versions.push(engine_version_info(
+            engine,
+            "11.5.9.0.sb00000000.r1",
+            &format!("{engine}-11.5"),
+            description,
+            "Db2 11.5.9.0.sb00000000.r1",
+        ));
+    }
+    versions
+}
+
+fn engine_version_info(
+    engine: &str,
+    version: &str,
+    family: &str,
+    description: &str,
+    version_description: &str,
+) -> EngineVersionInfo {
+    EngineVersionInfo {
+        engine: engine.to_string(),
+        engine_version: version.to_string(),
+        db_parameter_group_family: family.to_string(),
+        db_engine_description: description.to_string(),
+        db_engine_version_description: version_description.to_string(),
+        status: "available".to_string(),
+    }
 }
 
 pub fn default_orderable_options() -> Vec<OrderableDbInstanceOption> {
+    // One option per engine version and class, in `default_engine_versions`
+    // order, so the default (first-per-engine) version stays the established
+    // GA release for `DefaultOnly` / `aws_rds_orderable_db_instance`.
     let mut options = Vec::new();
-    // Default (first-per-engine) versions stay the established GA release so
-    // `DefaultOnly`/`aws_rds_engine_version` resolves to them; the newer majors
-    // AWS also accepts (18, 8.4) are appended as non-default options.
-    let engines_and_versions = vec![
-        ("postgres", "17.4", "postgresql-license"),
-        ("postgres", "16.3", "postgresql-license"),
-        ("postgres", "15.5", "postgresql-license"),
-        ("postgres", "14.10", "postgresql-license"),
-        ("postgres", "13.13", "postgresql-license"),
-        ("postgres", "18.0", "postgresql-license"),
-        ("mysql", "8.0.35", "general-public-license"),
-        ("mysql", "8.0.28", "general-public-license"),
-        ("mysql", "5.7.44", "general-public-license"),
-        ("mysql", "8.4.0", "general-public-license"),
-        ("mariadb", "11.4.5", "general-public-license"),
-        ("mariadb", "10.11.6", "general-public-license"),
-        ("mariadb", "10.6.16", "general-public-license"),
-    ];
-
-    for (engine, version, license) in engines_and_versions {
+    for version in default_engine_versions() {
         for class in SUPPORTED_INSTANCE_CLASSES {
             options.push(OrderableDbInstanceOption {
-                engine: engine.to_string(),
-                engine_version: version.to_string(),
+                engine: version.engine.clone(),
+                engine_version: version.engine_version.clone(),
                 db_instance_class: class.to_string(),
-                license_model: license.to_string(),
+                license_model: crate::service::service_helpers::license_model_for_engine(
+                    &version.engine,
+                )
+                .to_string(),
                 storage_type: "gp2".to_string(),
                 min_storage_size: 20,
                 max_storage_size: 16384,
             });
         }
     }
-
     options
 }
 
@@ -1057,6 +1155,7 @@ pub fn default_parameter_groups(
         ("mysql8.4", "Default parameter group for mysql8.4"),
         ("mysql8.0", "Default parameter group for mysql8.0"),
         ("mysql5.7", "Default parameter group for mysql5.7"),
+        ("mariadb11.8", "Default parameter group for mariadb11.8"),
         ("mariadb11.4", "Default parameter group for mariadb11.4"),
         ("mariadb10.11", "Default parameter group for mariadb10.11"),
         ("mariadb10.6", "Default parameter group for mariadb10.6"),
@@ -1077,6 +1176,51 @@ pub fn default_parameter_groups(
         (
             "oracle-se2-cdb-23",
             "Default parameter group for oracle-se2-cdb-23",
+        ),
+        (
+            "oracle-ee-cdb-21",
+            "Default parameter group for oracle-ee-cdb-21",
+        ),
+        (
+            "oracle-ee-cdb-19",
+            "Default parameter group for oracle-ee-cdb-19",
+        ),
+        (
+            "oracle-se2-cdb-21",
+            "Default parameter group for oracle-se2-cdb-21",
+        ),
+        (
+            "oracle-se2-cdb-19",
+            "Default parameter group for oracle-se2-cdb-19",
+        ),
+        // Aurora instances take their family's default DB parameter group.
+        (
+            "aurora-postgresql17",
+            "Default parameter group for aurora-postgresql17",
+        ),
+        (
+            "aurora-postgresql16",
+            "Default parameter group for aurora-postgresql16",
+        ),
+        (
+            "aurora-postgresql15",
+            "Default parameter group for aurora-postgresql15",
+        ),
+        (
+            "aurora-postgresql14",
+            "Default parameter group for aurora-postgresql14",
+        ),
+        (
+            "aurora-postgresql13",
+            "Default parameter group for aurora-postgresql13",
+        ),
+        (
+            "aurora-mysql8.0",
+            "Default parameter group for aurora-mysql8.0",
+        ),
+        (
+            "aurora-mysql5.7",
+            "Default parameter group for aurora-mysql5.7",
         ),
         (
             "sqlserver-ee-16",
@@ -1254,9 +1398,10 @@ mod tests {
     fn default_engine_versions_are_postgres_metadata() {
         let versions = default_engine_versions();
 
-        assert_eq!(versions.len(), 13); // 6 postgres + 4 mysql + 3 mariadb
-                                        // The first postgres entry is the DefaultOnly/default version (17.4);
-                                        // 18.0 is present but appended as a non-default option.
+        // 6 postgres + 5 mysql + 4 mariadb + 6 oracle + 8 sqlserver + 2 db2
+        assert_eq!(versions.len(), 31);
+        // The first postgres entry is the DefaultOnly/default version (17.4);
+        // 18.0 is present but appended as a non-default option.
         assert_eq!(versions[0].engine, "postgres");
         assert_eq!(versions[0].engine_version, "17.4");
         assert_eq!(versions[0].db_parameter_group_family, "postgres17");
@@ -1276,8 +1421,11 @@ mod tests {
         let versions = default_engine_versions();
         let options = default_orderable_options();
 
-        // 13 engine versions * every representative instance class.
-        assert_eq!(options.len(), 13 * SUPPORTED_INSTANCE_CLASSES.len());
+        // Every engine version * every representative instance class.
+        assert_eq!(
+            options.len(),
+            versions.len() * SUPPORTED_INSTANCE_CLASSES.len()
+        );
         // Verify all engines and versions have orderable options
         for version in &versions {
             assert!(options.iter().any(|opt| {

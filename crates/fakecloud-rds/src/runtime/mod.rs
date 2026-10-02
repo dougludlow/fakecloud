@@ -198,6 +198,7 @@ impl RdsRuntime {
         data_volume: &str,
     ) -> Result<RunningDbContainer, RuntimeError> {
         let key = incarnation.to_string();
+        let engine = container_engine(engine);
         if let Some(k) = &self.k8s {
             // Per-instance Pod scheduling overrides come from the
             // resource's reserved `fakecloud-k8s/*` tags. Ignored on the
@@ -276,13 +277,7 @@ impl RdsRuntime {
                 (image, "3306", env_vars, Some(major_version.to_string()))
             }
             "mariadb" => {
-                let major_version = if engine_version.starts_with("10.11") {
-                    "10.11"
-                } else if engine_version.starts_with("11.4") {
-                    "11.4"
-                } else {
-                    "10.6"
-                };
+                let major_version = mariadb_major(engine_version);
                 let image = self.ensure_mariadb_image(major_version).await?;
                 let env_vars = vec![
                     format!("MARIADB_ROOT_PASSWORD={password}"),
@@ -502,6 +497,7 @@ impl RdsRuntime {
         password: &str,
         db_name: &str,
     ) -> Result<RunningDbContainer, RuntimeError> {
+        let engine = container_engine(engine);
         if let Some(k) = &self.k8s {
             let running = k
                 .restart(incarnation, engine, username, password, db_name)
@@ -1072,6 +1068,7 @@ impl RdsRuntime {
         password: &str,
         db_name: &str,
     ) -> Result<Vec<u8>, RuntimeError> {
+        let engine = container_engine(engine);
         let container = self
             .containers
             .read()
@@ -1187,6 +1184,7 @@ impl RdsRuntime {
         db_name: &str,
         dump_data: &[u8],
     ) -> Result<(), RuntimeError> {
+        let engine = container_engine(engine);
         let container = self
             .containers
             .read()
@@ -1331,6 +1329,27 @@ pub(crate) fn bridge_image_tag(image: &str, major_version: &str) -> String {
     let registry = std::env::var("FAKECLOUD_POSTGRES_REGISTRY")
         .unwrap_or_else(|_| DEFAULT_POSTGRES_REGISTRY.to_string());
     bridge_image_tag_with_registry(&registry, image, major_version)
+}
+
+/// The container engine an RDS engine runs on. Aurora cluster members store
+/// their data on the engine their family is compatible with, so an
+/// `aurora-postgresql` instance is a postgres container and an
+/// `aurora-mysql` one a mysql container.
+pub(crate) fn container_engine(engine: &str) -> &str {
+    match engine {
+        "aurora-mysql" | "aurora" => "mysql",
+        "aurora-postgresql" => "postgres",
+        other => other,
+    }
+}
+
+/// The MariaDB bridge-image major for an engine version. Unknown majors fall
+/// back to 10.6, the oldest supported one.
+pub(crate) fn mariadb_major(engine_version: &str) -> &'static str {
+    ["11.8", "11.4", "10.11"]
+        .into_iter()
+        .find(|major| engine_version == *major || engine_version.starts_with(&format!("{major}.")))
+        .unwrap_or("10.6")
 }
 
 /// Pure tag builder split out from [`bridge_image_tag`] so callers (and
