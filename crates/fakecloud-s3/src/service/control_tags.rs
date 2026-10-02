@@ -82,9 +82,15 @@ pub(super) fn resource_arn_from_path(req: &AwsRequest) -> Option<String> {
     (!arn.is_empty()).then_some(arn)
 }
 
+/// Whether `req` is an S3 Control `/v20180820/tags/{resourceArn}` request.
+pub(super) fn is_control_tags_request(req: &AwsRequest) -> bool {
+    fakecloud_core::protocol::is_s3_control_host(&req.headers)
+        && resource_arn_from_path(req).is_some()
+}
+
 /// Every `tagKeys` value in the raw query string, in order. The parsed
 /// query map keeps only the last of a repeated key.
-fn tag_keys_from_query(raw_query: &str) -> Vec<String> {
+pub(super) fn tag_keys_from_query(raw_query: &str) -> Vec<String> {
     raw_query
         .split('&')
         .filter_map(|pair| {
