@@ -280,7 +280,7 @@ pub async fn dispatch(
                 "UnknownService",
                 &format!("Service '{}' is not available", detected.service),
                 &request_id,
-                ErrorEnvelope::for_request(&detected),
+                ErrorEnvelope::for_request(&detected, &parts.headers),
             );
         }
     };
@@ -379,7 +379,7 @@ pub async fn dispatch(
                     "IncompleteSignature",
                     "Request is missing or has a malformed AWS Signature",
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
         };
@@ -391,7 +391,7 @@ pub async fn dispatch(
                     "InvalidClientTokenId",
                     "The security token included in the request is invalid",
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
         };
@@ -439,7 +439,7 @@ pub async fn dispatch(
                                 "SignatureDoesNotMatch",
                                 "The request signature we calculated does not match the signature you provided",
                                 &request_id,
-                                ErrorEnvelope::for_request(&detected),
+                                ErrorEnvelope::for_request(&detected, &parts.headers),
                             );
                         }
                     }
@@ -451,7 +451,7 @@ pub async fn dispatch(
                     "RequestTimeTooSkewed",
                     "The difference between the request time and the current time is too large",
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::InvalidDate(msg)) => {
@@ -460,7 +460,7 @@ pub async fn dispatch(
                     "IncompleteSignature",
                     &format!("Invalid x-amz-date: {msg}"),
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::Malformed(msg)) => {
@@ -469,7 +469,7 @@ pub async fn dispatch(
                     "IncompleteSignature",
                     &format!("Malformed SigV4 signature: {msg}"),
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::SignatureMismatch) => {
@@ -478,7 +478,7 @@ pub async fn dispatch(
                     "SignatureDoesNotMatch",
                     "The request signature we calculated does not match the signature you provided",
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::PresignedUrlExpired { .. }) => {
@@ -487,7 +487,7 @@ pub async fn dispatch(
                     "AccessDenied",
                     "Request has expired",
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::InvalidPresignExpires(_)) => {
@@ -496,7 +496,7 @@ pub async fn dispatch(
                     "AuthorizationQueryParametersError",
                     "X-Amz-Expires must be a number between 1 and 604800 seconds",
                     &request_id,
-                    ErrorEnvelope::for_request(&detected),
+                    ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
             }
         }
@@ -580,6 +580,7 @@ pub async fn dispatch(
     let caller_principal =
         caller_principal.or_else(|| internal_caller.as_ref().map(|c| c.principal()));
 
+    let error_envelope = ErrorEnvelope::for_request(&detected, &parts.headers);
     let aws_request = AwsRequest {
         service: detected.service.clone(),
         action: detected.action.clone(),
@@ -822,7 +823,7 @@ pub async fn dispatch(
                                         encoded,
                                     ),
                                     &request_id,
-                                    ErrorEnvelope::for_request(&detected),
+                                    error_envelope,
                                 );
                                 }
                                 // Soft mode: audit log already emitted; fall
@@ -858,7 +859,7 @@ pub async fn dispatch(
                                     principal.arn, aws_request.action,
                                 ),
                                 &request_id,
-                                ErrorEnvelope::for_request(&detected),
+                                error_envelope,
                             );
                         }
                         // Soft mode: audit log emitted; fall through to the
@@ -936,7 +937,7 @@ pub async fn dispatch(
                                     "AccessDenied",
                                     "Access Denied",
                                     &request_id,
-                                    ErrorEnvelope::for_request(&detected),
+                                    error_envelope,
                                 );
                             }
                             // Soft mode: audit log emitted; fall through to the handler.
@@ -963,7 +964,7 @@ pub async fn dispatch(
                             "AccessDenied",
                             "Access Denied",
                             &request_id,
-                            ErrorEnvelope::for_request(&detected),
+                            error_envelope,
                         );
                     }
                 }
@@ -1016,7 +1017,7 @@ pub async fn dispatch(
                 err.code(),
                 &err.message(),
                 &request_id,
-                ErrorEnvelope::for_request(&detected),
+                error_envelope,
                 err.extra_fields(),
             );
             for (k, v) in &error_headers {
@@ -1399,11 +1400,14 @@ struct ErrorEnvelope {
     protocol: AwsProtocol,
     /// `Some(xmlns)` selects the `<ErrorResponse>` REST-XML shape.
     rest_xml_namespace: Option<&'static str>,
+    /// An S3 Control request (`s3-control` host, served by the `s3`
+    /// handler): its errors use S3 Control's un-namespaced `<ErrorResponse>`.
+    s3_control: bool,
 }
 
 impl ErrorEnvelope {
     /// The envelope for an error answering a request routed to `detected`.
-    fn for_request(detected: &protocol::DetectedRequest) -> Self {
+    fn for_request(detected: &protocol::DetectedRequest, headers: &http::HeaderMap) -> Self {
         let rest_xml_namespace = if detected.protocol == AwsProtocol::Rest {
             fakecloud_aws::error::rest_xml_error_namespace(&detected.service)
         } else {
@@ -1412,6 +1416,9 @@ impl ErrorEnvelope {
         Self {
             protocol: detected.protocol,
             rest_xml_namespace,
+            s3_control: detected.protocol == AwsProtocol::Rest
+                && detected.service == "s3"
+                && protocol::is_s3_control_host(headers),
         }
     }
 }
@@ -1421,6 +1428,7 @@ impl From<AwsProtocol> for ErrorEnvelope {
         Self {
             protocol,
             rest_xml_namespace: None,
+            s3_control: false,
         }
     }
 }
@@ -1462,6 +1470,15 @@ fn build_error_response_with_fields(
         (AwsProtocol::Rest, Some(namespace)) => fakecloud_aws::error::rest_xml_error_response(
             status, code, message, request_id, namespace,
         ),
+        (AwsProtocol::Rest, None) if envelope.s3_control => {
+            fakecloud_aws::error::s3_control_xml_error_response(
+                status,
+                code,
+                message,
+                request_id,
+                extra_fields,
+            )
+        }
         (AwsProtocol::Rest, None) => fakecloud_aws::error::s3_xml_error_response_with_fields(
             status,
             code,
@@ -1641,7 +1658,7 @@ fn authorize_internal_caller(
                 "AccessDenied",
                 "Access Denied",
                 request_id,
-                ErrorEnvelope::for_request(detected),
+                ErrorEnvelope::for_request(detected, &aws_request.headers),
             )
         })
     };
@@ -2321,7 +2338,7 @@ mod tests {
                 "NoSuchThing",
                 "missing",
                 "req-w",
-                ErrorEnvelope::for_request(&rest_detected(service)),
+                ErrorEnvelope::for_request(&rest_detected(service), &http::HeaderMap::new()),
             );
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             assert_eq!(
@@ -2347,12 +2364,43 @@ mod tests {
             "NoSuchBucket",
             "missing",
             "req-s3",
-            ErrorEnvelope::for_request(&rest_detected("s3")),
+            ErrorEnvelope::for_request(&rest_detected("s3"), &http::HeaderMap::new()),
         );
         let body = body_string(resp).await;
         assert!(!body.contains("<ErrorResponse"), "{body}");
         assert!(body.contains("<Error>"), "{body}");
         assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn s3_control_errors_use_error_response_wrapper() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "host",
+            "000000000000.s3-control.us-east-1.amazonaws.com"
+                .parse()
+                .unwrap(),
+        );
+        let resp = build_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchAccessPoint",
+            "missing",
+            "req-ctl",
+            ErrorEnvelope::for_request(&rest_detected("s3"), &headers),
+        );
+        assert_eq!(
+            resp.headers().get("x-amz-error-code").unwrap(),
+            "NoSuchAccessPoint"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains(
+                "<ErrorResponse><Error><Code>NoSuchAccessPoint</Code>\
+                 <Message>missing</Message></Error>\
+                 <RequestId>req-ctl</RequestId></ErrorResponse>"
+            ),
+            "{body}"
+        );
     }
 
     #[test]

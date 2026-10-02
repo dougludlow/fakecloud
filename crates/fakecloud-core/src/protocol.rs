@@ -370,6 +370,27 @@ pub fn parse_routing_host(host: &str) -> Option<RoutingHost> {
         .and_then(parse_aws_prefix)
 }
 
+/// Whether the request is addressed to an S3 Control endpoint
+/// (`[<account-id>.]s3-control.<region>...`). S3 Control is served by the
+/// `s3` handler, so the host is the only thing telling the two apart. The
+/// `s3-control` label must lead the host (after the SDK's account-ID
+/// prefix), so a bucket whose name merely contains `s3-control` stays S3.
+pub fn is_s3_control_host(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let hostname = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    let labels: Vec<&str> = hostname.split('.').collect();
+    let control_label = match labels.as_slice() {
+        ["s3-control", ..] => true,
+        [account, "s3-control", ..] => {
+            account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    };
+    control_label && parse_routing_host(host).is_none_or(|h| h.bucket.is_none())
+}
+
 /// Pull the `Host` header and parse it with [`parse_routing_host`].
 pub fn parse_routing_host_from_headers(headers: &HeaderMap) -> Option<RoutingHost> {
     let host = headers.get("host")?.to_str().ok()?;
@@ -966,6 +987,29 @@ fn from_hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_control_host_requires_leading_control_label() {
+        let is_control = |host: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", host.parse().unwrap());
+            is_s3_control_host(&headers)
+        };
+        assert!(is_control("s3-control.us-east-1.amazonaws.com"));
+        assert!(is_control(
+            "123456789012.s3-control.us-east-1.amazonaws.com"
+        ));
+        assert!(is_control(
+            "000000000000.s3-control.us-east-1.localhost.localstack.cloud:4566"
+        ));
+        assert!(is_control("123456789012.s3-control.localhost"));
+        assert!(!is_control("my-s3-control-logs.s3.us-east-1.amazonaws.com"));
+        assert!(!is_control(
+            "my-s3-control-logs.s3.us-east-1.localhost.localstack.cloud:4566"
+        ));
+        assert!(!is_control("a.s3-control.b.s3.us-east-1.amazonaws.com"));
+        assert!(!is_control("localhost:4566"));
+    }
 
     #[test]
     fn form_urlencoded_pairs_preserves_repeated_keys() {

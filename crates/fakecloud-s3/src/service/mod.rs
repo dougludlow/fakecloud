@@ -23,6 +23,7 @@ mod acl;
 mod annotations;
 mod buckets;
 pub(crate) mod config;
+mod control_tags;
 mod lock;
 mod multipart;
 pub(crate) mod notifications;
@@ -521,7 +522,11 @@ impl AwsService for S3Service {
         // flagged (PutObjectTagging, PutObjectAcl, PutObjectRetention,
         // PutObjectLegalHold, CopyObject, …) reads a small XML/JSON
         // body from `req.body`, so drain the stream for them.
+        // S3 Control (`s3-control` host) shares this handler; its PUTs
+        // (CreateAccessPoint, ...) carry an XML body, never object data.
+        let is_control = fakecloud_core::protocol::is_s3_control_host(&req.headers);
         let is_put_to_key = req.method == Method::PUT
+            && !is_control
             && req.path_segments.len() >= 2
             && req
                 .path_segments
@@ -555,13 +560,7 @@ impl AwsService for S3Service {
 
         let account_id = req.account_id.as_str();
 
-        // S3 Control endpoint (access point management).
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let is_control = host.to_ascii_lowercase().contains("s3-control");
+        // S3 Control endpoint (access point management, resource tagging).
         if is_control {
             let v1 = req.path_segments.first().map(|s| s.as_str());
             let v2 = req.path_segments.get(1).map(|s| s.as_str());
@@ -576,6 +575,11 @@ impl AwsService for S3Service {
                     }
                 } else if req.method == Method::GET {
                     return self.list_access_points(account_id, &req);
+                }
+            }
+            if v1 == Some("v20180820") && v2 == Some("tags") {
+                if let Some(result) = self.handle_control_tags(account_id, &req) {
+                    return result;
                 }
             }
         }
@@ -1612,15 +1616,28 @@ impl AwsService for S3Service {
         // ListAccessPoints actions — NOT the object-level GetObject/PutObject/
         // DeleteObject the generic method-based detection would pick, which made
         // access-point policies ineffective.
-        let host = request
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if host.to_ascii_lowercase().contains("s3-control")
-            && request.path_segments.first().map(|s| s.as_str()) == Some("v20180820")
-            && request.path_segments.get(1).map(|s| s.as_str()) == Some("accesspoint")
-        {
+        let is_control = fakecloud_core::protocol::is_s3_control_host(&request.headers)
+            && request.path_segments.first().map(|s| s.as_str()) == Some("v20180820");
+        // S3 Control resource tagging is authorized as s3:TagResource /
+        // UntagResource / ListTagsForResource on the tagged resource's ARN.
+        if is_control && request.path_segments.get(1).map(|s| s.as_str()) == Some("tags") {
+            let action = match request.method.as_str() {
+                "GET" => Some("ListTagsForResource"),
+                "POST" => Some("TagResource"),
+                "DELETE" => Some("UntagResource"),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let resource = control_tags::resource_arn_from_path(request)
+                    .unwrap_or_else(|| "*".to_string());
+                return Some(fakecloud_core::auth::IamAction {
+                    service: "s3",
+                    action,
+                    resource,
+                });
+            }
+        }
+        if is_control && request.path_segments.get(1).map(|s| s.as_str()) == Some("accesspoint") {
             let has_name = request.path_segments.get(2).is_some();
             let ap_action = match (request.method.as_str(), has_name) {
                 ("PUT", true) => Some("CreateAccessPoint"),
@@ -1761,7 +1778,15 @@ impl AwsService for S3Service {
         request: &AwsRequest,
         action: &fakecloud_core::auth::IamAction,
     ) -> std::collections::BTreeMap<String, Vec<String>> {
-        s3_condition_keys(action.action, &request.query_params, &request.headers)
+        let mut keys = s3_condition_keys(action.action, &request.query_params, &request.headers);
+        // S3 Control UntagResource: `aws:TagKeys` lists the keys being removed.
+        if action.action == "UntagResource" && control_tags::is_control_tags_request(request) {
+            keys.insert(
+                "aws:TagKeys".to_string(),
+                control_tags::tag_keys_from_query(&request.raw_query),
+            );
+        }
+        keys
     }
 
     fn resource_tags_for(
@@ -1874,6 +1899,8 @@ fn s3_condition_keys(
 ///
 /// Bucket-level ARN (`arn:aws:s3:::bucket`) -> bucket tags.
 /// Object-level ARN (`arn:aws:s3:::bucket/key`) -> object tags.
+/// Access point ARN (`arn:aws:s3:<region>:<account>:accesspoint/<name>`) ->
+/// access point tags.
 /// `*` (ListBuckets) -> `Some(empty)` (no resource to tag).
 fn s3_resource_tags(
     state: &SharedS3State,
@@ -1882,9 +1909,29 @@ fn s3_resource_tags(
     if resource_arn == "*" {
         return Some(std::collections::BTreeMap::new());
     }
-    // S3 ARNs: arn:aws:s3:::bucket or arn:aws:s3:::bucket/key
-    let after_prefix = arn_resource(resource_arn, "s3")?.strip_prefix("::")?;
+    let resource = arn_resource(resource_arn, "s3")?;
     let mas = state.read();
+    // Bucket or object ARN: arn:aws:s3:::bucket[/key]
+    if let Some(after_prefix) = resource.strip_prefix("::") {
+        return s3_bucket_or_object_tags(&mas, after_prefix);
+    }
+    // Access point ARN: arn:aws:s3:<region>:<account>:accesspoint/<name>,
+    // taggable through S3 Control TagResource.
+    let (_region, rest) = resource.split_once(':')?;
+    let (account, rest) = rest.split_once(':')?;
+    let name = rest.strip_prefix("accesspoint/")?;
+    mas.get(account)?
+        .access_points
+        .get(name)
+        .map(|ap| ap.tags.clone())
+}
+
+/// Tags of the bucket or object an S3 ARN resource (`bucket` or
+/// `bucket/key`, after `arn:aws:s3:::`) names.
+fn s3_bucket_or_object_tags(
+    mas: &fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    after_prefix: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
     // S3 bucket names are globally unique; scan all accounts to find the bucket
     let bucket_name = after_prefix.split('/').next().unwrap_or(after_prefix);
     let state = mas
@@ -1937,6 +1984,18 @@ fn s3_request_tags(
             let tags = parse_tagging_xml(body);
             Some(tags.into_iter().collect())
         }
+        // S3 Control TagResource carries its tags in a `<TagResourceRequest>`
+        // body. (CreateBucket also authorizes `s3:TagResource` for the tags
+        // in its CreateBucketConfiguration; that falls to the arm below.)
+        "TagResource" if control_tags::is_control_tags_request(request) => {
+            let body = std::str::from_utf8(&request.body).unwrap_or("");
+            Some(parse_tagging_xml(body).into_iter().collect())
+        }
+        // UntagResource carries no tag values, only keys: AWS sets
+        // `aws:TagKeys` (see `iam_condition_keys_for`) but no
+        // `aws:RequestTag/*`. `None` keeps those unset, and lets the
+        // `aws:TagKeys` lookup fall through to the condition keys.
+        "UntagResource" if control_tags::is_control_tags_request(request) => None,
         // CreateBucket carries its tag set inside CreateBucketConfiguration, and
         // every authorization it requires alongside `s3:CreateBucket` is
         // evaluated against the same tags -- AWS builds one request context for
@@ -4357,6 +4416,47 @@ mod partition_tests {
     }
 
     #[test]
+    fn control_tagging_iam_action_targets_resource_arn() {
+        let svc = S3Service::new(
+            Arc::new(RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            Arc::new(DeliveryBus::new()),
+        );
+        for (method, want_action, path, want_resource) in [
+            (
+                Method::GET,
+                "ListTagsForResource",
+                "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Amy-bucket",
+                "arn:aws:s3:::my-bucket",
+            ),
+            (
+                Method::POST,
+                "TagResource",
+                "/v20180820/tags/arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+            ),
+            (
+                Method::DELETE,
+                "UntagResource",
+                "/v20180820/tags/arn:aws:s3:::my-bucket",
+                "arn:aws:s3:::my-bucket",
+            ),
+        ] {
+            let mut r = request(method, "us-east-1", path);
+            r.headers
+                .insert("host", "123456789012.s3-control.localhost".parse().unwrap());
+            let action = svc.iam_action_for(&r).unwrap();
+            assert_eq!(action.action, want_action);
+            assert_eq!(action.resource, want_resource);
+        }
+    }
+
+    #[test]
     fn iam_resource_uses_bucket_region_partition() {
         let state: SharedS3State = Arc::new(RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
@@ -4413,6 +4513,121 @@ mod partition_tests {
             .insert("env".to_string(), "prod".to_string());
         let tags = s3_resource_tags(&state, &arn).unwrap();
         assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+    }
+
+    fn control_request(method: Method, path: &str, raw_query: &str, body: &str) -> AwsRequest {
+        let mut r = request(method, "us-east-1", path);
+        r.headers
+            .insert("host", "123456789012.s3-control.localhost".parse().unwrap());
+        r.raw_query = raw_query.to_string();
+        r.body = Bytes::from(body.to_string());
+        r
+    }
+
+    #[test]
+    fn control_tag_resource_exposes_request_tags() {
+        let r = control_request(
+            Method::POST,
+            "/v20180820/tags/arn:aws:s3:::my-bucket",
+            "",
+            "<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+             <Tags><Tag><Key>env</Key><Value>prod</Value></Tag></Tags></TagResourceRequest>",
+        );
+        let tags = s3_request_tags(&r, "TagResource").unwrap();
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.len(), 1);
+
+        // CreateBucket's own s3:TagResource authorization still reads the
+        // tags from its CreateBucketConfiguration.
+        let mut create = request(Method::PUT, "us-east-1", "/new-bucket");
+        create.body = Bytes::from_static(
+            b"<CreateBucketConfiguration><Tags><Tag><Key>team</Key>\
+              <Value>core</Value></Tag></Tags></CreateBucketConfiguration>",
+        );
+        let tags = s3_request_tags(&create, "TagResource").unwrap();
+        assert_eq!(tags.get("team").map(String::as_str), Some("core"));
+    }
+
+    #[test]
+    fn control_untag_resource_sets_tag_keys_without_request_tags() {
+        let svc = S3Service::new(
+            Arc::new(RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            Arc::new(DeliveryBus::new()),
+        );
+        let r = control_request(
+            Method::DELETE,
+            "/v20180820/tags/arn:aws:s3:::my-bucket",
+            "tagKeys=env&tagKeys=team",
+            "",
+        );
+        assert_eq!(s3_request_tags(&r, "UntagResource"), None);
+        let action = svc.iam_action_for(&r).unwrap();
+        assert_eq!(action.action, "UntagResource");
+        let keys = svc.iam_condition_keys_for(&r, &action);
+        assert_eq!(
+            keys.get("aws:TagKeys"),
+            Some(&vec!["env".to_string(), "team".to_string()])
+        );
+
+        let ctx = fakecloud_core::auth::ConditionContext {
+            request_tags: svc.request_tags_from(&r, "UntagResource"),
+            service_keys: keys,
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx.lookup("aws:TagKeys"),
+            Some(vec!["env".to_string(), "team".to_string()])
+        );
+        assert_eq!(ctx.lookup("aws:RequestTag/env"), None);
+    }
+
+    #[test]
+    fn access_point_arn_resolves_resource_tags() {
+        let state: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        {
+            let mut mas = state.write();
+            let st = mas.get_or_create("123456789012");
+            st.buckets.insert(
+                "ap-bucket".to_string(),
+                S3Bucket::new("ap-bucket", "us-east-1", "123456789012"),
+            );
+            st.access_points.insert(
+                "ap1".to_string(),
+                crate::state::S3AccessPoint {
+                    name: "ap1".to_string(),
+                    bucket: "ap-bucket".to_string(),
+                    account_id: "123456789012".to_string(),
+                    network_origin: "Internet".to_string(),
+                    vpc_configuration: None,
+                    creation_date: Utc::now(),
+                    public_access_block: None,
+                    bucket_account_id: Some("123456789012".to_string()),
+                    tags: [("env".to_string(), "prod".to_string())].into(),
+                },
+            );
+        }
+        let tags =
+            s3_resource_tags(&state, "arn:aws:s3:us-east-1:123456789012:accesspoint/ap1").unwrap();
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            s3_resource_tags(
+                &state,
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/missing"
+            ),
+            None
+        );
+        assert_eq!(
+            s3_resource_tags(&state, "arn:aws:s3:us-east-1:999999999999:accesspoint/ap1"),
+            None
+        );
     }
 }
 
