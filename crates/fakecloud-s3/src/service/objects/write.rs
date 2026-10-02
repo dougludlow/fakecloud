@@ -596,7 +596,7 @@ impl S3Service {
                 }
             }
             // Replicate (in-memory copy) then persist replicas via the store.
-            replicate_through_store(state, &self.store, bucket, key)
+            replicate_through_store(&mut accts, account_id, &self.store, bucket, key)
                 .map_err(crate::service::persistence_error)?;
         } // write lock dropped
 
@@ -1278,7 +1278,7 @@ impl S3Service {
         let region = state.region.clone();
 
         // Replicate object if replication is configured on the destination bucket
-        replicate_through_store(state, &self.store, dest_bucket, dest_key)
+        replicate_through_store(&mut accts, account_id, &self.store, dest_bucket, dest_key)
             .map_err(crate::service::persistence_error)?;
 
         drop(accts);

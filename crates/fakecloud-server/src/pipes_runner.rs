@@ -786,8 +786,13 @@ impl PipesRunner {
             .iter()
             .map(|e| apply_input_template(pipe.input_template.as_deref(), e))
             .collect();
-        self.deliver(&pipe.target_arn, pipe.target_params.as_ref(), &transformed)
-            .await
+        self.deliver(
+            &pipe.arn,
+            &pipe.target_arn,
+            pipe.target_params.as_ref(),
+            &transformed,
+        )
+        .await
     }
 
     /// Send the batch through the pipe's enrichment (a Lambda) and return the
@@ -833,6 +838,7 @@ impl PipesRunner {
     /// message per event.
     async fn deliver(
         &self,
+        pipe_arn: &str,
         target_arn: &str,
         target_params: Option<&Value>,
         batch: &[Value],
@@ -895,10 +901,6 @@ impl PipesRunner {
             // EventBridge bus: PutEvents one entry per event. Source/DetailType
             // come from the target's EventBridgeEventBusParameters (AWS
             // requires them), defaulting to Pipes' conventional values.
-            let bus_name = target_arn
-                .rsplit_once("event-bus/")
-                .map(|(_, n)| n)
-                .unwrap_or("default");
             let eb_params = target_params.and_then(|p| p.get("EventBridgeEventBusParameters"));
             let source = eb_params
                 .and_then(|p| p.get("Source"))
@@ -908,10 +910,32 @@ impl PipesRunner {
                 .and_then(|p| p.get("DetailType"))
                 .and_then(Value::as_str)
                 .unwrap_or("Event");
+            // The events originate in the pipe's account and region; the bus
+            // is addressed by its ARN so it routes to the bus owner.
+            let origin_account = arn_account(pipe_arn);
+            let origin_region = arn_region(pipe_arn);
+            let resources: Vec<String> = eb_params
+                .and_then(|p| p.get("Resources"))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
             for event in batch {
                 let detail = event_to_payload(event);
-                self.delivery
-                    .put_event_to_eventbridge(source, detail_type, &detail, bus_name);
+                self.delivery.put_event_to_eventbridge(
+                    &fakecloud_core::delivery::CrossServiceEvent {
+                        source,
+                        detail_type,
+                        detail: &detail,
+                        event_bus: target_arn,
+                        account_id: &origin_account,
+                        region: &origin_region,
+                        resources: &resources,
+                    },
+                );
             }
             true
         } else if target_arn.contains(":kinesis:") {

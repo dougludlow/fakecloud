@@ -536,6 +536,9 @@ struct CapturedEvent {
     source: String,
     detail_type: String,
     detail: String,
+    account_id: String,
+    region: String,
+    resources: Vec<String>,
 }
 
 #[derive(Default)]
@@ -544,11 +547,14 @@ struct RecordingEb {
 }
 
 impl fakecloud_core::delivery::EventBridgeDelivery for RecordingEb {
-    fn put_event(&self, source: &str, detail_type: &str, detail: &str, _bus: &str) {
+    fn put_event(&self, e: &fakecloud_core::delivery::CrossServiceEvent<'_>) {
         self.events.lock().unwrap().push(CapturedEvent {
-            source: source.to_string(),
-            detail_type: detail_type.to_string(),
-            detail: detail.to_string(),
+            source: e.source.to_string(),
+            detail_type: e.detail_type.to_string(),
+            detail: e.detail.to_string(),
+            account_id: e.account_id.to_string(),
+            region: e.region.to_string(),
+            resources: e.resources.to_vec(),
         });
     }
 }
@@ -585,6 +591,31 @@ fn emit_event_emits_aws_rds_event_via_bus() {
     assert_eq!(detail["SourceIdentifier"], "my-db");
     assert_eq!(detail["Message"], "DB instance created");
     assert_eq!(detail["EventCategories"][0], "creation");
+    assert_eq!(e.account_id, "123456789012");
+    assert_eq!(e.region, "us-east-1");
+    assert_eq!(
+        e.resources,
+        vec!["arn:aws:rds:us-east-1:123456789012:db:my-db"]
+    );
+}
+
+/// The event carries the source resource's account and region, not the
+/// server's startup account/region.
+#[test]
+fn emit_event_uses_source_arn_account_and_region() {
+    let (svc, rec) = make_service_with_recorder();
+    svc.emit_event(
+        RdsSourceType::DbInstance,
+        "eu-db",
+        "arn:aws:rds:eu-west-2:111111111111:db:eu-db",
+        "RDS-EVENT-0005",
+        &["creation"],
+        "DB instance created",
+    );
+    let events = rec.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].account_id, "111111111111");
+    assert_eq!(events[0].region, "eu-west-2");
 }
 
 #[test]

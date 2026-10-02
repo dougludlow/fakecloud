@@ -421,3 +421,229 @@ async fn unauthenticated_uses_default_account() {
     let identity = sts.get_caller_identity().send().await.unwrap();
     assert_eq!(identity.account().unwrap(), ACCOUNT_A);
 }
+
+// ======================================================================
+// S3 -> EventBridge: event scoped to the bucket owner and bucket region
+// ======================================================================
+
+async fn config_in_region(
+    server: &TestServer,
+    akid: &str,
+    secret: &str,
+    region: &'static str,
+) -> aws_config::SdkConfig {
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(server.endpoint())
+        .region(aws_config::Region::new(region))
+        .credentials_provider(Credentials::new(akid, secret, None, None, "multi-acct"))
+        .load()
+        .await
+}
+
+/// A bucket in a non-default account and region publishes its EventBridge
+/// notification to that account's default bus, stamped with that account and
+/// region: a rule there matching on both fires.
+#[tokio::test]
+async fn s3_eventbridge_event_reaches_bucket_owner_rule_in_bucket_region() {
+    let server = start().await;
+    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let cfg = config_in_region(&server, &b_akid, &b_secret, "eu-west-2").await;
+    let s3 = S3Client::new(&cfg);
+    let sqs = SqsClient::new(&cfg);
+    let eb = aws_sdk_eventbridge::Client::new(&cfg);
+
+    let queue_url = sqs
+        .create_queue()
+        .queue_name("s3-events")
+        .send()
+        .await
+        .unwrap()
+        .queue_url()
+        .unwrap()
+        .to_string();
+    let queue_arn = sqs
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .send()
+        .await
+        .unwrap()
+        .attributes()
+        .unwrap()
+        .get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .unwrap()
+        .to_string();
+
+    eb.put_rule()
+        .name("owner-s3")
+        .event_pattern(format!(
+            r#"{{"source":["aws.s3"],"detail-type":["Object Created"],"account":["{ACCOUNT_B}"],"region":["eu-west-2"]}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    eb.put_targets()
+        .rule("owner-s3")
+        .targets(
+            aws_sdk_eventbridge::types::Target::builder()
+                .id("q")
+                .arn(&queue_arn)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.create_bucket()
+        .bucket("owner-b-events")
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::EuWest2)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_notification_configuration()
+        .bucket("owner-b-events")
+        .notification_configuration(
+            aws_sdk_s3::types::NotificationConfiguration::builder()
+                .event_bridge_configuration(
+                    aws_sdk_s3::types::EventBridgeConfiguration::builder().build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket("owner-b-events")
+        .key("hello.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hi"))
+        .send()
+        .await
+        .unwrap();
+
+    let msgs = sqs
+        .receive_message()
+        .queue_url(&queue_url)
+        .wait_time_seconds(10)
+        .send()
+        .await
+        .unwrap();
+    let msgs = msgs.messages();
+    assert_eq!(
+        msgs.len(),
+        1,
+        "rule in the bucket owner's account must fire"
+    );
+    let event: serde_json::Value = serde_json::from_str(msgs[0].body().unwrap()).unwrap();
+    assert_eq!(event["account"], ACCOUNT_B);
+    assert_eq!(event["region"], "eu-west-2");
+    assert_eq!(event["detail"]["bucket"]["name"], "owner-b-events");
+    assert_eq!(
+        event["resources"],
+        serde_json::json!(["arn:aws:s3:::owner-b-events"])
+    );
+}
+
+// ======================================================================
+// S3 replication into a bucket owned by another account
+// ======================================================================
+
+#[tokio::test]
+async fn s3_replication_delivers_to_bucket_in_another_account() {
+    let server = start().await;
+    let (a_akid, a_secret) = server.create_admin(ACCOUNT_A, "admin-a").await;
+    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let s3_a = S3Client::new(&config_with(&server, &a_akid, &a_secret).await);
+    let s3_b = S3Client::new(&config_with(&server, &b_akid, &b_secret).await);
+
+    let enable_versioning = |s3: S3Client, bucket: &'static str| async move {
+        s3.put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+    };
+    s3_a.create_bucket()
+        .bucket("repl-src-a")
+        .send()
+        .await
+        .unwrap();
+    enable_versioning(s3_a.clone(), "repl-src-a").await;
+    s3_b.create_bucket()
+        .bucket("repl-dst-b")
+        .send()
+        .await
+        .unwrap();
+    enable_versioning(s3_b.clone(), "repl-dst-b").await;
+
+    let rule = aws_sdk_s3::types::ReplicationRule::builder()
+        .id("to-b")
+        .status(aws_sdk_s3::types::ReplicationRuleStatus::Enabled)
+        .priority(1)
+        .filter(
+            aws_sdk_s3::types::ReplicationRuleFilter::builder()
+                .prefix("")
+                .build(),
+        )
+        .delete_marker_replication(
+            aws_sdk_s3::types::DeleteMarkerReplication::builder()
+                .status(aws_sdk_s3::types::DeleteMarkerReplicationStatus::Disabled)
+                .build(),
+        )
+        .destination(
+            aws_sdk_s3::types::Destination::builder()
+                .bucket("arn:aws:s3:::repl-dst-b")
+                .account(ACCOUNT_B)
+                .access_control_translation(
+                    aws_sdk_s3::types::AccessControlTranslation::builder()
+                        .owner(aws_sdk_s3::types::OwnerOverride::Destination)
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    s3_a.put_bucket_replication()
+        .bucket("repl-src-a")
+        .replication_configuration(
+            aws_sdk_s3::types::ReplicationConfiguration::builder()
+                .role(format!("arn:aws:iam::{ACCOUNT_A}:role/replication"))
+                .rules(rule)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3_a.put_object()
+        .bucket("repl-src-a")
+        .key("doc.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"replicated",
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let got = s3_b
+        .get_object()
+        .bucket("repl-dst-b")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect("replica must land in account B's bucket");
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&body[..], b"replicated");
+}

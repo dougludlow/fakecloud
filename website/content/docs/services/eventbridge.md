@@ -30,6 +30,7 @@ JSON protocol. `X-Amz-Target` header, JSON body, JSON responses.
 
 - **EventBridge -> SNS / SQS / Lambda / Logs / Kinesis / Step Functions / HTTP** — Rules deliver to targets on schedule or event match
 - **EventBridge Scheduler** — Cron and rate-based rules fire on schedule
+- **Service events** (S3, ECS, RDS, SES, Lambda destinations, Step Functions, Pipes, Scheduler): each event lands on a bus in the account that owns the emitting resource (or the account of a target bus ARN), carries that resource's `account` and `region`, and is matched by rules and captured by archives exactly like a `PutEvents` entry.
 
 ## Source
 

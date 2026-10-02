@@ -472,10 +472,13 @@ pub(crate) fn invoke_sns_publish(
     }))
 }
 
-/// Put events onto an EventBridge bus via DeliveryBus.
+/// Put events onto an EventBridge bus via DeliveryBus. The events originate
+/// in the execution's account and region (both read from `execution_arn`);
+/// an `EventBusName` ARN routes to that bus's account.
 pub(crate) fn invoke_eventbridge_put_events(
     input: &Value,
     delivery: &Option<Arc<DeliveryBus>>,
+    execution_arn: &str,
 ) -> Result<Value, (String, String)> {
     let delivery = delivery.as_ref().ok_or_else(|| {
         (
@@ -506,8 +509,24 @@ pub(crate) fn invoke_eventbridge_put_events(
                     .expect("serde_json::Value serialization is infallible")
             });
         let bus_name = entry["EventBusName"].as_str().unwrap_or("default");
+        let resources: Vec<String> = entry["Resources"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        delivery.put_event_to_eventbridge(source, detail_type, &detail, bus_name);
+        delivery.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+            source,
+            detail_type,
+            detail: &detail,
+            event_bus: bus_name,
+            account_id: account_id_from_arn(execution_arn),
+            region: region_from_arn(execution_arn),
+            resources: &resources,
+        });
         event_ids.push(uuid::Uuid::new_v4().to_string());
     }
 
@@ -1241,6 +1260,11 @@ pub(crate) fn apply_state_catcher(
     });
     let new_input = apply_result_path(effective_input, &error_output, result_path.as_deref());
     Some((next, new_input))
+}
+
+/// Extract the region from an execution ARN (`arn:aws:states:region:account_id:...`).
+pub(crate) fn region_from_arn(arn: &str) -> &str {
+    arn.split(':').nth(3).unwrap_or("")
 }
 
 /// Extract account ID from an execution ARN (`arn:aws:states:region:account_id:...`).

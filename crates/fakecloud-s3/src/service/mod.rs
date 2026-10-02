@@ -30,8 +30,6 @@ mod objects;
 mod tags;
 
 // Re-export notification helpers for use in sub-modules
-#[cfg(test)]
-use notifications::replicate_object;
 pub(super) use notifications::{
     deliver_notifications, normalize_notification_ids, normalize_replication_xml,
     replicate_through_store,

@@ -1087,12 +1087,33 @@ pub(crate) fn emit_event_static_with_state(
         "SourceIdentifier": source_identifier,
         "EventID": event_id,
     });
-    bus.put_event_to_eventbridge(
-        "aws.rds",
-        source_type.detail_type(),
-        &detail.to_string(),
-        "default",
-    );
+    // The event originates in the source resource's account and region,
+    // both carried by its ARN.
+    let mut arn_parts = source_arn.split(':');
+    let region = arn_parts.nth(3).unwrap_or("");
+    let arn_account = arn_parts.next().unwrap_or("");
+    let origin_account = if arn_account.is_empty() {
+        account_id.unwrap_or("")
+    } else {
+        arn_account
+    };
+    if origin_account.is_empty() || region.is_empty() {
+        tracing::warn!(
+            source_arn,
+            "RDS event source ARN carries no account/region; not publishing to EventBridge"
+        );
+        return;
+    }
+    let detail = detail.to_string();
+    bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+        source: "aws.rds",
+        detail_type: source_type.detail_type(),
+        detail: &detail,
+        event_bus: "default",
+        account_id: origin_account,
+        region,
+        resources: &[source_arn.to_string()],
+    });
 }
 
 /// The declared `DBSubnetGroupNotFoundFault` wire shape AWS RDS returns

@@ -915,7 +915,20 @@ fn route_to_destination(
         } else {
             "Lambda Function Invocation Result - Failure"
         };
-        bus.put_event_to_eventbridge("lambda", detail_type, &body, "default");
+        // The destination names the bus by ARN (possibly another account's);
+        // the event originates in the function's account and region.
+        let mut arn_parts = function_arn.split(':');
+        let region = arn_parts.nth(3).unwrap_or("");
+        let account_id = arn_parts.next().unwrap_or("");
+        bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+            source: "lambda",
+            detail_type,
+            detail: &body,
+            event_bus: dest,
+            account_id,
+            region,
+            resources: &[function_arn.to_string()],
+        });
     }
 }
 

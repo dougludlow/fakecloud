@@ -722,23 +722,12 @@ fn test_parse_normalized_replication_rules() {
     assert_eq!(rules[0].dest_bucket, "repl-dest");
 }
 
-#[test]
-fn test_replicate_object() {
-    use crate::state::{S3Bucket, S3State};
-
-    let mut state = S3State::new("123456789012", "us-east-1");
-
-    // Create source and destination buckets
-    let mut src = S3Bucket::new("source", "us-east-1", "owner");
+/// Source object for the replication tests: `test-key` in a versioned
+/// `source` bucket whose replication config is `config`.
+fn replication_source(config: &str, owner: &str) -> crate::state::S3Bucket {
+    let mut src = crate::state::S3Bucket::new("source", "us-east-1", owner);
     src.versioning = Some("Enabled".to_string());
-    src.replication_config = Some(
-        "<ReplicationConfiguration>\
-         <Rule><Status>Enabled</Status>\
-         <Filter><Prefix></Prefix></Filter>\
-         <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
-         </Rule></ReplicationConfiguration>"
-            .to_string(),
-    );
+    src.replication_config = Some(config.to_string());
     let obj = S3Object {
         key: "test-key".to_string(),
         body: crate::state::memory_body(Bytes::from_static(b"hello")),
@@ -748,17 +737,52 @@ fn test_replicate_object() {
         last_modified: Utc::now(),
         storage_class: "STANDARD".to_string(),
         version_id: Some("v1".to_string()),
+        acl_owner_id: Some(owner.to_string()),
         ..Default::default()
     };
     src.objects.insert("test-key".to_string(), obj);
-    state.buckets.insert("source".to_string(), src);
+    src
+}
 
-    let dest = S3Bucket::new("destination", "us-east-1", "owner");
-    state.buckets.insert("destination".to_string(), dest);
+fn replicate(
+    accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    source_account: &str,
+) {
+    let store: Arc<dyn fakecloud_persistence::S3Store> =
+        Arc::new(fakecloud_persistence::MemoryS3Store::new());
+    replicate_through_store(accounts, source_account, &store, "source", "test-key").unwrap();
+}
 
-    replicate_object(&mut state, "source", "test-key");
+#[test]
+fn test_replicate_object() {
+    use crate::state::S3Bucket;
 
-    // Object should now exist in destination
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "123456789012",
+            "us-east-1",
+            "",
+        );
+    let state = accounts.get_or_create("123456789012");
+    state.buckets.insert(
+        "source".to_string(),
+        replication_source(
+            "<ReplicationConfiguration>\
+             <Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>",
+            "owner",
+        ),
+    );
+    state.buckets.insert(
+        "destination".to_string(),
+        S3Bucket::new("destination", "us-east-1", "owner"),
+    );
+
+    replicate(&mut accounts, "123456789012");
+
+    let state = accounts.get("123456789012").unwrap();
     let dest_obj = state
         .buckets
         .get("destination")
@@ -770,6 +794,122 @@ fn test_replicate_object() {
         state.read_body(&dest_obj.unwrap().body).unwrap(),
         Bytes::from_static(b"hello")
     );
+}
+
+/// Bucket names are global: a rule whose destination bucket lives in another
+/// account replicates into that account's bucket, and
+/// `AccessControlTranslation` `Owner=Destination` hands the replica to the
+/// destination owner.
+#[test]
+fn replicate_into_bucket_owned_by_another_account() {
+    use crate::state::S3Bucket;
+
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "111111111111",
+            "us-east-1",
+            "",
+        );
+    accounts.get_or_create("111111111111").buckets.insert(
+        "source".to_string(),
+        replication_source(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::dest-b</Bucket>\
+             <Account>222222222222</Account>\
+             <AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>\
+             </Destination></Rule></ReplicationConfiguration>",
+            "111111111111",
+        ),
+    );
+    accounts.get_or_create("222222222222").buckets.insert(
+        "dest-b".to_string(),
+        S3Bucket::new("dest-b", "us-east-1", "222222222222"),
+    );
+
+    replicate(&mut accounts, "111111111111");
+
+    let b = accounts.get("222222222222").unwrap();
+    let replica = b.buckets["dest-b"]
+        .objects
+        .get("test-key")
+        .expect("replica lands in the destination owner's bucket");
+    assert_eq!(
+        b.read_body(&replica.body).unwrap(),
+        Bytes::from_static(b"hello")
+    );
+    assert_eq!(replica.acl_owner_id.as_deref(), Some("222222222222"));
+    assert_eq!(
+        replica.acl_grants[0].grantee_id.as_deref(),
+        Some("222222222222")
+    );
+}
+
+/// Without ownership translation the replica keeps the source object's owner.
+#[test]
+fn replicate_cross_account_keeps_source_owner_without_translation() {
+    use crate::state::S3Bucket;
+
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "111111111111",
+            "us-east-1",
+            "",
+        );
+    accounts.get_or_create("111111111111").buckets.insert(
+        "source".to_string(),
+        replication_source(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::dest-b</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>",
+            "111111111111",
+        ),
+    );
+    accounts.get_or_create("222222222222").buckets.insert(
+        "dest-b".to_string(),
+        S3Bucket::new("dest-b", "us-east-1", "222222222222"),
+    );
+
+    replicate(&mut accounts, "111111111111");
+
+    let replica = &accounts.get("222222222222").unwrap().buckets["dest-b"].objects["test-key"];
+    assert_eq!(replica.acl_owner_id.as_deref(), Some("111111111111"));
+}
+
+/// A `Destination.Account` that does not own the destination bucket fails
+/// the replication: nothing is written.
+#[test]
+fn replicate_skips_when_destination_account_does_not_own_bucket() {
+    use crate::state::S3Bucket;
+
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "111111111111",
+            "us-east-1",
+            "",
+        );
+    accounts.get_or_create("111111111111").buckets.insert(
+        "source".to_string(),
+        replication_source(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::dest-b</Bucket>\
+             <Account>333333333333</Account></Destination>\
+             </Rule></ReplicationConfiguration>",
+            "111111111111",
+        ),
+    );
+    accounts.get_or_create("222222222222").buckets.insert(
+        "dest-b".to_string(),
+        S3Bucket::new("dest-b", "us-east-1", "222222222222"),
+    );
+
+    replicate(&mut accounts, "111111111111");
+
+    assert!(accounts.get("222222222222").unwrap().buckets["dest-b"]
+        .objects
+        .is_empty());
 }
 
 #[test]

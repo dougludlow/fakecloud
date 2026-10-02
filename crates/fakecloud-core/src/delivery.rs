@@ -158,28 +158,40 @@ pub trait SnsDelivery: Send + Sync {
     }
 }
 
+/// An event another service puts onto an EventBridge bus (S3 bucket
+/// notifications, ECS task state changes, Scheduler/Pipes/Step Functions
+/// targets, ...).
+///
+/// `account_id` and `region` name where the event *originates*: the owner
+/// account and region of the emitting resource. They are stamped into the
+/// event's `account` and `region` fields and are what rule patterns match on,
+/// exactly as AWS does for service events. There is deliberately no
+/// "default account" form: every caller knows the resource the event is
+/// about, and an event that silently lands on another account's bus is
+/// invisible to the rules that should have fired.
+#[derive(Debug, Clone, Copy)]
+pub struct CrossServiceEvent<'a> {
+    pub source: &'a str,
+    pub detail_type: &'a str,
+    /// JSON detail document.
+    pub detail: &'a str,
+    /// Bus name (a bus owned by `account_id`) or a full event-bus ARN. An ARN
+    /// routes the event to the bus owner's account (a cross-account target),
+    /// while the event keeps its originating `account` / `region`.
+    pub event_bus: &'a str,
+    /// Account the event originates in.
+    pub account_id: &'a str,
+    /// Region the event originates in.
+    pub region: &'a str,
+    /// ARNs of the resources the event is about (`resources` field).
+    pub resources: &'a [String],
+}
+
 /// Trait for putting events onto an EventBridge bus from cross-service integrations.
 pub trait EventBridgeDelivery: Send + Sync {
-    /// Put an event onto the specified event bus in the default account.
-    /// The implementation should handle rule matching and target delivery.
-    fn put_event(&self, source: &str, detail_type: &str, detail: &str, event_bus_name: &str);
-
-    /// Put an event onto the specified event bus owned by `target_account_id`.
-    /// Used for cross-account delivery where the source service (e.g. Scheduler)
-    /// has a target ARN containing the destination account. The default impl
-    /// falls back to the default-account `put_event` for backwards compat —
-    /// real implementations should override and route to the target account's
-    /// state.
-    fn put_event_to_account(
-        &self,
-        source: &str,
-        detail_type: &str,
-        detail: &str,
-        event_bus_name: &str,
-        _target_account_id: &str,
-    ) {
-        self.put_event(source, detail_type, detail, event_bus_name);
-    }
+    /// Put `event` onto the bus it names, scoped to the account that owns that
+    /// bus. The implementation handles rule matching and target delivery.
+    fn put_event(&self, event: &CrossServiceEvent<'_>);
 }
 
 /// Trait for invoking Lambda functions from cross-service integrations.
@@ -918,37 +930,11 @@ impl DeliveryBus {
         }
     }
 
-    /// Put an event onto an EventBridge bus in the default account.
-    pub fn put_event_to_eventbridge(
-        &self,
-        source: &str,
-        detail_type: &str,
-        detail: &str,
-        event_bus_name: &str,
-    ) {
+    /// Put a cross-service event onto an EventBridge bus (see
+    /// [`CrossServiceEvent`] for how the bus and account are resolved).
+    pub fn put_event_to_eventbridge(&self, event: &CrossServiceEvent<'_>) {
         if let Some(ref sender) = self.eventbridge_sender {
-            sender.put_event(source, detail_type, detail, event_bus_name);
-        }
-    }
-
-    /// Put an event onto an EventBridge bus in a specific account. Used by
-    /// Scheduler to deliver to cross-account event buses.
-    pub fn put_event_to_eventbridge_for_account(
-        &self,
-        source: &str,
-        detail_type: &str,
-        detail: &str,
-        event_bus_name: &str,
-        target_account_id: &str,
-    ) {
-        if let Some(ref sender) = self.eventbridge_sender {
-            sender.put_event_to_account(
-                source,
-                detail_type,
-                detail,
-                event_bus_name,
-                target_account_id,
-            );
+            sender.put_event(event);
         }
     }
 
@@ -1020,14 +1006,20 @@ mod tests {
         call_count: AtomicUsize,
     }
     impl EventBridgeDelivery for MockEventBridge {
-        fn put_event(
-            &self,
-            _source: &str,
-            _detail_type: &str,
-            _detail: &str,
-            _event_bus_name: &str,
-        ) {
+        fn put_event(&self, _event: &CrossServiceEvent<'_>) {
             self.call_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn test_event<'a>(source: &'a str, bus: &'a str) -> CrossServiceEvent<'a> {
+        CrossServiceEvent {
+            source,
+            detail_type: "type",
+            detail: "{}",
+            event_bus: bus,
+            account_id: "111111111111",
+            region: "eu-west-1",
+            resources: &[],
         }
     }
 
@@ -1055,7 +1047,7 @@ mod tests {
         // Calling methods without senders should be no-ops
         bus.send_to_sqs("arn:queue", "body", &HashMap::new());
         bus.publish_to_sns("arn:topic", "msg", None);
-        bus.put_event_to_eventbridge("src", "type", "{}", "default");
+        bus.put_event_to_eventbridge(&test_event("src", "default"));
         bus.send_to_kinesis("arn:stream", "data", "pk");
         bus.start_stepfunctions_execution("arn:sfn", "{}");
         // No panics = success
@@ -1119,7 +1111,7 @@ mod tests {
         });
         let bus = DeliveryBus::new().with_eventbridge(mock.clone());
 
-        bus.put_event_to_eventbridge("aws.s3", "Object Created", "{}", "default");
+        bus.put_event_to_eventbridge(&test_event("aws.s3", "default"));
         assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -1172,7 +1164,7 @@ mod tests {
 
         bus.send_to_sqs("q", "m", &HashMap::new());
         bus.publish_to_sns("t", "m", None);
-        bus.put_event_to_eventbridge("s", "d", "{}", "b");
+        bus.put_event_to_eventbridge(&test_event("s", "b"));
         bus.send_to_kinesis("s", "d", "k");
         bus.start_stepfunctions_execution("sm", "{}");
 
