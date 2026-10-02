@@ -2608,6 +2608,7 @@ async fn main() {
     }
     registry.register(Arc::new(
         S3Service::with_store(s3_state.clone(), delivery_for_s3, s3_store.clone())
+            .with_iam_mode(cli.iam_mode())
             .with_kms(kms_state.clone())
             .with_kms_hook(kms_hook_for_services.clone())
             .with_credential_resolver(

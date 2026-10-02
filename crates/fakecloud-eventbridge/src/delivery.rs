@@ -2,13 +2,18 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use fakecloud_core::delivery::{CrossServiceEvent, DeliveryBus, EventBridgeDelivery};
+use fakecloud_core::delivery::{
+    CrossServiceEvent, DeliveryBus, EventBridgeDelivery, EventBridgeDeliveryError,
+};
 use fakecloud_lambda::runtime::ContainerRuntime;
 use fakecloud_lambda::SharedLambdaState;
 use fakecloud_logs::SharedLogsState;
 
 use crate::service::helpers::archive_matching_event;
-use crate::service::{dispatch_event_target, matches_pattern, EventDispatchContext};
+use crate::service::{
+    account_root_principal, cross_account_put_denial, dispatch_event_target, matches_pattern,
+    EventDispatchContext,
+};
 use crate::state::{PutEvent, SharedEventBridgeState};
 
 /// The non-bus plumbing a rule target dispatch needs beyond the
@@ -128,9 +133,11 @@ impl DeferredEventBridgeDelivery {
 }
 
 impl EventBridgeDelivery for DeferredEventBridgeDelivery {
-    fn put_event(&self, event: &CrossServiceEvent<'_>) {
-        if let Some(inner) = self.get(event.source, event.detail_type) {
-            inner.put_event(event);
+    fn put_event(&self, event: &CrossServiceEvent<'_>) -> Result<String, EventBridgeDeliveryError> {
+        match self.get(event.source, event.detail_type) {
+            Some(inner) => inner.put_event(event),
+            // Not wired yet (startup): dropped with the warning `get` logs.
+            None => Ok(String::new()),
         }
     }
 }
@@ -149,8 +156,24 @@ fn bus_owner_account<'a>(event_bus: &'a str, origin_account: &'a str) -> &'a str
     }
 }
 
+/// The principal a cross-service event is put as: the source's role when it
+/// names one, otherwise the originating account's root.
+fn event_principal(event: &CrossServiceEvent<'_>) -> fakecloud_core::auth::Principal {
+    match event.principal_arn {
+        Some(arn) if !arn.is_empty() => fakecloud_core::auth::Principal {
+            arn: arn.to_string(),
+            user_id: arn.to_string(),
+            account_id: event.account_id.to_string(),
+            principal_type: fakecloud_core::auth::PrincipalType::AssumedRole,
+            source_identity: None,
+            tags: None,
+        },
+        _ => account_root_principal(event.account_id, event.region),
+    }
+}
+
 impl EventBridgeDelivery for EventBridgeDeliveryImpl {
-    fn put_event(&self, event: &CrossServiceEvent<'_>) {
+    fn put_event(&self, event: &CrossServiceEvent<'_>) -> Result<String, EventBridgeDeliveryError> {
         let CrossServiceEvent {
             source,
             detail_type,
@@ -159,6 +182,7 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
             account_id,
             region,
             resources,
+            principal_arn: _,
         } = *event;
         let event_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -167,6 +191,18 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(owner_account);
         let event_bus_name = state.resolve_bus_name(event_bus);
+
+        // A bus in another account takes the event only when its resource
+        // policy allows the source's principal, exactly as PutEvents gates
+        // cross-account callers. A refused event is not stored, archived or
+        // delivered.
+        if owner_account != account_id {
+            if let Some(message) =
+                cross_account_put_denial(state, &event_bus_name, region, &event_principal(event))
+            {
+                return Err(EventBridgeDeliveryError::AccessDenied(message));
+            }
+        }
 
         let stored = PutEvent {
             event_id: event_id.clone(),
@@ -219,7 +255,7 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
         drop(accounts);
 
         if matching_targets.is_empty() {
-            return;
+            return Ok(event_id);
         }
 
         // Build the EventBridge event envelope
@@ -257,6 +293,7 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
                 Some(&rule_arn),
             );
         }
+        Ok(event_id)
     }
 }
 
@@ -334,6 +371,7 @@ mod tests {
             account_id,
             region: "us-east-1",
             resources: &[],
+            principal_arn: None,
         }
     }
 
@@ -380,7 +418,9 @@ mod tests {
         let state = make_shared();
         let bus = Arc::new(DeliveryBus::new());
         let delivery = EventBridgeDeliveryImpl::new(state.clone(), bus);
-        delivery.put_event(&ev("my.source", "MyType", r#"{"k":"v"}"#, "default"));
+        delivery
+            .put_event(&ev("my.source", "MyType", r#"{"k":"v"}"#, "default"))
+            .unwrap();
         let guard = state.read();
         let default = guard.default_ref();
         assert_eq!(default.events.len(), 1);
@@ -402,7 +442,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state, bus);
-        delivery.put_event(&ev("app", "Changed", r#"{"x":1}"#, "default"));
+        delivery
+            .put_event(&ev("app", "Changed", r#"{"x":1}"#, "default"))
+            .unwrap();
         let calls = recorder.sqs.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, q_arn);
@@ -425,7 +467,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sns(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state, bus);
-        delivery.put_event(&ev("app", "Changed", r#"{}"#, "default"));
+        delivery
+            .put_event(&ev("app", "Changed", r#"{}"#, "default"))
+            .unwrap();
         let calls = recorder.sns.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, topic_arn);
@@ -447,7 +491,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state, bus);
-        delivery.put_event(&ev("app", "Changed", r#"{}"#, "default"));
+        delivery
+            .put_event(&ev("app", "Changed", r#"{}"#, "default"))
+            .unwrap();
         assert!(recorder.sqs.lock().unwrap().is_empty());
     }
 
@@ -466,7 +512,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state, bus);
-        delivery.put_event(&ev("app", "Changed", r#"{}"#, "default"));
+        delivery
+            .put_event(&ev("app", "Changed", r#"{}"#, "default"))
+            .unwrap();
         assert!(recorder.sqs.lock().unwrap().is_empty());
     }
 
@@ -484,7 +532,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state, bus);
-        delivery.put_event(&ev("app", "Type", "not-json", "default"));
+        delivery
+            .put_event(&ev("app", "Type", "not-json", "default"))
+            .unwrap();
         let calls = recorder.sqs.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let env: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
@@ -496,13 +546,15 @@ mod tests {
         let state = make_shared();
         let bus = Arc::new(DeliveryBus::new());
         let delivery = EventBridgeDeliveryImpl::new(state.clone(), bus);
-        delivery.put_event(&ev_in(
-            "scheduler",
-            "Fired",
-            r#"{}"#,
-            "default",
-            "999988887777",
-        ));
+        delivery
+            .put_event(&ev_in(
+                "scheduler",
+                "Fired",
+                r#"{}"#,
+                "default",
+                "999988887777",
+            ))
+            .unwrap();
 
         let guard = state.read();
         let target = guard
@@ -528,13 +580,15 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state, bus);
-        delivery.put_event(&ev_in(
-            "scheduler",
-            "Cross",
-            r#"{"hi":1}"#,
-            "default",
-            "999988887777",
-        ));
+        delivery
+            .put_event(&ev_in(
+                "scheduler",
+                "Cross",
+                r#"{"hi":1}"#,
+                "default",
+                "999988887777",
+            ))
+            .unwrap();
         let calls = recorder.sqs.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, q_arn);
@@ -562,15 +616,18 @@ mod tests {
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state.clone(), bus);
         let resources = vec!["arn:aws:s3:::b".to_string()];
-        delivery.put_event(&CrossServiceEvent {
-            source: "aws.s3",
-            detail_type: "Object Created",
-            detail: "{}",
-            event_bus: "default",
-            account_id: "111111111111",
-            region: "eu-west-2",
-            resources: &resources,
-        });
+        delivery
+            .put_event(&CrossServiceEvent {
+                source: "aws.s3",
+                detail_type: "Object Created",
+                detail: "{}",
+                event_bus: "default",
+                account_id: "111111111111",
+                region: "eu-west-2",
+                resources: &resources,
+                principal_arn: None,
+            })
+            .unwrap();
         let calls = recorder.sqs.lock().unwrap();
         assert_eq!(calls.len(), 1, "region/account pattern must match");
         let env: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
@@ -582,15 +639,34 @@ mod tests {
         assert_eq!(accounts.get("111111111111").unwrap().events.len(), 1);
     }
 
-    /// An event-bus ARN routes the event to the bus owner's account while the
-    /// event keeps its originating account.
-    #[test]
-    fn put_event_bus_arn_routes_to_bus_owner_account() {
+    /// Create bus `custom` in 999988887777 with `policy` and a rule on it
+    /// targeting an SQS queue; returns the SQS recorder's delivery.
+    fn cross_account_bus(
+        policy: Option<serde_json::Value>,
+    ) -> (
+        SharedEventBridgeState,
+        Arc<Recorder>,
+        EventBridgeDeliveryImpl,
+    ) {
         let state = make_shared();
         let q_arn = "arn:aws:sqs:us-east-1:999988887777:q".to_string();
         {
             let mut accounts = state.write();
             let s = accounts.get_or_create("999988887777");
+            s.buses.insert(
+                "custom".to_string(),
+                crate::state::EventBus {
+                    name: "custom".to_string(),
+                    arn: "arn:aws:events:us-east-1:999988887777:event-bus/custom".to_string(),
+                    tags: BTreeMap::new(),
+                    policy,
+                    description: None,
+                    kms_key_identifier: None,
+                    dead_letter_config: None,
+                    creation_time: Utc::now(),
+                    last_modified_time: Utc::now(),
+                },
+            );
             let mut rule = make_rule("on-custom", None, &q_arn);
             rule.event_bus_name = "custom".to_string();
             s.rules
@@ -599,13 +675,34 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(recorder.clone()));
         let delivery = EventBridgeDeliveryImpl::new(state.clone(), bus);
-        delivery.put_event(&ev_in(
-            "app",
-            "T",
-            "{}",
-            "arn:aws:events:us-east-1:999988887777:event-bus/custom",
-            "111111111111",
-        ));
+        (state, recorder, delivery)
+    }
+
+    fn put_events_policy(principal: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "allow",
+                "Effect": "Allow",
+                "Principal": {"AWS": principal},
+                "Action": "events:PutEvents",
+                "Resource": "arn:aws:events:us-east-1:999988887777:event-bus/custom"
+            }]
+        })
+    }
+
+    const CUSTOM_BUS_ARN: &str = "arn:aws:events:us-east-1:999988887777:event-bus/custom";
+
+    /// An event-bus ARN routes the event to the bus owner's account (when its
+    /// policy allows the source account) while the event keeps its
+    /// originating account.
+    #[test]
+    fn put_event_bus_arn_routes_to_bus_owner_account() {
+        let (state, recorder, delivery) =
+            cross_account_bus(Some(put_events_policy("arn:aws:iam::111111111111:root")));
+        delivery
+            .put_event(&ev_in("app", "T", "{}", CUSTOM_BUS_ARN, "111111111111"))
+            .expect("policy allows the source account");
         let calls = recorder.sqs.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let env: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
@@ -615,6 +712,40 @@ mod tests {
         assert_eq!(owner.events.len(), 1);
         assert_eq!(owner.events[0].event_bus_name, "custom");
         assert!(accounts.get("111111111111").is_none());
+    }
+
+    /// A bus in another account with no resource policy refuses the event:
+    /// nothing is stored or delivered and the source gets AccessDenied.
+    #[test]
+    fn put_event_cross_account_bus_without_policy_is_denied() {
+        let (state, recorder, delivery) = cross_account_bus(None);
+        let err = delivery
+            .put_event(&ev_in("app", "T", "{}", CUSTOM_BUS_ARN, "111111111111"))
+            .unwrap_err();
+        assert!(matches!(err, EventBridgeDeliveryError::AccessDenied(_)));
+        assert!(recorder.sqs.lock().unwrap().is_empty());
+        assert!(state.read().get("999988887777").unwrap().events.is_empty());
+    }
+
+    /// The policy is evaluated against the source's role: a policy naming a
+    /// different principal refuses it, one naming the role allows it.
+    #[test]
+    fn put_event_cross_account_policy_is_evaluated_against_source_role() {
+        let role = "arn:aws:iam::111111111111:role/scheduler-role";
+        let (_, _, delivery) = cross_account_bus(Some(put_events_policy(
+            "arn:aws:iam::111111111111:role/other",
+        )));
+        let mut event = ev_in("app", "T", "{}", CUSTOM_BUS_ARN, "111111111111");
+        event.principal_arn = Some(role);
+        assert!(matches!(
+            delivery.put_event(&event),
+            Err(EventBridgeDeliveryError::AccessDenied(_))
+        ));
+
+        let (state, recorder, delivery) = cross_account_bus(Some(put_events_policy(role)));
+        delivery.put_event(&event).expect("policy names the role");
+        assert_eq!(recorder.sqs.lock().unwrap().len(), 1);
+        assert_eq!(state.read().get("999988887777").unwrap().events.len(), 1);
     }
 
     /// Archives on the bus capture service events like PutEvents entries.
@@ -643,8 +774,12 @@ mod tests {
             );
         }
         let delivery = EventBridgeDeliveryImpl::new(state.clone(), Arc::new(DeliveryBus::new()));
-        delivery.put_event(&ev("aws.s3", "Object Created", "{}", "default"));
-        delivery.put_event(&ev("other", "T", "{}", "default"));
+        delivery
+            .put_event(&ev("aws.s3", "Object Created", "{}", "default"))
+            .unwrap();
+        delivery
+            .put_event(&ev("other", "T", "{}", "default"))
+            .unwrap();
         let accounts = state.read();
         let archive = &accounts.default_ref().archives["arch"];
         assert_eq!(archive.event_count, 1);
@@ -685,12 +820,14 @@ mod tests {
                 ..Default::default()
             });
 
-        delivery.put_event(&ev(
-            "aws.s3",
-            "Object Created",
-            r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
-            "default",
-        ));
+        delivery
+            .put_event(&ev(
+                "aws.s3",
+                "Object Created",
+                r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
+                "default",
+            ))
+            .unwrap();
 
         let accounts = lambda_state.read();
         let invocations = &accounts.default_ref().invocations;
@@ -723,7 +860,9 @@ mod tests {
                 ..Default::default()
             });
 
-        delivery.put_event(&ev("app", "T", "{}", "default"));
+        delivery
+            .put_event(&ev("app", "T", "{}", "default"))
+            .unwrap();
 
         let accounts = lambda_state.read();
         assert!(accounts.default_ref().invocations.is_empty());
@@ -748,7 +887,9 @@ mod tests {
                 ..Default::default()
             });
 
-        delivery.put_event(&ev("app", "T", "{}", "default"));
+        delivery
+            .put_event(&ev("app", "T", "{}", "default"))
+            .unwrap();
 
         let accounts = lambda_state.read();
         assert!(accounts.get("555555555555").is_none());
@@ -898,12 +1039,14 @@ mod tests {
                 ..Default::default()
             });
 
-        delivery.put_event(&ev(
-            "aws.s3",
-            "Object Created",
-            r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
-            "default",
-        ));
+        delivery
+            .put_event(&ev(
+                "aws.s3",
+                "Object Created",
+                r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
+                "default",
+            ))
+            .unwrap();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while bodies.lock().unwrap().is_empty() {
@@ -997,7 +1140,9 @@ mod tests {
                 ..Default::default()
             });
 
-        delivery.put_event(&ev("aws.s3", "Object Created", r#"{"k":1}"#, "default"));
+        delivery
+            .put_event(&ev("aws.s3", "Object Created", r#"{"k":1}"#, "default"))
+            .unwrap();
 
         let accounts = logs_state.read();
         let group = accounts
@@ -1016,15 +1161,21 @@ mod tests {
         let state = make_shared();
         let deferred = DeferredEventBridgeDelivery::new();
         // Before the real sender is bound the event is dropped, not panicked on.
-        deferred.put_event(&ev("early", "T", "{}", "default"));
+        deferred
+            .put_event(&ev("early", "T", "{}", "default"))
+            .unwrap();
         assert!(state.read().default_ref().events.is_empty());
 
         deferred.set(Arc::new(EventBridgeDeliveryImpl::new(
             state.clone(),
             Arc::new(DeliveryBus::new()),
         )));
-        deferred.put_event(&ev("app", "T", "{}", "default"));
-        deferred.put_event(&ev_in("app", "T", "{}", "default", "999988887777"));
+        deferred
+            .put_event(&ev("app", "T", "{}", "default"))
+            .unwrap();
+        deferred
+            .put_event(&ev_in("app", "T", "{}", "default", "999988887777"))
+            .unwrap();
 
         let accounts = state.read();
         assert_eq!(accounts.default_ref().events.len(), 1);

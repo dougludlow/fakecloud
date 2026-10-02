@@ -1248,7 +1248,12 @@ async fn invoke_resource(
     }
 
     if is_integration("events:putEvents") {
-        return invoke_eventbridge_put_events(input, delivery, execution_arn);
+        return invoke_eventbridge_put_events(
+            input,
+            delivery,
+            execution_arn,
+            &execution_role_arn(shared_state, execution_arn),
+        );
     }
 
     if is_integration("dynamodb:getItem") {

@@ -99,7 +99,12 @@ pub fn deliver_target(bus: &Arc<DeliveryBus>, schedule: &Schedule) -> Result<(),
             account_id: origin_account,
             region: origin_region,
             resources: std::slice::from_ref(&schedule.arn),
-        });
+            // The schedule puts the event as its execution role; a target
+            // bus in another account must allow that role, or the fire
+            // fails (and is retried / dead-lettered).
+            principal_arn: Some(&schedule.target.role_arn),
+        })
+        .map_err(|err| SqsDeliveryError::AccessDenied(err.to_string()))?;
         return Ok(());
     }
 
@@ -460,8 +465,6 @@ fn fifo_dedup_id(queue_arn: &str, _schedule_arn: &str) -> Option<String> {
     Some(uuid::Uuid::new_v4().to_string())
 }
 
-/// Extract the account-id segment from any AWS ARN. Returns `None` when
-/// the ARN is malformed or omits the account (some service ARNs do).
 /// The `(account, region)` segments of an ARN (empty when absent).
 fn arn_account_region(arn: &str) -> (&str, &str) {
     let mut parts = arn.split(':');
@@ -470,6 +473,8 @@ fn arn_account_region(arn: &str) -> (&str, &str) {
     (account, region)
 }
 
+/// Extract the account-id segment from any AWS ARN. Returns `None` when
+/// the ARN is malformed or omits the account (some service ARNs do).
 fn account_id_from_arn(arn: &str) -> Option<String> {
     let account = arn.split(':').nth(4)?;
     if account.is_empty() {
@@ -631,7 +636,10 @@ mod tests {
         type EbCall = (String, String, String, String, String, String, Vec<String>);
         struct EbRec(Mutex<Vec<EbCall>>);
         impl fakecloud_core::delivery::EventBridgeDelivery for EbRec {
-            fn put_event(&self, e: &fakecloud_core::delivery::CrossServiceEvent<'_>) {
+            fn put_event(
+                &self,
+                e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
                 self.0.lock().unwrap().push((
                     e.source.to_string(),
                     e.detail_type.to_string(),
@@ -641,6 +649,7 @@ mod tests {
                     e.region.to_string(),
                     e.resources.to_vec(),
                 ));
+                Ok("id".to_string())
             }
         }
         let eb = Arc::new(EbRec(Mutex::new(Vec::new())));
@@ -672,6 +681,35 @@ mod tests {
         assert_eq!(calls[0].4, sched_account);
         assert_eq!(calls[0].5, sched_region);
         assert_eq!(calls[0].6, vec![sched.arn.clone()]);
+    }
+
+    /// A target bus that refuses the schedule's role fails the fire, so the
+    /// ticker retries it and routes it to the DLQ.
+    #[test]
+    fn deliver_target_eventbridge_refusal_is_a_delivery_failure() {
+        struct Refusing;
+        impl fakecloud_core::delivery::EventBridgeDelivery for Refusing {
+            fn put_event(
+                &self,
+                _e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+                Err(
+                    fakecloud_core::delivery::EventBridgeDeliveryError::AccessDenied(
+                        "not allowed".to_string(),
+                    ),
+                )
+            }
+        }
+        let bus = Arc::new(DeliveryBus::new().with_eventbridge(Arc::new(Refusing)));
+        let sched = make_schedule(
+            "arn:aws:events:us-east-1:999988887777:event-bus/other",
+            None,
+            Some("{}"),
+        );
+        assert!(matches!(
+            deliver_target(&bus, &sched),
+            Err(SqsDeliveryError::AccessDenied(_))
+        ));
     }
 
     #[test]

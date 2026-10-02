@@ -4116,9 +4116,8 @@ fn put_events_cross_account_allowed_when_bus_policy_grants_caller() {
 #[test]
 fn put_events_cross_account_denied_when_bus_has_no_policy() {
     let svc = make_service();
-    // No bus policy set; cross-account caller still hits an empty policy check
-    // — the gate skips evaluation entirely (AWS treats absence as same-account-only).
-    // Regression: ensure our gate doesn't crash when policy is None.
+    // A bus without a resource policy accepts events only from its own
+    // account, as on AWS.
     let req = cross_account_request(
         "PutEvents",
         json!({
@@ -4129,9 +4128,10 @@ fn put_events_cross_account_denied_when_bus_has_no_policy() {
     );
     let resp = svc.put_events(&req).unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    // No policy = AWS would reject, but we historically allow. Document the
-    // current behavior in this assertion so a future tightening shows up.
-    assert_eq!(body["FailedEntryCount"].as_i64().unwrap(), 0);
+    assert_eq!(body["FailedEntryCount"].as_i64().unwrap(), 1);
+    assert_eq!(body["Entries"][0]["ErrorCode"], "AccessDeniedException");
+    let accounts = svc.state.read();
+    assert!(accounts.default_ref().events.is_empty());
 }
 
 /// No snapshot store (memory mode) -> no persist hook for the CFN provisioner.

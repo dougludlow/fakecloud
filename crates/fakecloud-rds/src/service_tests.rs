@@ -547,7 +547,10 @@ struct RecordingEb {
 }
 
 impl fakecloud_core::delivery::EventBridgeDelivery for RecordingEb {
-    fn put_event(&self, e: &fakecloud_core::delivery::CrossServiceEvent<'_>) {
+    fn put_event(
+        &self,
+        e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+    ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
         self.events.lock().unwrap().push(CapturedEvent {
             source: e.source.to_string(),
             detail_type: e.detail_type.to_string(),
@@ -556,6 +559,7 @@ impl fakecloud_core::delivery::EventBridgeDelivery for RecordingEb {
             region: e.region.to_string(),
             resources: e.resources.to_vec(),
         });
+        Ok("id".to_string())
     }
 }
 

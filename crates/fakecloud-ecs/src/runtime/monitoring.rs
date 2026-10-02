@@ -125,15 +125,21 @@ impl EcsRuntime {
         // region the task runs in; the event originates there.
         let region = task_view.task_arn.split(':').nth(3).unwrap_or("");
         let detail = detail.to_string();
-        bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
-            source: "aws.ecs",
-            detail_type: "ECS Task State Change",
-            detail: &detail,
-            event_bus: "default",
-            account_id,
-            region,
-            resources: std::slice::from_ref(&task_view.task_arn),
-        });
+        // The task account's own default bus: never refused.
+        if let Err(err) =
+            bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+                source: "aws.ecs",
+                detail_type: "ECS Task State Change",
+                detail: &detail,
+                event_bus: "default",
+                account_id,
+                region,
+                resources: std::slice::from_ref(&task_view.task_arn),
+                principal_arn: None,
+            })
+        {
+            tracing::warn!(task_id, %err, "ECS task state change event refused");
+        }
     }
 
     /// Forward captured stdout/stderr to CloudWatch Logs when the task's

@@ -247,12 +247,23 @@ pub(crate) fn parse_replication_rules(xml: &str) -> Vec<ReplicationRule> {
 /// replicate into a bucket another account owns. When the rule names a
 /// `Destination.Account` that does not own the destination bucket, AWS fails
 /// the replication, so nothing is written.
+///
+/// Writing into another account's bucket needs that bucket's policy to allow
+/// the replication role (`s3:ReplicateObject`, plus
+/// `s3:ObjectOwnerOverrideToBucketOwner` with ownership translation). Like
+/// every cross-account check, this follows the IAM mode: a refusal is logged
+/// under `soft` and enforced under `strict`.
+///
+/// The source object's `x-amz-replication-status` becomes `COMPLETED` when
+/// every applicable rule replicated it and `FAILED` otherwise; replicas are
+/// marked `REPLICA`.
 pub(crate) fn replicate_through_store(
     accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
     source_account: &str,
     store: &std::sync::Arc<dyn fakecloud_persistence::S3Store>,
     source_bucket: &str,
     key: &str,
+    iam_mode: fakecloud_core::auth::IamMode,
 ) -> fakecloud_persistence::StoreResult<()> {
     let Some(state) = accounts.get(source_account) else {
         return Ok(());
@@ -264,6 +275,7 @@ pub(crate) fn replicate_through_store(
         return Ok(());
     };
     let rules = parse_replication_rules(&replication_config);
+    let replication_role = extract_xml_value(&replication_config, "Role");
     let Some(src_obj) = src_bucket.objects.get(key).cloned() else {
         return Ok(());
     };
@@ -284,6 +296,8 @@ pub(crate) fn replicate_through_store(
         None
     };
 
+    let mut applied = false;
+    let mut failed = false;
     for rule in &rules {
         if rule.status != "Enabled" {
             continue;
@@ -291,11 +305,39 @@ pub(crate) fn replicate_through_store(
         if !key.starts_with(&rule.prefix) {
             continue;
         }
+        applied = true;
         let dest_bucket_name = rule.dest_bucket.clone();
         let Some(dest_account) = replication_dest_account(accounts, source_account, rule) else {
+            failed = true;
             continue;
         };
+        if dest_account != source_account && iam_mode.is_enabled() {
+            let allowed = replication_authorized(
+                accounts,
+                &dest_account,
+                &dest_bucket_name,
+                key,
+                source_account,
+                replication_role.as_deref(),
+                rule.owner_override,
+            );
+            if !allowed {
+                tracing::warn!(
+                    target: "fakecloud::iam::audit",
+                    source_bucket,
+                    destination_bucket = %dest_bucket_name,
+                    role = replication_role.as_deref().unwrap_or(""),
+                    mode = %iam_mode,
+                    "S3 replication: destination bucket policy does not allow the replication role"
+                );
+                if iam_mode.is_strict() {
+                    failed = true;
+                    continue;
+                }
+            }
+        }
         let Some(dest_state) = accounts.get_mut(&dest_account) else {
+            failed = true;
             continue;
         };
         let dest_versioning_enabled;
@@ -306,6 +348,7 @@ pub(crate) fn replicate_through_store(
             dest_versioning_enabled = dest_bucket.versioning.as_deref() == Some("Enabled");
             let mut replica = src_obj.clone();
             replica.storage_class = "STANDARD".to_string();
+            replica.replication_status = Some("REPLICA".to_string());
             translate_replica_owner(&mut replica, dest_bucket, rule.owner_override);
             // Seed the runtime replica body from whatever we have handy; it
             // is overwritten after `put_object` returns the canonical ref.
@@ -365,7 +408,126 @@ pub(crate) fn replicate_through_store(
             }
         }
     }
+    if applied {
+        let status = if failed { "FAILED" } else { "COMPLETED" };
+        mark_source_replication_status(
+            accounts,
+            source_account,
+            store,
+            source_bucket,
+            key,
+            src_obj.version_id.as_deref(),
+            status,
+        )?;
+    }
     Ok(())
+}
+
+/// Record `status` as the source object's `x-amz-replication-status` (the
+/// current object and its entry in the version history) and persist it.
+fn mark_source_replication_status(
+    accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    source_account: &str,
+    store: &std::sync::Arc<dyn fakecloud_persistence::S3Store>,
+    source_bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    status: &str,
+) -> fakecloud_persistence::StoreResult<()> {
+    let Some(bucket) = accounts
+        .get_mut(source_account)
+        .and_then(|s| s.buckets.get_mut(source_bucket))
+    else {
+        return Ok(());
+    };
+    let mut meta = None;
+    if let Some(obj) = bucket.objects.get_mut(key) {
+        if obj.version_id.as_deref() == version_id {
+            obj.replication_status = Some(status.to_string());
+            meta = Some(crate::persistence::object_meta_snapshot(obj));
+        }
+    }
+    if let Some(versions) = bucket.object_versions.get_mut(key) {
+        if let Some(v) = versions
+            .iter_mut()
+            .rev()
+            .find(|v| v.version_id.as_deref() == version_id)
+        {
+            v.replication_status = Some(status.to_string());
+        }
+    }
+    match meta {
+        Some(meta) => store.put_object_meta(source_bucket, key, version_id, &meta),
+        None => Ok(()),
+    }
+}
+
+/// Whether the destination bucket's policy lets the replication role
+/// (`role`, in `source_account`; the account root when the configuration
+/// names none) replicate `key` into it: `s3:ReplicateObject`, plus
+/// `s3:ObjectOwnerOverrideToBucketOwner` when the rule translates ownership.
+/// A bucket without a policy grants nothing to another account.
+fn replication_authorized(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    dest_account: &str,
+    dest_bucket: &str,
+    key: &str,
+    source_account: &str,
+    role: Option<&str>,
+    owner_override: bool,
+) -> bool {
+    let Some(bucket) = accounts
+        .get(dest_account)
+        .and_then(|s| s.buckets.get(dest_bucket))
+    else {
+        return false;
+    };
+    let Some(policy) = bucket.policy.as_deref() else {
+        return false;
+    };
+    let doc = fakecloud_iam::evaluator::PolicyDocument::parse(policy);
+    let partition = fakecloud_aws::arn::partition_for(&bucket.region);
+    let principal = match role.filter(|r| !r.is_empty()) {
+        Some(role) => fakecloud_core::auth::Principal {
+            arn: role.to_string(),
+            user_id: role.to_string(),
+            account_id: source_account.to_string(),
+            principal_type: fakecloud_core::auth::PrincipalType::AssumedRole,
+            source_identity: None,
+            tags: None,
+        },
+        None => fakecloud_core::auth::Principal {
+            arn: Arn::global("iam", source_account, "root")
+                .with_partition(partition)
+                .to_string(),
+            user_id: source_account.to_string(),
+            account_id: source_account.to_string(),
+            principal_type: fakecloud_core::auth::PrincipalType::Root,
+            source_identity: None,
+            tags: None,
+        },
+    };
+    let resource = Arn::s3_in(&bucket.region, &format!("{dest_bucket}/{key}")).to_string();
+    let mut actions = vec!["s3:ReplicateObject"];
+    if owner_override {
+        actions.push("s3:ObjectOwnerOverrideToBucketOwner");
+    }
+    actions.into_iter().all(|action| {
+        let request = fakecloud_iam::evaluator::EvalRequest {
+            principal: &principal,
+            action: action.to_string(),
+            resource: resource.clone(),
+            context: fakecloud_iam::evaluator::RequestContext {
+                aws_principal_arn: Some(principal.arn.clone()),
+                aws_principal_account: Some(principal.account_id.clone()),
+                ..Default::default()
+            },
+        };
+        matches!(
+            fakecloud_iam::evaluator::evaluate_resource_policy_only(&doc, &request),
+            fakecloud_iam::evaluator::Decision::Allow
+        )
+    })
 }
 
 /// The account owning a replication rule's destination bucket: the source
@@ -911,7 +1073,9 @@ pub(crate) fn deliver_notification_batch(
                 detail["deletion-type"] = serde_json::json!("Delete marker created");
             }
             let detail = detail.to_string();
-            delivery.put_event_to_eventbridge(&CrossServiceEvent {
+            // The owner's own default bus: never a cross-account put, so it
+            // cannot be refused.
+            if let Err(err) = delivery.put_event_to_eventbridge(&CrossServiceEvent {
                 source: "aws.s3",
                 detail_type: &eventbridge_detail_type(event_name),
                 detail: &detail,
@@ -919,7 +1083,10 @@ pub(crate) fn deliver_notification_batch(
                 account_id: &owner_account,
                 region: &bucket_region,
                 resources: &bucket_arn,
-            });
+                principal_arn: None,
+            }) {
+                tracing::warn!(bucket = bucket_name, %err, "S3 EventBridge notification refused");
+            }
         }
 
         let mut matched = false;
@@ -1159,13 +1326,17 @@ mod tests {
     struct EbRecorder(std::sync::Mutex<Vec<EbCall>>);
 
     impl fakecloud_core::delivery::EventBridgeDelivery for EbRecorder {
-        fn put_event(&self, e: &CrossServiceEvent<'_>) {
+        fn put_event(
+            &self,
+            e: &CrossServiceEvent<'_>,
+        ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
             self.0.lock().unwrap().push((
                 e.event_bus.to_string(),
                 e.account_id.to_string(),
                 e.region.to_string(),
                 e.resources.to_vec(),
             ));
+            Ok("id".to_string())
         }
     }
 

@@ -123,6 +123,9 @@ impl S3Service {
         headers.insert("accept-ranges", "bytes".parse().unwrap());
         // Always include storage class
         headers.insert("x-amz-storage-class", obj.storage_class.parse().unwrap());
+        if let Some(status) = obj.replication_status.as_deref() {
+            headers.insert("x-amz-replication-status", status.parse().unwrap());
+        }
         if let Some(vid) = &obj.version_id {
             headers.insert("x-amz-version-id", vid.parse().unwrap());
         }
@@ -440,6 +443,9 @@ impl S3Service {
         );
         headers.insert("accept-ranges", "bytes".parse().unwrap());
         headers.insert("x-amz-storage-class", obj.storage_class.parse().unwrap());
+        if let Some(status) = obj.replication_status.as_deref() {
+            headers.insert("x-amz-replication-status", status.parse().unwrap());
+        }
         let hq = |k: &str| req.query_params.get(k).map(|s| s.to_string());
         if let Some(enc) = hq("response-content-encoding").or_else(|| obj.content_encoding.clone())
         {

@@ -1105,7 +1105,8 @@ pub(crate) fn emit_event_static_with_state(
         return;
     }
     let detail = detail.to_string();
-    bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+    // The source account's own default bus: never refused.
+    if let Err(err) = bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
         source: "aws.rds",
         detail_type: source_type.detail_type(),
         detail: &detail,
@@ -1113,7 +1114,10 @@ pub(crate) fn emit_event_static_with_state(
         account_id: origin_account,
         region,
         resources: &[source_arn.to_string()],
-    });
+        principal_arn: None,
+    }) {
+        tracing::warn!(source_arn, %err, "RDS EventBridge event refused");
+    }
 }
 
 /// The declared `DBSubnetGroupNotFoundFault` wire shape AWS RDS returns

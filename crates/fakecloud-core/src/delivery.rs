@@ -69,6 +69,10 @@ pub enum SqsDeliveryError {
     /// content-based dedup enabled). Surfaces as a non-retriable
     /// failure so the upstream service can route to its configured DLQ.
     InvalidParameter(String),
+    /// The target refused the delivery for lack of authorization (e.g. a
+    /// Scheduler target bus in another account whose resource policy does
+    /// not allow the schedule's role).
+    AccessDenied(String),
 }
 
 impl std::fmt::Display for SqsDeliveryError {
@@ -77,6 +81,7 @@ impl std::fmt::Display for SqsDeliveryError {
             Self::QueueNotFound(arn) => write!(f, "queue not found: {arn}"),
             Self::InvalidArn(arn) => write!(f, "invalid queue ARN: {arn}"),
             Self::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
+            Self::AccessDenied(msg) => write!(f, "access denied: {msg}"),
         }
     }
 }
@@ -185,13 +190,29 @@ pub struct CrossServiceEvent<'a> {
     pub region: &'a str,
     /// ARNs of the resources the event is about (`resources` field).
     pub resources: &'a [String],
+    /// The IAM role the source acts as when it puts the event (a schedule's
+    /// or pipe's role, a state machine's execution role). A bus in another
+    /// account authorizes the put against this principal through its
+    /// resource policy; `None` means the originating account's root.
+    pub principal_arn: Option<&'a str>,
+}
+
+/// Why EventBridge refused a cross-service event.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EventBridgeDeliveryError {
+    /// The target bus belongs to another account and its resource policy
+    /// does not allow the source's principal to put events on it. The event
+    /// is not stored, archived or delivered.
+    #[error("AccessDeniedException: {0}")]
+    AccessDenied(String),
 }
 
 /// Trait for putting events onto an EventBridge bus from cross-service integrations.
 pub trait EventBridgeDelivery: Send + Sync {
     /// Put `event` onto the bus it names, scoped to the account that owns that
     /// bus. The implementation handles rule matching and target delivery.
-    fn put_event(&self, event: &CrossServiceEvent<'_>);
+    /// Returns the new event's ID, or why the put was refused.
+    fn put_event(&self, event: &CrossServiceEvent<'_>) -> Result<String, EventBridgeDeliveryError>;
 }
 
 /// Trait for invoking Lambda functions from cross-service integrations.
@@ -932,9 +953,14 @@ impl DeliveryBus {
 
     /// Put a cross-service event onto an EventBridge bus (see
     /// [`CrossServiceEvent`] for how the bus and account are resolved).
-    pub fn put_event_to_eventbridge(&self, event: &CrossServiceEvent<'_>) {
-        if let Some(ref sender) = self.eventbridge_sender {
-            sender.put_event(event);
+    /// `Ok(None)` when no EventBridge sender is wired.
+    pub fn put_event_to_eventbridge(
+        &self,
+        event: &CrossServiceEvent<'_>,
+    ) -> Result<Option<String>, EventBridgeDeliveryError> {
+        match self.eventbridge_sender {
+            Some(ref sender) => sender.put_event(event).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -1006,8 +1032,12 @@ mod tests {
         call_count: AtomicUsize,
     }
     impl EventBridgeDelivery for MockEventBridge {
-        fn put_event(&self, _event: &CrossServiceEvent<'_>) {
+        fn put_event(
+            &self,
+            _event: &CrossServiceEvent<'_>,
+        ) -> Result<String, EventBridgeDeliveryError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok("id".to_string())
         }
     }
 
@@ -1020,6 +1050,7 @@ mod tests {
             account_id: "111111111111",
             region: "eu-west-1",
             resources: &[],
+            principal_arn: None,
         }
     }
 
@@ -1047,7 +1078,7 @@ mod tests {
         // Calling methods without senders should be no-ops
         bus.send_to_sqs("arn:queue", "body", &HashMap::new());
         bus.publish_to_sns("arn:topic", "msg", None);
-        bus.put_event_to_eventbridge(&test_event("src", "default"));
+        let _ = bus.put_event_to_eventbridge(&test_event("src", "default"));
         bus.send_to_kinesis("arn:stream", "data", "pk");
         bus.start_stepfunctions_execution("arn:sfn", "{}");
         // No panics = success
@@ -1111,7 +1142,7 @@ mod tests {
         });
         let bus = DeliveryBus::new().with_eventbridge(mock.clone());
 
-        bus.put_event_to_eventbridge(&test_event("aws.s3", "default"));
+        let _ = bus.put_event_to_eventbridge(&test_event("aws.s3", "default"));
         assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -1164,7 +1195,7 @@ mod tests {
 
         bus.send_to_sqs("q", "m", &HashMap::new());
         bus.publish_to_sns("t", "m", None);
-        bus.put_event_to_eventbridge(&test_event("s", "b"));
+        let _ = bus.put_event_to_eventbridge(&test_event("s", "b"));
         bus.send_to_kinesis("s", "d", "k");
         bus.start_stepfunctions_execution("sm", "{}");
 

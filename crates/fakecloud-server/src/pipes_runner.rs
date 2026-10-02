@@ -788,6 +788,7 @@ impl PipesRunner {
             .collect();
         self.deliver(
             &pipe.arn,
+            pipe.role_arn.as_deref(),
             &pipe.target_arn,
             pipe.target_params.as_ref(),
             &transformed,
@@ -839,6 +840,7 @@ impl PipesRunner {
     async fn deliver(
         &self,
         pipe_arn: &str,
+        pipe_role_arn: Option<&str>,
         target_arn: &str,
         target_params: Option<&Value>,
         batch: &[Value],
@@ -925,7 +927,7 @@ impl PipesRunner {
                 .unwrap_or_default();
             for event in batch {
                 let detail = event_to_payload(event);
-                self.delivery.put_event_to_eventbridge(
+                let put = self.delivery.put_event_to_eventbridge(
                     &fakecloud_core::delivery::CrossServiceEvent {
                         source,
                         detail_type,
@@ -934,8 +936,15 @@ impl PipesRunner {
                         account_id: &origin_account,
                         region: &origin_region,
                         resources: &resources,
+                        principal_arn: pipe_role_arn,
                     },
                 );
+                if let Err(err) = put {
+                    // The target bus refused the pipe's role: a failed
+                    // delivery, retried / dead-lettered like any other.
+                    tracing::warn!(%target_arn, %err, "pipes: EventBridge target refused the event");
+                    return false;
+                }
             }
             true
         } else if target_arn.contains(":kinesis:") {

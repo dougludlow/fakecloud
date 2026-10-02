@@ -748,9 +748,17 @@ fn replicate(
     accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
     source_account: &str,
 ) {
+    replicate_with_mode(accounts, source_account, fakecloud_core::auth::IamMode::Off);
+}
+
+fn replicate_with_mode(
+    accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    source_account: &str,
+    mode: fakecloud_core::auth::IamMode,
+) {
     let store: Arc<dyn fakecloud_persistence::S3Store> =
         Arc::new(fakecloud_persistence::MemoryS3Store::new());
-    replicate_through_store(accounts, source_account, &store, "source", "test-key").unwrap();
+    replicate_through_store(accounts, source_account, &store, "source", "test-key", mode).unwrap();
 }
 
 #[test]
@@ -910,6 +918,116 @@ fn replicate_skips_when_destination_account_does_not_own_bucket() {
     assert!(accounts.get("222222222222").unwrap().buckets["dest-b"]
         .objects
         .is_empty());
+    assert_eq!(
+        accounts.get("111111111111").unwrap().buckets["source"].objects["test-key"]
+            .replication_status
+            .as_deref(),
+        Some("FAILED")
+    );
+}
+
+const CROSS_ACCOUNT_REPLICATION: &str = "<ReplicationConfiguration>\
+     <Role>arn:aws:iam::111111111111:role/replication</Role>\
+     <Rule><Status>Enabled</Status><Filter><Prefix></Prefix></Filter>\
+     <Destination><Bucket>arn:aws:s3:::dest-b</Bucket></Destination>\
+     </Rule></ReplicationConfiguration>";
+
+/// Source bucket in 111111111111 replicating into `dest-b` in 222222222222,
+/// whose bucket policy is `policy`.
+fn cross_account_replication(
+    policy: Option<&str>,
+) -> fakecloud_core::multi_account::MultiAccountState<crate::state::S3State> {
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "111111111111",
+            "us-east-1",
+            "",
+        );
+    accounts.get_or_create("111111111111").buckets.insert(
+        "source".to_string(),
+        replication_source(CROSS_ACCOUNT_REPLICATION, "111111111111"),
+    );
+    let mut dest = crate::state::S3Bucket::new("dest-b", "us-east-1", "222222222222");
+    dest.policy = policy.map(str::to_string);
+    accounts
+        .get_or_create("222222222222")
+        .buckets
+        .insert("dest-b".to_string(), dest);
+    accounts
+}
+
+fn source_status(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+) -> Option<String> {
+    accounts.get("111111111111").unwrap().buckets["source"].objects["test-key"]
+        .replication_status
+        .clone()
+}
+
+/// Under strict IAM, a destination bucket in another account without a
+/// policy granting the replication role refuses the replica, and the source
+/// is marked FAILED.
+#[test]
+fn replicate_cross_account_denied_without_bucket_policy_under_strict() {
+    let mut accounts = cross_account_replication(None);
+    replicate_with_mode(
+        &mut accounts,
+        "111111111111",
+        fakecloud_core::auth::IamMode::Strict,
+    );
+    assert!(accounts.get("222222222222").unwrap().buckets["dest-b"]
+        .objects
+        .is_empty());
+    assert_eq!(source_status(&accounts).as_deref(), Some("FAILED"));
+}
+
+/// A destination policy granting `s3:ReplicateObject` to the replication role
+/// lets the replica through; the source is COMPLETED and the replica REPLICA.
+#[test]
+fn replicate_cross_account_allowed_by_bucket_policy_under_strict() {
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+        "Principal":{"AWS":"arn:aws:iam::111111111111:role/replication"},
+        "Action":["s3:ReplicateObject","s3:ReplicateDelete"],
+        "Resource":"arn:aws:s3:::dest-b/*"}]}"#;
+    let mut accounts = cross_account_replication(Some(policy));
+    replicate_with_mode(
+        &mut accounts,
+        "111111111111",
+        fakecloud_core::auth::IamMode::Strict,
+    );
+    let replica = &accounts.get("222222222222").unwrap().buckets["dest-b"].objects["test-key"];
+    assert_eq!(replica.replication_status.as_deref(), Some("REPLICA"));
+    assert_eq!(source_status(&accounts).as_deref(), Some("COMPLETED"));
+}
+
+/// A policy naming another principal does not authorize the role.
+#[test]
+fn replicate_cross_account_denied_when_policy_names_other_principal() {
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+        "Principal":{"AWS":"arn:aws:iam::111111111111:role/other"},
+        "Action":"s3:ReplicateObject","Resource":"arn:aws:s3:::dest-b/*"}]}"#;
+    let mut accounts = cross_account_replication(Some(policy));
+    replicate_with_mode(
+        &mut accounts,
+        "111111111111",
+        fakecloud_core::auth::IamMode::Strict,
+    );
+    assert_eq!(source_status(&accounts).as_deref(), Some("FAILED"));
+}
+
+/// Under soft IAM the refusal is only logged: the replica is written.
+#[test]
+fn replicate_cross_account_soft_mode_logs_and_replicates() {
+    let mut accounts = cross_account_replication(None);
+    replicate_with_mode(
+        &mut accounts,
+        "111111111111",
+        fakecloud_core::auth::IamMode::Soft,
+    );
+    assert!(accounts.get("222222222222").unwrap().buckets["dest-b"]
+        .objects
+        .contains_key("test-key"));
+    assert_eq!(source_status(&accounts).as_deref(), Some("COMPLETED"));
 }
 
 #[test]

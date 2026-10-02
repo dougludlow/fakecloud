@@ -552,15 +552,22 @@ async fn s3_eventbridge_event_reaches_bucket_owner_rule_in_bucket_region() {
 // S3 replication into a bucket owned by another account
 // ======================================================================
 
-#[tokio::test]
-async fn s3_replication_delivers_to_bucket_in_another_account() {
-    let server = start().await;
+/// Account A's versioned `src` bucket replicating everything into account
+/// B's versioned `dst` bucket (with ownership translation), B's bucket policy
+/// set to `dst_policy`. Returns both clients.
+async fn setup_cross_account_replication(
+    server: &TestServer,
+    src: &'static str,
+    dst: &'static str,
+    dst_policy: Option<String>,
+) -> (S3Client, S3Client) {
     let (a_akid, a_secret) = server.create_admin(ACCOUNT_A, "admin-a").await;
     let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
-    let s3_a = S3Client::new(&config_with(&server, &a_akid, &a_secret).await);
-    let s3_b = S3Client::new(&config_with(&server, &b_akid, &b_secret).await);
+    let s3_a = S3Client::new(&config_with(server, &a_akid, &a_secret).await);
+    let s3_b = S3Client::new(&config_with(server, &b_akid, &b_secret).await);
 
-    let enable_versioning = |s3: S3Client, bucket: &'static str| async move {
+    for (s3, bucket) in [(&s3_a, src), (&s3_b, dst)] {
+        s3.create_bucket().bucket(bucket).send().await.unwrap();
         s3.put_bucket_versioning()
             .bucket(bucket)
             .versioning_configuration(
@@ -571,19 +578,15 @@ async fn s3_replication_delivers_to_bucket_in_another_account() {
             .send()
             .await
             .unwrap();
-    };
-    s3_a.create_bucket()
-        .bucket("repl-src-a")
-        .send()
-        .await
-        .unwrap();
-    enable_versioning(s3_a.clone(), "repl-src-a").await;
-    s3_b.create_bucket()
-        .bucket("repl-dst-b")
-        .send()
-        .await
-        .unwrap();
-    enable_versioning(s3_b.clone(), "repl-dst-b").await;
+    }
+    if let Some(policy) = dst_policy {
+        s3_b.put_bucket_policy()
+            .bucket(dst)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+    }
 
     let rule = aws_sdk_s3::types::ReplicationRule::builder()
         .id("to-b")
@@ -601,7 +604,7 @@ async fn s3_replication_delivers_to_bucket_in_another_account() {
         )
         .destination(
             aws_sdk_s3::types::Destination::builder()
-                .bucket("arn:aws:s3:::repl-dst-b")
+                .bucket(format!("arn:aws:s3:::{dst}"))
                 .account(ACCOUNT_B)
                 .access_control_translation(
                     aws_sdk_s3::types::AccessControlTranslation::builder()
@@ -615,10 +618,10 @@ async fn s3_replication_delivers_to_bucket_in_another_account() {
         .build()
         .unwrap();
     s3_a.put_bucket_replication()
-        .bucket("repl-src-a")
+        .bucket(src)
         .replication_configuration(
             aws_sdk_s3::types::ReplicationConfiguration::builder()
-                .role(format!("arn:aws:iam::{ACCOUNT_A}:role/replication"))
+                .role(REPLICATION_ROLE)
                 .rules(rule)
                 .build()
                 .unwrap(),
@@ -628,7 +631,7 @@ async fn s3_replication_delivers_to_bucket_in_another_account() {
         .unwrap();
 
     s3_a.put_object()
-        .bucket("repl-src-a")
+        .bucket(src)
         .key("doc.txt")
         .body(aws_sdk_s3::primitives::ByteStream::from_static(
             b"replicated",
@@ -636,6 +639,22 @@ async fn s3_replication_delivers_to_bucket_in_another_account() {
         .send()
         .await
         .unwrap();
+    (s3_a, s3_b)
+}
+
+const REPLICATION_ROLE: &str = "arn:aws:iam::123456789012:role/replication";
+
+/// Account B's bucket policy grants account A's replication role the
+/// replication actions, so the replica lands in B's bucket (as REPLICA) and
+/// the source reports COMPLETED.
+#[tokio::test]
+async fn s3_replication_delivers_to_bucket_in_another_account() {
+    let server = start().await;
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{REPLICATION_ROLE}"}},"Action":["s3:ReplicateObject","s3:ReplicateDelete","s3:ObjectOwnerOverrideToBucketOwner"],"Resource":"arn:aws:s3:::repl-dst-b/*"}}]}}"#
+    );
+    let (s3_a, s3_b) =
+        setup_cross_account_replication(&server, "repl-src-a", "repl-dst-b", Some(policy)).await;
 
     let got = s3_b
         .get_object()
@@ -644,6 +663,52 @@ async fn s3_replication_delivers_to_bucket_in_another_account() {
         .send()
         .await
         .expect("replica must land in account B's bucket");
+    assert_eq!(
+        got.replication_status(),
+        Some(&aws_sdk_s3::types::ReplicationStatus::Replica)
+    );
     let body = got.body.collect().await.unwrap().into_bytes();
     assert_eq!(&body[..], b"replicated");
+
+    let head = s3_a
+        .head_object()
+        .bucket("repl-src-a")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.replication_status(),
+        Some(&aws_sdk_s3::types::ReplicationStatus::Completed)
+    );
+}
+
+/// Without a bucket policy granting the replication role, account B's bucket
+/// refuses the replica (strict IAM): nothing lands there and the source
+/// reports FAILED.
+#[tokio::test]
+async fn s3_replication_to_another_account_requires_bucket_policy() {
+    let server = start().await;
+    let (s3_a, s3_b) =
+        setup_cross_account_replication(&server, "repl-src-deny", "repl-dst-deny", None).await;
+
+    let missing = s3_b
+        .get_object()
+        .bucket("repl-dst-deny")
+        .key("doc.txt")
+        .send()
+        .await;
+    assert!(missing.is_err(), "no replica without a bucket policy grant");
+
+    let head = s3_a
+        .head_object()
+        .bucket("repl-src-deny")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.replication_status(),
+        Some(&aws_sdk_s3::types::ReplicationStatus::Failed)
+    );
 }
