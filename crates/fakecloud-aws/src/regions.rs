@@ -41,18 +41,15 @@ pub const COMMERCIAL_REGIONS: &[(&str, bool)] = &[
     ("sa-east-1", false),
 ];
 
-/// The availability-zone letters a Region has (AWS's real AZ count; where
-/// AWS skips a letter for new accounts, e.g. ap-northeast-1 and
-/// ca-central-1, the letters accounts actually get). Regions outside the
+/// The availability-zone letters a Region has (AWS's real AZ count). Where
+/// the letters an account sees differ between accounts (us-west-1 exposes
+/// two of a/b/c, ap-northeast-1 three of a/b/c/d), this is the union, so a
+/// name any real account accepts is accepted here. Regions outside the
 /// commercial list default to three zones, `a`-`c`.
 pub fn availability_zone_letters(region: &str) -> &'static str {
     match region {
         "us-east-1" => "abcdef",
-        "us-west-2" | "ap-northeast-2" => "abcd",
-        // Accounts see two of a/b/c; `a` keeps the `{region}a` default
-        // placement valid everywhere.
-        "us-west-1" => "ac",
-        "ap-northeast-1" => "acd",
+        "us-west-2" | "ap-northeast-2" | "ap-northeast-1" => "abcd",
         "ca-central-1" => "abd",
         _ => "abc",
     }
@@ -93,8 +90,9 @@ mod tests {
     fn availability_zone_counts_follow_aws() {
         assert_eq!(availability_zone_letters("us-east-1").len(), 6);
         assert_eq!(availability_zone_letters("us-west-2").len(), 4);
-        assert_eq!(availability_zone_letters("us-west-1").len(), 2);
-        assert_eq!(availability_zone_letters("ap-northeast-1"), "acd");
+        // Unions of the letters different accounts see.
+        assert_eq!(availability_zone_letters("us-west-1"), "abc");
+        assert_eq!(availability_zone_letters("ap-northeast-1"), "abcd");
         for (r, _) in COMMERCIAL_REGIONS {
             let letters = availability_zone_letters(r);
             assert!(letters.len() >= 2, "{r}");

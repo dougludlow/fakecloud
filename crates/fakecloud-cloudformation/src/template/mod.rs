@@ -920,11 +920,11 @@ Resources:
             resolve_refs(&v, &p, &r, &ids, &attrs),
             serde_json::json!(["eu-west-1a", "eu-west-1b", "eu-west-1c"])
         );
-        // A region without a `b` zone never yields one.
-        let v: Value = serde_json::from_str(r#"{"Fn::GetAZs": "ap-northeast-1"}"#).unwrap();
+        // A region's zone set follows EC2's (ca-central-1 has no `c`).
+        let v: Value = serde_json::from_str(r#"{"Fn::GetAZs": "ca-central-1"}"#).unwrap();
         assert_eq!(
             resolve_refs(&v, &p, &r, &ids, &attrs),
-            serde_json::json!(["ap-northeast-1a", "ap-northeast-1c", "ap-northeast-1d"])
+            serde_json::json!(["ca-central-1a", "ca-central-1b", "ca-central-1d"])
         );
     }
 

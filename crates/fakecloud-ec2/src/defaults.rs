@@ -728,8 +728,9 @@ mod tests {
         assert_eq!(zone_id_for("us-east-1a"), "use1-az1");
         assert_eq!(zone_id_for("us-east-1f"), "use1-az6");
         assert_eq!(zone_id_for("us-gov-west-1b"), "usgw1-az2");
-        // ap-northeast-1 has no `b` zone: its listed zones number in order.
-        assert_eq!(zone_id_for("ap-northeast-1c"), "apne1-az2");
+        // Zones number in order of their letters.
+        assert_eq!(zone_id_for("ap-northeast-1d"), "apne1-az4");
+        assert_eq!(zone_id_for("ca-central-1d"), "cac1-az3");
         assert_eq!(zone_id_for("ap-southeast-2c"), "apse2-az3");
         assert_eq!(zone_id_for("ap-south-1b"), "aps1-az2");
         assert_eq!(
@@ -770,7 +771,11 @@ mod tests {
         // Only the zones DescribeAvailabilityZones lists.
         assert!(!zone_in_region("us-east-1", "us-east-1g"));
         assert!(!zone_in_region("us-west-2", "us-west-2e"));
-        assert!(!zone_in_region("ap-northeast-1", "ap-northeast-1b"));
+        // Names some real accounts have are accepted.
+        assert!(zone_in_region("ap-northeast-1", "ap-northeast-1b"));
+        assert!(zone_in_region("us-west-1", "us-west-1b"));
+        assert!(zone_in_region("us-west-1", "us-west-1c"));
+        assert!(!zone_in_region("us-west-1", "us-west-1d"));
         assert!(!zone_in_region("us-east-1", "us-west-2a"));
         assert!(!zone_in_region("us-east-1", "us-east-1"));
         assert!(!zone_in_region("us-east-1", "us-east-1ab"));

@@ -492,6 +492,9 @@ async fn describe_regions_and_zone_ids_follow_aws_naming() {
         ("ap-southeast-1", "apse1", 3),
         ("us-west-2", "usw2", 4),
         ("us-east-1", "use1", 6),
+        // The union of the letters different accounts see.
+        ("us-west-1", "usw1", 3),
+        ("ap-northeast-1", "apne1", 4),
     ] {
         let rc = aws_sdk_ec2::Client::new(&server.aws_config_in(region).await);
         let zones = rc.describe_availability_zones().send().await.unwrap();
