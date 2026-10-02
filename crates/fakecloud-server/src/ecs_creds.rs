@@ -242,6 +242,18 @@ impl EcsTaskCredentials {
         self.respond_relative(task_id)
     }
 
+    /// Whether a request for the agent's relative-URI surface that reached
+    /// the main port from `peer` may be served. On ECS that address only
+    /// answers inside the task's network, so under `--iam strict` it is
+    /// served only to peers on a container network (a task's NAT rule makes
+    /// its requests arrive from the container's bridge / pod address), not to
+    /// arbitrary clients of the main port such as processes on the host
+    /// itself. Outside strict mode every peer is served, as before. The
+    /// dedicated `--imds-link-local` listener is not subject to this check.
+    pub fn relative_uri_source_allowed(&self, peer: Option<std::net::IpAddr>) -> bool {
+        !self.require_authorization_token || peer.is_some_and(is_container_network_address)
+    }
+
     /// The agent's relative-URI (`169.254.170.2/v2/credentials/<id>`)
     /// response for `task_id`. As on ECS it takes no authorization token:
     /// the address is only routed from inside the task's own network
@@ -332,9 +344,42 @@ pub async fn link_local_host_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     if is_link_local_host(req.headers()) {
+        let peer = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip());
+        if !creds.relative_uri_source_allowed(peer) {
+            tracing::warn!(
+                target: "fakecloud::iam::audit",
+                peer = ?peer,
+                "agent credentials request on the main port from outside a container network; refused under --iam strict"
+            );
+            return CredentialsError::Unauthorized.into_response();
+        }
         return respond_link_local(&creds, req.method(), req.uri().path());
     }
     next.run(req).await
+}
+
+/// Whether `ip` is an address a container network hands out: the private
+/// IPv4 ranges Docker / Podman bridges and Kubernetes pod networks draw from
+/// (10/8, 172.16/12, 192.168/16, 100.64/10 CGNAT) and IPv6 unique-local /
+/// link-local. Loopback (the host itself) and public addresses are not.
+fn is_container_network_address(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_private() || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_container_network_address(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// Revoke stopped tasks' credentials for as long as the server runs.
@@ -608,12 +653,76 @@ mod tests {
         // only reachable from the task's own network namespace.
         let app = app(endpoint);
         use tower::ServiceExt;
-        let req = axum::http::Request::builder()
+        let mut req = axum::http::Request::builder()
             .uri("/v2/credentials/t")
             .header(axum::http::header::HOST, LINK_LOCAL_HOST)
             .body(axum::body::Body::empty())
             .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "172.17.0.2:40000".parse::<std::net::SocketAddr>().unwrap(),
+        ));
         let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn strict_mode_serves_the_agent_surface_only_to_container_networks() {
+        let (ecs, iam, default) = setup();
+        let strict = EcsTaskCredentials::with_authorization(ecs, iam, ACCOUNT, true);
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        for allowed in [
+            "172.17.0.2",
+            "172.31.255.1",
+            "10.88.0.5",
+            "10.244.1.7",
+            "192.168.65.3",
+            "100.64.0.9",
+            "fd00::5",
+            "fe80::1",
+            "::ffff:172.18.0.4",
+        ] {
+            assert!(strict.relative_uri_source_allowed(ip(allowed)), "{allowed}");
+        }
+        for refused in [
+            "127.0.0.1",
+            "::1",
+            "8.8.8.8",
+            "172.32.0.1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                !strict.relative_uri_source_allowed(ip(refused)),
+                "{refused}"
+            );
+        }
+        assert!(!strict.relative_uri_source_allowed(None));
+        // Outside strict mode every peer is served, as before.
+        assert!(default.relative_uri_source_allowed(ip("127.0.0.1")));
+        assert!(default.relative_uri_source_allowed(None));
+    }
+
+    #[tokio::test]
+    async fn strict_middleware_refuses_host_loopback_and_serves_a_container_peer() {
+        use tower::ServiceExt;
+        let (ecs, iam, _) = setup();
+        let endpoint = EcsTaskCredentials::with_authorization(ecs.clone(), iam, ACCOUNT, true);
+        add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+        let app = app(endpoint);
+        let req = |peer: &str| {
+            let mut r = axum::http::Request::builder()
+                .uri("/v2/credentials/t")
+                .header(axum::http::header::HOST, LINK_LOCAL_HOST)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            r.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            r
+        };
+        let resp = app.clone().oneshot(req("127.0.0.1:5555")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app.clone().oneshot(req("172.17.0.2:5555")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
