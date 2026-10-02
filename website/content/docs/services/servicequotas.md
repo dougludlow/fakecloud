@@ -80,8 +80,9 @@ from an account outside an organization return
   **`GetAssociationForServiceQuotaTemplate`** reports `ASSOCIATED` or
   `DISASSOCIATED`, and **`DisassociateServiceQuotaTemplate`** detaches it.
 - An associated template is applied to every account **created** in the
-  organization after the association: each entry becomes an approved increase
-  request in that account and region. Accounts that were already members, or
+  organization after the association, when the account is created: each entry
+  becomes an increase request in that account and region, decided on the same
+  terms as `RequestServiceQuotaIncrease`. Accounts that were already members, or
   that joined by invitation, are left alone.
 
 ### Tags

@@ -2500,11 +2500,12 @@ pub(crate) fn modify_instance_attribute(
     // `DisableApiTermination.Value`). Validate it only when present.
     validate_enum(&req.query_params, "Attribute", ATTRIBUTE_VALUES)?;
     let p = &req.query_params;
-    crate::service::quota::check_groups_per_instance(
+    crate::service::quota::check_group_count(
         svc,
         &req.account_id,
         &req.region,
-        indexed_list(p, "GroupId").len(),
+        crate::service::quota::GroupHolder::Instance,
+        crate::service::quota::distinct_count(&indexed_list(p, "GroupId")),
     )?;
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);

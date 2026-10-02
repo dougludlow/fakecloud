@@ -10,6 +10,17 @@
 //! own resources reports the usage behind a quota, which Service Quotas turns
 //! into a quota utilization report.
 
+/// Service code of the Amazon VPC quotas.
+pub const VPC_SERVICE_CODE: &str = "vpc";
+/// `vpc` quota: security groups per network interface.
+pub const SECURITY_GROUPS_PER_INTERFACE: &str = "L-2AFB9258";
+/// `vpc` quota: inbound or outbound rules per security group.
+pub const RULES_PER_SECURITY_GROUP: &str = "L-0EA8095F";
+/// AWS default for [`SECURITY_GROUPS_PER_INTERFACE`].
+pub const DEFAULT_SECURITY_GROUPS_PER_INTERFACE: usize = 5;
+/// AWS default for [`RULES_PER_SECURITY_GROUP`].
+pub const DEFAULT_RULES_PER_SECURITY_GROUP: usize = 60;
+
 /// Resolves the applied value of a quota for an account.
 pub trait QuotaProvider: Send + Sync {
     /// The applied value of `service_code`/`quota_code` for `account_id` in

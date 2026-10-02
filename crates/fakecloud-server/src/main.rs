@@ -832,11 +832,12 @@ async fn main() {
     );
     // Applied quota values, for the services that enforce a quota (EC2's
     // security groups per interface and rules per group).
+    let servicequotas_provider = Arc::new(fakecloud_servicequotas::ServiceQuotasProvider::new(
+        servicequotas_state.clone(),
+        organizations_state.clone(),
+    ));
     let quota_provider: Arc<dyn fakecloud_core::quota::QuotaProvider> =
-        Arc::new(fakecloud_servicequotas::ServiceQuotasProvider::new(
-            servicequotas_state.clone(),
-            organizations_state.clone(),
-        ));
+        servicequotas_provider.clone();
     let support_state: fakecloud_support::SharedSupportState = Arc::new(parking_lot::RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new(
             &cli.account_id,
@@ -4453,14 +4454,27 @@ async fn main() {
         servicequotas_state.clone(),
         organizations_state.clone(),
     )
-    .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()));
+    .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()))
+    // Associating the template enables trusted access in Organizations.
+    .with_organizations_snapshot_hook(cfn_snapshot_hooks.get("organizations").cloned());
     if let Some(store) = servicequotas_snapshot_store {
         servicequotas_service = servicequotas_service.with_snapshot_store(store);
     }
     if let Some(h) = servicequotas_service.snapshot_hook() {
+        servicequotas_provider.set_snapshot_hook(h.clone());
         cfn_snapshot_hooks.insert("servicequotas", h);
     }
-    registry.register(Arc::new(servicequotas_service));
+    let servicequotas_service = Arc::new(servicequotas_service);
+    registry.register(servicequotas_service.clone());
+    // AWS applies an associated quota request template when an account is
+    // created in the organization.
+    {
+        let sq = servicequotas_service.clone();
+        org_change_hooks.register(Arc::new(move || {
+            let sq = sq.clone();
+            Box::pin(async move { sq.apply_templates_to_org_members().await })
+        }));
+    }
 
     // AWS Support (support): awsJson1.1 support-cases + Trusted Advisor control
     // plane (cases, communications, attachment sets, severity levels, the

@@ -6292,6 +6292,85 @@ mod tests {
     }
 
     #[test]
+    fn ec2_security_group_over_the_rule_quota_leaves_no_partial_state() {
+        // 61 inline ingress rules exceed the default 60 rules-per-group quota.
+        let over: Vec<serde_json::Value> = (0..61)
+            .map(|i| {
+                serde_json::json!({"IpProtocol": "tcp", "FromPort": 1000 + i,
+                    "ToPort": 1000 + i, "CidrIp": "10.0.0.0/8"})
+            })
+            .collect();
+        let prov = make_provisioner();
+        let vpc = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc",
+                serde_json::json!({ "CidrBlock": "10.4.0.0/16" }),
+            ))
+            .expect("VPC provisions");
+        let groups_before = prov
+            .ec2_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .security_groups
+            .len();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::SecurityGroup",
+                "Big",
+                serde_json::json!({
+                    "GroupDescription": "test", "VpcId": vpc.physical_id,
+                    "SecurityGroupIngress": over.clone()
+                }),
+            ))
+            .expect_err("over the rules quota");
+        assert!(err.contains("rules per security group"), "{err}");
+        assert_eq!(
+            prov.ec2_state
+                .read()
+                .get("123456789012")
+                .unwrap()
+                .security_groups
+                .len(),
+            groups_before,
+            "the rejected group is not orphaned"
+        );
+
+        // An update over the quota keeps the group's current rules.
+        let sg = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::SecurityGroup",
+                "Sg",
+                serde_json::json!({
+                    "GroupDescription": "test", "VpcId": vpc.physical_id,
+                    "SecurityGroupIngress": [
+                        {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": "0.0.0.0/0"}
+                    ]
+                }),
+            ))
+            .expect("SG provisions");
+        assert!(prov
+            .update_resource(
+                &sg,
+                &make_resource(
+                    "AWS::EC2::SecurityGroup",
+                    "Sg",
+                    serde_json::json!({
+                        "GroupDescription": "test", "VpcId": vpc.physical_id,
+                        "SecurityGroupIngress": over
+                    }),
+                ),
+            )
+            .is_err());
+        let ec2 = prov.ec2_state.read();
+        let g = &ec2.get("123456789012").unwrap().security_groups[&sg.physical_id];
+        let ingress: Vec<_> = g.rules.iter().filter(|r| !r.is_egress).collect();
+        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress[0].from_port, 22);
+    }
+
+    #[test]
     fn unknown_resource_type_records_instead_of_failing() {
         let prov = make_provisioner();
         // A real AWS type fakecloud has no provisioner for. It must NOT fail

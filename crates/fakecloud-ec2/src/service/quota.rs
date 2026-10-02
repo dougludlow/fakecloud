@@ -16,16 +16,12 @@ use crate::service::Ec2Service;
 use crate::service_helpers::indexed_list;
 use crate::state::{SecurityGroupRule, SharedEc2State};
 
-const VPC: &str = "vpc";
-/// `vpc` L-2AFB9258: security groups per network interface.
-const SECURITY_GROUPS_PER_INTERFACE: &str = "L-2AFB9258";
-/// `vpc` L-0EA8095F: inbound or outbound rules per security group.
-const RULES_PER_SECURITY_GROUP: &str = "L-0EA8095F";
-
-/// AWS default for security groups per network interface.
-pub(crate) const DEFAULT_SECURITY_GROUPS_PER_INTERFACE: usize = 5;
-/// AWS default for inbound (or outbound) rules per security group.
-pub(crate) const DEFAULT_RULES_PER_SECURITY_GROUP: usize = 60;
+pub(crate) use fakecloud_core::quota::{
+    DEFAULT_RULES_PER_SECURITY_GROUP, DEFAULT_SECURITY_GROUPS_PER_INTERFACE,
+};
+use fakecloud_core::quota::{
+    RULES_PER_SECURITY_GROUP, SECURITY_GROUPS_PER_INTERFACE, VPC_SERVICE_CODE as VPC,
+};
 
 impl Ec2Service {
     fn applied_quota(
@@ -71,6 +67,12 @@ impl Ec2Service {
 pub(crate) fn direction_rule_count<'a>(
     rules: impl Iterator<Item = &'a SecurityGroupRule>,
 ) -> usize {
+    let [v4, v6] = side_counts(rules);
+    v4.max(v6)
+}
+
+/// IPv4-side and IPv6-side rule counts of one direction's rules.
+pub(crate) fn side_counts<'a>(rules: impl Iterator<Item = &'a SecurityGroupRule>) -> [usize; 2] {
     let (mut v4, mut v6) = (0usize, 0usize);
     for r in rules {
         if r.cidr_ipv6.is_none() {
@@ -80,7 +82,27 @@ pub(crate) fn direction_rule_count<'a>(
             v6 += 1;
         }
     }
-    v4.max(v6)
+    [v4, v6]
+}
+
+/// The first quota side (direction x IP version) an edit grows past `limit`,
+/// as `(count, direction)`. A side that was already over the limit and does
+/// not grow is left alone: the edit did not cause it.
+pub(crate) fn side_grown_past(
+    before: &[SecurityGroupRule],
+    after: &[SecurityGroupRule],
+    limit: usize,
+) -> Option<(usize, &'static str)> {
+    for (egress, direction) in [(false, "inbound"), (true, "outbound")] {
+        let b = side_counts(before.iter().filter(|r| r.is_egress == egress));
+        let a = side_counts(after.iter().filter(|r| r.is_egress == egress));
+        for side in 0..2 {
+            if a[side] > limit && a[side] > b[side] {
+                return Some((a[side], direction));
+            }
+        }
+    }
+    None
 }
 
 /// The binding rule count of a group: the busier direction.
@@ -93,46 +115,47 @@ fn bad_request(code: &str, message: String) -> AwsServiceError {
     AwsServiceError::aws_error(http::StatusCode::BAD_REQUEST, code, message)
 }
 
-/// `SecurityGroupsPerInterfaceLimitExceeded` when a network interface would
-/// carry more groups than the applied quota allows.
-pub(crate) fn check_groups_per_interface(
-    svc: &Ec2Service,
-    account_id: &str,
-    region: &str,
-    requested: usize,
-) -> Result<(), AwsServiceError> {
-    let limit = svc.security_groups_per_interface(account_id, region);
-    if requested > limit {
-        return Err(bad_request(
-            "SecurityGroupsPerInterfaceLimitExceeded",
-            format!(
-                "The maximum number of security groups per interface has been reached: \
-                 requested {requested}, limit {limit}"
-            ),
-        ));
-    }
-    Ok(())
+/// Which kind of resource a security-group count is for: AWS reports the
+/// same quota under a different error code for each.
+#[derive(Clone, Copy)]
+pub(crate) enum GroupHolder {
+    Interface,
+    Instance,
 }
 
-/// `SecurityGroupsPerInstanceLimitExceeded` when an instance would carry more
-/// groups than its network interface may.
-pub(crate) fn check_groups_per_instance(
+/// `SecurityGroupsPerInterfaceLimitExceeded` (or `...PerInstance...` for an
+/// instance) when more groups are requested than the applied quota allows.
+pub(crate) fn check_group_count(
     svc: &Ec2Service,
     account_id: &str,
     region: &str,
+    holder: GroupHolder,
     requested: usize,
 ) -> Result<(), AwsServiceError> {
     let limit = svc.security_groups_per_interface(account_id, region);
-    if requested > limit {
-        return Err(bad_request(
-            "SecurityGroupsPerInstanceLimitExceeded",
-            format!(
-                "The maximum number of security groups per instance has been reached: \
-                 requested {requested}, limit {limit}"
-            ),
-        ));
+    if requested <= limit {
+        return Ok(());
     }
-    Ok(())
+    let (code, noun) = match holder {
+        GroupHolder::Interface => ("SecurityGroupsPerInterfaceLimitExceeded", "interface"),
+        GroupHolder::Instance => ("SecurityGroupsPerInstanceLimitExceeded", "instance"),
+    };
+    Err(bad_request(
+        code,
+        format!(
+            "The maximum number of security groups per {noun} has been reached: requested \
+             {requested}, limit {limit}"
+        ),
+    ))
+}
+
+/// Groups a request names, counted once each: AWS does not count a repeated
+/// id twice.
+pub(crate) fn distinct_count(ids: &[String]) -> usize {
+    let mut ids: Vec<&String> = ids.iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len()
 }
 
 /// Security-group counts of a launch (`RunInstances` parameters, after any
@@ -144,9 +167,35 @@ pub(crate) fn check_launch_groups(
     region: &str,
     params: &HashMap<String, String>,
 ) -> Result<(), AwsServiceError> {
-    let instance_level = distinct(indexed_list(params, "SecurityGroupId"))
-        + distinct(indexed_list(params, "SecurityGroup"));
-    check_groups_per_instance(svc, account_id, region, instance_level)?;
+    let mut ids = indexed_list(params, "SecurityGroupId");
+    let names = indexed_list(params, "SecurityGroup");
+    if !names.is_empty() {
+        // A group named by `SecurityGroup.N` is the same group when its id is
+        // also listed, so resolve names to ids before counting.
+        let accounts = svc.state.read();
+        if let Some(state) = accounts.get(account_id) {
+            for name in &names {
+                let resolved: Vec<&String> = state
+                    .security_groups
+                    .values()
+                    .filter(|g| &g.group_name == name)
+                    .map(|g| &g.group_id)
+                    .collect();
+                if !resolved.iter().any(|id| ids.contains(id)) {
+                    ids.push(format!("name:{name}"));
+                }
+            }
+        } else {
+            ids.extend(names.iter().map(|n| format!("name:{n}")));
+        }
+    }
+    check_group_count(
+        svc,
+        account_id,
+        region,
+        GroupHolder::Instance,
+        distinct_count(&ids),
+    )?;
     let mut interfaces: Vec<&str> = params
         .keys()
         .filter_map(|k| k.strip_prefix("NetworkInterface."))
@@ -156,15 +205,15 @@ pub(crate) fn check_launch_groups(
     interfaces.dedup();
     for n in interfaces {
         let groups = indexed_list(params, &format!("NetworkInterface.{n}.SecurityGroupId"));
-        check_groups_per_interface(svc, account_id, region, distinct(groups))?;
+        check_group_count(
+            svc,
+            account_id,
+            region,
+            GroupHolder::Interface,
+            distinct_count(&groups),
+        )?;
     }
     Ok(())
-}
-
-fn distinct(mut ids: Vec<String>) -> usize {
-    ids.sort_unstable();
-    ids.dedup();
-    ids.len()
 }
 
 /// `RulesPerSecurityGroupLimitExceeded`.
@@ -252,6 +301,31 @@ mod tests {
         assert_eq!(group_rule_count(&rules), 3);
     }
 
+    #[test]
+    fn an_edit_is_judged_on_the_side_it_grows() {
+        // Ingress already holds 3 IPv4 rules (over a limit of 2); egress has
+        // 2 IPv4 rules. Moving one egress rule to IPv6 grows nothing past 2.
+        let mut before = vec![
+            rule(false, Some("10.0.0.0/8"), None, None),
+            rule(false, Some("10.1.0.0/16"), None, None),
+            rule(false, Some("10.2.0.0/16"), None, None),
+            rule(true, Some("10.0.0.0/8"), None, None),
+            rule(true, Some("10.1.0.0/16"), None, None),
+        ];
+        let mut after = before.clone();
+        after[4].cidr_ipv4 = None;
+        after[4].cidr_ipv6 = Some("::/0".into());
+        assert_eq!(side_grown_past(&before, &after, 2), None);
+        // Egress growing to 3 IPv6 rules is caught even though ingress, the
+        // busier direction, does not change.
+        before.push(rule(true, None, Some("::/1"), None));
+        before.push(rule(true, None, Some("::/2"), None));
+        let mut after = before.clone();
+        after[3].cidr_ipv4 = None;
+        after[3].cidr_ipv6 = Some("::/3".into());
+        assert_eq!(side_grown_past(&before, &after, 2), Some((3, "outbound")));
+    }
+
     struct Fixed(f64);
     impl QuotaProvider for Fixed {
         fn applied_value(&self, _: &str, _: &str, _: &str, _: &str) -> Option<f64> {
@@ -268,11 +342,10 @@ mod tests {
         assert_eq!(svc.rules_per_security_group(a, r), 60);
         let svc = Ec2Service::new().with_quota_provider(Some(Arc::new(Fixed(8.0))));
         assert_eq!(svc.security_groups_per_interface(a, r), 8);
-        assert!(check_groups_per_interface(&svc, a, r, 8).is_ok());
+        let check = |n| check_group_count(&svc, a, r, GroupHolder::Interface, n);
+        assert!(check(8).is_ok());
         assert_eq!(
-            check_groups_per_interface(&svc, a, r, 9)
-                .unwrap_err()
-                .code(),
+            check(9).unwrap_err().code(),
             "SecurityGroupsPerInterfaceLimitExceeded"
         );
     }

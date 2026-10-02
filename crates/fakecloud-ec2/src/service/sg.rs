@@ -7,7 +7,8 @@ use fakecloud_aws::ec2query::{ec2_bool, ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::quota::{
-    check_groups_per_interface, direction_rule_count, group_rule_count, rules_limit_exceeded,
+    check_group_count, direction_rule_count, group_rule_count, rules_limit_exceeded,
+    side_grown_past, GroupHolder,
 };
 use crate::service::Ec2Service;
 use crate::service_helpers::{
@@ -820,11 +821,10 @@ pub(crate) fn modify_security_group_rules(
             }
             n += 1;
         }
-        let worst = group_rule_count(&rules);
-        if worst > rule_limit && worst > group_rule_count(&sg.rules) {
+        if let Some((count, direction)) = side_grown_past(&sg.rules, &rules, rule_limit) {
             return Err(rules_limit_exceeded(format!(
                 "The maximum number of rules per security group has been reached: the \
-                 security group '{group_id}' would have {worst} rules in one direction, limit \
+                 security group '{group_id}' would have {count} {direction} rules, limit \
                  {rule_limit}"
             )));
         }
@@ -1132,7 +1132,13 @@ pub(crate) fn validate_security_group_quotas_for_interface(
         }
     }
 
-    check_groups_per_interface(svc, &req.account_id, &req.region, group_ids.len())?;
+    check_group_count(
+        svc,
+        &req.account_id,
+        &req.region,
+        GroupHolder::Interface,
+        group_ids.len(),
+    )?;
     let rule_limit = svc.rules_per_security_group(&req.account_id, &req.region);
     for (id, worst) in &counts {
         // Each direction has its own allowance, so the busier one decides.

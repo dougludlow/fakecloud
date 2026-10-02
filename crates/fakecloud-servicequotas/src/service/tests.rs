@@ -613,3 +613,62 @@ fn provider_reports_applied_values() {
         None
     );
 }
+
+#[test]
+fn template_entries_are_held_to_the_approval_rules() {
+    let o = org_with_member(3600);
+    let s = svc_with(o);
+    for (code, value) in [("L-2AFB9258", 16.0), ("L-0EA8095F", 200.0)] {
+        run(
+            &s,
+            MGMT,
+            "PutServiceQuotaIncreaseRequestIntoTemplate",
+            json!({ "ServiceCode": "vpc", "QuotaCode": code, "AwsRegion": "us-east-1", "DesiredValue": value }),
+        )
+        .unwrap();
+    }
+    run(&s, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    let groups = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap()["Quota"]
+        ["Value"]
+        .as_f64()
+        .unwrap();
+    let rules = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap()["Quota"]
+        ["Value"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        groups * rules <= catalog::SG_RULES_PRODUCT_LIMIT,
+        "{groups} x {rules}"
+    );
+    let hist = run(
+        &s,
+        MEMBER,
+        "ListRequestedServiceQuotaChangeHistory",
+        json!({ "Status": "NOT_APPROVED" }),
+    )
+    .unwrap();
+    assert_eq!(hist["RequestedQuotas"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn template_applied_on_membership_change_survives_disassociation() {
+    let o = org_with_member(3600);
+    let s = svc_with(o);
+    run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1", "DesiredValue": 8.0 }),
+    )
+    .unwrap();
+    run(&s, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    // The account is created (Organizations fires its change hooks) before it
+    // ever calls Service Quotas, and the template is disassociated after.
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(s.apply_templates_to_org_members());
+    run(&s, MGMT, "DisassociateServiceQuotaTemplate", json!({})).unwrap();
+    let member_quota = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(member_quota["Quota"]["Value"], 8.0);
+}

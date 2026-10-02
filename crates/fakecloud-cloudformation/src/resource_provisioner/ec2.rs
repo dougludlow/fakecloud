@@ -388,15 +388,27 @@ impl ResourceProvisioner {
         // Apply inline ingress/egress rules (CreateSecurityGroup only creates
         // the empty group; without this the template's rules are silently
         // dropped and the SG denies everything).
-        if let Some(rules) = props.get("SecurityGroupIngress").and_then(|v| v.as_array()) {
-            if !rules.is_empty() {
-                self.ec2_dispatch("AuthorizeSecurityGroupIngress", sg_rule_params(&id, rules))?;
+        let authorize = || -> Result<(), String> {
+            for (key, action) in [
+                ("SecurityGroupIngress", "AuthorizeSecurityGroupIngress"),
+                ("SecurityGroupEgress", "AuthorizeSecurityGroupEgress"),
+            ] {
+                if let Some(rules) = props.get(key).and_then(|v| v.as_array()) {
+                    if !rules.is_empty() {
+                        self.ec2_dispatch(action, sg_rule_params(&id, rules))?;
+                    }
+                }
             }
-        }
-        if let Some(rules) = props.get("SecurityGroupEgress").and_then(|v| v.as_array()) {
-            if !rules.is_empty() {
-                self.ec2_dispatch("AuthorizeSecurityGroupEgress", sg_rule_params(&id, rules))?;
-            }
+            Ok(())
+        };
+        // A rejected rule set (over the rules-per-group quota, say) fails the
+        // resource, which then has no physical id to roll back through, so the
+        // group created above is removed here rather than orphaned.
+        if let Err(err) = authorize() {
+            let mut params = HashMap::new();
+            params.insert("GroupId".to_string(), id.clone());
+            let _ = self.ec2_dispatch("DeleteSecurityGroup", params);
+            return Err(err);
         }
 
         Ok(ProvisionResult::new(id.clone())
@@ -574,20 +586,37 @@ impl ResourceProvisioner {
         // provision dispatch has no Revoke action, so drop them directly in
         // state (equivalent to a revoke-all for the direction the template
         // manages inline), then authorize the desired set via the real handler.
-        {
+        let removed: Vec<_> = {
             let mut accounts = self.ec2_state.write();
             let state = accounts.get_or_create(&self.account_id);
-            if let Some(sg) = state.security_groups.get_mut(group_id) {
-                sg.rules.retain(|r| r.is_egress != is_egress);
+            match state.security_groups.get_mut(group_id) {
+                Some(sg) => {
+                    let (removed, kept) = std::mem::take(&mut sg.rules)
+                        .into_iter()
+                        .partition(|r| r.is_egress == is_egress);
+                    sg.rules = kept;
+                    removed
+                }
+                None => Vec::new(),
             }
-        }
+        };
         if !rules.is_empty() {
             let action = if is_egress {
                 "AuthorizeSecurityGroupEgress"
             } else {
                 "AuthorizeSecurityGroupIngress"
             };
-            self.ec2_dispatch(action, sg_rule_params(group_id, rules))?;
+            if let Err(err) = self.ec2_dispatch(action, sg_rule_params(group_id, rules)) {
+                // The update failed (the new set is over the rules-per-group
+                // quota, say): put the direction's previous rules back so the
+                // group is left as it was, not stripped.
+                let mut accounts = self.ec2_state.write();
+                let state = accounts.get_or_create(&self.account_id);
+                if let Some(sg) = state.security_groups.get_mut(group_id) {
+                    sg.rules.extend(removed);
+                }
+                return Err(err);
+            }
         }
         Ok(())
     }

@@ -39,13 +39,11 @@ pub struct QuotaDef {
     pub usage_metric: Option<UsageMetric>,
 }
 
-pub const VPC: &str = "vpc";
-pub const EC2: &str = "ec2";
+pub use fakecloud_core::quota::{
+    RULES_PER_SECURITY_GROUP, SECURITY_GROUPS_PER_INTERFACE, VPC_SERVICE_CODE as VPC,
+};
 
-/// `vpc` L-2AFB9258: security groups per network interface.
-pub const SECURITY_GROUPS_PER_INTERFACE: &str = "L-2AFB9258";
-/// `vpc` L-0EA8095F: inbound or outbound rules per security group.
-pub const RULES_PER_SECURITY_GROUP: &str = "L-0EA8095F";
+pub const EC2: &str = "ec2";
 /// AWS caps security groups per interface multiplied by rules per security
 /// group at this value; an increase request that would exceed it is denied.
 pub const SG_RULES_PRODUCT_LIMIT: f64 = 1000.0;
@@ -150,7 +148,7 @@ pub const QUOTAS: &[QuotaDef] = &[
             VPC,
             SECURITY_GROUPS_PER_INTERFACE,
             "Security groups per network interface",
-            5.0,
+            fakecloud_core::quota::DEFAULT_SECURITY_GROUPS_PER_INTERFACE as f64,
             true,
         ),
         16.0,
@@ -159,7 +157,7 @@ pub const QUOTAS: &[QuotaDef] = &[
         VPC,
         RULES_PER_SECURITY_GROUP,
         "Inbound or outbound rules per security group",
-        60.0,
+        fakecloud_core::quota::DEFAULT_RULES_PER_SECURITY_GROUP as f64,
         true,
     ),
     q(VPC, "L-F678F1CE", "VPCs per Region", 5.0, true),

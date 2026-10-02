@@ -84,11 +84,12 @@ pub(crate) fn create_network_interface(
         "InterfaceType",
         &["efa", "efa-only", "branch", "trunk"],
     )?;
-    crate::service::quota::check_groups_per_interface(
+    crate::service::quota::check_group_count(
         svc,
         &req.account_id,
         &req.region,
-        indexed_list(&req.query_params, "SecurityGroupId").len(),
+        crate::service::quota::GroupHolder::Interface,
+        crate::service::quota::distinct_count(&indexed_list(&req.query_params, "SecurityGroupId")),
     )?;
     let id = gen_id("eni");
     // Resolve the subnet's VPC, and default the security group to that VPC's
@@ -374,11 +375,12 @@ pub(crate) fn modify_network_interface_attribute(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let eni_id = require(&req.query_params, "NetworkInterfaceId")?;
-    crate::service::quota::check_groups_per_interface(
+    crate::service::quota::check_group_count(
         svc,
         &req.account_id,
         &req.region,
-        indexed_list(&req.query_params, "SecurityGroupId").len(),
+        crate::service::quota::GroupHolder::Interface,
+        crate::service::quota::distinct_count(&indexed_list(&req.query_params, "SecurityGroupId")),
     )?;
     // The old handler validated the id and returned true, persisting nothing --
     // so SourceDestCheck (NAT-instance source/dest disable), Description, and

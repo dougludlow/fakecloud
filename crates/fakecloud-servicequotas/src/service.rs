@@ -30,11 +30,12 @@ use fakecloud_persistence::SnapshotStore;
 use crate::catalog::{self, QuotaDef};
 use crate::persistence::save_snapshot;
 use crate::provider::{
-    applied_value, apply_template_if_new, new_request_id, quota_arn, quota_region, requester,
+    applied_value, apply_template_if_new, approvable, new_request_id, quota_arn, quota_region,
+    requester,
 };
 use crate::state::{
-    applied_key, template_key, AutoManagement, QuotaRequest, ServiceQuotasData,
-    SharedServiceQuotasState, TemplateEntry, UtilizationEntry, UtilizationReport,
+    applied_key, template_key, AutoManagement, QuotaRequest, SharedServiceQuotasState,
+    TemplateEntry, UtilizationEntry, UtilizationReport,
 };
 use crate::validate::{
     check_str, illegal_argument, opt_bool, opt_enum, opt_int, opt_plain_str, opt_str, req_double,
@@ -97,6 +98,9 @@ pub struct ServiceQuotasService {
     state: SharedServiceQuotasState,
     orgs: SharedOrganizationsState,
     usage_sources: Vec<Arc<dyn QuotaUsageSource>>,
+    /// Persists Organizations state, which associating the template changes
+    /// (it enables trusted access for Service Quotas).
+    orgs_snapshot_hook: Option<fakecloud_persistence::SnapshotHook>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
 }
@@ -107,6 +111,7 @@ impl ServiceQuotasService {
             state,
             orgs,
             usage_sources: Vec::new(),
+            orgs_snapshot_hook: None,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
@@ -121,6 +126,44 @@ impl ServiceQuotasService {
     pub fn with_usage_source(mut self, source: Arc<dyn QuotaUsageSource>) -> Self {
         self.usage_sources.push(source);
         self
+    }
+
+    /// Persist Organizations state through `hook` after the template is
+    /// associated.
+    pub fn with_organizations_snapshot_hook(
+        mut self,
+        hook: Option<fakecloud_persistence::SnapshotHook>,
+    ) -> Self {
+        self.orgs_snapshot_hook = hook;
+        self
+    }
+
+    /// Apply the organization's quota request template to every member
+    /// account it is due for. AWS applies it when an account is created, so
+    /// this runs on every Organizations membership change; the per-request
+    /// check in [`AwsService::handle`] covers accounts restored from a
+    /// snapshot.
+    pub async fn apply_templates_to_org_members(&self) {
+        let members: Vec<String> = self
+            .orgs
+            .read()
+            .iter()
+            .flat_map(|org| {
+                org.accounts
+                    .keys()
+                    .filter(|id| **id != org.management_account_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let now = Utc::now();
+        let mut changed = false;
+        for account in &members {
+            changed |= apply_template_if_new(&self.state, &self.orgs, account, now);
+        }
+        if changed {
+            self.save().await;
+        }
     }
 
     pub fn snapshot_hook(&self) -> Option<fakecloud_persistence::SnapshotHook> {
@@ -156,24 +199,18 @@ impl AwsService for ServiceQuotasService {
     async fn handle(&self, request: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         // Applying the organization's template to a new account changes its
         // state, so it counts as a mutation even on a read.
-        let before = self
-            .state
-            .read()
-            .get(&request.account_id)
-            .map(checked_marker);
-        apply_template_if_new(&self.state, &self.orgs, &request.account_id, Utc::now());
-        let template_applied = self
-            .state
-            .read()
-            .get(&request.account_id)
-            .map(checked_marker)
-            != before;
+        let template_applied =
+            apply_template_if_new(&self.state, &self.orgs, &request.account_id, Utc::now());
 
         let mutates = is_mutating(request.action.as_str());
         let result = dispatch(self, &request);
-        if template_applied
-            || (mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()))
-        {
+        let succeeded = matches!(result.as_ref(), Ok(resp) if resp.status.is_success());
+        if succeeded && request.action == "AssociateServiceQuotaTemplate" {
+            if let Some(hook) = &self.orgs_snapshot_hook {
+                hook().await;
+            }
+        }
+        if template_applied || (mutates && succeeded) {
             self.save().await;
         }
         result
@@ -182,10 +219,6 @@ impl AwsService for ServiceQuotasService {
     fn supported_actions(&self) -> &[&str] {
         SERVICEQUOTAS_ACTIONS
     }
-}
-
-fn checked_marker(d: &ServiceQuotasData) -> Option<String> {
-    d.template_checked.clone()
 }
 
 fn is_mutating(action: &str) -> bool {
@@ -1220,24 +1253,6 @@ impl ServiceQuotasService {
         out.insert("Quotas".into(), Value::Array(quotas));
         ok(with_next_token(out, token))
     }
-}
-
-/// Whether AWS would approve raising `def` to `desired`: not above the
-/// quota's documented maximum, and -- for the two security-group quotas --
-/// not pushing groups-per-interface times rules-per-group past 1000.
-fn approvable(data: &ServiceQuotasData, region: &str, def: &QuotaDef, desired: f64) -> bool {
-    if def.max_value.is_some_and(|m| desired > m) {
-        return false;
-    }
-    let other = match (def.service_code, def.quota_code) {
-        (catalog::VPC, catalog::SECURITY_GROUPS_PER_INTERFACE) => catalog::RULES_PER_SECURITY_GROUP,
-        (catalog::VPC, catalog::RULES_PER_SECURITY_GROUP) => catalog::SECURITY_GROUPS_PER_INTERFACE,
-        _ => return true,
-    };
-    let other_value = catalog::quota(catalog::VPC, other)
-        .map(|o| applied_value(Some(data), region, o))
-        .unwrap_or(0.0);
-    desired * other_value <= catalog::SG_RULES_PRODUCT_LIMIT
 }
 
 /// A support case id, the numeric display id AWS Support assigns.
