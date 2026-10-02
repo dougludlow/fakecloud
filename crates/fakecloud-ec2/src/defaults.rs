@@ -27,11 +27,6 @@ use crate::state::{
 /// CIDR of the default VPC, matching AWS.
 const DEFAULT_VPC_CIDR: &str = "172.31.0.0/16";
 
-/// The Availability Zone suffixes that receive a default subnet. AWS creates a
-/// default subnet in every AZ; three covers the cardinality every realistic
-/// test exercises (and keeps the deterministic CIDR layout simple).
-const DEFAULT_AZ_SUFFIXES: [&str; 3] = ["a", "b", "c"];
-
 /// Deterministic EC2 resource id: `<prefix>-<17 hex>` derived from the account
 /// and a per-resource `role`. Deliberately **region-independent**: a
 /// `MultiAccountState` partitions by account and pins a single region per
@@ -99,64 +94,37 @@ pub(crate) fn az_id_prefix(region: &str) -> String {
     out
 }
 
-/// Number of `-`-separated parts that make up the Region in a zone name:
-/// `us-east-1` (3) or `us-gov-west-1` (4).
-fn region_part_count(parts: &[&str]) -> usize {
-    if parts.get(1) == Some(&"gov") {
-        4
-    } else {
-        3
-    }
-}
-
-/// The zone id of an availability zone name, using the same letter-to-number
-/// mapping DescribeAvailabilityZones reports: `us-east-1b -> use1-az2`, and a
-/// Local Zone `us-west-2-lax-1a -> usw2-lax1-az1`.
-pub(crate) fn zone_id_for(zone: &str) -> String {
-    let parts: Vec<&str> = zone.split('-').collect();
-    let n = region_part_count(&parts);
-    if parts.len() < n {
-        return format!("{}-az1", az_id_prefix(zone));
-    }
-    // The zone letter closes the last part: `1b`, or `1a` of `lax-1a`.
-    let mut tail = parts[n - 1..].concat();
-    let letter = match tail.pop() {
-        Some(c) if c.is_ascii_lowercase() => c,
-        Some(c) => {
-            tail.push(c);
-            'a'
-        }
-        None => 'a',
-    };
-    let az = u32::from(letter) - u32::from('a') + 1;
-    let region_number = &parts[n - 1];
-    let region = format!(
-        "{}-{}",
-        parts[..n - 1].join("-"),
-        region_number.trim_end_matches(|c: char| c.is_ascii_lowercase())
-    );
-    let local = &tail[region_number
-        .trim_end_matches(|c: char| c.is_ascii_lowercase())
-        .len()..];
-    if local.is_empty() {
-        format!("{}-az{az}", az_id_prefix(&region))
-    } else {
-        format!("{}-{local}-az{az}", az_id_prefix(&region))
-    }
-}
-
 /// The availability zones of `region`, as `(zone name, zone id)`: exactly
 /// what DescribeAvailabilityZones reports, and so exactly what a subnet can
-/// be placed in by name or by id.
+/// be placed in by name or by id. Zone ids number the zones in order
+/// (`us-east-1a -> use1-az1` ... `us-east-1f -> use1-az6`), a fixed stand-in
+/// for AWS's per-account letter-to-id mapping.
 pub(crate) fn region_zones(region: &str) -> Vec<(String, String)> {
-    DEFAULT_AZ_SUFFIXES
-        .iter()
-        .map(|suffix| {
-            let zone = format!("{region}{suffix}");
-            let id = zone_id_for(&zone);
-            (zone, id)
-        })
+    let prefix = az_id_prefix(region);
+    fakecloud_aws::regions::availability_zone_letters(region)
+        .chars()
+        .enumerate()
+        .map(|(i, letter)| (format!("{region}{letter}"), format!("{prefix}-az{}", i + 1)))
         .collect()
+}
+
+/// The zone id of an availability zone name, as DescribeAvailabilityZones
+/// reports it. A name outside the region's zone set (a subnet persisted by
+/// an older build) gets the next id after the listed zones' ids, keyed by
+/// its letter, so it still has a stable, region-shaped id.
+pub(crate) fn zone_id_for(zone: &str) -> String {
+    let Some(letter) = zone.chars().last().filter(char::is_ascii_lowercase) else {
+        return format!("{}-az1", az_id_prefix(zone));
+    };
+    let region = &zone[..zone.len() - 1];
+    if let Some((_, id)) = region_zones(region)
+        .into_iter()
+        .find(|(name, _)| name == zone)
+    {
+        return id;
+    }
+    let n = u32::from(letter) - u32::from('a') + 1;
+    format!("{}-az{n}", az_id_prefix(region))
 }
 
 /// Whether `zone` is one of `region`'s availability zones.
@@ -391,11 +359,14 @@ pub(crate) fn bootstrap_default_network(state: &mut Ec2State) {
     );
 
     // --- default subnets, one per AZ ---
-    let az_prefix = az_id_prefix(&region);
+    // Placed in the region's first (up to) three listed zones, so every
+    // default subnet sits in a zone DescribeAvailabilityZones reports. AWS
+    // creates one per AZ; three covers the cardinality realistic tests
+    // exercise and keeps the deterministic CIDR layout simple.
     let mut subnet_ids = Vec::new();
-    for (idx, suffix) in DEFAULT_AZ_SUFFIXES.iter().enumerate() {
+    for (idx, (az, zone_id)) in region_zones(&region).into_iter().take(3).enumerate() {
+        let suffix = az.chars().last().unwrap_or('a');
         let subnet_id = deterministic_id("subnet", &account, &format!("default-subnet-{suffix}"));
-        let az = format!("{region}{suffix}");
         state.subnets.insert(
             subnet_id.clone(),
             Subnet {
@@ -404,7 +375,7 @@ pub(crate) fn bootstrap_default_network(state: &mut Ec2State) {
                 // /20 blocks carved from 172.31.0.0/16: .0, .16, .32 …
                 cidr_block: format!("172.31.{}.0/20", idx * 16),
                 availability_zone: az,
-                availability_zone_id: format!("{az_prefix}-az{}", idx + 1),
+                availability_zone_id: zone_id,
                 state: "available".to_string(),
                 available_ip_address_count: 4091,
                 default_for_az: true,
@@ -755,8 +726,10 @@ mod tests {
     #[test]
     fn zone_ids_round_trip_through_zone_names() {
         assert_eq!(zone_id_for("us-east-1a"), "use1-az1");
-        assert_eq!(zone_id_for("us-west-2-lax-1a"), "usw2-lax1-az1");
+        assert_eq!(zone_id_for("us-east-1f"), "use1-az6");
         assert_eq!(zone_id_for("us-gov-west-1b"), "usgw1-az2");
+        // ap-northeast-1 has no `b` zone: its listed zones number in order.
+        assert_eq!(zone_id_for("ap-northeast-1c"), "apne1-az2");
         assert_eq!(zone_id_for("ap-southeast-2c"), "apse2-az3");
         assert_eq!(zone_id_for("ap-south-1b"), "aps1-az2");
         assert_eq!(
@@ -766,7 +739,11 @@ mod tests {
         // An id from another region is not a zone of this one.
         assert_eq!(zone_name_for_id("ap-southeast-1", "aps1-az1"), None);
         assert_eq!(zone_name_for_id("us-east-1", "use1-az0"), None);
-        assert_eq!(zone_name_for_id("us-east-1", "use1-az4"), None);
+        assert_eq!(zone_name_for_id("us-east-1", "use1-az7"), None);
+        assert_eq!(
+            zone_name_for_id("us-east-1", "use1-az6").as_deref(),
+            Some("us-east-1f")
+        );
         // Every listed zone round-trips by id.
         for (name, id) in region_zones("ap-south-1") {
             assert_eq!(zone_name_for_id("ap-south-1", &id), Some(name));
@@ -788,8 +765,12 @@ mod tests {
     fn zone_membership_follows_the_region() {
         assert!(zone_in_region("us-east-1", "us-east-1a"));
         assert!(zone_in_region("us-east-1", "us-east-1c"));
+        assert!(zone_in_region("us-east-1", "us-east-1f"));
+        assert!(zone_in_region("us-west-2", "us-west-2d"));
         // Only the zones DescribeAvailabilityZones lists.
-        assert!(!zone_in_region("us-east-1", "us-east-1f"));
+        assert!(!zone_in_region("us-east-1", "us-east-1g"));
+        assert!(!zone_in_region("us-west-2", "us-west-2e"));
+        assert!(!zone_in_region("ap-northeast-1", "ap-northeast-1b"));
         assert!(!zone_in_region("us-east-1", "us-west-2a"));
         assert!(!zone_in_region("us-east-1", "us-east-1"));
         assert!(!zone_in_region("us-east-1", "us-east-1ab"));
@@ -806,7 +787,7 @@ mod tests {
         assert!(vpc.is_default);
         assert_eq!(vpc.cidr_block, "172.31.0.0/16");
         // one subnet per AZ suffix, all default_for_az + public
-        assert_eq!(state.subnets.len(), DEFAULT_AZ_SUFFIXES.len());
+        assert_eq!(state.subnets.len(), 3);
         assert!(state.subnets.values().all(|s| s.default_for_az));
         assert!(state.subnets.values().all(|s| s.map_public_ip_on_launch));
         // IGW attached to the default VPC

@@ -485,11 +485,13 @@ async fn describe_regions_and_zone_ids_follow_aws_naming() {
 
     // Zone ids use AWS's prefixes: ap-southeast-2 is `apse2`, and ap-south-1
     // (`aps1`) does not collide with ap-southeast-1 (`apse1`).
-    for (region, prefix) in [
-        ("ap-southeast-2", "apse2"),
-        ("ap-south-1", "aps1"),
-        ("ap-southeast-1", "apse1"),
-        ("us-west-2", "usw2"),
+    // Each region lists its real number of zones (us-east-1 has six).
+    for (region, prefix, count) in [
+        ("ap-southeast-2", "apse2", 3),
+        ("ap-south-1", "aps1", 3),
+        ("ap-southeast-1", "apse1", 3),
+        ("us-west-2", "usw2", 4),
+        ("us-east-1", "use1", 6),
     ] {
         let rc = aws_sdk_ec2::Client::new(&server.aws_config_in(region).await);
         let zones = rc.describe_availability_zones().send().await.unwrap();
@@ -498,16 +500,30 @@ async fn describe_regions_and_zone_ids_follow_aws_naming() {
             .iter()
             .filter_map(|z| z.zone_id())
             .collect();
-        assert_eq!(
-            ids,
-            vec![
-                format!("{prefix}-az1"),
-                format!("{prefix}-az2"),
-                format!("{prefix}-az3")
-            ],
-            "{region}"
-        );
+        let expected: Vec<String> = (1..=count).map(|n| format!("{prefix}-az{n}")).collect();
+        assert_eq!(ids, expected, "{region}");
     }
+
+    // us-east-1d..f are real zones: a subnet can be placed there.
+    let east = aws_sdk_ec2::Client::new(&server.aws_config_in("us-east-1").await);
+    let east_vpc = east
+        .create_vpc()
+        .cidr_block("10.41.0.0/16")
+        .send()
+        .await
+        .unwrap();
+    let east_subnet = east
+        .create_subnet()
+        .vpc_id(east_vpc.vpc().unwrap().vpc_id().unwrap())
+        .cidr_block("10.41.1.0/24")
+        .availability_zone("us-east-1f")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        east_subnet.subnet().unwrap().availability_zone_id(),
+        Some("use1-az6")
+    );
 
     // A subnet's zone id agrees with DescribeAvailabilityZones, and a subnet
     // can be placed by zone id.
@@ -548,6 +564,7 @@ async fn describe_regions_and_zone_ids_follow_aws_naming() {
     // crash the handler).
     for (az, az_id) in [
         (Some("us-east-1a"), None),
+        (Some("ap-southeast-2d"), None),
         (Some("us-\u{e9}-1a"), None),
         (None, Some("use1-az1")),
         (None, Some("apse2-az99")),

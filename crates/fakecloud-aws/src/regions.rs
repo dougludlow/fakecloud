@@ -41,6 +41,23 @@ pub const COMMERCIAL_REGIONS: &[(&str, bool)] = &[
     ("sa-east-1", false),
 ];
 
+/// The availability-zone letters a Region has (AWS's real AZ count; where
+/// AWS skips a letter for new accounts, e.g. ap-northeast-1 and
+/// ca-central-1, the letters accounts actually get). Regions outside the
+/// commercial list default to three zones, `a`-`c`.
+pub fn availability_zone_letters(region: &str) -> &'static str {
+    match region {
+        "us-east-1" => "abcdef",
+        "us-west-2" | "ap-northeast-2" => "abcd",
+        // Accounts see two of a/b/c; `a` keeps the `{region}a` default
+        // placement valid everywhere.
+        "us-west-1" => "ac",
+        "ap-northeast-1" => "acd",
+        "ca-central-1" => "abd",
+        _ => "abc",
+    }
+}
+
 /// Whether `region` is an opt-in commercial Region. `None` for a name that is
 /// not a commercial Region.
 pub fn is_opt_in(region: &str) -> Option<bool> {
@@ -70,6 +87,21 @@ mod tests {
         }
         assert_eq!(is_opt_in("us-east-1"), Some(false));
         assert_eq!(is_opt_in("us-gov-west-1"), None);
+    }
+
+    #[test]
+    fn availability_zone_counts_follow_aws() {
+        assert_eq!(availability_zone_letters("us-east-1").len(), 6);
+        assert_eq!(availability_zone_letters("us-west-2").len(), 4);
+        assert_eq!(availability_zone_letters("us-west-1").len(), 2);
+        assert_eq!(availability_zone_letters("ap-northeast-1"), "acd");
+        for (r, _) in COMMERCIAL_REGIONS {
+            let letters = availability_zone_letters(r);
+            assert!(letters.len() >= 2, "{r}");
+            // Handlers default to `{region}a` when no zone is given.
+            assert!(letters.starts_with('a'), "{r}");
+            assert!(letters.chars().all(|c| c.is_ascii_lowercase()), "{r}");
+        }
     }
 
     #[test]

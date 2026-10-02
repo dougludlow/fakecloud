@@ -372,10 +372,12 @@ pub(super) fn resolve_refs_full(
                 } else {
                     region
                 };
+                // The region's real zones, the same set EC2's
+                // DescribeAvailabilityZones lists and CreateSubnet accepts.
                 return Value::Array(
-                    ["a", "b", "c"]
-                        .iter()
-                        .map(|s| Value::String(format!("{region}{s}")))
+                    fakecloud_aws::regions::availability_zone_letters(&region)
+                        .chars()
+                        .map(|letter| Value::String(format!("{region}{letter}")))
                         .collect(),
                 );
             }

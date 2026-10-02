@@ -151,7 +151,8 @@ async fn ec2_describe_availability_zones() {
 
     let response = client.describe_availability_zones().send().await.unwrap();
     let zones = response.availability_zones();
-    assert_eq!(zones.len(), 3);
+    // us-east-1 has six zones, a-f.
+    assert_eq!(zones.len(), 6);
     assert!(zones.iter().all(|z| z.region_name() == Some("us-east-1")));
     assert!(zones.iter().any(|z| z.zone_name() == Some("us-east-1a")));
     let a = zones
