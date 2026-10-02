@@ -388,6 +388,20 @@ impl ResourceProvisioner {
         // Apply inline ingress/egress rules (CreateSecurityGroup only creates
         // the empty group; without this the template's rules are silently
         // dropped and the SG denies everything).
+        // AWS CloudFormation replaces the group's default allow-all egress
+        // rule with the template's SecurityGroupEgress when one is given, so
+        // the template's rules are not stacked on top of it.
+        if props
+            .get("SecurityGroupEgress")
+            .and_then(|v| v.as_array())
+            .is_some_and(|rules| !rules.is_empty())
+        {
+            let mut accounts = self.ec2_state.write();
+            let state = accounts.get_or_create(&self.account_id);
+            if let Some(sg) = state.security_groups.get_mut(&id) {
+                sg.rules.retain(|r| !r.is_egress);
+            }
+        }
         let authorize = || -> Result<(), String> {
             for (key, action) in [
                 ("SecurityGroupIngress", "AuthorizeSecurityGroupIngress"),

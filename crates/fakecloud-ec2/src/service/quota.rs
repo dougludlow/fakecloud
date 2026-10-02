@@ -377,6 +377,7 @@ mod tests {
                 max_entries: 10,
                 version: 1,
                 state: "create-complete".into(),
+                state_message: None,
                 entries: Vec::new(),
                 version_history: BTreeMap::new(),
             },

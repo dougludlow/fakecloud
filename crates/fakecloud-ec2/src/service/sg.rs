@@ -1899,6 +1899,7 @@ mod modify_tests {
                         max_entries,
                         version: 1,
                         state: "create-complete".into(),
+                        state_message: None,
                         entries: Vec::new(),
                         version_history: std::collections::BTreeMap::new(),
                     },

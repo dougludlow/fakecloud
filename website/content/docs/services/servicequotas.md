@@ -114,6 +114,9 @@ As on AWS, the rules quota applies to each direction separately and counts
 IPv4 and IPv6 rules separately. A rule that references a security group counts
 toward both. A rule that references a customer-managed prefix list counts as
 the list's maximum number of entries, toward the list's address family.
+`ModifyManagedPrefixList` honours this too: a larger `MaxEntries` that would
+push a referencing group over the quota leaves the list at its old size in
+`modify-failed`, with the group ids in `StateMessage`.
 
 ## Known limitations
 

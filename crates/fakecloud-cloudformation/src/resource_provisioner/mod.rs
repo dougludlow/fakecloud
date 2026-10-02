@@ -6292,6 +6292,45 @@ mod tests {
     }
 
     #[test]
+    fn ec2_security_group_egress_replaces_the_default_rule() {
+        // AWS CloudFormation drops the default allow-all egress rule when the
+        // template gives SecurityGroupEgress, so 60 template rules fit the
+        // default 60 rules-per-group quota.
+        let egress: Vec<serde_json::Value> = (0..60)
+            .map(|i| {
+                serde_json::json!({"IpProtocol": "tcp", "FromPort": 2000 + i,
+                    "ToPort": 2000 + i, "CidrIp": "10.0.0.0/8"})
+            })
+            .collect();
+        let prov = make_provisioner();
+        let vpc = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc",
+                serde_json::json!({ "CidrBlock": "10.5.0.0/16" }),
+            ))
+            .expect("VPC provisions");
+        let sg = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::SecurityGroup",
+                "Sg",
+                serde_json::json!({
+                    "GroupDescription": "test", "VpcId": vpc.physical_id,
+                    "SecurityGroupEgress": egress
+                }),
+            ))
+            .expect("60 egress rules fit the quota");
+        let ec2 = prov.ec2_state.read();
+        let g = &ec2.get("123456789012").unwrap().security_groups[&sg.physical_id];
+        let out: Vec<_> = g.rules.iter().filter(|r| r.is_egress).collect();
+        assert_eq!(out.len(), 60);
+        assert!(
+            !out.iter().any(|r| r.ip_protocol == "-1"),
+            "default rule removed"
+        );
+    }
+
+    #[test]
     fn ec2_security_group_over_the_rule_quota_leaves_no_partial_state() {
         // 61 inline ingress rules exceed the default 60 rules-per-group quota.
         let over: Vec<serde_json::Value> = (0..61)
