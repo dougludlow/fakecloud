@@ -1,0 +1,686 @@
+//! Provisioner fidelity tests: same-name collisions, DynamoDB settings
+//! applied through the service's own state, OpenAPI imports, IoT topic
+//! rules, event source mapping shapes, and SAM templates provisioned end to
+//! end.
+
+use super::tests::{make_provisioner, make_resource};
+use super::*;
+use serde_json::json;
+
+const ACCT: &str = "123456789012";
+
+fn create(
+    prov: &ResourceProvisioner,
+    ty: &str,
+    id: &str,
+    props: serde_json::Value,
+) -> StackResource {
+    prov.create_resource(&make_resource(ty, id, props))
+        .unwrap_or_else(|e| panic!("create {id}: {e}"))
+}
+
+fn create_err(prov: &ResourceProvisioner, ty: &str, id: &str, props: serde_json::Value) -> String {
+    prov.create_resource(&make_resource(ty, id, props))
+        .expect_err("create should fail")
+}
+
+fn function_props(name: &str) -> serde_json::Value {
+    json!({
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Role": "arn:aws:iam::123456789012:role/r",
+        "Handler": "index.handler",
+        "Code": {"ZipFile": "def handler(e, c): return e"}
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1. A same-name resource that already exists fails the create.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn named_resources_that_already_exist_fail_instead_of_overwriting() {
+    let prov = make_provisioner();
+    let table = json!({
+        "TableName": "kept",
+        "BillingMode": "PAY_PER_REQUEST",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+    });
+    create(&prov, "AWS::DynamoDB::Table", "T", table.clone());
+    // Data written to the retained table must survive the second create.
+    prov.dynamodb_state
+        .write()
+        .get_or_create(ACCT)
+        .tables
+        .get_mut("kept")
+        .unwrap()
+        .item_count = 7;
+    let err = create_err(&prov, "AWS::DynamoDB::Table", "T", table);
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(
+        prov.dynamodb_state.read().get(ACCT).unwrap().tables["kept"].item_count,
+        7
+    );
+
+    create(
+        &prov,
+        "AWS::S3::Bucket",
+        "B",
+        json!({"BucketName": "kept-bucket"}),
+    );
+    let err = create_err(
+        &prov,
+        "AWS::S3::Bucket",
+        "B",
+        json!({"BucketName": "kept-bucket"}),
+    );
+    assert!(err.contains("already exists"), "{err}");
+
+    create(
+        &prov,
+        "AWS::SQS::Queue",
+        "Q",
+        json!({"QueueName": "kept-q"}),
+    );
+    let err = create_err(
+        &prov,
+        "AWS::SQS::Queue",
+        "Q",
+        json!({"QueueName": "kept-q"}),
+    );
+    assert!(err.contains("already exists"), "{err}");
+
+    create(
+        &prov,
+        "AWS::SNS::Topic",
+        "S",
+        json!({"TopicName": "kept-t"}),
+    );
+    let err = create_err(
+        &prov,
+        "AWS::SNS::Topic",
+        "S",
+        json!({"TopicName": "kept-t"}),
+    );
+    assert!(err.contains("already exists"), "{err}");
+
+    create(
+        &prov,
+        "AWS::Lambda::Function",
+        "F",
+        function_props("kept-fn"),
+    );
+    let err = create_err(
+        &prov,
+        "AWS::Lambda::Function",
+        "F",
+        function_props("kept-fn"),
+    );
+    assert!(err.contains("already exists"), "{err}");
+}
+
+#[test]
+fn bucket_name_held_by_another_account_fails_the_create() {
+    let prov = make_provisioner();
+    {
+        let mut s3 = prov.s3_state.write();
+        let other = s3.get_or_create("999999999999");
+        other.buckets.insert(
+            "taken".to_string(),
+            fakecloud_s3::S3Bucket::new("taken", "us-east-1", "999999999999"),
+        );
+    }
+    let err = create_err(
+        &prov,
+        "AWS::S3::Bucket",
+        "B",
+        json!({"BucketName": "taken"}),
+    );
+    assert!(err.contains("already exists"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// 2. DynamoDB: billing default, TTL / PITR / Kinesis / stream settings.
+// ---------------------------------------------------------------------------
+
+fn table_props(extra: serde_json::Value) -> serde_json::Value {
+    let mut props = json!({
+        "TableName": "settings",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        props[k] = v.clone();
+    }
+    props
+}
+
+#[test]
+fn dynamodb_billing_mode_defaults_to_provisioned() {
+    let prov = make_provisioner();
+    let err = create_err(&prov, "AWS::DynamoDB::Table", "T", table_props(json!({})));
+    assert!(err.contains("ReadCapacityUnits"), "{err}");
+
+    create(
+        &prov,
+        "AWS::DynamoDB::Table",
+        "T",
+        table_props(json!({
+            "ProvisionedThroughput": {"ReadCapacityUnits": 3, "WriteCapacityUnits": "4"}
+        })),
+    );
+    let ddb = prov.dynamodb_state.read();
+    let t = &ddb.get(ACCT).unwrap().tables["settings"];
+    assert_eq!(t.billing_mode, "PROVISIONED");
+    assert_eq!(t.provisioned_throughput.read_capacity_units, 3);
+    assert_eq!(t.provisioned_throughput.write_capacity_units, 4);
+}
+
+#[test]
+fn dynamodb_ttl_pitr_kinesis_and_stream_apply_on_create_and_update() {
+    let prov = make_provisioner();
+    let stream = "arn:aws:kinesis:us-east-1:123456789012:stream/s1";
+    let def = make_resource(
+        "AWS::DynamoDB::Table",
+        "T",
+        table_props(json!({
+            "BillingMode": "PAY_PER_REQUEST",
+            "TimeToLiveSpecification": {"AttributeName": "expires", "Enabled": true},
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": "true"},
+            "KinesisStreamSpecification": {"StreamArn": stream}
+        })),
+    );
+    let sr = prov.create_resource(&def).unwrap();
+    {
+        let ddb = prov.dynamodb_state.read();
+        let t = &ddb.get(ACCT).unwrap().tables["settings"];
+        assert!(t.ttl_enabled);
+        assert_eq!(t.ttl_attribute.as_deref(), Some("expires"));
+        assert!(t.pitr_enabled);
+        assert_eq!(t.kinesis_destinations.len(), 1);
+        assert_eq!(t.kinesis_destinations[0].stream_arn, stream);
+        assert_eq!(t.kinesis_destinations[0].destination_status, "ACTIVE");
+        assert!(!t.stream_enabled);
+    }
+
+    // Update: turn the table stream on, drop TTL / PITR / Kinesis.
+    let updated = make_resource(
+        "AWS::DynamoDB::Table",
+        "T",
+        table_props(json!({
+            "BillingMode": "PAY_PER_REQUEST",
+            "StreamSpecification": {"StreamViewType": "NEW_IMAGE"}
+        })),
+    );
+    let result = prov.update_resource(&sr, &updated).unwrap().unwrap();
+    let ddb = prov.dynamodb_state.read();
+    let t = &ddb.get(ACCT).unwrap().tables["settings"];
+    assert!(t.stream_enabled);
+    assert_eq!(t.stream_view_type.as_deref(), Some("NEW_IMAGE"));
+    let stream_arn = t.stream_arn.clone().unwrap();
+    assert_eq!(result.attributes.get("StreamArn"), Some(&stream_arn));
+    assert!(!t.ttl_enabled);
+    assert!(!t.pitr_enabled);
+    assert_eq!(t.kinesis_destinations[0].destination_status, "DISABLED");
+}
+
+// ---------------------------------------------------------------------------
+// Cognito LambdaConfig.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cognito_user_pool_applies_lambda_config_on_create_and_update() {
+    let prov = make_provisioner();
+    let arn = "arn:aws:lambda:us-east-1:123456789012:function:pre";
+    let sr = create(
+        &prov,
+        "AWS::Cognito::UserPool",
+        "P",
+        json!({"PoolName": "p", "LambdaConfig": {"PreSignUp": arn}}),
+    );
+    let lambda_config = |prov: &ResourceProvisioner| {
+        prov.cognito_state.read().get(ACCT).unwrap().user_pools[&sr.physical_id]
+            .lambda_config
+            .clone()
+    };
+    assert_eq!(lambda_config(&prov), Some(json!({"PreSignUp": arn})));
+    prov.update_resource(
+        &sr,
+        &make_resource("AWS::Cognito::UserPool", "P", json!({"PoolName": "p"})),
+    )
+    .unwrap();
+    assert_eq!(lambda_config(&prov), None);
+}
+
+// ---------------------------------------------------------------------------
+// 3. RestApi / HttpApi OpenAPI import.
+// ---------------------------------------------------------------------------
+
+fn openapi_body(path: &str) -> serde_json::Value {
+    json!({
+        "openapi": "3.0.1",
+        "info": {"title": "imported-title", "version": "1"},
+        "paths": {
+            path: {
+                "get": {
+                    "x-amazon-apigateway-integration": {
+                        "type": "aws_proxy",
+                        "httpMethod": "POST",
+                        "uri": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:f/invocations"
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn rest_api_body_is_imported_and_named_from_its_title() {
+    let prov = make_provisioner();
+    let sr = create(
+        &prov,
+        "AWS::ApiGateway::RestApi",
+        "Api",
+        json!({"Body": openapi_body("/pets/{id}")}),
+    );
+    let id = sr.physical_id.clone();
+    {
+        let st = prov.apigateway_state.read();
+        let st = st.get(ACCT).unwrap();
+        assert_eq!(st.apis[&id].name, "imported-title");
+        let pet = st.resources[&id]
+            .values()
+            .find(|r| r.path == "/pets/{id}")
+            .expect("imported resource");
+        let integ = &st.integrations[&format!("{id}/{}/GET", pet.id)];
+        assert_eq!(integ.integration_type, "AWS_PROXY");
+    }
+    // An update with a new Body (and an explicit Name) replaces the paths.
+    prov.update_resource(
+        &sr,
+        &make_resource(
+            "AWS::ApiGateway::RestApi",
+            "Api",
+            json!({"Name": "named", "Body": openapi_body("/owners")}),
+        ),
+    )
+    .unwrap();
+    let st = prov.apigateway_state.read();
+    let st = st.get(ACCT).unwrap();
+    assert_eq!(st.apis[&id].name, "named");
+    assert!(st.resources[&id].values().any(|r| r.path == "/owners"));
+    assert!(!st.resources[&id].values().any(|r| r.path == "/pets"));
+}
+
+#[test]
+fn rest_api_body_s3_location_is_read_and_imported() {
+    let prov = make_provisioner();
+    let spec =
+        "openapi: 3.0.1\ninfo:\n  title: from-s3\n  version: '1'\npaths:\n  /yaml:\n    get: {}\n";
+    {
+        let mut s3 = prov.s3_state.write();
+        let state = s3.get_or_create(ACCT);
+        let mut bucket = fakecloud_s3::S3Bucket::new("specs", "us-east-1", ACCT);
+        bucket.objects.insert(
+            "api.yaml".to_string(),
+            fakecloud_s3::S3Object {
+                key: "api.yaml".to_string(),
+                body: fakecloud_s3::memory_body(bytes::Bytes::from_static(spec.as_bytes())),
+                size: spec.len() as u64,
+                ..Default::default()
+            },
+        );
+        state.buckets.insert("specs".to_string(), bucket);
+    }
+    let sr = create(
+        &prov,
+        "AWS::ApiGateway::RestApi",
+        "Api",
+        json!({"BodyS3Location": {"Bucket": "specs", "Key": "api.yaml"}}),
+    );
+    let st = prov.apigateway_state.read();
+    let st = st.get(ACCT).unwrap();
+    assert_eq!(st.apis[&sr.physical_id].name, "from-s3");
+    assert!(st.resources[&sr.physical_id]
+        .values()
+        .any(|r| r.path == "/yaml"));
+}
+
+#[test]
+fn rest_api_without_name_or_body_still_requires_a_name() {
+    let prov = make_provisioner();
+    let err = create_err(&prov, "AWS::ApiGateway::RestApi", "Api", json!({}));
+    assert!(err.contains("Name is required"), "{err}");
+}
+
+#[test]
+fn http_api_body_is_imported_as_routes() {
+    let prov = make_provisioner();
+    let sr = create(
+        &prov,
+        "AWS::ApiGatewayV2::Api",
+        "H",
+        json!({"Body": openapi_body("/items")}),
+    );
+    let st = prov.apigatewayv2_state.read();
+    let st = st.get(ACCT).unwrap();
+    assert_eq!(st.apis[&sr.physical_id].name, "imported-title");
+    let routes = &st.routes[&sr.physical_id];
+    let route = routes
+        .values()
+        .find(|r| r.route_key == "GET /items")
+        .unwrap();
+    assert!(route
+        .target
+        .as_deref()
+        .unwrap()
+        .starts_with("integrations/"));
+}
+
+// ---------------------------------------------------------------------------
+// IoT topic rule.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iot_topic_rule_round_trips_through_iot_state() {
+    let prov = make_provisioner();
+    let props = json!({
+        "RuleName": "my_rule",
+        "TopicRulePayload": {
+            "Sql": "SELECT * FROM 'a/b'",
+            "Actions": [{"Lambda": {"FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:f"}}]
+        }
+    });
+    let sr = create(&prov, "AWS::IoT::TopicRule", "R", props.clone());
+    assert_eq!(sr.physical_id, "my_rule");
+    assert_eq!(
+        sr.attributes.get("Arn").map(String::as_str),
+        Some("arn:aws:iot:us-east-1:123456789012:rule/my_rule")
+    );
+    {
+        let iot = prov.iot_state.read();
+        let rule = iot
+            .get(ACCT)
+            .unwrap()
+            .get_resource("rules", "my_rule")
+            .unwrap();
+        assert_eq!(rule["sql"], "SELECT * FROM 'a/b'");
+        assert_eq!(
+            rule["actions"][0]["lambda"]["functionArn"],
+            "arn:aws:lambda:us-east-1:123456789012:function:f"
+        );
+        assert_eq!(rule["ruleDisabled"], false);
+    }
+    let err = create_err(&prov, "AWS::IoT::TopicRule", "R", props);
+    assert!(err.contains("already exists"), "{err}");
+    prov.delete_resource(&sr).unwrap();
+    assert!(prov
+        .iot_state
+        .read()
+        .get(ACCT)
+        .unwrap()
+        .get_resource("rules", "my_rule")
+        .is_none());
+}
+
+#[test]
+fn unnamed_iot_topic_rule_gets_an_underscore_name() {
+    let prov = make_provisioner();
+    let sr = create(
+        &prov,
+        "AWS::IoT::TopicRule",
+        "R",
+        json!({"TopicRulePayload": {"Sql": "SELECT 1 FROM 'x'", "Actions": []}}),
+    );
+    assert!(
+        sr.physical_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "{}",
+        sr.physical_id
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Event source mappings.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn event_source_mapping_keeps_alias_qualifier_and_self_managed_config() {
+    let prov = make_provisioner();
+    create(
+        &prov,
+        "AWS::Lambda::Function",
+        "F",
+        function_props("esm-fn"),
+    );
+    let alias_arn = "arn:aws:lambda:us-east-1:123456789012:function:esm-fn:live";
+    let sr = create(
+        &prov,
+        "AWS::Lambda::EventSourceMapping",
+        "M",
+        json!({
+            "FunctionName": alias_arn,
+            "SelfManagedEventSource": {"Endpoints": {"KafkaBootstrapServers": ["b1:9092"]}},
+            "SelfManagedKafkaEventSourceConfig": {"ConsumerGroupId": "g"},
+            "Topics": ["t"],
+            "SourceAccessConfigurations": [{"Type": "BASIC_AUTH", "URI": "arn:aws:secretsmanager:us-east-1:123456789012:secret:s"}],
+            "StartingPosition": "LATEST"
+        }),
+    );
+    let lam = prov.lambda_state.read();
+    let esm = &lam.get(ACCT).unwrap().event_source_mappings[&sr.physical_id];
+    assert_eq!(esm.function_arn, alias_arn);
+    assert_eq!(
+        esm.self_managed_event_source,
+        Some(json!({"Endpoints": {"KafkaBootstrapServers": ["b1:9092"]}}))
+    );
+    assert_eq!(
+        esm.self_managed_kafka_event_source_config,
+        Some(json!({"ConsumerGroupId": "g"}))
+    );
+    assert_eq!(esm.source_access_configurations.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// SAM templates provisioned end to end.
+// ---------------------------------------------------------------------------
+
+fn provision_template(
+    prov: &ResourceProvisioner,
+    template: serde_json::Value,
+) -> Vec<StackResource> {
+    let body = template.to_string();
+    let mut params = BTreeMap::new();
+    params.insert("AWS::StackName".to_string(), "samstack".to_string());
+    params.insert("AWS::Region".to_string(), "us-east-1".to_string());
+    params.insert("AWS::AccountId".to_string(), ACCT.to_string());
+    params.insert("AWS::Partition".to_string(), "aws".to_string());
+    let parsed = crate::template::parse_template(&body, &params).expect("template parses");
+    crate::service::provision_stack_resources(
+        prov,
+        &parsed.resources,
+        &body,
+        &params,
+        &BTreeMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("provision failed: {e:?}"))
+}
+
+fn by_logical<'a>(resources: &'a [StackResource], id: &str) -> &'a StackResource {
+    resources
+        .iter()
+        .find(|r| r.logical_id == id)
+        .unwrap_or_else(|| panic!("no resource {id}"))
+}
+
+#[test]
+fn sam_explicit_api_s3_event_and_auto_publish_alias_provision() {
+    let prov = make_provisioner();
+    let resources = provision_template(
+        &prov,
+        json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "Uploads": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": "sam-uploads"}},
+                "MyApi": {
+                    "Type": "AWS::Serverless::Api",
+                    "Properties": {"StageName": "dev", "Cors": "'*'"}
+                },
+                "Fn": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "FunctionName": "sam-fn",
+                        "Runtime": "python3.12",
+                        "Handler": "index.handler",
+                        "InlineCode": "def handler(e, c): return {'statusCode': 200}",
+                        "AutoPublishAlias": "live",
+                        "FunctionUrlConfig": {"AuthType": "NONE"},
+                        "Events": {
+                            "Get": {"Type": "Api", "Properties": {"RestApiId": {"Ref": "MyApi"}, "Path": "/items/{id}", "Method": "get"}},
+                            "Upload": {"Type": "S3", "Properties": {"Bucket": {"Ref": "Uploads"}, "Events": "s3:ObjectCreated:*"}}
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    // The explicit API is named after the stack and carries the route.
+    let api = by_logical(&resources, "MyApi");
+    let alias = by_logical(&resources, "FnAliaslive");
+    let alias_arn = "arn:aws:lambda:us-east-1:123456789012:function:sam-fn:live";
+    assert_eq!(alias.physical_id, alias_arn);
+    {
+        let st = prov.apigateway_state.read();
+        let st = st.get(ACCT).unwrap();
+        assert_eq!(st.apis[&api.physical_id].name, "samstack");
+        let res = st.resources[&api.physical_id]
+            .values()
+            .find(|r| r.path == "/items/{id}")
+            .expect("route resource");
+        let integ = &st.integrations[&format!("{}/{}/GET", api.physical_id, res.id)];
+        assert_eq!(integ.integration_type, "AWS_PROXY");
+        assert!(
+            integ.uri.as_deref().unwrap().contains(alias_arn),
+            "integration targets the alias: {:?}",
+            integ.uri
+        );
+        // Cors adds the preflight method.
+        assert!(st
+            .methods
+            .contains_key(&format!("{}/{}/OPTIONS", api.physical_id, res.id)));
+        assert!(st.stages[&api.physical_id].contains_key("dev"));
+    }
+
+    // AutoPublishAlias published version 1 and pointed the alias at it.
+    {
+        let lam = prov.lambda_state.read();
+        let lam = lam.get(ACCT).unwrap();
+        assert_eq!(lam.aliases["sam-fn:live"].function_version, "1");
+        assert!(lam.function_url_configs.contains_key("sam-fn:live"));
+        let policy = lam.functions["sam-fn"].policy.clone().unwrap();
+        assert!(policy.contains("apigateway.amazonaws.com"), "{policy}");
+        assert!(policy.contains("s3.amazonaws.com"), "{policy}");
+        assert!(policy.contains("lambda:InvokeFunctionUrl"), "{policy}");
+    }
+
+    // The bucket notifies the alias.
+    let s3 = prov.s3_state.read();
+    let bucket = &s3.get(ACCT).unwrap().buckets["sam-uploads"];
+    let notification = bucket.notification_config.clone().unwrap();
+    assert!(notification.contains(alias_arn), "{notification}");
+}
+
+#[test]
+fn sam_cognito_logs_iot_and_kafka_events_provision() {
+    let prov = make_provisioner();
+    let resources = provision_template(
+        &prov,
+        json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {"PoolName": "p"}},
+                "Logs": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": "/app/logs"}},
+                "Fn": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "FunctionName": "events-fn",
+                        "Runtime": "python3.12",
+                        "Handler": "index.handler",
+                        "InlineCode": "x",
+                        "Events": {
+                            "SignUp": {"Type": "Cognito", "Properties": {"UserPool": {"Ref": "Pool"}, "Trigger": ["PreSignUp", "PostConfirmation"]}},
+                            "Tail": {"Type": "CloudWatchLogs", "Properties": {"LogGroupName": {"Ref": "Logs"}, "FilterPattern": "ERROR"}},
+                            "Iot": {"Type": "IoTRule", "Properties": {"Sql": "SELECT * FROM 'sensors'"}},
+                            "Kafka": {"Type": "SelfManagedKafka", "Properties": {
+                                "KafkaBootstrapServers": ["broker:9092"],
+                                "Topics": ["orders"],
+                                "SourceAccessConfigurations": [{"Type": "BASIC_AUTH", "URI": "arn:aws:secretsmanager:us-east-1:123456789012:secret:k"}]
+                            }}
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:events-fn";
+    let pool = by_logical(&resources, "Pool");
+    let cognito = prov.cognito_state.read();
+    let lc = cognito.get(ACCT).unwrap().user_pools[&pool.physical_id]
+        .lambda_config
+        .clone()
+        .unwrap();
+    assert_eq!(lc["PreSignUp"], fn_arn);
+    assert_eq!(lc["PostConfirmation"], fn_arn);
+
+    let filter = by_logical(&resources, "FnTail");
+    assert_eq!(filter.resource_type, "AWS::Logs::SubscriptionFilter");
+
+    let rule = by_logical(&resources, "FnIot");
+    let iot = prov.iot_state.read();
+    let record = iot
+        .get(ACCT)
+        .unwrap()
+        .get_resource("rules", &rule.physical_id)
+        .unwrap();
+    assert_eq!(record["actions"][0]["lambda"]["functionArn"], fn_arn);
+
+    let esm = by_logical(&resources, "FnKafkaEventSourceMapping");
+    let lam = prov.lambda_state.read();
+    let mapping = &lam.get(ACCT).unwrap().event_source_mappings[&esm.physical_id];
+    assert_eq!(mapping.topics, vec!["orders".to_string()]);
+    assert!(mapping.self_managed_event_source.is_some());
+}
+
+#[test]
+fn sam_deployment_preference_creates_codedeploy_group_and_alias() {
+    let prov = make_provisioner();
+    let resources = provision_template(
+        &prov,
+        json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "Fn": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "FunctionName": "dp-fn",
+                        "Runtime": "python3.12",
+                        "Handler": "index.handler",
+                        "InlineCode": "x",
+                        "AutoPublishAlias": "live",
+                        "ProvisionedConcurrencyConfig": {"ProvisionedConcurrentExecutions": 2},
+                        "DeploymentPreference": {"Type": "AllAtOnce"}
+                    }
+                }
+            }
+        }),
+    );
+    by_logical(&resources, "ServerlessDeploymentApplication");
+    by_logical(&resources, "FnDeploymentGroup");
+    let lam = prov.lambda_state.read();
+    let lam = lam.get(ACCT).unwrap();
+    assert!(lam.aliases.contains_key("dp-fn:live"));
+    assert_eq!(lam.provisioned_concurrency["dp-fn:live"].requested, 2);
+}

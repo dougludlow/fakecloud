@@ -115,6 +115,9 @@ impl ResourceProvisioner {
         let mut __sns_mas = self.sns_state.write();
         let state = __sns_mas.get_or_create(&self.account_id);
         let topic_arn = fakecloud_sns::topic_arn(&self.region, &self.account_id, topic_name);
+        if state.topics.contains_key(&topic_arn) {
+            return Err(resource_already_exists("AWS::SNS::Topic", &topic_arn));
+        }
 
         // Carry the topic configuration attributes a CFN topic can set, so
         // GetTopicAttributes round-trips them instead of returning defaults.

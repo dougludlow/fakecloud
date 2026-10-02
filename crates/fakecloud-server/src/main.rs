@@ -1689,6 +1689,7 @@ async fn main() {
             timestream: timestream_state.clone(),
             mwaa: mwaa_state.clone(),
             amplify: amplify_state.clone(),
+            iot: iot_state.clone(),
             appconfig: appconfig_state.clone(),
             delivery: delivery_for_cf,
             lambda_runtime: container_runtime.clone(),

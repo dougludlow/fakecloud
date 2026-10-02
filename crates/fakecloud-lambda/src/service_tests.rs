@@ -4274,6 +4274,55 @@ async fn list_function_url_configs_is_scoped_to_its_function() {
     );
 }
 
+/// A function URL created with a `Qualifier` belongs to that alias: it is
+/// read, updated and deleted with the same qualifier, is listed with the
+/// function's URLs, and is distinct from the unqualified URL.
+#[tokio::test]
+async fn function_url_config_honors_the_qualifier() {
+    let svc = LambdaService::new(make_state());
+    seed_function(&svc, "fn-q").await;
+    let qualified = |method: Method, body: &str| {
+        let mut req = make_request(method, "/2021-10-31/functions/fn-q/url", body);
+        req.query_params
+            .insert("Qualifier".to_string(), "live".to_string());
+        req
+    };
+    let resp = svc
+        .handle(qualified(Method::POST, r#"{"AuthType":"NONE"}"#))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert!(
+        body["FunctionArn"]
+            .as_str()
+            .unwrap()
+            .ends_with(":function:fn-q:live"),
+        "{body}"
+    );
+    // No unqualified URL exists.
+    assert!(svc
+        .handle(make_request(
+            Method::GET,
+            "/2021-10-31/functions/fn-q/url",
+            ""
+        ))
+        .await
+        .is_err());
+    svc.handle(qualified(Method::GET, "")).await.unwrap();
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/2021-10-31/functions/fn-q/urls",
+            "",
+        ))
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(resp.body.expect_bytes()).to_string();
+    assert!(body.contains("fn-q:live"), "{body}");
+    svc.handle(qualified(Method::DELETE, "")).await.unwrap();
+    assert!(svc.handle(qualified(Method::GET, "")).await.is_err());
+}
+
 #[tokio::test]
 async fn china_region_arns_use_the_aws_cn_partition() {
     let svc = LambdaService::new(make_state());

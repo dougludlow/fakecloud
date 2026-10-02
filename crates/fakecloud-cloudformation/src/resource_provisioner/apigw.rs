@@ -4,6 +4,27 @@
 //! `apigw`.
 
 use super::*;
+use fakecloud_apigateway::openapi_import::{
+    import_openapi, is_openapi_document, parse_openapi_document, ImportMode,
+};
+
+/// After an import set the API's name/description from the definition's
+/// `info`, the template's own `Name` / `Description` take precedence, as
+/// they do for a CloudFormation RestApi with a `Body`.
+fn reapply_explicit_rest_api_props(
+    state: &mut fakecloud_apigateway::ApiGatewayState,
+    id: &str,
+    props: &serde_json::Value,
+) {
+    if let Some(api) = state.apis.get_mut(id) {
+        if let Some(name) = props.get("Name").and_then(|v| v.as_str()) {
+            api.name = name.to_string();
+        }
+        if let Some(desc) = props.get("Description").and_then(|v| v.as_str()) {
+            api.description = Some(desc.to_string());
+        }
+    }
+}
 
 impl ResourceProvisioner {
     // --- API Gateway v1 ---
@@ -13,11 +34,20 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let name = props
-            .get("Name")
-            .and_then(|v| v.as_str())
-            .ok_or("Name is required")?
-            .to_string();
+        // An OpenAPI definition (`Body` / `BodyS3Location`) is imported into
+        // the API, so it names the API when `Name` is not given.
+        let definition = self.apigw_rest_api_definition(props)?;
+        let explicit_name = props.get("Name").and_then(|v| v.as_str());
+        let name = explicit_name
+            .map(str::to_string)
+            .or_else(|| {
+                definition
+                    .as_ref()
+                    .and_then(|d| d.pointer("/info/title"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .ok_or("Name is required")?;
         let description = props
             .get("Description")
             .and_then(|v| v.as_str())
@@ -48,17 +78,12 @@ impl ResourceProvisioner {
             .get("DisableExecuteApiEndpoint")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // CFN exposes optional `Body`/`BodyS3Location`/`CloneFrom` for OpenAPI
-        // import. We don't run a full Swagger import — we record the source
-        // in the api's `import_source` field so callers can reason about it.
-        let import_source = if props.get("Body").is_some() {
-            Some("Body".to_string())
-        } else if props.get("BodyS3Location").is_some() {
-            Some("BodyS3Location".to_string())
-        } else if props.get("CloneFrom").is_some() {
-            Some("CloneFrom".to_string())
-        } else {
-            None
+        // The imported definition is kept as the API's import source, as
+        // ImportRestApi keeps it, for GetExport.
+        let import_source = match &definition {
+            Some(d) => Some(d.to_string()),
+            None if props.get("CloneFrom").is_some() => Some("CloneFrom".to_string()),
+            None => None,
         };
         let tags = parse_acm_tags(props.get("Tags"));
 
@@ -100,10 +125,55 @@ impl ResourceProvisioner {
             },
         );
         state.resources.insert(id.clone(), resources);
+        if let Some(definition) = &definition {
+            let imported = import_openapi(state, &id, definition, ImportMode::Overwrite);
+            if let Err(e) = imported {
+                state.apis.remove(&id);
+                state.resources.remove(&id);
+                return Err(e);
+            }
+            reapply_explicit_rest_api_props(state, &id, props);
+        }
 
         Ok(ProvisionResult::new(id.clone())
             .with("RestApiId", id.clone())
             .with("RootResourceId", root_resource_id))
+    }
+
+    /// The OpenAPI definition an `AWS::ApiGateway::RestApi` imports: the
+    /// inline `Body` (an object, or a JSON/YAML string) or the object
+    /// `BodyS3Location` names, read from S3.
+    pub(super) fn apigw_rest_api_definition(
+        &self,
+        props: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let doc = if let Some(body) = props.get("Body") {
+            match body {
+                serde_json::Value::String(raw) => parse_openapi_document(raw)?,
+                other => other.clone(),
+            }
+        } else if let Some(loc) = props.get("BodyS3Location") {
+            let bucket = loc
+                .get("Bucket")
+                .and_then(|v| v.as_str())
+                .ok_or("BodyS3Location.Bucket is required")?;
+            let key = loc
+                .get("Key")
+                .and_then(|v| v.as_str())
+                .ok_or("BodyS3Location.Key is required")?;
+            let bytes = self
+                .read_s3_object_bytes(bucket, key)
+                .map_err(|e| format!("Failed to read BodyS3Location s3://{bucket}/{key}: {e}"))?;
+            parse_openapi_document(&String::from_utf8_lossy(&bytes))?
+        } else {
+            return Ok(None);
+        };
+        if !is_openapi_document(&doc) {
+            return Err(
+                "Invalid OpenAPI input: Body is not an OpenAPI or Swagger definition".to_string(),
+            );
+        }
+        Ok(Some(doc))
     }
 
     pub(super) fn update_apigw_rest_api(
@@ -113,8 +183,23 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let id = existing.physical_id.clone();
+        let definition = self.apigw_rest_api_definition(props)?;
         let mut accounts = self.apigateway_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        let api = state
+            .apis
+            .get_mut(&id)
+            .ok_or_else(|| format!("RestApi {id} not found for update"))?;
+        if let Some(definition) = &definition {
+            api.import_source = Some(definition.to_string());
+            // Like PutRestApi: the definition replaces the API's resources and
+            // methods unless the template asks to merge.
+            let mode = match props.get("Mode").and_then(|v| v.as_str()) {
+                Some(m) if m.eq_ignore_ascii_case("merge") => ImportMode::Merge,
+                _ => ImportMode::Overwrite,
+            };
+            import_openapi(state, &id, definition, mode)?;
+        }
         let api = state
             .apis
             .get_mut(&id)

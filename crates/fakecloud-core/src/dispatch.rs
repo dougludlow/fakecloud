@@ -167,11 +167,17 @@ pub async fn dispatch(
                     );
                 }
                 // OPTIONS requests (CORS preflight) don't carry Authorization headers.
-                // Route them to S3 since S3 is the only REST service that handles CORS.
-                // Note: API Gateway CORS preflight is not fully supported in this emulator
-                // because we can't distinguish between S3 and API Gateway OPTIONS requests
-                // without additional context (in real AWS, they have different domains).
-                if parts.method == http::Method::OPTIONS {
+                // One addressed to an API's `{api-id}.execute-api.` host is that
+                // API's preflight (its OPTIONS method, e.g. a MOCK CORS
+                // integration); any other unsigned OPTIONS goes to S3, the other
+                // REST service that answers CORS preflights.
+                if parts.method == http::Method::OPTIONS && is_execute_api_host(&parts.headers) {
+                    protocol::DetectedRequest {
+                        service: "apigateway".to_string(),
+                        action: String::new(),
+                        protocol: AwsProtocol::RestJson,
+                    }
+                } else if parts.method == http::Method::OPTIONS {
                     protocol::DetectedRequest {
                         service: "s3".to_string(),
                         action: String::new(),
@@ -2765,5 +2771,34 @@ mod tests {
             ),
             None,
         );
+    }
+}
+
+/// Whether the request is addressed to an API Gateway execute-api host
+/// (`{api-id}.execute-api.{region}.amazonaws.com`, or a local alias of it).
+fn is_execute_api_host(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| host.contains(".execute-api."))
+}
+
+#[cfg(test)]
+mod execute_api_host_tests {
+    use super::is_execute_api_host;
+
+    #[test]
+    fn recognizes_execute_api_hosts_only() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::HOST,
+            "abc123.execute-api.us-east-1.amazonaws.com"
+                .parse()
+                .unwrap(),
+        );
+        assert!(is_execute_api_host(&h));
+        h.insert(http::header::HOST, "localhost:4566".parse().unwrap());
+        assert!(!is_execute_api_host(&h));
+        assert!(!is_execute_api_host(&http::HeaderMap::new()));
     }
 }

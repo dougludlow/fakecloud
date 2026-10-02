@@ -91,6 +91,9 @@ impl ResourceProvisioner {
 
         let mut __sqs_mas = self.sqs_state.write();
         let state = __sqs_mas.get_or_create(&self.account_id);
+        if let Some(existing_url) = state.name_to_url.get(queue_name) {
+            return Err(resource_already_exists("AWS::SQS::Queue", existing_url));
+        }
         let queue_url = format!("{}/{}/{}", state.endpoint, state.account_id, queue_name);
         let arn = self.regional_arn("sqs", queue_name);
 

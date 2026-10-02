@@ -41,7 +41,7 @@ pub fn parse_template_with_resolution(
     // hand-authored one. Parameters flow in so the items list can be a
     // `Ref` to a CommaDelimitedList parameter.
     let value = expand_for_each(&value, &BTreeMap::new(), parameters)?;
-    let value = expand_sam(&value);
+    let value = expand_sam(&value)?;
 
     let description = value
         .get("Description")
@@ -218,6 +218,9 @@ pub fn parse_outputs(
     // entries. Callers pass the raw template value, which may still
     // contain unexpanded ForEach macros.
     let template_owned = expand_for_each(template, &BTreeMap::new(), parameters)?;
+    // The SAM transform resolves `Ref: MyFunction.Alias` / `MyApi.Stage`
+    // style references to the resources it generates.
+    let template_owned = expand_sam(&template_owned)?;
     let template = &template_owned;
     let outputs_obj = match template.get("Outputs").and_then(|v| v.as_object()) {
         Some(o) => o,

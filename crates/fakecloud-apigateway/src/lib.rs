@@ -15,6 +15,7 @@ pub mod dispatch;
 pub mod facade;
 pub mod lambda_proxy;
 pub mod model_validation;
+pub mod openapi_import;
 pub(crate) mod service;
 pub(crate) mod state;
 pub(crate) mod validation;

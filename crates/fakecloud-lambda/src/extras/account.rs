@@ -119,9 +119,9 @@ impl LambdaService {
 
             // Function URL
             "CreateFunctionUrlConfig" => self.create_function_url_config(res, req),
-            "GetFunctionUrlConfig" => self.get_function_url_config(res, aid),
+            "GetFunctionUrlConfig" => self.get_function_url_config(res, req),
             "UpdateFunctionUrlConfig" => self.update_function_url_config(res, req),
-            "DeleteFunctionUrlConfig" => self.delete_function_url_config(res, aid),
+            "DeleteFunctionUrlConfig" => self.delete_function_url_config(res, req),
             "ListFunctionUrlConfigs" => self.list_function_url_configs(res, aid),
 
             // Concurrency

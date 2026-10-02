@@ -145,3 +145,153 @@ async fn sam_function_expands_policies_and_events() {
         esms.event_source_mappings()
     );
 }
+
+const TRIGGERS_TEMPLATE: &str = r#"
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      PoolName: sam-trigger-pool
+  AppLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /sam/app
+  Handler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sam-trigger-fn
+      Runtime: python3.12
+      Handler: index.handler
+      InlineCode: |
+        def handler(event, context):
+            return event
+      Events:
+        SignUp:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref Pool
+            Trigger: PreSignUp
+        Errors:
+          Type: CloudWatchLogs
+          Properties:
+            LogGroupName: !Ref AppLogs
+            FilterPattern: ERROR
+        Telemetry:
+          Type: IoTRule
+          Properties:
+            Sql: "SELECT * FROM 'sensors/+'"
+"#;
+
+/// Cognito / CloudWatchLogs / IoTRule events (previously dropped) set the
+/// pool's trigger, subscribe the log group and create the topic rule.
+#[tokio::test]
+async fn sam_cognito_logs_and_iot_events_wire_their_sources() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    cfn.create_stack()
+        .stack_name("sam-triggers")
+        .template_body(TRIGGERS_TEMPLATE)
+        .capabilities(Capability::CapabilityNamedIam)
+        .capabilities(Capability::CapabilityAutoExpand)
+        .send()
+        .await
+        .expect("create_stack");
+    let status = helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cfn
+            .describe_stacks()
+            .stack_name("sam-triggers")
+            .send()
+            .await
+            .ok()?;
+        let s = out.stacks().first()?;
+        let status = s.stack_status()?.as_str().to_string();
+        (!status.ends_with("IN_PROGRESS")).then(|| {
+            (
+                status,
+                s.stack_status_reason().unwrap_or_default().to_string(),
+            )
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.0, "CREATE_COMPLETE", "{}", status.1);
+    let fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:sam-trigger-fn";
+    let physical = |logical: &'static str| {
+        let cfn = cfn.clone();
+        async move {
+            cfn.describe_stack_resource()
+                .stack_name("sam-triggers")
+                .logical_resource_id(logical)
+                .send()
+                .await
+                .unwrap()
+                .stack_resource_detail()
+                .unwrap()
+                .physical_resource_id()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    let cognito = server.cognito_client().await;
+    let pool = cognito
+        .describe_user_pool()
+        .user_pool_id(physical("Pool").await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pool.user_pool()
+            .unwrap()
+            .lambda_config()
+            .and_then(|c| c.pre_sign_up()),
+        Some(fn_arn)
+    );
+
+    let logs = server.logs_client().await;
+    let filters = logs
+        .describe_subscription_filters()
+        .log_group_name("/sam/app")
+        .send()
+        .await
+        .unwrap();
+    let filter = &filters.subscription_filters()[0];
+    assert_eq!(filter.destination_arn(), Some(fn_arn));
+    assert_eq!(filter.filter_pattern(), Some("ERROR"));
+
+    let iot = aws_sdk_iot::Client::from_conf(
+        aws_sdk_iot::config::Builder::from(&server.aws_config().await).build(),
+    );
+    let rule = iot
+        .get_topic_rule()
+        .rule_name(physical("HandlerTelemetry").await)
+        .send()
+        .await
+        .unwrap();
+    let rule = rule.rule().unwrap();
+    assert_eq!(rule.sql(), Some("SELECT * FROM 'sensors/+'"));
+    assert_eq!(
+        rule.actions()[0].lambda().map(|l| l.function_arn()),
+        Some(fn_arn)
+    );
+
+    let lambda = server.lambda_client().await;
+    let policy = lambda
+        .get_policy()
+        .function_name("sam-trigger-fn")
+        .send()
+        .await
+        .unwrap();
+    let policy = policy.policy().unwrap();
+    for principal in [
+        "cognito-idp.amazonaws.com",
+        "logs.amazonaws.com",
+        "iot.amazonaws.com",
+    ] {
+        assert!(
+            policy.contains(principal),
+            "{principal} may invoke: {policy}"
+        );
+    }
+}

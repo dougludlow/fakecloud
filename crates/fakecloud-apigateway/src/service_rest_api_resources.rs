@@ -347,7 +347,24 @@ impl ApiGatewayService {
             .apis
             .get_mut(&id)
             .ok_or_else(|| not_found(format!("RestApi {id} not found")))?;
-        api.import_source = Some(String::from_utf8_lossy(&req.body).to_string());
+        let raw = String::from_utf8_lossy(&req.body).to_string();
+        api.import_source = Some(raw.clone());
+        // A definition document rebuilds the API's resources and methods,
+        // merged into or overwriting what it has per `mode` (default merge).
+        if let Some(spec) = crate::openapi_import::parse_openapi_document(&raw)
+            .ok()
+            .filter(crate::openapi_import::is_openapi_document)
+        {
+            let mode = match req.query_params.get("mode").map(String::as_str) {
+                Some("overwrite") => crate::openapi_import::ImportMode::Overwrite,
+                _ => crate::openapi_import::ImportMode::Merge,
+            };
+            crate::openapi_import::import_openapi(state, &id, &spec, mode).map_err(bad_request)?;
+        }
+        let api = state
+            .apis
+            .get(&id)
+            .ok_or_else(|| not_found(format!("RestApi {id} not found")))?;
         ok(rest_api_to_json(api))
     }
 
@@ -380,9 +397,13 @@ impl ApiGatewayService {
             tags: BTreeMap::new(),
             import_source: Some(String::from_utf8_lossy(&req.body).to_string()),
         };
+        let spec =
+            crate::openapi_import::parse_openapi_document(&String::from_utf8_lossy(&req.body))
+                .ok()
+                .filter(crate::openapi_import::is_openapi_document);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request_account(req));
-        state.apis.insert(id.clone(), api.clone());
+        state.apis.insert(id.clone(), api);
         let mut res_map = BTreeMap::new();
         res_map.insert(
             root_id.clone(),
@@ -393,8 +414,22 @@ impl ApiGatewayService {
                 path: "/".to_string(),
             },
         );
-        state.resources.insert(id, res_map);
-        ok_status(StatusCode::CREATED, rest_api_to_json(&api))
+        state.resources.insert(id.clone(), res_map);
+        // A definition document creates the API's resources, methods and
+        // integrations (and names it after `info.title`).
+        if let Some(spec) = spec {
+            if let Err(e) = crate::openapi_import::import_openapi(
+                state,
+                &id,
+                &spec,
+                crate::openapi_import::ImportMode::Overwrite,
+            ) {
+                state.apis.remove(&id);
+                state.resources.remove(&id);
+                return Err(bad_request(e));
+            }
+        }
+        ok_status(StatusCode::CREATED, rest_api_to_json(&state.apis[&id]))
     }
 
     // ── Resources ──

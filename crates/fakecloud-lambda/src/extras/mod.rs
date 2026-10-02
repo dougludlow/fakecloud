@@ -1027,6 +1027,12 @@ impl LambdaService {
         {
             esm.source_access_configurations = sac.clone();
         }
+        if let Some(cfg) = body
+            .get("DocumentDBEventSourceConfig")
+            .filter(|v| v.is_object())
+        {
+            esm.document_db_event_source_config = Some(cfg.clone());
+        }
         esm.last_modified = chrono::Utc::now();
         // Reuse the shared serializer so Update echoes the same full field set
         // (State, SourceAccessConfigurations, KMSKeyArn, DestinationConfig,

@@ -104,6 +104,8 @@ pub(crate) fn name_rule(resource_type: &str) -> NameRule {
         "AWS::Cognito::UserPool" | "AWS::Cognito::UserPoolClient" => NameRule::new(128),
         // Identity pool names allow only word characters and spaces.
         "AWS::Cognito::IdentityPool" => NameRule::new(128).separated_by('_'),
+        // Topic rule names allow only letters, digits and underscores.
+        "AWS::IoT::TopicRule" => NameRule::new(128).separated_by('_'),
         "AWS::RDS::DBSubnetGroup"
         | "AWS::RDS::DBParameterGroup"
         | "AWS::RDS::DBClusterParameterGroup"

@@ -38,7 +38,7 @@ pub fn resolve_resource_properties_with_attrs(
     // AWS::StepFunctions::StateMachine, Role -> RoleArn). Without this the
     // properties get re-read from the raw SAM resource and the native
     // provisioner sees SAM property names it doesn't understand.
-    let value = expand_sam(&value);
+    let value = expand_sam(&value)?;
 
     let resources_obj = value
         .get("Resources")
@@ -115,7 +115,9 @@ pub fn dependency_order(
     let Ok(value) = expand_for_each(&value, &BTreeMap::new(), parameters) else {
         return identity();
     };
-    let value = expand_sam(&value);
+    let Ok(value) = expand_sam(&value) else {
+        return identity();
+    };
     let Some(resources_obj) = value.get("Resources").and_then(|v| v.as_object()) else {
         return identity();
     };

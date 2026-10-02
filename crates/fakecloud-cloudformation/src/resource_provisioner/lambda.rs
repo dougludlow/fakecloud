@@ -41,6 +41,19 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.physical_name(resource));
+        // Checked up front (before reading code from S3 or warming the
+        // runtime image) and again at insert time below.
+        if self
+            .lambda_state
+            .read()
+            .get(&self.account_id)
+            .is_some_and(|s| s.functions.contains_key(&function_name))
+        {
+            return Err(resource_already_exists(
+                "AWS::Lambda::Function",
+                &function_name,
+            ));
+        }
 
         let cfg = parse_lambda_function_props(props)?;
         self.validate_lambda_execution_role(&cfg.role)?;
@@ -158,6 +171,15 @@ impl ResourceProvisioner {
 
         let mut accounts = self.lambda_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        // An existing function under this name (e.g. one a deleted stack
+        // retained) fails the create, as Lambda's ResourceConflictException
+        // does, instead of being overwritten.
+        if state.functions.contains_key(&function_name) {
+            return Err(resource_already_exists(
+                "AWS::Lambda::Function",
+                &function_name,
+            ));
+        }
         state.functions.insert(function_name.clone(), func);
 
         // Capture every GetAtt-resolvable attribute eagerly. Output
@@ -377,8 +399,13 @@ impl ResourceProvisioner {
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
             ));
         }
-        let function_arn =
-            fakecloud_lambda::function_arn(&self.region, &self.account_id, &function_name);
+        // An ARN (e.g. an alias's, from `Ref` on an AWS::Lambda::Alias) keeps
+        // its qualifier, as CreateEventSourceMapping keeps it, so the mapping
+        // invokes that alias.
+        let function_arn = match props.get("FunctionName").and_then(|v| v.as_str()) {
+            Some(arn) if arn.starts_with("arn:") => arn.to_string(),
+            _ => fakecloud_lambda::function_arn(&self.region, &self.account_id, &function_name),
+        };
         let uuid = Uuid::new_v4().to_string();
         let esm = EventSourceMapping {
             uuid: uuid.clone(),
@@ -407,7 +434,10 @@ impl ResourceProvisioner {
             tumbling_window_in_seconds: cfg.tumbling_window_in_seconds,
             topics: cfg.topics,
             queues: cfg.queues,
-            source_access_configurations: Vec::new(),
+            source_access_configurations: cfg.source_access_configurations,
+            self_managed_event_source: cfg.self_managed_event_source,
+            self_managed_kafka_event_source_config: cfg.self_managed_kafka_event_source_config,
+            document_db_event_source_config: cfg.document_db_event_source_config,
         };
         state.event_source_mappings.insert(uuid.clone(), esm);
         Ok(ProvisionResult::new(uuid.clone()).with("Id", uuid))
@@ -452,6 +482,8 @@ impl ResourceProvisioner {
         esm.maximum_record_age_in_seconds = cfg.maximum_record_age_in_seconds;
         esm.bisect_batch_on_function_error = cfg.bisect_batch_on_function_error;
         esm.tumbling_window_in_seconds = cfg.tumbling_window_in_seconds;
+        esm.source_access_configurations = cfg.source_access_configurations;
+        esm.document_db_event_source_config = cfg.document_db_event_source_config;
         Ok(ProvisionResult::new(existing.physical_id.clone())
             .with("Id", existing.physical_id.clone()))
     }

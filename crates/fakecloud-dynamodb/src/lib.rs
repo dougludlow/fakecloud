@@ -15,8 +15,8 @@ pub use service::helpers::schemas::{parse_gsi, parse_lsi, parse_tags};
 pub use service::{save_dynamodb_snapshot, DynamoDbService};
 pub use state::{
     global_table_arn, table_arn, AttributeDefinition, DynamoDbSnapshot, DynamoDbState, DynamoTable,
-    GlobalSecondaryIndex, ItemId, KeySchemaElement, LocalSecondaryIndex, OnDemandThroughput,
-    Projection, ProvisionedThroughput, SharedDynamoDbState, StreamRecord, TableItems,
-    DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
+    GlobalSecondaryIndex, ItemId, KeySchemaElement, KinesisDestination, LocalSecondaryIndex,
+    OnDemandThroughput, Projection, ProvisionedThroughput, SharedDynamoDbState, StreamRecord,
+    TableItems, DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use streams_dataplane::{cmp_seq, DynamoDbStreamsService};

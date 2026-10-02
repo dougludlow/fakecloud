@@ -64,11 +64,22 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        // An OpenAPI definition (`Body` / `BodyS3Location`) is imported as the
+        // API's routes and integrations, and names the API when `Name` is not
+        // given, as ImportApi does.
+        let definition = self.apigw_rest_api_definition(props)?;
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .ok_or("Name is required")?
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| {
+                definition
+                    .as_ref()
+                    .and_then(|d| d.pointer("/info/title"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .ok_or("Name is required")?;
         let protocol_type = props
             .get("ProtocolType")
             .and_then(|v| v.as_str())
@@ -151,10 +162,27 @@ impl ResourceProvisioner {
             });
         }
 
+        let imported = definition.as_ref().map(|definition| {
+            let (spec_api, routes, integrations) =
+                fakecloud_apigatewayv2::extras::build_api_from_spec(
+                    definition,
+                    id.clone(),
+                    &self.region,
+                );
+            if api.description.is_none() {
+                api.description = spec_api.description;
+            }
+            api.version = spec_api.version;
+            (routes, integrations)
+        });
         let api_endpoint = api.api_endpoint.clone();
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         state.apis.insert(id.clone(), api);
+        if let Some((routes, integrations)) = imported {
+            state.routes.insert(id.clone(), routes);
+            state.integrations.insert(id.clone(), integrations);
+        }
 
         Ok(ProvisionResult::new(id.clone())
             .with("ApiId", id)
@@ -961,8 +989,28 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let api_id = existing.physical_id.clone();
+        let definition = self.apigw_rest_api_definition(props)?;
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        // A changed definition rebuilds the routes and integrations, as
+        // ReimportApi does.
+        if let Some(definition) = &definition {
+            let (spec_api, routes, integrations) =
+                fakecloud_apigatewayv2::extras::build_api_from_spec(
+                    definition,
+                    api_id.clone(),
+                    &self.region,
+                );
+            let api = state
+                .apis
+                .get_mut(&api_id)
+                .ok_or_else(|| format!("Api {api_id} no longer exists in state"))?;
+            api.name = spec_api.name;
+            api.description = spec_api.description;
+            api.version = spec_api.version;
+            state.routes.insert(api_id.clone(), routes);
+            state.integrations.insert(api_id.clone(), integrations);
+        }
         let api = state
             .apis
             .get_mut(&api_id)
