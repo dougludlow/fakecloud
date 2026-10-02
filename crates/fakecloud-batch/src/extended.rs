@@ -2480,6 +2480,21 @@ mod tests {
         .await;
         let d = ok(&s, "describejobqueues", json!({"jobQueues": ["cq"]})).await;
         assert_eq!(d["jobQueues"][0]["jobQueueType"], "SAGEMAKER_TRAINING");
+        // And back: a service queue switched to a compute order drops the
+        // service environment type.
+        ok(
+            &s,
+            "updatejobqueue",
+            json!({"jobQueue": "smq", "serviceEnvironmentOrder": [],
+                   "computeEnvironmentOrder": [{"order": 1, "computeEnvironment": "ce"}]}),
+        )
+        .await;
+        let d = ok(&s, "describejobqueues", json!({"jobQueues": ["smq"]})).await;
+        assert!(d["jobQueues"][0].get("jobQueueType").is_none(), "{d}");
+        assert_eq!(
+            d["jobQueues"][0]["computeEnvironmentOrder"][0]["computeEnvironment"],
+            "ce"
+        );
     }
 
     async fn sagemaker_queue(s: &BatchService) -> String {

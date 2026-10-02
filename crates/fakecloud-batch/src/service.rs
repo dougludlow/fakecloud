@@ -732,7 +732,11 @@ impl BatchService {
         // Validate the queue as it will be after the update, not just the
         // request: a compute queue can't gain a serviceEnvironmentOrder (and
         // vice versa) by sending only one of the two lists.
+        let non_empty =
+            |v: Option<&Value>| v.and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        let was_service_queue = non_empty(stored.get("serviceEnvironmentOrder"));
         let mut new_type = None;
+        let mut clear_type = false;
         if body.get("serviceEnvironmentOrder").is_some()
             || body.get("computeEnvironmentOrder").is_some()
         {
@@ -757,6 +761,13 @@ impl BatchService {
                     ));
                 }
                 (Some(k), None) => new_type = Some(k.to_string()),
+                // A service queue switched to a compute order is no longer a
+                // service queue: drop the service environment type it took.
+                (None, Some(_))
+                    if was_service_queue && non_empty(effective.get("computeEnvironmentOrder")) =>
+                {
+                    clear_type = true;
+                }
                 _ => {}
             }
         }
@@ -764,8 +775,12 @@ impl BatchService {
             .job_queues
             .get_mut(&name)
             .ok_or_else(|| client_error("ClientException", format!("Object not found: {name}")))?;
-        if let (Some(t), Some(o)) = (new_type, q.as_object_mut()) {
-            o.insert("jobQueueType".into(), json!(t));
+        if let Some(o) = q.as_object_mut() {
+            if let Some(t) = new_type {
+                o.insert("jobQueueType".into(), json!(t));
+            } else if clear_type {
+                o.remove("jobQueueType");
+            }
         }
         let arn = merge_updates(
             q,
