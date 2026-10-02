@@ -31,6 +31,8 @@ impl PinpointService {
         let record = build_template(name, ttype, "1", &arn, body);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
+        // Create-time tags live in the ARN-keyed tag store the reads render.
+        data.set_tags(&arn, body.get("tags"));
         let entry = data.templates.entry(name.to_string()).or_default();
         entry.template_type = ttype.to_string();
         entry.versions = vec![record];
@@ -51,13 +53,16 @@ impl PinpointService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let version = query_one(q, "Version");
         let guard = self.state.read();
-        let tmpl = guard
+        let data = guard
             .get(&ctx.account)
-            .and_then(|d| d.templates.get(name))
+            .ok_or_else(|| not_found_template(name))?;
+        let tmpl = data
+            .templates
+            .get(name)
             .filter(|t| t.template_type == ttype)
             .ok_or_else(|| not_found_template(name))?;
         let record = select_version(tmpl, version)?;
-        ok(record)
+        ok(data.render(&record))
     }
 
     pub(super) fn update_template(
@@ -109,6 +114,7 @@ impl PinpointService {
             return Err(not_found_template(name));
         }
         data.templates.remove(name);
+        data.remove_tags(&template_arn(&ctx.region, &ctx.account, name, ttype));
         accepted(json!({ "Message": "Template deleted.", "RequestID": shared::hex_id() }))
     }
 
@@ -134,7 +140,7 @@ impl PinpointService {
                         filter_type.map(|ft| ft == t.template_type).unwrap_or(true)
                             && prefix.map(|p| name.starts_with(p)).unwrap_or(true)
                     })
-                    .filter_map(|(_, t)| t.versions.last().cloned())
+                    .filter_map(|(_, t)| t.versions.last().map(|r| d.render(r)))
                     .collect()
             })
             .unwrap_or_default();
@@ -227,6 +233,9 @@ fn build_template(name: &str, ttype: &str, version: &str, arn: &str, body: &Valu
     let now = shared::now_iso();
     let mut out = Map::new();
     merge_body(&mut out, body);
+    // Tags live in the ARN-keyed tag store, never inline on the record (an
+    // update's `tags` is deprecated and ignored by AWS).
+    out.remove("tags");
     out.insert("TemplateName".into(), json!(name));
     out.insert("TemplateType".into(), json!(ttype));
     out.insert("Arn".into(), json!(arn));

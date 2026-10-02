@@ -52,7 +52,11 @@ bumps the version and is listed by the matching `Get*Versions`, and every
   `DeleteEventStream` store the Kinesis/Firehose destination ARN plus role.
 - **Recommender configurations & Tags.** Recommenders are a global, persisted
   resource family; tags are ARN-keyed (`TagResource` / `UntagResource` /
-  `ListTagsForResource`).
+  `ListTagsForResource`). Tags passed at create time (apps, campaigns,
+  segments, templates) land in that same store, every `Get*` / list response
+  renders `tags` from it (so a `TagResource` shows up in `GetApp`), an
+  update's deprecated `tags` member is ignored as on AWS, and deleting a
+  resource drops its tags.
 
 Model-derived validation rejects contract violations with the error codes
 Pinpoint declares (`BadRequestException`, `NotFoundException`,

@@ -1476,3 +1476,123 @@ fn update_wireless_gateway_nests_filters_into_lorawan() {
     assert!(got.get("JoinEuiFilters").is_none());
     assert!(got.get("MaxEirp").is_none());
 }
+
+// ---------- create-time tags share the ListTagsForResource store ----------
+
+fn list_tags_of(s: &IotWirelessService, arn: &str) -> Value {
+    body_of(
+        &run(
+            s,
+            "GET",
+            &format!("/tags?resourceArn={arn}"),
+            &[],
+            Value::Null,
+        )
+        .unwrap(),
+    )["Tags"]
+        .clone()
+}
+
+#[test]
+fn create_time_tags_visible_to_list_tags_and_cleared_on_delete() {
+    let s = svc();
+    let body = json!({"Name": "dest-t", "ExpressionType": "RuleName", "Expression": "rule",
+                      "RoleArn": "arn:aws:iam::000000000000:role/x",
+                      "Tags": [{"Key": "env", "Value": "prod"}]});
+    let created = body_of(&run(&s, "POST", "/destinations", &[], body).unwrap());
+    let arn = created["Arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        list_tags_of(&s, &arn),
+        json!([{"Key": "env", "Value": "prod"}])
+    );
+
+    run(
+        &s,
+        "POST",
+        &format!("/tags?resourceArn={arn}"),
+        &[],
+        json!({"Tags": [{"Key": "team", "Value": "w"}]}),
+    )
+    .unwrap();
+    run(
+        &s,
+        "DELETE",
+        &format!("/tags?resourceArn={arn}&tagKeys=env"),
+        &[],
+        Value::Null,
+    )
+    .unwrap();
+    assert_eq!(
+        list_tags_of(&s, &arn),
+        json!([{"Key": "team", "Value": "w"}])
+    );
+
+    run(&s, "DELETE", "/destinations/dest-t", &[], Value::Null).unwrap();
+    assert_eq!(list_tags_of(&s, &arn), json!([]));
+    let body = json!({"Name": "dest-t", "ExpressionType": "RuleName", "Expression": "rule",
+                      "RoleArn": "arn:aws:iam::000000000000:role/x"});
+    run(&s, "POST", "/destinations", &[], body).unwrap();
+    assert_eq!(list_tags_of(&s, &arn), json!([]));
+}
+
+#[test]
+fn minted_id_create_tags_keyed_by_returned_arn() {
+    let s = svc();
+    let created = body_of(
+        &run(
+            &s,
+            "POST",
+            "/device-profiles",
+            &[],
+            json!({"Name": "dp", "Tags": [{"Key": "a", "Value": "1"}]}),
+        )
+        .unwrap(),
+    );
+    let arn = created["Arn"].as_str().unwrap().to_string();
+    assert_eq!(list_tags_of(&s, &arn), json!([{"Key": "a", "Value": "1"}]));
+}
+
+#[test]
+fn update_of_missing_resource_is_not_found_and_creates_nothing() {
+    let s = svc();
+    let err = expect_err(run(
+        &s,
+        "PATCH",
+        "/destinations/ghost",
+        &[],
+        json!({"Description": "x"}),
+    ));
+    assert!(is_code(&err, "ResourceNotFoundException"));
+    let err = expect_err(run(&s, "GET", "/destinations/ghost", &[], Value::Null));
+    assert!(is_code(&err, "ResourceNotFoundException"));
+    let listed = body_of(&run(&s, "GET", "/destinations", &[], Value::Null).unwrap());
+    assert!(listed["DestinationList"].as_array().unwrap().is_empty());
+
+    let err = expect_err(run(
+        &s,
+        "PATCH",
+        "/wireless-devices/00000000-0000-0000-0000-000000000000",
+        &[],
+        json!({"Description": "x"}),
+    ));
+    assert!(is_code(&err, "ResourceNotFoundException"));
+}
+
+#[test]
+fn inline_tags_migrate_into_tag_store() {
+    let mut d = crate::state::IotWirelessData::default();
+    d.resources
+        .entry("destinations".into())
+        .or_default()
+        .insert(
+            "d1".into(),
+            json!({"Name": "d1", "Arn": "arn:d1", "Tags": [{"Key": "k", "Value": "v"}]}),
+        );
+    d.migrate_inline_tags();
+    assert_eq!(d.tags["arn:d1"]["k"], "v");
+    assert!(d
+        .get_resource("destinations", "d1")
+        .unwrap()
+        .get("Tags")
+        .is_none());
+}

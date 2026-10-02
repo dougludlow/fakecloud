@@ -56,16 +56,14 @@ fn build_record(
     }
     // The primary name is the last label component of the key.
     let primary = key.rsplit('/').next().unwrap_or(key);
+    let resource_arn = key_arn(ctx, rtype, key).unwrap_or_else(|| mint_arn(ctx, rtype, primary));
     for (wire, kind) in meta.omembers {
         if record.contains_key(*wire) {
             continue;
         }
         match kind {
             K::Str if wire.ends_with("Arn") => {
-                record.insert(
-                    (*wire).to_string(),
-                    Value::String(mint_arn(ctx, rtype, primary)),
-                );
+                record.insert((*wire).to_string(), Value::String(resource_arn.clone()));
             }
             K::Str if wire.ends_with("Id") => {
                 record.insert(
@@ -156,6 +154,19 @@ pub(super) fn create(
 ) -> Result<AwsResponse, AwsServiceError> {
     let rtype = resource_type(meta);
     let key = storage_key(meta, labels);
+    // Static and dynamic thing groups share one name (and ARN) namespace.
+    let sibling = match rtype.as_str() {
+        "thing-groups" => Some("dynamic-thing-groups"),
+        "dynamic-thing-groups" => Some("thing-groups"),
+        _ => None,
+    };
+    if sibling.is_some_and(|sib| data.get_resource(sib, &key).is_some()) {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::CONFLICT,
+            "ResourceAlreadyExistsException",
+            format!("Thing group {key} already exists."),
+        ));
+    }
     if data.get_resource(&rtype, &key).is_some() {
         if meta.errors.contains(&"ResourceAlreadyExistsException") {
             return Err(AwsServiceError::aws_error(
@@ -173,10 +184,45 @@ pub(super) fn create(
         }
         // No declared conflict error: treat create as idempotent overwrite.
     }
-    let record = build_record(ctx, meta, &rtype, &key, labels, query, body);
+    let mut record = build_record(ctx, meta, &rtype, &key, labels, query, body);
+    // Create-time `tags` live in the ARN-keyed tag store ListTagsForResource /
+    // TagResource / UntagResource share, not inline on the record (where no
+    // read would see them and Describe wrappers would leak them). The set
+    // replaces any tags a previous same-name resource left behind.
+    let tags = record
+        .as_object_mut()
+        .and_then(|o| o.remove("tags"))
+        .map(|t| super::parse_tags(&t))
+        .unwrap_or_default();
+    if let Some(arn) = key_arn(ctx, &rtype, &key) {
+        data.set_tags(&arn, tags);
+    }
     let out = build_output(meta, &record);
     data.put_resource(&rtype, &key, record);
     Ok(ok_json(out))
+}
+
+/// The AWS ARN of the resource stored under `key` in `rtype`, which is also
+/// the ARN it is tagged under. Every taggable collection is addressed by a
+/// single name, except software package versions, whose ARN carries both
+/// labels (`package/<pkg>/version/<ver>`), so equal version names of
+/// different packages never share an ARN. Collections that are not ARN-named
+/// resources (policy / template versions, job executions) have none.
+pub(super) fn key_arn(ctx: &Ctx, rtype: &str, key: &str) -> Option<String> {
+    if super::arn_path(rtype).is_empty() {
+        return None;
+    }
+    if rtype == "packages/versions" {
+        let (pkg, ver) = key.split_once('/')?;
+        return Some(super::package_version_arn(
+            &ctx.region,
+            &ctx.account,
+            pkg,
+            ver,
+        ));
+    }
+    let primary = key.rsplit('/').next().unwrap_or(key);
+    Some(mint_arn(ctx, rtype, primary))
 }
 
 pub(super) fn update(
@@ -211,12 +257,19 @@ pub(super) fn update(
 
 pub(super) fn delete(
     data: &mut IotData,
+    ctx: &Ctx,
     meta: &OpMeta,
     labels: &HashMap<String, String>,
 ) -> AwsResponse {
     let rtype = resource_type(meta);
     let key = storage_key(meta, labels);
-    data.remove_resource(&rtype, &key);
+    if data.remove_resource(&rtype, &key).is_some() {
+        // The resource's tags go with it, so a same-name re-create starts
+        // untagged.
+        if let Some(arn) = key_arn(ctx, &rtype, &key) {
+            data.remove_tags(&arn);
+        }
+    }
     // AWS delete operations are idempotent: deleting an absent resource is a
     // success. The output shapes carry no required members.
     ok_json(Value::Object(Map::new()))

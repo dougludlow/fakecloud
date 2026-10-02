@@ -55,7 +55,16 @@ round-trips on read / list / update:
   config, async-inference config, all persisted and echoed on describe.
 - **Jobs** — training, processing, transform, labeling, compilation, AutoML
   (v1 + v2), and hyper-parameter-tuning jobs are created, persisted, described,
-  and listed; `Stop*` is accepted.
+  and listed; `Stop*` / `Start*` move the stored status (a Describe reflects
+  it). For a resource that does not exist they return the operation's
+  declared `ResourceNotFound`, or SageMaker's `ValidationException`
+  (`RecordNotFound`) for operations that declare none, such as
+  `StopNotebookInstance`.
+- **Edge deployment stages**: a plan's stages live on the plan:
+  `CreateEdgeDeploymentStage` appends to it (an unknown plan or a duplicate
+  stage name is rejected), `DeleteEdgeDeploymentStage` removes one stage, and
+  `Start` / `StopEdgeDeploymentStage` move its status, all visible in
+  `DescribeEdgeDeploymentPlan`.
 - **Model packages** (+ groups), **pipelines**, **feature groups**, **domains**,
   **user profiles**, **spaces**, **apps**, **images** (+ versions),
   **experiments**, **trials** (+ components), **actions**, **artifacts**,
@@ -70,7 +79,31 @@ round-trips on read / list / update:
   same ENI to the same node returns the same attachment; an ENI already on
   another node is a `ConflictException`; an unknown node is
   `ResourceNotFound`).
-- **Tags** — ARN-keyed `AddTags` / `ListTags` / `DeleteTags`.
+- **HyperPod node volumes**: `AttachClusterNodeVolume` records the volume on
+  an existing node with the next free device name (`/dev/sdf`, `/dev/sdg`, ...);
+  a volume already attached to any node is a `ConflictException`.
+  `DetachClusterNodeVolume` removes it and echoes its device name and attach
+  time; an unknown node, or a volume not attached to it, is `ResourceNotFound`.
+- **Training plan extensions**: `SearchTrainingPlanOfferings` with a
+  `TrainingPlanArn` mints an extension offering that starts where the plan
+  ends; `ExtendTrainingPlan` redeems it (growing the plan's `EndTime` /
+  `DurationHours`) and records it for `DescribeTrainingPlanExtensionHistory`.
+  An unknown offering or plan is `ResourceNotFound`.
+- **Search**: evaluates the `SearchExpression` (filters with every
+  operator, nested filters, sub-expressions, `And` / `Or`, `Tags.<key>`
+  properties) over the stored resources of the requested type, sorts by
+  `SortBy` / `SortOrder` (default `LastModifiedTime`, `Descending`), paginates, and projects each hit onto its
+  `SearchRecord` member with an exact `TotalHits`.
+- **QueryLineage**: walks the stored `AddAssociation` edges from the start
+  entities (`Ascendants` / `Descendants` / `Both`, `MaxDepth`, `Filters`),
+  returning the reached vertices with their lineage type and entity type plus
+  the traversed edges. Any stored SageMaker resource is a valid start entity
+  (one with no associations comes back as a lone vertex); an unknown start
+  ARN is `ResourceNotFound`.
+- **Tags**: ARN-keyed `AddTags` / `ListTags` / `DeleteTags`. Tags passed to
+  a `Create*` land in the same store, so `ListTags` returns them right away;
+  Describe outputs that carry `Tags` (for example `DescribeLabelingJob`)
+  render from that store, and deleting a resource drops its tags.
 
 Input validation is model-derived: `required` members, string `@length`,
 numeric `@range`, and `@enum` constraints are enforced, returning SageMaker's
@@ -87,5 +120,5 @@ persisted, and described, but no container is scheduled, no model is trained,
 and no inference endpoint serves traffic. Jobs and endpoints are not advanced
 through a live lifecycle by a background scheduler — a described job reflects
 what was submitted, not a running computation. Presigned-URL operations
-(`CreatePresignedNotebookInstanceUrl`, `CreatePresignedDomainUrl`) and the
-lineage / search query operations are accepted as control-plane no-ops.
+(`CreatePresignedNotebookInstanceUrl`, `CreatePresignedDomainUrl`) are
+accepted as control-plane no-ops.

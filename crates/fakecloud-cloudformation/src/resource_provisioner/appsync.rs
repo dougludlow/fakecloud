@@ -61,7 +61,6 @@ impl ResourceProvisioner {
         }
         let tags = string_tag_map(props.get("Tags"));
         if !tags.is_empty() {
-            data.tags.insert(api_id.clone(), tags.clone());
             data.tags.insert(arn.clone(), tags);
         }
         data.graphql_apis.insert(api_id.clone(), Value::Object(api));
@@ -127,11 +126,12 @@ impl ResourceProvisioner {
         let realtime_url = sub("uris", "REALTIME");
         let realtime_dns = sub("dns", "REALTIME");
 
+        // Tags are keyed by ARN only (the store ListTagsForResource and
+        // GetGraphqlApi read); drop any legacy api-id-keyed copy.
+        data.tags.remove(&api_id);
         if tags.is_empty() {
-            data.tags.remove(&api_id);
             data.tags.remove(&arn);
         } else {
-            data.tags.insert(api_id.clone(), tags.clone());
             data.tags.insert(arn.clone(), tags);
         }
 

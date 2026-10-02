@@ -551,3 +551,120 @@ async fn iot_security_profile_attach_detach_reflected() {
         "detach must remove the target"
     );
 }
+
+/// Create-time tags are visible to ListTagsForResource, UntagResource acts on
+/// the same set, and a deleted + re-created group starts untagged.
+#[tokio::test]
+async fn iot_create_time_tags_share_list_tags_store() {
+    use aws_sdk_iot::types::Tag;
+    let server = TestServer::start().await;
+    let client = iot_client(&server).await;
+    let created = client
+        .create_thing_group()
+        .thing_group_name("tagged-group")
+        .tags(Tag::builder().key("env").value("prod").build().unwrap())
+        .send()
+        .await
+        .expect("create_thing_group");
+    let arn = created.thing_group_arn().unwrap().to_string();
+    let tags = client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .expect("list_tags_for_resource");
+    let tags = tags.tags();
+    assert_eq!(tags.len(), 1, "create-time tags missing: {tags:?}");
+    assert_eq!(tags[0].key(), "env");
+    assert_eq!(tags[0].value(), Some("prod"));
+
+    client
+        .untag_resource()
+        .resource_arn(&arn)
+        .tag_keys("env")
+        .send()
+        .await
+        .expect("untag_resource");
+    assert!(client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .unwrap()
+        .tags()
+        .is_empty());
+
+    client
+        .tag_resource()
+        .resource_arn(&arn)
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .expect("tag_resource");
+    client
+        .delete_thing_group()
+        .thing_group_name("tagged-group")
+        .send()
+        .await
+        .expect("delete_thing_group");
+    client
+        .create_thing_group()
+        .thing_group_name("tagged-group")
+        .send()
+        .await
+        .expect("re-create");
+    assert!(client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .unwrap()
+        .tags()
+        .is_empty());
+}
+
+/// Equal version names under different packages get distinct ARNs and tags.
+#[tokio::test]
+async fn iot_package_version_arns_include_the_package() {
+    let server = TestServer::start().await;
+    let client = iot_client(&server).await;
+    for pkg in ["fw-a", "fw-b"] {
+        client
+            .create_package()
+            .package_name(pkg)
+            .send()
+            .await
+            .expect("create_package");
+    }
+    let a = client
+        .create_package_version()
+        .package_name("fw-a")
+        .version_name("1.0")
+        .tags("owner", "a")
+        .send()
+        .await
+        .expect("create_package_version a");
+    let arn_a = a.package_version_arn().unwrap().to_string();
+    assert!(arn_a.ends_with(":package/fw-a/version/1.0"), "{arn_a}");
+    client
+        .create_package_version()
+        .package_name("fw-b")
+        .version_name("1.0")
+        .send()
+        .await
+        .expect("create_package_version b");
+    client
+        .delete_package_version()
+        .package_name("fw-b")
+        .version_name("1.0")
+        .send()
+        .await
+        .expect("delete_package_version b");
+    let tags = client
+        .list_tags_for_resource()
+        .resource_arn(&arn_a)
+        .send()
+        .await
+        .expect("list_tags_for_resource");
+    assert_eq!(tags.tags().len(), 1, "fw-a tags lost: {:?}", tags.tags());
+}

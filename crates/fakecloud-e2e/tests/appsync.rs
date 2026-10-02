@@ -178,3 +178,88 @@ async fn appsync_control_plane_and_schema_round_trip() {
         "GraphQL API should be gone after DeleteGraphqlApi"
     );
 }
+
+/// Event API create-time tags show in ListTagsForResource; UpdateGraphqlApi
+/// merges onto the stored API (apiType / visibility / tags survive).
+#[tokio::test]
+async fn appsync_tags_single_store_and_update_merges() {
+    use aws_sdk_appsync::types::{AuthProvider, EventConfig, GraphQlApiType, GraphQlApiVisibility};
+    let server = TestServer::start().await;
+    let appsync = appsync_client(&server).await;
+
+    let api_key = AuthProvider::builder()
+        .auth_type(AuthenticationType::ApiKey)
+        .build()
+        .unwrap();
+    let ev = appsync
+        .create_api()
+        .name("events")
+        .event_config(
+            EventConfig::builder()
+                .auth_providers(api_key.clone())
+                .connection_auth_modes(
+                    aws_sdk_appsync::types::AuthMode::builder()
+                        .auth_type(AuthenticationType::ApiKey)
+                        .build()
+                        .unwrap(),
+                )
+                .default_publish_auth_modes(
+                    aws_sdk_appsync::types::AuthMode::builder()
+                        .auth_type(AuthenticationType::ApiKey)
+                        .build()
+                        .unwrap(),
+                )
+                .default_subscribe_auth_modes(
+                    aws_sdk_appsync::types::AuthMode::builder()
+                        .auth_type(AuthenticationType::ApiKey)
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .tags("env", "prod")
+        .send()
+        .await
+        .expect("create_api");
+    let ev_arn = ev.api().unwrap().api_arn().unwrap().to_string();
+    let listed = appsync
+        .list_tags_for_resource()
+        .resource_arn(&ev_arn)
+        .send()
+        .await
+        .expect("list_tags_for_resource");
+    assert_eq!(
+        listed.tags().unwrap().get("env").map(String::as_str),
+        Some("prod")
+    );
+
+    let created = appsync
+        .create_graphql_api()
+        .name("merged")
+        .authentication_type(AuthenticationType::ApiKey)
+        .api_type(GraphQlApiType::Merged)
+        .visibility(GraphQlApiVisibility::Private)
+        .merged_api_execution_role_arn("arn:aws:iam::000000000000:role/merge")
+        .tags("team", "x")
+        .send()
+        .await
+        .expect("create_graphql_api");
+    let api_id = created.graphql_api().unwrap().api_id().unwrap().to_string();
+    let updated = appsync
+        .update_graphql_api()
+        .api_id(&api_id)
+        .name("merged-2")
+        .authentication_type(AuthenticationType::ApiKey)
+        .send()
+        .await
+        .expect("update_graphql_api");
+    let api = updated.graphql_api().unwrap();
+    assert_eq!(api.name(), Some("merged-2"));
+    assert_eq!(api.api_type(), Some(&GraphQlApiType::Merged));
+    assert_eq!(api.visibility(), Some(&GraphQlApiVisibility::Private));
+    assert_eq!(
+        api.tags().and_then(|t| t.get("team")).map(String::as_str),
+        Some("x")
+    );
+}

@@ -12,10 +12,9 @@
 //!   resource family so those siblings resolve it. (`DeleteAssociation` is also
 //!   claimed here so the composite source+destination edge is removed exactly.)
 //!
-//! These are distinct from the intentional Start/Stop *lifecycle* no-ops
-//! (`StartNotebookInstance`, `StopTrainingJob`, `StopPipelineExecution`, ...)
-//! which advance state on a resource that already exists — a documented
-//! emulation limit left to the generic Action arm.
+//! `Start*` / `Stop*` lifecycle operations (`StartNotebookInstance`,
+//! `StopTrainingJob`, `StopPipelineExecution`, ...) transition the stored
+//! resource's status and reject a missing resource with `ResourceNotFound`.
 
 use serde_json::{Map, Value};
 
@@ -99,7 +98,36 @@ pub(super) fn dispatch(
         )),
         "UpdateMonitoringAlert" => Ok(Some(update_monitoring_alert(svc, ctx, meta, body)?)),
         "UpdatePipelineVersion" => Ok(Some(update_pipeline_version(svc, ctx, meta, body)?)),
-        op if is_lifecycle_transition(op) => Ok(lifecycle_transition(svc, ctx, meta, body)),
+        "Search" => Ok(Some(super::search::search(svc, ctx, meta, body))),
+        "QueryLineage" => Ok(Some(super::search::query_lineage(svc, ctx, body)?)),
+        "SearchTrainingPlanOfferings" => Ok(Some(super::actions::search_training_plan_offerings(
+            svc, ctx, meta, body,
+        )?)),
+        "ExtendTrainingPlan" => Ok(Some(super::actions::extend_training_plan(
+            svc, ctx, meta, body,
+        )?)),
+        "DescribeTrainingPlanExtensionHistory" => Ok(Some(
+            super::actions::describe_training_plan_extension_history(svc, ctx, meta, body)?,
+        )),
+        "AttachClusterNodeVolume" => Ok(Some(super::actions::attach_cluster_node_volume(
+            svc, ctx, body,
+        )?)),
+        "DetachClusterNodeVolume" => Ok(Some(super::actions::detach_cluster_node_volume(
+            svc, ctx, body,
+        )?)),
+        "StartClusterHealthCheck" => Ok(Some(super::actions::start_cluster_health_check(
+            svc, ctx, body,
+        )?)),
+        "CreateEdgeDeploymentStage" => Ok(Some(super::actions::create_edge_deployment_stage(
+            svc, ctx, meta, body,
+        )?)),
+        "DeleteEdgeDeploymentStage" => Ok(Some(super::actions::delete_edge_deployment_stage(
+            svc, ctx, meta, body,
+        )?)),
+        "StartEdgeDeploymentStage" | "StopEdgeDeploymentStage" => Ok(Some(
+            super::actions::edge_deployment_stage_transition(svc, ctx, meta, body)?,
+        )),
+        op if is_lifecycle_transition(op) => Ok(Some(lifecycle_transition(svc, ctx, meta, body)?)),
         _ => Ok(None),
     }
 }
@@ -246,14 +274,17 @@ fn register_devices(
             record
                 .entry("DeviceFleetName".to_string())
                 .or_insert_with(|| Value::String(fleet.clone()));
-            record.insert(
-                "DeviceArn".to_string(),
-                Value::String(super::mint_arn(ctx, "device", name)),
-            );
+            let device_arn = super::mint_arn(ctx, "device", name);
+            record.insert("DeviceArn".to_string(), Value::String(device_arn.clone()));
             record
                 .entry("RegistrationTime".to_string())
                 .or_insert_with(now_epoch);
             data.put_resource(DEVICE_FAMILY, name, Value::Object(record));
+            // The request-level `Tags` apply to every registered device and
+            // live in the ARN-keyed tag store ListTags reads.
+            if let Some(tags) = body.get("Tags").and_then(Value::as_array) {
+                data.apply_tag_list(&device_arn, tags, true);
+            }
         }
     }
     (engine::action(ctx, meta, body), true)
@@ -346,24 +377,26 @@ fn transition_status(family: &str, started: bool) -> &'static str {
 /// Apply a `Start*` / `Stop*` transition to the target resource's `{Family}Status`
 /// member (or the single `*Status` member it carries) so a subsequent Describe
 /// reflects the new state instead of the stale one. Returns the standard action
-/// output. If no matching record exists, returns `None` so the caller falls back
-/// to the generic no-op action response (matching AWS, which 4xx's only when the
-/// resource is absent — but our engine has no such record to reject against).
+/// output. A Start / Stop against a resource that does not exist is rejected
+/// with `ResourceNotFound`, as AWS does.
 fn lifecycle_transition(
     svc: &SageMakerService,
     ctx: &Ctx,
     meta: &OpMeta,
     body: &Map<String, Value>,
-) -> Option<(AwsResponse, bool)> {
+) -> Result<(AwsResponse, bool), AwsServiceError> {
     let started = meta.op.starts_with("Start");
     let new_status = transition_status(meta.family, started);
     let ident = super::engine::action_key(body);
 
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
-    let key = data.resolve_key(meta.family, &ident)?;
-    let rec = data.get_resource_mut(meta.family, &key)?;
-    let obj = rec.as_object_mut()?;
+    let missing = || super::missing(meta, format!("Resource '{ident}' does not exist."));
+    let key = data.resolve_key(meta.family, &ident).ok_or_else(missing)?;
+    let obj = data
+        .get_resource_mut(meta.family, &key)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(missing)?;
 
     // Prefer an existing `*Status` member; otherwise write the canonical
     // `{Family}Status`. A freshly-created record often carries no status member
@@ -381,10 +414,11 @@ fn lifecycle_transition(
             .unwrap_or(canonical)
     };
     obj.insert(status_key, Value::String(new_status.to_string()));
-    Some((super::engine::action(ctx, meta, body), true))
+    obj.insert("LastModifiedTime".to_string(), now_epoch());
+    Ok((super::engine::action(ctx, meta, body), true))
 }
 
-fn str_member(body: &Map<String, Value>, key: &str) -> String {
+pub(super) fn str_member(body: &Map<String, Value>, key: &str) -> String {
     body.get(key)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -542,7 +576,7 @@ fn association_key(body: &Map<String, Value>) -> String {
 // shape-valid; `ClusterName` is an internal scoping member the projection drops
 // (it is not a `ClusterNodeSummary` field).
 
-const CLUSTER_NODE_FAMILY: &str = "ClusterNode";
+pub(super) const CLUSTER_NODE_FAMILY: &str = "ClusterNode";
 
 /// The set of caller-supplied node identifiers (`NodeIds` are instance ids,
 /// `NodeLogicalIds` are logical ids) a batch node operation targets.
@@ -775,6 +809,70 @@ fn list_cluster_nodes(
     )
 }
 
+/// The spellings a HyperPod cluster can be referenced by (the caller's value,
+/// its bare name and this account/region's ARN for it, plus the stored
+/// record's `ClusterName` / `ClusterArn`), and the cluster's canonical ARN.
+/// Nodes carry the `ClusterName` they were added under, which may be either
+/// spelling; an ARN from another account or region only ever matches itself.
+pub(super) fn cluster_aliases(
+    data: &crate::state::SageMakerData,
+    ctx: &Ctx,
+    cluster: &str,
+) -> (Vec<String>, String) {
+    let cluster_record = data
+        .resolve_key("Cluster", cluster)
+        .and_then(|k| data.get_resource("Cluster", &k).cloned());
+    let local_arn_prefix = super::mint_arn(ctx, "cluster", "");
+    let local_name = if cluster.starts_with("arn:") {
+        cluster.strip_prefix(local_arn_prefix.as_str())
+    } else {
+        Some(cluster)
+    };
+    let mut aliases = vec![cluster.to_string()];
+    if let Some(name) = local_name.filter(|n| !n.is_empty()) {
+        aliases.push(name.to_string());
+        aliases.push(super::mint_arn(ctx, "cluster", name));
+    }
+    if let Some(obj) = cluster_record.as_ref().and_then(Value::as_object) {
+        for member in ["ClusterName", "ClusterArn"] {
+            if let Some(v) = obj.get(member).and_then(Value::as_str) {
+                aliases.push(v.to_string());
+            }
+        }
+    }
+    let arn = cluster_record
+        .as_ref()
+        .and_then(|r| r.get("ClusterArn"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if cluster.starts_with("arn:") {
+                cluster.to_string()
+            } else {
+                super::mint_arn(ctx, "cluster", cluster)
+            }
+        });
+    (aliases, arn)
+}
+
+/// The storage key of the node `node_id` (logical id or instance id) within
+/// the cluster known by any of `aliases`.
+pub(super) fn find_cluster_node(
+    data: &crate::state::SageMakerData,
+    aliases: &[String],
+    node_id: &str,
+) -> Option<String> {
+    data.list_resource_entries(CLUSTER_NODE_FAMILY)
+        .into_iter()
+        .find(|(_k, rec)| {
+            aliases.iter().any(|c| node_in_cluster(rec, c)) && {
+                let (nlid, iid) = node_identifiers(rec);
+                Some(node_id) == nlid || Some(node_id) == iid
+            }
+        })
+        .map(|(k, _)| k)
+}
+
 /// Internal node-record member holding the node's ENI attachments as
 /// `{NetworkInterfaceId, AttachmentId}` objects. Not a `ClusterNodeDetails` /
 /// `ClusterNodeSummary` field, so every output projection drops it.
@@ -799,43 +897,7 @@ fn attach_cluster_node_network_interface(
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
 
-    // Nodes carry the `ClusterName` they were added under, which may be the
-    // cluster's name or its ARN; accept either spelling of a known cluster.
-    let cluster_record = data
-        .resolve_key("Cluster", &cluster)
-        .and_then(|k| data.get_resource("Cluster", &k).cloned());
-    // A bare name and this account/region's cluster ARN are interchangeable; an
-    // ARN from another account or region only ever matches itself.
-    let local_arn_prefix = super::mint_arn(ctx, "cluster", "");
-    let local_name = if cluster.starts_with("arn:") {
-        cluster.strip_prefix(local_arn_prefix.as_str())
-    } else {
-        Some(cluster.as_str())
-    };
-    let mut cluster_aliases = vec![cluster.clone()];
-    if let Some(name) = local_name.filter(|n| !n.is_empty()) {
-        cluster_aliases.push(name.to_string());
-        cluster_aliases.push(super::mint_arn(ctx, "cluster", name));
-    }
-    if let Some(obj) = cluster_record.as_ref().and_then(Value::as_object) {
-        for member in ["ClusterName", "ClusterArn"] {
-            if let Some(v) = obj.get(member).and_then(Value::as_str) {
-                cluster_aliases.push(v.to_string());
-            }
-        }
-    }
-    let cluster_arn = cluster_record
-        .as_ref()
-        .and_then(|r| r.get("ClusterArn"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if cluster.starts_with("arn:") {
-                cluster.clone()
-            } else {
-                super::mint_arn(ctx, "cluster", &cluster)
-            }
-        });
+    let (cluster_aliases, cluster_arn) = cluster_aliases(data, ctx, &cluster);
 
     let attachments_of = |rec: &Value| -> Vec<Value> {
         rec.get(NETWORK_INTERFACE_ATTACHMENTS)

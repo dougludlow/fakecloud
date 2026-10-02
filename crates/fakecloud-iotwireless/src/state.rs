@@ -99,6 +99,64 @@ impl IotWirelessData {
             .unwrap_or_default()
     }
 
+    /// Replace `arn`'s whole tag set from a `[{Key, Value}]` list (an empty set
+    /// removes the entry). Tags have exactly one home, this ARN-keyed map,
+    /// which TagResource / UntagResource / ListTagsForResource and every
+    /// tagged `Create*` share.
+    pub fn set_tag_list(&mut self, arn: &str, list: Option<&Value>) {
+        let mut set = BTreeMap::new();
+        for t in list.and_then(Value::as_array).into_iter().flatten() {
+            let k = t
+                .get("Key")
+                .or_else(|| t.get("key"))
+                .and_then(Value::as_str);
+            let v = t
+                .get("Value")
+                .or_else(|| t.get("value"))
+                .and_then(Value::as_str);
+            if let Some(k) = k {
+                set.insert(k.to_string(), v.unwrap_or("").to_string());
+            }
+        }
+        if set.is_empty() {
+            self.tags.remove(arn);
+        } else {
+            self.tags.insert(arn.to_string(), set);
+        }
+    }
+
+    /// Drop every tag stored for `arn` (the resource was deleted).
+    pub fn remove_tags(&mut self, arn: &str) {
+        self.tags.remove(arn);
+    }
+
+    /// One-time migration for snapshots written before tags had a single home:
+    /// move each record's inline `Tags` list into the tag store under the
+    /// record's `Arn` (tags already in the store win on conflict).
+    pub fn migrate_inline_tags(&mut self) {
+        let mut moved: Vec<(String, Value)> = Vec::new();
+        for records in self.resources.values_mut() {
+            for rec in records.values_mut() {
+                let Some(obj) = rec.as_object_mut() else {
+                    continue;
+                };
+                let Some(arn) = obj.get("Arn").and_then(Value::as_str).map(str::to_string) else {
+                    continue;
+                };
+                if let Some(tags) = obj.remove("Tags") {
+                    moved.push((arn, tags));
+                }
+            }
+        }
+        for (arn, tags) in moved {
+            let existing = self.tags.remove(&arn).unwrap_or_default();
+            self.set_tag_list(&arn, Some(&tags));
+            if !existing.is_empty() {
+                self.tags.entry(arn).or_default().extend(existing);
+            }
+        }
+    }
+
     /// Next unique sequence value for id minting.
     pub fn next_seq(&mut self) -> u64 {
         self.seq += 1;

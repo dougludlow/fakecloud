@@ -27,9 +27,17 @@ returns, and every sub-resource operation validates its parent API.
   `lambdaAuthorizerConfig`, `logConfig`, and the introspection / query-depth /
   resolver-count limits.
 - **`GetGraphqlApi`** / **`ListGraphqlApis`** / **`UpdateGraphqlApi`** /
-  **`DeleteGraphqlApi`** round-trip the stored API. Deleting an API cascades to
-  its keys, data sources, resolvers, functions, types, cache, schema, and
+  **`DeleteGraphqlApi`** round-trip the stored API. `UpdateGraphqlApi` merges
+  only the members it can change onto the stored API, so the create-only
+  `apiType` / `visibility` and the tags survive (likewise `UpdateApi` and
+  `UpdateChannelNamespace` keep `created`). Deleting an API cascades to its
+  keys, data sources, resolvers, functions, types, cache, schema, and
   environment variables.
+- **Tags**: ARN-keyed `TagResource` / `UntagResource` /
+  `ListTagsForResource`. Tags passed when creating a GraphQL API, Event API,
+  channel namespace, or domain name land in the same store, the `tags` member
+  of every Get / List / Update response renders from it, and deleting the
+  resource drops its tags.
 
 ## Sub-resources
 

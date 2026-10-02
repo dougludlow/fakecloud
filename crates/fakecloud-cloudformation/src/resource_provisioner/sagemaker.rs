@@ -172,6 +172,10 @@ impl ResourceProvisioner {
                 obj.insert(k.clone(), v.clone());
             }
         }
+        // The template's `Tags` are the resource's whole tag set: an absent
+        // property clears them. `put_resource` moves the list into the
+        // ARN-keyed tag store `ListTags` reads.
+        obj.entry("Tags".to_string()).or_insert_with(|| json!([]));
         obj.insert(arn_member.clone(), json!(arn.clone()));
         if let Some(ct) = creation_time {
             obj.insert("CreationTime".to_string(), ct);

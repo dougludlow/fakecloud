@@ -100,6 +100,98 @@ pub fn now_epoch() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0
 }
 
+impl AppSyncData {
+    /// Replace `arn`'s whole tag set with a request's `tags` map (an absent or
+    /// empty map clears it). Tags have exactly one home, this ARN-keyed map,
+    /// which TagResource / UntagResource / ListTagsForResource and every tagged
+    /// create share.
+    pub fn set_tags(&mut self, arn: &str, tags: Option<&Value>) {
+        let set: BTreeMap<String, String> = tags
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if set.is_empty() {
+            self.tags.remove(arn);
+        } else {
+            self.tags.insert(arn.to_string(), set);
+        }
+    }
+
+    /// Drop every tag stored for `arn` (the resource was deleted).
+    pub fn remove_tags(&mut self, arn: &str) {
+        self.tags.remove(arn);
+    }
+
+    /// A response view of a stored resource object with its `tags` rendered
+    /// from the tag store under the ARN held in its `arn_member`.
+    pub fn render(&self, record: &Value, arn_member: &str) -> Value {
+        let mut out = record.clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.remove("tags");
+            let arn = obj
+                .get(arn_member)
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(set) = arn
+                .and_then(|a| self.tags.get(&a))
+                .filter(|s| !s.is_empty())
+            {
+                obj.insert("tags".to_string(), serde_json::json!(set));
+            }
+        }
+        out
+    }
+
+    /// One-time migration for snapshots written before tags had a single home:
+    /// move inline `tags` off GraphQL API / Event API / channel namespace /
+    /// domain name objects into the tag store (stored tags win on conflict).
+    pub fn migrate_inline_tags(&mut self) {
+        let mut moved: Vec<(String, Value)> = Vec::new();
+        let mut take = |rec: &mut Value, arn_member: &str| {
+            let Some(obj) = rec.as_object_mut() else {
+                return;
+            };
+            let Some(arn) = obj
+                .get(arn_member)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            if let Some(tags) = obj.remove("tags") {
+                moved.push((arn, tags));
+            }
+        };
+        for api in self.graphql_apis.values_mut() {
+            take(api, "arn");
+        }
+        for api in self.apis.values_mut() {
+            take(api, "apiArn");
+        }
+        for ns in self
+            .channel_namespaces
+            .values_mut()
+            .flat_map(|m| m.values_mut())
+        {
+            take(ns, "channelNamespaceArn");
+        }
+        for d in self.domain_names.values_mut() {
+            take(d, "domainNameArn");
+        }
+        for (arn, tags) in moved {
+            let existing = self.tags.remove(&arn).unwrap_or_default();
+            self.set_tags(&arn, Some(&tags));
+            if !existing.is_empty() {
+                self.tags.entry(arn).or_default().extend(existing);
+            }
+        }
+    }
+}
+
 impl AccountState for AppSyncData {
     fn new_for_account(_account_id: &str, _region: &str, _endpoint: &str) -> Self {
         Self::default()

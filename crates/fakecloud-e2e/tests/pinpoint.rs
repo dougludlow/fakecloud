@@ -379,3 +379,64 @@ async fn pinpoint_remove_attributes_strips_endpoint_attributes() {
     assert!(!attrs.contains_key("interests"), "removed key must be gone");
     assert!(attrs.contains_key("keep"), "other keys must remain");
 }
+
+/// Create-time tags show in ListTagsForResource, and Tag / Untag show in
+/// GetApp (one tag store, both directions).
+#[tokio::test]
+async fn pinpoint_app_tags_share_one_store() {
+    let server = TestServer::start().await;
+    let client = pinpoint_client(&server).await;
+    let created = client
+        .create_app()
+        .create_application_request(
+            CreateApplicationRequest::builder()
+                .name("tagged")
+                .tags("env", "prod")
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_app");
+    let app = created.application_response().unwrap();
+    let app_id = app.id().unwrap().to_string();
+    let arn = app.arn().unwrap().to_string();
+
+    let listed = client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .expect("list_tags_for_resource");
+    assert_eq!(
+        listed
+            .tags_model()
+            .and_then(|m| m.tags())
+            .and_then(|t| t.get("env"))
+            .map(String::as_str),
+        Some("prod")
+    );
+
+    client
+        .tag_resource()
+        .resource_arn(&arn)
+        .tags_model(TagsModel::builder().tags("team", "growth").build())
+        .send()
+        .await
+        .expect("tag_resource");
+    client
+        .untag_resource()
+        .resource_arn(&arn)
+        .tag_keys("env")
+        .send()
+        .await
+        .expect("untag_resource");
+    let got = client
+        .get_app()
+        .application_id(&app_id)
+        .send()
+        .await
+        .expect("get_app");
+    let tags = got.application_response().unwrap().tags().unwrap();
+    assert_eq!(tags.get("team").map(String::as_str), Some("growth"));
+    assert!(!tags.contains_key("env"));
+}

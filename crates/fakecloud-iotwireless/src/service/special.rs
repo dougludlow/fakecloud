@@ -561,6 +561,7 @@ fn start_import_task(
     record.insert("FailedImportedDeviceCount".to_string(), Value::from(0));
 
     data.put_resource("wireless_device_import_task", &id, Value::Object(record));
+    data.set_tag_list(&arn, body.get("Tags"));
     (ok_json(json!({ "Id": id, "Arn": arn })), true)
 }
 
@@ -957,6 +958,7 @@ fn associate_partner_account(
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
     data.put_resource("partner-accounts", &amazon_id, record);
+    data.set_tag_list(&arn, body.get("Tags"));
     // AssociateAwsAccountWithPartnerAccountResponse.Sidewalk is `SidewalkAccountInfo`
     // (AmazonId only — never the fingerprint/arn variant, which belongs to the
     // Get/List reads), plus a top-level Arn.
@@ -975,9 +977,9 @@ fn disassociate_partner_account(
     if let Some(id) = id {
         let mut g = svc.state.write();
         let data = g.get_or_create(&ctx.account);
-        data.resources
-            .get_mut("partner-accounts")
-            .map(|m| m.remove(id));
+        if data.remove_resource("partner-accounts", id).is_some() {
+            data.remove_tags(&mint_arn(ctx, "partner-accounts", id));
+        }
     }
     (ok_json(Value::Object(Map::new())), true)
 }

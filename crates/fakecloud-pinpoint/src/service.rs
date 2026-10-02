@@ -738,6 +738,20 @@ fn template_type_for(action: &str) -> &'static str {
 impl PinpointService {
     /// Look up an application read-only, erroring `NotFoundException` when
     /// absent.
+    /// Like [`Self::with_app`], also handing the closure the account data (for
+    /// rendering tags from the ARN-keyed tag store).
+    pub(crate) fn with_app_data<T>(
+        &self,
+        account: &str,
+        app_id: &str,
+        f: impl FnOnce(&crate::state::PinpointData, &App) -> Result<T, AwsServiceError>,
+    ) -> Result<T, AwsServiceError> {
+        let guard = self.state.read();
+        let data = guard.get(account).ok_or_else(|| not_found_app(app_id))?;
+        let app = data.apps.get(app_id).ok_or_else(|| not_found_app(app_id))?;
+        f(data, app)
+    }
+
     pub(crate) fn with_app<T>(
         &self,
         account: &str,

@@ -43,8 +43,12 @@ pub fn load_into(
             supported: IOTWIRELESS_SNAPSHOT_SCHEMA_VERSION,
         });
     }
-    let accounts = snapshot.accounts.account_count();
-    *state.write() = snapshot.accounts;
+    let mut accounts_state = snapshot.accounts;
+    for (_, data) in accounts_state.iter_mut() {
+        data.migrate_inline_tags();
+    }
+    let accounts = accounts_state.account_count();
+    *state.write() = accounts_state;
     Ok(LoadOutcome::Loaded(accounts))
 }
 

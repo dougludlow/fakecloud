@@ -11135,6 +11135,33 @@ mod tests {
     }
 
     #[test]
+    fn sagemaker_model_tags_land_in_list_tags_store() {
+        let prov = make_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::SageMaker::Model",
+            "M",
+            serde_json::json!({
+                "ModelName": "mt",
+                "ExecutionRoleArn": "arn:aws:iam::123456789012:role/sm",
+                "Tags": [{"Key": "env", "Value": "prod"}]
+            }),
+        ))
+        .expect("model provisions");
+        let g = prov.sagemaker_state.read();
+        let data = g.get("123456789012").unwrap();
+        let arn = "arn:aws:sagemaker:us-east-1:123456789012:model/mt";
+        assert_eq!(
+            data.tag_list(arn),
+            vec![serde_json::json!({"Key": "env", "Value": "prod"})]
+        );
+        assert!(data
+            .get_resource("Model", "mt")
+            .unwrap()
+            .get("Tags")
+            .is_none());
+    }
+
+    #[test]
     fn backup_vault_and_plan_write_through() {
         let prov = make_provisioner();
         let vault = prov

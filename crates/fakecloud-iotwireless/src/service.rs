@@ -180,14 +180,14 @@ impl IotWirelessService {
                 let mut g = self.state.write();
                 let data = g.get_or_create(&ctx.account);
                 Ok((
-                    engine::update(data, &ctx, meta, labels, &query, &body),
+                    engine::update(data, &ctx, meta, labels, &query, &body)?,
                     true,
                 ))
             }
             Verb::Delete => {
                 let mut g = self.state.write();
                 let data = g.get_or_create(&ctx.account);
-                Ok((engine::delete(data, meta, labels), true))
+                Ok((engine::delete(data, &ctx, meta, labels), true))
             }
             Verb::Get => {
                 let g = self.state.read();

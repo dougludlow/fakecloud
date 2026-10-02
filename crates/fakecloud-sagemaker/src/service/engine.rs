@@ -132,7 +132,7 @@ fn synth_string(ctx: &Ctx, meta: &OpMeta, key: &str, f: &Field) -> String {
 /// synthesised default; a present structure or list element is descended into so
 /// its own required sub-members are completed too (an echoed-but-incomplete
 /// stored struct still projects a shape-valid response).
-fn fill_required(
+pub(super) fn fill_required(
     ctx: &Ctx,
     meta: &OpMeta,
     key: &str,
@@ -212,7 +212,11 @@ fn coerce_ts(v: &Value) -> Option<Value> {
 /// Project a stored record's members onto the given `(wire, kind)` projection,
 /// keeping members whose JSON type matches the modelled kind and coercing
 /// timestamps to their numeric wire form.
-fn project(obj: Option<&Map<String, Value>>, members: &[(&str, K)], out: &mut Map<String, Value>) {
+pub(super) fn project(
+    obj: Option<&Map<String, Value>>,
+    members: &[(&str, K)],
+    out: &mut Map<String, Value>,
+) {
     let Some(obj) = obj else { return };
     for (wire, kind) in members {
         let Some(v) = obj.get(*wire) else { continue };
@@ -330,6 +334,9 @@ pub(super) fn create(
             ));
         }
         // No declared conflict error: treat create as idempotent overwrite.
+        // Drop the old record (and its tags) so the new create's tag set, if
+        // any, is the whole set.
+        data.remove_resource(meta.family, &key);
     }
     let record = build_record(ctx, meta, &key, body);
     let out = build_output(ctx, meta, &key, &record);
@@ -353,12 +360,25 @@ pub(super) fn update(
         .unwrap_or(Value::Null);
     if let Some(obj) = record.as_object_mut() {
         for (k, v) in body {
+            // `Tags` on an update (UpdateProject / UpdatePartnerApp) adds to the
+            // resource's tag set in the ARN-keyed tag store rather than living
+            // inline on the record.
+            if k == "Tags" {
+                continue;
+            }
             obj.insert(k.clone(), v.clone());
         }
         obj.insert("LastModifiedTime".to_string(), now_epoch());
     }
+    let arn = record
+        .get(format!("{}Arn", meta.family))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let out = build_output(ctx, meta, &key, &record);
     data.put_resource(meta.family, &key, record);
+    if let (Some(arn), Some(list)) = (arn, body.get("Tags").and_then(Value::as_array)) {
+        data.apply_tag_list(&arn, list, false);
+    }
     Ok(ok_json(out))
 }
 
@@ -386,8 +406,12 @@ pub(super) fn get(
 ) -> Result<AwsResponse, AwsServiceError> {
     let value = key_value(meta, body).unwrap_or_default();
     let resolved = data.and_then(|d| {
-        d.resolve_key(meta.family, &value)
-            .map(|k| (k.clone(), d.get_resource(meta.family, &k).cloned()))
+        d.resolve_key(meta.family, &value).map(|k| {
+            let record = d
+                .get_resource(meta.family, &k)
+                .map(|r| d.record_with_tags(meta.family, r));
+            (k, record)
+        })
     });
     match resolved {
         Some((key, Some(record))) => Ok(ok_json(build_output(ctx, meta, &key, &record))),
@@ -508,8 +532,16 @@ pub(super) fn list(
     meta: &OpMeta,
     body: &Map<String, Value>,
 ) -> AwsResponse {
-    let mut entries = data
-        .map(|d| d.list_resource_entries(meta.family))
+    let mut entries: Vec<(String, Value)> = data
+        .map(|d| {
+            d.list_resource_entries(meta.family)
+                .into_iter()
+                .map(|(id, r)| {
+                    let r = d.record_with_tags(meta.family, &r);
+                    (id, r)
+                })
+                .collect()
+        })
         .unwrap_or_default();
     entries.retain(|(id, r)| passes_filters(id, r, body));
     list_entries_response(ctx, meta, body, entries)
