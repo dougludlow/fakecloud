@@ -104,7 +104,14 @@ pub fn deliver_target(bus: &Arc<DeliveryBus>, schedule: &Schedule) -> Result<(),
             // fails (and is retried / dead-lettered).
             principal_arn: Some(&schedule.target.role_arn),
         })
-        .map_err(|err| SqsDeliveryError::AccessDenied(err.to_string()))?;
+        .map_err(|err| match err {
+            fakecloud_core::delivery::EventBridgeDeliveryError::AccessDenied(message) => {
+                SqsDeliveryError::AccessDenied(message)
+            }
+            fakecloud_core::delivery::EventBridgeDeliveryError::Unavailable(message) => {
+                SqsDeliveryError::TargetUnavailable(message)
+            }
+        })?;
         return Ok(());
     }
 

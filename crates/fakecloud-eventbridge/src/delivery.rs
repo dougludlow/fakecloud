@@ -136,8 +136,11 @@ impl EventBridgeDelivery for DeferredEventBridgeDelivery {
     fn put_event(&self, event: &CrossServiceEvent<'_>) -> Result<String, EventBridgeDeliveryError> {
         match self.get(event.source, event.detail_type) {
             Some(inner) => inner.put_event(event),
-            // Not wired yet (startup): dropped with the warning `get` logs.
-            None => Ok(String::new()),
+            // Not wired yet (startup): the event is dropped (with the warning
+            // `get` logs), which the source must record as a failed delivery.
+            None => Err(EventBridgeDeliveryError::Unavailable(
+                "EventBridge delivery is not wired yet".to_string(),
+            )),
         }
     }
 }
@@ -153,6 +156,20 @@ fn bus_owner_account<'a>(event_bus: &'a str, origin_account: &'a str) -> &'a str
             .unwrap_or(origin_account)
     } else {
         origin_account
+    }
+}
+
+/// The region of the bus `event_bus` names: the ARN's region for a full
+/// event-bus ARN, otherwise the event's originating region.
+fn bus_region<'a>(event_bus: &'a str, origin_region: &'a str) -> &'a str {
+    if event_bus.starts_with("arn:") {
+        event_bus
+            .split(':')
+            .nth(3)
+            .filter(|r| !r.is_empty())
+            .unwrap_or(origin_region)
+    } else {
+        origin_region
     }
 }
 
@@ -187,6 +204,9 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
         let event_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let owner_account = bus_owner_account(event_bus, account_id);
+        // The bus (its policy, ARN and rule targets) lives in its own region,
+        // which a bus ARN names; the event keeps its originating `region`.
+        let target_region = bus_region(event_bus, region);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(owner_account);
@@ -197,9 +217,12 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
         // cross-account callers. A refused event is not stored, archived or
         // delivered.
         if owner_account != account_id {
-            if let Some(message) =
-                cross_account_put_denial(state, &event_bus_name, region, &event_principal(event))
-            {
+            if let Some(message) = cross_account_put_denial(
+                state,
+                &event_bus_name,
+                target_region,
+                &event_principal(event),
+            ) {
                 return Err(EventBridgeDeliveryError::AccessDenied(message));
             }
         }
@@ -281,7 +304,7 @@ impl EventBridgeDelivery for EventBridgeDeliveryImpl {
             logs_persist: self.wiring.logs_persist.as_ref(),
             container_runtime: &self.wiring.container_runtime,
             account_id: owner_account,
-            region,
+            region: target_region,
         };
         for (rule_arn, target) in matching_targets {
             dispatch_event_target(
@@ -712,6 +735,27 @@ mod tests {
         assert_eq!(owner.events.len(), 1);
         assert_eq!(owner.events[0].event_bus_name, "custom");
         assert!(accounts.get("111111111111").is_none());
+    }
+
+    /// A bus ARN in another account and another region is authorized against
+    /// that bus's own ARN (its region), not the source's region: a policy
+    /// scoped to the eu-west-1 bus ARN allows a us-east-1 source.
+    #[test]
+    fn put_event_cross_account_bus_in_other_region_uses_bus_region() {
+        let bus_arn = "arn:aws:events:eu-west-1:999988887777:event-bus/custom";
+        let mut policy = put_events_policy("arn:aws:iam::111111111111:root");
+        policy["Statement"][0]["Resource"] = serde_json::json!(bus_arn);
+        let (state, recorder, delivery) = cross_account_bus(Some(policy));
+        let event_id = delivery
+            .put_event(&ev_in("app", "T", "{}", bus_arn, "111111111111"))
+            .expect("policy allows the source on the eu-west-1 bus");
+        assert!(!event_id.is_empty());
+        let calls = recorder.sqs.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let env: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        // The event keeps its originating region.
+        assert_eq!(env["region"], "us-east-1");
+        assert_eq!(state.read().get("999988887777").unwrap().events.len(), 1);
     }
 
     /// A bus in another account with no resource policy refuses the event:
@@ -1160,10 +1204,12 @@ mod tests {
     fn deferred_delivery_forwards_once_set() {
         let state = make_shared();
         let deferred = DeferredEventBridgeDelivery::new();
-        // Before the real sender is bound the event is dropped, not panicked on.
-        deferred
-            .put_event(&ev("early", "T", "{}", "default"))
-            .unwrap();
+        // Before the real sender is bound the event is dropped, not panicked
+        // on, and reported as a failed delivery so the source records it.
+        assert!(matches!(
+            deferred.put_event(&ev("early", "T", "{}", "default")),
+            Err(EventBridgeDeliveryError::Unavailable(_))
+        ));
         assert!(state.read().default_ref().events.is_empty());
 
         deferred.set(Arc::new(EventBridgeDeliveryImpl::new(

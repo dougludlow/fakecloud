@@ -537,10 +537,15 @@ pub(crate) fn invoke_eventbridge_put_events(
             Ok(id) => result_entries.push(json!({
                 "EventId": id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             })),
-            Err(fakecloud_core::delivery::EventBridgeDeliveryError::AccessDenied(message)) => {
+            Err(err) => {
+                use fakecloud_core::delivery::EventBridgeDeliveryError as E;
+                let (code, message) = match err {
+                    E::AccessDenied(message) => ("AccessDeniedException", message),
+                    E::Unavailable(message) => ("InternalException", message),
+                };
                 failed_count += 1;
                 result_entries.push(json!({
-                    "ErrorCode": "AccessDeniedException",
+                    "ErrorCode": code,
                     "ErrorMessage": message,
                 }));
             }
@@ -1568,6 +1573,38 @@ mod tests {
         assert_eq!(calls[0].0, "111111111111");
         assert_eq!(calls[0].1, "eu-west-2");
         assert_eq!(calls[0].3.as_deref(), Some(ROLE));
+    }
+
+    /// An event EventBridge could not take (delivery not wired yet) is a
+    /// failed entry, never a success with an empty EventId.
+    #[test]
+    fn eventbridge_put_events_unavailable_is_a_failed_entry() {
+        struct Unwired;
+        impl fakecloud_core::delivery::EventBridgeDelivery for Unwired {
+            fn put_event(
+                &self,
+                _e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+                Err(
+                    fakecloud_core::delivery::EventBridgeDeliveryError::Unavailable(
+                        "not wired".to_string(),
+                    ),
+                )
+            }
+        }
+        let delivery = Some(Arc::new(
+            DeliveryBus::new().with_eventbridge(Arc::new(Unwired)),
+        ));
+        let (error, cause) = invoke_eventbridge_put_events(
+            &json!({"Entries": [{"Source": "app", "DetailType": "T", "Detail": "{}"}]}),
+            &delivery,
+            EXEC_ARN,
+            ROLE,
+        )
+        .unwrap_err();
+        assert_eq!(error, "EventBridge.FailedEntry");
+        let cause: Value = serde_json::from_str(&cause).unwrap();
+        assert_eq!(cause["Entries"][0]["ErrorCode"], "InternalException");
     }
 
     /// A refused entry fails the task with EventBridge.FailedEntry, as AWS's

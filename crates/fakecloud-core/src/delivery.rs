@@ -73,6 +73,9 @@ pub enum SqsDeliveryError {
     /// Scheduler target bus in another account whose resource policy does
     /// not allow the schedule's role).
     AccessDenied(String),
+    /// The target could not take the delivery right now (e.g. a service's
+    /// delivery not wired yet at startup).
+    TargetUnavailable(String),
 }
 
 impl std::fmt::Display for SqsDeliveryError {
@@ -82,6 +85,7 @@ impl std::fmt::Display for SqsDeliveryError {
             Self::InvalidArn(arn) => write!(f, "invalid queue ARN: {arn}"),
             Self::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
             Self::AccessDenied(msg) => write!(f, "access denied: {msg}"),
+            Self::TargetUnavailable(msg) => write!(f, "target unavailable: {msg}"),
         }
     }
 }
@@ -205,6 +209,10 @@ pub enum EventBridgeDeliveryError {
     /// is not stored, archived or delivered.
     #[error("AccessDeniedException: {0}")]
     AccessDenied(String),
+    /// EventBridge could not take the event (e.g. delivery not wired yet at
+    /// startup). The event is dropped; the source records a failed delivery.
+    #[error("InternalException: {0}")]
+    Unavailable(String),
 }
 
 /// Trait for putting events onto an EventBridge bus from cross-service integrations.
