@@ -385,7 +385,7 @@ mod tests {
         pl.prefix_list_id = Some("pl-1".into());
         let mut unknown = rule(false, None, None, None);
         unknown.prefix_list_id = Some("pl-aws".into());
-        let rules = vec![pl, unknown, rule(false, None, Some("::/0"), None)];
+        let rules = [pl, unknown, rule(false, None, Some("::/0"), None)];
         let w = RuleWeights::new(&lists);
         // IPv4: 10 (pl-1) + 1 (unknown list); IPv6: 1 (unknown list) + 1.
         assert_eq!(w.side_counts(rules.iter()), [11, 2]);
