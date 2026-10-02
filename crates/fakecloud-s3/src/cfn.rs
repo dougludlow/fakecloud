@@ -334,7 +334,8 @@ fn build_public_access_block_xml(pab: &Value) -> Option<String> {
 /// Build the notification-config XML and return whether EventBridge delivery is
 /// enabled. Matches the tag shapes `parse_notification_config` reads on the
 /// firing path (`<QueueConfiguration>/<Queue>`, `<TopicConfiguration>/<Topic>`,
-/// `<LambdaFunctionConfiguration>/<Function>`), so notifications actually fire.
+/// `<CloudFunctionConfiguration>/<CloudFunction>`), so notifications actually
+/// fire.
 fn build_notification_xml(nc: &Value) -> (String, bool) {
     let mut body = String::new();
     build_notification_entries(
@@ -351,10 +352,13 @@ fn build_notification_xml(nc: &Value) -> (String, bool) {
         "Topic",
         &mut body,
     );
+    // On the wire a Lambda configuration is `<CloudFunctionConfiguration>`
+    // with the ARN in `<CloudFunction>` (the S3 model's XML names), which is
+    // what GetBucketNotificationConfiguration clients parse.
     build_notification_entries(
         nc,
         "LambdaConfigurations",
-        "LambdaFunctionConfiguration",
+        "CloudFunctionConfiguration",
         "Function",
         &mut body,
     );
@@ -396,7 +400,12 @@ fn build_notification_entries(
         if let Some(id) = entry.get("Id").and_then(Value::as_str) {
             out.push_str(&format!("<Id>{}</Id>", xml_escape(id)));
         }
-        out.push_str(&format!("<{target_tag}>{}</{target_tag}>", xml_escape(arn)));
+        let wire_tag = if target_tag == "Function" {
+            "CloudFunction"
+        } else {
+            target_tag
+        };
+        out.push_str(&format!("<{wire_tag}>{}</{wire_tag}>", xml_escape(arn)));
         // CFN carries a single Event string per configuration.
         if let Some(ev) = entry.get("Event").and_then(Value::as_str) {
             out.push_str(&format!("<Event>{}</Event>", xml_escape(ev)));
@@ -938,11 +947,17 @@ mod tests {
         )
         .unwrap();
         let xml = b.notification_config.clone().unwrap();
-        // Lambda uses the newer <LambdaFunctionConfiguration>/<Function> shape.
-        assert!(xml.contains("<LambdaFunctionConfiguration>"));
-        assert!(
-            xml.contains("<Function>arn:aws:lambda:us-east-1:123456789012:function:f</Function>")
-        );
+        // Lambda uses the wire shape clients parse:
+        // <CloudFunctionConfiguration>/<CloudFunction>.
+        assert!(xml.contains("<CloudFunctionConfiguration>"));
+        assert!(xml.contains(
+            "<CloudFunction>arn:aws:lambda:us-east-1:123456789012:function:f</CloudFunction>"
+        ));
+        // ... and the firing path still sees the target.
+        let targets = crate::service::notifications::parse_notification_config(&xml);
+        assert!(targets
+            .iter()
+            .any(|t| t.arn == "arn:aws:lambda:us-east-1:123456789012:function:f"));
         assert!(xml.contains("<Queue>arn:aws:sqs:us-east-1:123456789012:q</Queue>"));
         assert!(xml.contains("<Topic>arn:aws:sns:us-east-1:123456789012:t</Topic>"));
         assert!(xml.contains("<FilterRule><Name>prefix</Name><Value>in/</Value></FilterRule>"));

@@ -431,6 +431,9 @@ mod tests {
             topics: Vec::new(),
             queues: Vec::new(),
             source_access_configurations: Vec::new(),
+            self_managed_event_source: None,
+            self_managed_kafka_event_source_config: None,
+            document_db_event_source_config: None,
         }
     }
 

@@ -316,7 +316,7 @@ const OPENAPI_HTTP_METHODS: &[&str] = &[
 /// route keyed `"<METHOD> <path>"`; an `x-amazon-apigateway-integration`
 /// extension on the operation becomes an `Integration` wired as the route
 /// target. Shared by `ImportApi` and `ReimportApi`.
-fn build_api_from_spec(
+pub fn build_api_from_spec(
     spec: &Value,
     api_id: String,
     region: &str,

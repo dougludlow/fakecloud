@@ -438,3 +438,246 @@ async fn cfn_s3_bucket_update_enables_versioning() {
         "versioning update was a silent no-op"
     );
 }
+
+async fn wait_stack_terminal(
+    cfn: &aws_sdk_cloudformation::Client,
+    stack: &str,
+) -> (String, String) {
+    helpers::wait_until(std::time::Duration::from_secs(60), || async {
+        let out = cfn.describe_stacks().stack_name(stack).send().await.ok()?;
+        let s = out.stacks().first()?;
+        let status = s.stack_status()?.as_str().to_string();
+        (!status.ends_with("IN_PROGRESS")).then(|| {
+            (
+                status,
+                s.stack_status_reason().unwrap_or_default().to_string(),
+            )
+        })
+    })
+    .await
+    .expect("stack reached a terminal status")
+}
+
+const RETAINED_TABLE: &str = r#"{
+  "Resources": {
+    "Table": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "TableName": "cfn-retained-table",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+      }
+    }
+  }
+}"#;
+
+/// `DeletionPolicy: Retain` + an explicit name: deleting the stack keeps the
+/// table, and deploying the stack again fails with "already exists" instead
+/// of overwriting the retained table (and wiping its items).
+#[tokio::test]
+async fn cfn_redeploy_over_retained_table_fails_and_keeps_data() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let ddb = server.dynamodb_client().await;
+
+    cfn.create_stack()
+        .stack_name("retain-1")
+        .template_body(RETAINED_TABLE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_stack_terminal(&cfn, "retain-1").await.0,
+        "CREATE_COMPLETE"
+    );
+    ddb.put_item()
+        .table_name("cfn-retained-table")
+        .item(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S("keep-me".into()),
+        )
+        .send()
+        .await
+        .unwrap();
+    cfn.delete_stack()
+        .stack_name("retain-1")
+        .send()
+        .await
+        .unwrap();
+    helpers::wait_until(std::time::Duration::from_secs(30), || async {
+        let out = cfn.describe_stacks().stack_name("retain-1").send().await;
+        match out {
+            Err(_) => Some(()),
+            Ok(o) => o
+                .stacks()
+                .first()
+                .and_then(|s| s.stack_status())
+                .filter(|s| s.as_str() == "DELETE_COMPLETE")
+                .map(|_| ()),
+        }
+    })
+    .await
+    .expect("stack deleted");
+
+    let result = cfn
+        .create_stack()
+        .stack_name("retain-2")
+        .template_body(RETAINED_TABLE)
+        .send()
+        .await;
+    let reason = match result {
+        Err(e) => format!("{e:?}"),
+        Ok(_) => {
+            let (status, reason) = wait_stack_terminal(&cfn, "retain-2").await;
+            assert_ne!(status, "CREATE_COMPLETE");
+            reason
+        }
+    };
+    assert!(reason.contains("already exists"), "{reason}");
+
+    let got = ddb
+        .get_item()
+        .table_name("cfn-retained-table")
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S("keep-me".into()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(got.item().is_some(), "retained item survived the redeploy");
+}
+
+/// TimeToLiveSpecification, PointInTimeRecoverySpecification and
+/// KinesisStreamSpecification reach the table (DescribeTimeToLive /
+/// DescribeContinuousBackups / DescribeKinesisStreamingDestination), and a
+/// stack update that turns on StreamSpecification yields a StreamArn.
+#[tokio::test]
+async fn cfn_dynamodb_table_applies_ttl_pitr_kinesis_and_stream_updates() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let ddb = server.dynamodb_client().await;
+    let template = |stream: bool| {
+        let mut props = serde_json::json!({
+            "TableName": "cfn-ttl-table",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "ProvisionedThroughput": {"ReadCapacityUnits": 2, "WriteCapacityUnits": 2},
+            "TimeToLiveSpecification": {"AttributeName": "expires", "Enabled": true},
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": true},
+            "KinesisStreamSpecification": {"StreamArn": "arn:aws:kinesis:us-east-1:123456789012:stream/ttl-dest"}
+        });
+        if stream {
+            props["StreamSpecification"] =
+                serde_json::json!({"StreamViewType": "NEW_AND_OLD_IMAGES"});
+        }
+        serde_json::json!({
+            "Resources": {"Table": {"Type": "AWS::DynamoDB::Table", "Properties": props}},
+            "Outputs": {"StreamArn": {"Value": {"Fn::GetAtt": ["Table", "StreamArn"]}}}
+        })
+        .to_string()
+    };
+    let initial = serde_json::from_str::<serde_json::Value>(&template(false)).unwrap();
+    let mut initial = initial;
+    initial.as_object_mut().unwrap().remove("Outputs");
+    cfn.create_stack()
+        .stack_name("ddb-settings")
+        .template_body(initial.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_stack_terminal(&cfn, "ddb-settings").await.0,
+        "CREATE_COMPLETE"
+    );
+
+    let table = ddb
+        .describe_table()
+        .table_name("cfn-ttl-table")
+        .send()
+        .await
+        .unwrap();
+    // CloudFormation's BillingMode default is PROVISIONED.
+    let summary = table.table().unwrap().billing_mode_summary();
+    assert!(
+        summary.is_none_or(|s| s.billing_mode().map(|m| m.as_str()) == Some("PROVISIONED")),
+        "{summary:?}"
+    );
+    let ttl = ddb
+        .describe_time_to_live()
+        .table_name("cfn-ttl-table")
+        .send()
+        .await
+        .unwrap();
+    let ttl = ttl.time_to_live_description().unwrap();
+    assert_eq!(ttl.time_to_live_status().unwrap().as_str(), "ENABLED");
+    assert_eq!(ttl.attribute_name(), Some("expires"));
+    let backups = ddb
+        .describe_continuous_backups()
+        .table_name("cfn-ttl-table")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        backups
+            .continuous_backups_description()
+            .unwrap()
+            .point_in_time_recovery_description()
+            .unwrap()
+            .point_in_time_recovery_status()
+            .unwrap()
+            .as_str(),
+        "ENABLED"
+    );
+    let kinesis = ddb
+        .describe_kinesis_streaming_destination()
+        .table_name("cfn-ttl-table")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        kinesis.kinesis_data_stream_destinations()[0].stream_arn(),
+        Some("arn:aws:kinesis:us-east-1:123456789012:stream/ttl-dest")
+    );
+
+    cfn.update_stack()
+        .stack_name("ddb-settings")
+        .template_body(template(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_stack_terminal(&cfn, "ddb-settings").await.0,
+        "UPDATE_COMPLETE"
+    );
+    let table = ddb
+        .describe_table()
+        .table_name("cfn-ttl-table")
+        .send()
+        .await
+        .unwrap();
+    let stream_arn = table
+        .table()
+        .unwrap()
+        .latest_stream_arn()
+        .expect("stream enabled by the update")
+        .to_string();
+    let outputs = cfn
+        .describe_stacks()
+        .stack_name("ddb-settings")
+        .send()
+        .await
+        .unwrap()
+        .stacks()[0]
+        .outputs()
+        .to_vec();
+    assert_eq!(
+        outputs
+            .iter()
+            .find(|o| o.output_key() == Some("StreamArn"))
+            .and_then(|o| o.output_value()),
+        Some(stream_arn.as_str())
+    );
+}

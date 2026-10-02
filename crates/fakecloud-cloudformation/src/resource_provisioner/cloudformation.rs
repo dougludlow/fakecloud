@@ -125,6 +125,7 @@ impl ResourceProvisioner {
             timestream_state: self.timestream_state.clone(),
             mwaa_state: self.mwaa_state.clone(),
             amplify_state: self.amplify_state.clone(),
+            iot_state: self.iot_state.clone(),
             appconfig_state: self.appconfig_state.clone(),
             cloudformation_state: self.cloudformation_state.clone(),
             delivery: self.delivery.clone(),

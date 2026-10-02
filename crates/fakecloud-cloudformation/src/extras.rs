@@ -3097,6 +3097,7 @@ pub(crate) mod tests {
             timestream: shared::<fakecloud_timestream::TimestreamData>(),
             mwaa: shared::<fakecloud_mwaa::MwaaData>(),
             amplify: shared::<fakecloud_amplify::state::AmplifyData>(),
+            iot: shared::<fakecloud_iot::IotData>(),
             appconfig: shared::<fakecloud_appconfig::AppConfigState>(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,

@@ -51,6 +51,15 @@ impl ResourceProvisioner {
             .unwrap_or(&generated_name);
 
         let mut __s3_mas = self.s3_state.write();
+        // The bucket namespace is global: a name held by any account (this
+        // one included, e.g. a bucket a deleted stack retained) fails the
+        // create rather than being overwritten.
+        if __s3_mas
+            .iter()
+            .any(|(_, acct)| acct.buckets.contains_key(bucket_name))
+        {
+            return Err(resource_already_exists("AWS::S3::Bucket", bucket_name));
+        }
         let state = __s3_mas.get_or_create(&self.account_id);
         let region = self.region.clone();
         let mut bucket = S3Bucket::new(bucket_name, &self.region, &state.account_id);

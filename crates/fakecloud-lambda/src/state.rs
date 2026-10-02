@@ -205,6 +205,17 @@ pub struct EventSourceMapping {
     /// so Get/List/Update echo back what the caller supplied (1.17).
     #[serde(default)]
     pub source_access_configurations: Vec<serde_json::Value>,
+    /// `SelfManagedEventSource` -- the bootstrap servers of a self-managed
+    /// Kafka cluster (`{"Endpoints": {"KAFKA_BOOTSTRAP_SERVERS": [...]}}`),
+    /// which has no event source ARN.
+    #[serde(default)]
+    pub self_managed_event_source: Option<serde_json::Value>,
+    /// `SelfManagedKafkaEventSourceConfig` (consumer group id).
+    #[serde(default)]
+    pub self_managed_kafka_event_source_config: Option<serde_json::Value>,
+    /// `DocumentDBEventSourceConfig` (database, collection, full document).
+    #[serde(default)]
+    pub document_db_event_source_config: Option<serde_json::Value>,
 }
 
 /// A recorded Lambda invocation from cross-service delivery.

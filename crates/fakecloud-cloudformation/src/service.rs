@@ -633,6 +633,7 @@ pub struct CloudFormationDeps {
     pub timestream: fakecloud_timestream::SharedTimestreamState,
     pub mwaa: fakecloud_mwaa::SharedMwaaState,
     pub amplify: fakecloud_amplify::SharedAmplifyState,
+    pub iot: fakecloud_iot::SharedIotState,
     pub appconfig: fakecloud_appconfig::SharedAppConfigState,
     pub delivery: Arc<DeliveryBus>,
     /// Lambda container runtime, when Docker/Podman is available. Used to
@@ -1307,6 +1308,7 @@ impl CloudFormationService {
             timestream_state: self.deps.timestream.clone(),
             mwaa_state: self.deps.mwaa.clone(),
             amplify_state: self.deps.amplify.clone(),
+            iot_state: self.deps.iot.clone(),
             appconfig_state: self.deps.appconfig.clone(),
             cloudformation_state: self.state.clone(),
             delivery: self.deps.delivery.clone(),
@@ -4559,6 +4561,7 @@ mod tests {
             timestream: mas(),
             mwaa: mas(),
             amplify: mas(),
+            iot: mas(),
             appconfig: mas(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,

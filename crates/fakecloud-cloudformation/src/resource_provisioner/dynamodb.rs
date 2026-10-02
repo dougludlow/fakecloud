@@ -5,6 +5,158 @@
 
 use super::*;
 
+fn cfn_bool(v: &serde_json::Value) -> Option<bool> {
+    v.as_bool().or_else(|| match v.as_str() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    })
+}
+
+/// Mint a stream ARN for `table`, labelled with the current time as
+/// DynamoDB labels a newly enabled stream.
+fn new_stream_arn(table: &DynamoTable) -> String {
+    format!(
+        "{}/stream/{}",
+        table.arn,
+        Utc::now().format("%Y-%m-%dT%H:%M:%S.%3f")
+    )
+}
+
+/// Apply the `AWS::DynamoDB::Table` properties that DynamoDB configures
+/// through operations other than CreateTable -- `TimeToLiveSpecification`
+/// (UpdateTimeToLive), `PointInTimeRecoverySpecification`
+/// (UpdateContinuousBackups), `KinesisStreamSpecification`
+/// (EnableKinesisStreamingDestination) and, on update, `StreamSpecification`
+/// (UpdateTable) -- onto the same table fields those operations write, so
+/// DescribeTimeToLive / DescribeContinuousBackups /
+/// DescribeKinesisStreamingDestination / DescribeTable reflect the template.
+///
+/// On update a property the template no longer sets reverts to its default
+/// (TTL, PITR, Kinesis streaming and the table stream are turned off), as a
+/// CloudFormation update that drops a property does.
+fn apply_cfn_table_settings(
+    table: &mut DynamoTable,
+    props: &serde_json::Value,
+    is_update: bool,
+) -> Result<(), String> {
+    // --- TimeToLiveSpecification ---
+    match props.get("TimeToLiveSpecification") {
+        Some(spec) => {
+            let enabled = spec
+                .get("Enabled")
+                .and_then(cfn_bool)
+                .ok_or("TimeToLiveSpecification.Enabled is required")?;
+            let attr = spec.get("AttributeName").and_then(|v| v.as_str());
+            if enabled {
+                let attr = attr.filter(|a| !a.is_empty()).ok_or(
+                    "TimeToLiveSpecification.AttributeName is required when TTL is enabled",
+                )?;
+                table.ttl_attribute = Some(attr.to_string());
+                table.ttl_enabled = true;
+            } else {
+                if let Some(attr) = attr.filter(|a| !a.is_empty()) {
+                    table.ttl_attribute = Some(attr.to_string());
+                }
+                table.ttl_enabled = false;
+            }
+        }
+        None if is_update => table.ttl_enabled = false,
+        None => {}
+    }
+
+    // --- PointInTimeRecoverySpecification ---
+    match props.get("PointInTimeRecoverySpecification") {
+        Some(spec) => {
+            table.pitr_enabled = spec
+                .get("PointInTimeRecoveryEnabled")
+                .and_then(cfn_bool)
+                .unwrap_or(false);
+        }
+        None if is_update => table.pitr_enabled = false,
+        None => {}
+    }
+
+    // --- KinesisStreamSpecification ---
+    let wanted = props.get("KinesisStreamSpecification");
+    let wanted_arn = match wanted {
+        Some(spec) => Some(
+            spec.get("StreamArn")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("KinesisStreamSpecification.StreamArn is required")?,
+        ),
+        None => None,
+    };
+    if wanted.is_some() || is_update {
+        // Any other active destination is turned off, as disabling it with
+        // DisableKinesisStreamingDestination would.
+        for dest in table.kinesis_destinations.iter_mut() {
+            if Some(dest.stream_arn.as_str()) != wanted_arn && dest.destination_status == "ACTIVE" {
+                dest.destination_status = "DISABLED".to_string();
+            }
+        }
+    }
+    if let (Some(spec), Some(arn)) = (wanted, wanted_arn) {
+        let precision = spec
+            .get("ApproximateCreationDateTimePrecision")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match table
+            .kinesis_destinations
+            .iter_mut()
+            .find(|d| d.stream_arn == arn)
+        {
+            Some(dest) => {
+                dest.destination_status = "ACTIVE".to_string();
+                dest.approximate_creation_date_time_precision = precision;
+            }
+            None => table.kinesis_destinations.push(KinesisDestination {
+                stream_arn: arn.to_string(),
+                destination_status: "ACTIVE".to_string(),
+                approximate_creation_date_time_precision: precision,
+            }),
+        }
+    }
+
+    // --- StreamSpecification (update; create sets it up front) ---
+    if is_update {
+        let (enabled, view_type) = match props.get("StreamSpecification") {
+            Some(spec) => {
+                let view_type = spec
+                    .get("StreamViewType")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let enabled = spec
+                    .get("StreamEnabled")
+                    .and_then(cfn_bool)
+                    .unwrap_or(view_type.is_some());
+                (enabled, view_type)
+            }
+            None => (false, None),
+        };
+        if enabled {
+            // Turning the stream on, or changing its view type (which
+            // CloudFormation does by disabling and re-enabling it), starts a
+            // new stream with a new ARN.
+            let view_changed = view_type.is_some() && view_type != table.stream_view_type;
+            if !table.stream_enabled || view_changed || table.stream_arn.is_none() {
+                table.stream_arn = Some(new_stream_arn(table));
+            }
+            table.stream_enabled = true;
+            if view_type.is_some() {
+                table.stream_view_type = view_type;
+            }
+        } else {
+            // Like UpdateTable, disabling keeps the last stream ARN visible as
+            // LatestStreamArn.
+            table.stream_enabled = false;
+        }
+    }
+    Ok(())
+}
+
 impl ResourceProvisioner {
     pub(super) fn get_att_dynamodb_table(
         &self,
@@ -74,28 +226,34 @@ impl ResourceProvisioner {
             }
         }
 
+        // CloudFormation's BillingMode default is PROVISIONED (SAM's
+        // SimpleTable sets PAY_PER_REQUEST itself during the transform), and
+        // a provisioned table must state both capacity units, as CreateTable
+        // requires.
         let billing_mode = props
             .get("BillingMode")
             .and_then(|v| v.as_str())
-            .unwrap_or("PAY_PER_REQUEST")
+            .unwrap_or("PROVISIONED")
             .to_string();
 
         let provisioned_throughput = if billing_mode == "PROVISIONED" {
-            if let Some(pt) = props.get("ProvisionedThroughput") {
-                ProvisionedThroughput {
-                    read_capacity_units: pt
-                        .get("ReadCapacityUnits")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(5),
-                    write_capacity_units: pt
-                        .get("WriteCapacityUnits")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(5),
-                }
-            } else {
-                ProvisionedThroughput {
-                    read_capacity_units: 5,
-                    write_capacity_units: 5,
+            let units = |key: &str| {
+                props
+                    .get("ProvisionedThroughput")
+                    .and_then(|pt| pt.get(key))
+                    .and_then(cfn_as_i64)
+            };
+            match (units("ReadCapacityUnits"), units("WriteCapacityUnits")) {
+                (Some(read), Some(write)) => ProvisionedThroughput {
+                    read_capacity_units: read,
+                    write_capacity_units: write,
+                },
+                _ => {
+                    return Err(
+                        "One or more parameter values were invalid: ReadCapacityUnits and \
+                         WriteCapacityUnits must both be specified when BillingMode is PROVISIONED"
+                            .to_string(),
+                    )
                 }
             }
         } else {
@@ -142,6 +300,9 @@ impl ResourceProvisioner {
 
         let mut __ddb_mas = self.dynamodb_state.write();
         let state = __ddb_mas.get_or_create(&self.account_id);
+        if state.tables.contains_key(table_name) {
+            return Err(resource_already_exists("AWS::DynamoDB::Table", table_name));
+        }
         let arn = fakecloud_dynamodb::table_arn(&self.region, &self.account_id, table_name);
 
         let stream_arn = if stream_enabled {
@@ -219,6 +380,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("STANDARD")
             .to_string();
+        apply_cfn_table_settings(&mut table, props, false)?;
         let table = table;
 
         state.tables.insert(table_name.to_string(), table);
@@ -323,8 +485,10 @@ impl ResourceProvisioner {
             }
         }
 
+        apply_cfn_table_settings(table, props, true)?;
+
         let mut result = ProvisionResult::new(arn.clone()).with("Arn", arn.clone());
-        if let Some(stream_arn) = table.stream_arn.clone() {
+        if let Some(stream_arn) = table.stream_arn.clone().filter(|_| table.stream_enabled) {
             result = result.with("StreamArn", stream_arn);
         }
         Ok(result)

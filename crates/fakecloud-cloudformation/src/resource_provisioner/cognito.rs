@@ -99,7 +99,9 @@ impl ResourceProvisioner {
             username_attributes,
             alias_attributes,
             schema_attributes,
-            lambda_config: None,
+            // Stored verbatim, as CreateUserPool stores it, so the pool's
+            // triggers fire.
+            lambda_config: props.get("LambdaConfig").filter(|v| v.is_object()).cloned(),
             mfa_configuration,
             email_configuration,
             sms_configuration,
@@ -193,6 +195,9 @@ impl ResourceProvisioner {
             pool.account_recovery_setting =
                 parse_cognito_account_recovery(props.get("AccountRecoverySetting"));
         }
+        // A template that drops LambdaConfig removes the triggers, as an
+        // UpdateUserPool without it does.
+        pool.lambda_config = props.get("LambdaConfig").filter(|v| v.is_object()).cloned();
         pool.last_modified_date = Utc::now();
 
         let arn = pool.arn.clone();

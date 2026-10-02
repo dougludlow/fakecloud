@@ -56,6 +56,69 @@ fn parse_cfn_tag_map(v: Option<&serde_json::Value>) -> Option<BTreeMap<String, S
     None
 }
 
+/// SHA-256 (hex) of a definition document, as recorded for change detection.
+fn definition_sha256(definition: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(definition.to_string().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Apply `definition` to the API `api_id` as a stack's `Body` /
+/// `BodyS3Location`: remove the routes and integrations the previous import
+/// created (and only those), import the new definition's, set the API's
+/// name / description / version from it, and record the import. `None`
+/// (the template dropped the definition) just removes the previous import.
+fn apply_http_api_definition(
+    state: &mut fakecloud_apigatewayv2::ApiGatewayV2State,
+    api_id: &str,
+    definition: Option<&serde_json::Value>,
+    region: &str,
+) -> Result<(), String> {
+    if let Some(previous) = state.definition_imports.remove(api_id) {
+        if let Some(routes) = state.routes.get_mut(api_id) {
+            for id in &previous.route_ids {
+                routes.remove(id);
+            }
+        }
+        if let Some(integrations) = state.integrations.get_mut(api_id) {
+            for id in &previous.integration_ids {
+                integrations.remove(id);
+            }
+        }
+    }
+    let Some(definition) = definition else {
+        return Ok(());
+    };
+    let (spec_api, routes, integrations) =
+        fakecloud_apigatewayv2::extras::build_api_from_spec(definition, api_id.to_string(), region);
+    let api = state
+        .apis
+        .get_mut(api_id)
+        .ok_or_else(|| format!("Api {api_id} no longer exists in state"))?;
+    api.name = spec_api.name;
+    api.description = spec_api.description;
+    api.version = spec_api.version;
+    let record = fakecloud_apigatewayv2::DefinitionImport {
+        definition_sha256: definition_sha256(definition),
+        route_ids: routes.keys().cloned().collect(),
+        integration_ids: integrations.keys().cloned().collect(),
+    };
+    state
+        .routes
+        .entry(api_id.to_string())
+        .or_default()
+        .extend(routes);
+    state
+        .integrations
+        .entry(api_id.to_string())
+        .or_default()
+        .extend(integrations);
+    state.definition_imports.insert(api_id.to_string(), record);
+    Ok(())
+}
+
 impl ResourceProvisioner {
     // --- API Gateway v2 (HTTP/WebSocket APIs) ---
 
@@ -64,11 +127,22 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        // An OpenAPI definition (`Body` / `BodyS3Location`) is imported as the
+        // API's routes and integrations, and names the API when `Name` is not
+        // given, as ImportApi does.
+        let definition = self.apigw_rest_api_definition(props)?;
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .ok_or("Name is required")?
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| {
+                definition
+                    .as_ref()
+                    .and_then(|d| d.pointer("/info/title"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .ok_or("Name is required")?;
         let protocol_type = props
             .get("ProtocolType")
             .and_then(|v| v.as_str())
@@ -154,7 +228,22 @@ impl ResourceProvisioner {
         let api_endpoint = api.api_endpoint.clone();
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        // The template's own Name / Description win over the definition's
+        // `info`.
+        let explicit_description = api.description.clone();
+        let explicit_name = props.get("Name").and_then(|v| v.as_str());
         state.apis.insert(id.clone(), api);
+        if definition.is_some() {
+            apply_http_api_definition(state, &id, definition.as_ref(), &self.region)?;
+            if let Some(api) = state.apis.get_mut(&id) {
+                if let Some(name) = explicit_name {
+                    api.name = name.to_string();
+                }
+                if explicit_description.is_some() {
+                    api.description = explicit_description;
+                }
+            }
+        }
 
         Ok(ProvisionResult::new(id.clone())
             .with("ApiId", id)
@@ -961,8 +1050,21 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let api_id = existing.physical_id.clone();
+        let definition = self.apigw_rest_api_definition(props)?;
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        // A definition that differs from the one last applied is re-imported
+        // in full (replacing only what that import created, as recorded); an
+        // unchanged one is left alone. Routes and integrations other stack
+        // resources own survive either way.
+        let applied = state
+            .definition_imports
+            .get(&api_id)
+            .map(|r| r.definition_sha256.clone());
+        let wanted = definition.as_ref().map(definition_sha256);
+        if applied != wanted {
+            apply_http_api_definition(state, &api_id, definition.as_ref(), &self.region)?;
+        }
         let api = state
             .apis
             .get_mut(&api_id)

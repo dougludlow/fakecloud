@@ -25,6 +25,21 @@ impl LambdaService {
         out
     }
 
+    /// The key a function URL is stored under: the function name, or
+    /// `{function}:{qualifier}` for a URL on an alias (the request's
+    /// `Qualifier`), so an alias URL and the unqualified one are distinct.
+    fn function_url_key(function_name: &str, req: &AwsRequest) -> String {
+        match req
+            .query_params
+            .get("Qualifier")
+            .map(String::as_str)
+            .filter(|q| !q.is_empty())
+        {
+            Some(q) => format!("{function_name}:{q}"),
+            None => function_name.to_string(),
+        }
+    }
+
     pub(super) fn create_function_url_config(
         &self,
         function_name: &str,
@@ -57,7 +72,16 @@ impl LambdaService {
         // request's credential-scope region (`req.region`), matching the
         // function's own ARN, not the server default (`state.region`). Both
         // are persisted and re-emitted by Get/Update/List.
-        let function_arn = function_arn(&req.region, &state.account_id, function_name);
+        let key = Self::function_url_key(function_name, req);
+        let function_arn = match key.split_once(':') {
+            Some((_, q)) => crate::state::qualified_function_arn(
+                &req.region,
+                &state.account_id,
+                function_name,
+                q,
+            ),
+            None => function_arn(&req.region, &state.account_id, function_name),
+        };
         let cfg = FunctionUrlConfig {
             function_arn: function_arn.clone(),
             function_url: format!("https://{function_name}.lambda-url.{}.on.aws/", req.region),
@@ -83,9 +107,7 @@ impl LambdaService {
                 m
             },
         };
-        state
-            .function_url_configs
-            .insert(function_name.to_string(), cfg.clone());
+        state.function_url_configs.insert(key, cfg.clone());
         // `CreateFunctionUrlConfigResponse` lacks `LastModifiedTime` —
         // that member only appears on `Get`/`Update` responses. Strip it
         // before returning so strict shape validators don't reject it.
@@ -99,13 +121,15 @@ impl LambdaService {
     pub(super) fn get_function_url_config(
         &self,
         function_name: &str,
-        account_id: &str,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let account_id = req.account_id.as_str();
+        let key = Self::function_url_key(function_name, req);
         let region = self.region_for(account_id);
         self.with_state_read(account_id, &region, |state| {
             state
                 .function_url_configs
-                .get(function_name)
+                .get(&key)
                 .map(|c| ok(Self::function_url_config_json(c)))
                 .unwrap_or_else(|| Err(not_found("FunctionUrlConfig", function_name)))
         })
@@ -119,9 +143,10 @@ impl LambdaService {
         let body = body(req);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        let key = Self::function_url_key(function_name, req);
         let cfg = state
             .function_url_configs
-            .get_mut(function_name)
+            .get_mut(&key)
             .ok_or_else(|| not_found("FunctionUrlConfig", function_name))?;
         if let Some(a) = body["AuthType"].as_str() {
             if a != "NONE" && a != "AWS_IAM" {
@@ -154,13 +179,14 @@ impl LambdaService {
     pub(super) fn delete_function_url_config(
         &self,
         function_name: &str,
-        account_id: &str,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let key = Self::function_url_key(function_name, req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.get_or_create(&req.account_id);
         // A URL config that was never created is a not-found, the same way
         // AWS answers it.
-        if state.function_url_configs.remove(function_name).is_none() {
+        if state.function_url_configs.remove(&key).is_none() {
             return Err(not_found("FunctionUrlConfig", function_name));
         }
         empty()
@@ -178,7 +204,12 @@ impl LambdaService {
             let configs: Vec<Value> = state
                 .function_url_configs
                 .iter()
-                .filter(|(name, _)| name.as_str() == function_name)
+                .filter(|(key, _)| {
+                    key.as_str() == function_name
+                        || key
+                            .strip_prefix(function_name)
+                            .is_some_and(|rest| rest.starts_with(':'))
+                })
                 .map(|(_, c)| Self::function_url_config_json(c))
                 .collect();
             ok(json!({"FunctionUrlConfigs": configs}))

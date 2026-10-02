@@ -96,8 +96,10 @@ pub(crate) fn expand_for_each(
 }
 
 /// Expand AWS::Serverless-2016-10-31 SAM resources into native
-/// CloudFormation resources so the provisioner can handle them.
-pub(super) fn expand_sam(value: &Value) -> Value {
+/// CloudFormation resources so the provisioner can handle them. A template
+/// the SAM translator would reject (an unsupported event type, an event
+/// referencing something it cannot) fails the transform.
+pub(super) fn expand_sam(value: &Value) -> Result<Value, String> {
     let transform = value.get("Transform");
     let has_sam = match transform {
         Some(Value::String(s)) => s == "AWS::Serverless-2016-10-31",
@@ -107,7 +109,7 @@ pub(super) fn expand_sam(value: &Value) -> Value {
         _ => false,
     };
     if !has_sam {
-        return value.clone();
+        return Ok(value.clone());
     }
 
     // SAM `Globals` supply default properties for every resource of a given
@@ -132,10 +134,10 @@ pub(super) fn expand_sam(value: &Value) -> Value {
 
     let mut value = value.clone();
     let Some(resources) = value.get_mut("Resources") else {
-        return value;
+        return Ok(value);
     };
     let Some(resources_map) = resources.as_object_mut() else {
-        return value;
+        return Ok(value);
     };
 
     // Immutable snapshot of the original resource set, used to resolve a
@@ -144,9 +146,16 @@ pub(super) fn expand_sam(value: &Value) -> Value {
     let resources_map_snapshot = resources_map.clone();
 
     let mut new_resources = serde_json::Map::new();
-    // Api/HttpApi routes collected from every function's Events, synthesized
-    // into the implicit API after the loop.
-    let mut sam_api_routes: Vec<super::sam_events::ApiRoute> = Vec::new();
+    // Api/HttpApi routes collected from every function's Events, plus the
+    // edits events make to other resources, applied after the loop.
+    let mut ctx = super::sam_events::SamContext {
+        resources: resources_map_snapshot.clone(),
+        ..Default::default()
+    };
+    // Explicit Serverless::Api / HttpApi resources, expanded once every
+    // function's routes are known.
+    let mut rest_apis: Vec<super::sam_api::ApiDef> = Vec::new();
+    let mut http_apis: Vec<super::sam_api::ApiDef> = Vec::new();
     for (logical_id, resource) in resources_map.iter() {
         let Some(resource_obj) = resource.as_object() else {
             new_resources.insert(logical_id.clone(), resource.clone());
@@ -195,8 +204,8 @@ pub(super) fn expand_sam(value: &Value) -> Value {
                 let extras = super::sam_events::expand_function_extras(
                     logical_id,
                     &mut lambda_props,
-                    &mut sam_api_routes,
-                );
+                    &mut ctx,
+                )?;
 
                 let mut lambda_resource = serde_json::Map::new();
                 lambda_resource.insert("Type".to_string(), json!("AWS::Lambda::Function"));
@@ -211,33 +220,26 @@ pub(super) fn expand_sam(value: &Value) -> Value {
                     new_resources.entry(extra_id).or_insert(extra);
                 }
             }
-            "AWS::Serverless::Api" => {
-                let mut api_props = merge_global_properties(&global_api, &properties);
-                if let Some(def) = api_props.get("DefinitionBody").cloned() {
-                    api_props.remove("DefinitionBody");
-                    api_props.insert("Body".to_string(), def);
+            "AWS::Serverless::Api" | "AWS::Serverless::HttpApi" => {
+                let globals = if ty == "AWS::Serverless::Api" {
+                    &global_api
+                } else {
+                    &global_http_api
+                };
+                let def = super::sam_api::ApiDef {
+                    logical_id: logical_id.clone(),
+                    props: merge_global_properties(globals, &properties),
+                    attributes: resource_obj
+                        .iter()
+                        .filter(|(k, _)| *k != "Type" && *k != "Properties")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                };
+                if ty == "AWS::Serverless::Api" {
+                    rest_apis.push(def);
+                } else {
+                    http_apis.push(def);
                 }
-                let mut api_resource = serde_json::Map::new();
-                api_resource.insert("Type".to_string(), json!("AWS::ApiGateway::RestApi"));
-                api_resource.insert("Properties".to_string(), Value::Object(api_props));
-                for (k, v) in resource_obj {
-                    if k != "Type" && k != "Properties" {
-                        api_resource.insert(k.clone(), v.clone());
-                    }
-                }
-                new_resources.insert(logical_id.clone(), Value::Object(api_resource));
-            }
-            "AWS::Serverless::HttpApi" => {
-                let httpapi_props = merge_global_properties(&global_http_api, &properties);
-                let mut httpapi_resource = serde_json::Map::new();
-                httpapi_resource.insert("Type".to_string(), json!("AWS::ApiGatewayV2::Api"));
-                httpapi_resource.insert("Properties".to_string(), Value::Object(httpapi_props));
-                for (k, v) in resource_obj {
-                    if k != "Type" && k != "Properties" {
-                        httpapi_resource.insert(k.clone(), v.clone());
-                    }
-                }
-                new_resources.insert(logical_id.clone(), Value::Object(httpapi_resource));
             }
             "AWS::Serverless::SimpleTable" => {
                 let mut table_props = merge_global_properties(&global_simple_table, &properties);
@@ -360,6 +362,7 @@ pub(super) fn expand_sam(value: &Value) -> Value {
                     .map(|events| {
                         super::sam_events::expand_state_machine_events(logical_id, &events)
                     })
+                    .transpose()?
                     .unwrap_or_default();
 
                 let mut sfn_resource = serde_json::Map::new();
@@ -411,17 +414,81 @@ pub(super) fn expand_sam(value: &Value) -> Value {
         }
     }
 
-    // Synthesize the implicit API resources from the collected Api/HttpApi
-    // routes (one RestApi/HttpApi shared across all functions).
-    for (id, res) in super::sam_events::synthesize_api_resources(&sam_api_routes) {
+    // The implicit APIs SAM creates for events without an explicit
+    // RestApiId / ApiId: `ServerlessRestApi` (stage `Prod`) and
+    // `ServerlessHttpApi` (stage `$default`), configured by Globals.
+    let implicit = |id: &str, globals: &serde_json::Map<String, Value>| super::sam_api::ApiDef {
+        logical_id: id.to_string(),
+        props: globals.clone(),
+        attributes: serde_json::Map::new(),
+    };
+    let routes_for = |api_id: &str, http: bool| -> Vec<&super::sam_events::ApiRoute> {
+        ctx.api_routes
+            .iter()
+            .filter(|r| r.api_id == api_id && r.http_api == http)
+            .collect()
+    };
+    let mut api_resources: Vec<(String, Value)> = Vec::new();
+    let mut api_refs: Vec<(String, String)> = Vec::new();
+    if !routes_for("ServerlessRestApi", false).is_empty()
+        && !rest_apis
+            .iter()
+            .any(|d| d.logical_id == "ServerlessRestApi")
+    {
+        let mut def = implicit("ServerlessRestApi", &global_api);
+        def.props.remove("StageName");
+        let (res, refs) = super::sam_api::build_rest_api(
+            &def,
+            &routes_for("ServerlessRestApi", false),
+            Some("Prod"),
+        )?;
+        api_resources.extend(res);
+        api_refs.extend(refs);
+    }
+    if !routes_for("ServerlessHttpApi", true).is_empty()
+        && !http_apis
+            .iter()
+            .any(|d| d.logical_id == "ServerlessHttpApi")
+    {
+        let def = implicit("ServerlessHttpApi", &global_http_api);
+        let (res, refs) =
+            super::sam_api::build_http_api(&def, &routes_for("ServerlessHttpApi", true))?;
+        api_resources.extend(res);
+        api_refs.extend(refs);
+    }
+    for def in &rest_apis {
+        let (res, refs) =
+            super::sam_api::build_rest_api(def, &routes_for(&def.logical_id, false), None)?;
+        api_resources.extend(res);
+        api_refs.extend(refs);
+    }
+    for def in &http_apis {
+        let (res, refs) = super::sam_api::build_http_api(def, &routes_for(&def.logical_id, true))?;
+        api_resources.extend(res);
+        api_refs.extend(refs);
+    }
+    for (id, res) in api_resources {
         new_resources.entry(id).or_insert(res);
     }
+    super::sam_events::apply_cross_resource_edits(&ctx, &mut new_resources)?;
 
     resources_map.clear();
     for (k, v) in new_resources {
         resources_map.insert(k, v);
     }
-    value
+
+    // `Ref: MyFunction.Alias` / `MyApi.Stage` and friends name generated
+    // resources; point them at their logical ids everywhere they appear.
+    let mut aliases = ctx.ref_aliases.clone();
+    aliases.extend(api_refs);
+    if let Some(obj) = value.as_object_mut() {
+        for section in ["Resources", "Outputs", "Conditions"] {
+            if let Some(v) = obj.get_mut(section) {
+                super::sam_events::rewrite_sam_refs(v, &aliases);
+            }
+        }
+    }
+    Ok(value)
 }
 
 /// Merge SAM `Globals.<Section>` defaults under a resource's own `Properties`,
@@ -589,7 +656,7 @@ mod tests {
             }
         });
 
-        let props = &expand_sam(&template)["Resources"]["Dispatcher"]["Properties"];
+        let props = &expand_sam(&template).unwrap()["Resources"]["Dispatcher"]["Properties"];
         assert_eq!(props["Handler"], json!("index.lambda_handler"));
         assert_eq!(props["Runtime"], json!("python3.13"));
         assert_eq!(props["Timeout"], json!(300));
@@ -612,7 +679,7 @@ mod tests {
             }
         });
 
-        let props = &expand_sam(&template)["Resources"]["F"]["Properties"];
+        let props = &expand_sam(&template).unwrap()["Resources"]["F"]["Properties"];
         assert_eq!(
             props["Handler"],
             json!("app.main"),
@@ -650,7 +717,7 @@ mod tests {
             }
         });
 
-        let props = &expand_sam(&template)["Resources"]["F"]["Properties"];
+        let props = &expand_sam(&template).unwrap()["Resources"]["F"]["Properties"];
         // Global var survives, resource var overrides shared key, resource adds new.
         assert_eq!(props["Environment"]["Variables"]["STAGE"], json!("prod"));
         assert_eq!(
@@ -687,7 +754,7 @@ mod tests {
             }
         });
 
-        let expanded = expand_sam(&template);
+        let expanded = expand_sam(&template).unwrap();
         let props = &expanded["Resources"]["F"]["Properties"];
         assert_eq!(
             props["Layers"],
@@ -727,13 +794,14 @@ mod tests {
             }
         });
 
-        let expanded = expand_sam(&template);
+        let expanded = expand_sam(&template).unwrap();
+        // The global Cors reaches the API: with no paths there is nothing to
+        // preflight, so it is consumed without adding OPTIONS methods.
+        assert!(expanded["Resources"]["Gw"]["Properties"]
+            .get("Cors")
+            .is_none());
         assert_eq!(
-            expanded["Resources"]["Gw"]["Properties"]["Cors"],
-            json!("'*'")
-        );
-        assert_eq!(
-            expanded["Resources"]["Gw"]["Properties"]["StageName"],
+            expanded["Resources"]["GwprodStage"]["Properties"]["StageName"],
             json!("prod")
         );
         assert_eq!(
@@ -764,7 +832,7 @@ mod tests {
             }
         });
 
-        let expanded = expand_sam(&template);
+        let expanded = expand_sam(&template).unwrap();
         let resource = &expanded["Resources"]["MySM"];
 
         assert_eq!(resource["Type"], json!("AWS::StepFunctions::StateMachine"));
@@ -805,7 +873,7 @@ mod tests {
             }
         });
 
-        let expanded = expand_sam(&template);
+        let expanded = expand_sam(&template).unwrap();
         let props = &expanded["Resources"]["MySM"]["Properties"];
 
         assert_eq!(
@@ -842,7 +910,7 @@ mod tests {
             }
         });
 
-        let expanded = expand_sam(&template);
+        let expanded = expand_sam(&template).unwrap();
         let resources = &expanded["Resources"];
         // The state machine no longer carries Events.
         assert!(resources["MySM"]["Properties"].get("Events").is_none());
@@ -892,7 +960,7 @@ mod tests {
             }
         });
 
-        let resources = expand_sam(&template)["Resources"].clone();
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
         let rule = &resources["MySMOnOrderRule"];
         assert_eq!(rule["Type"], json!("AWS::Events::Rule"));
         assert_eq!(
@@ -929,7 +997,7 @@ mod tests {
             }
         });
 
-        let resources = expand_sam(&template)["Resources"].clone();
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
         // The connector itself is gone; an IAM policy took its place.
         assert!(resources.get("WriterToTable").is_none());
         let policy = &resources["WriterToTablePolicy"];
@@ -971,7 +1039,7 @@ mod tests {
             }
         });
 
-        let resources = expand_sam(&template)["Resources"].clone();
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
         let stmt =
             &resources["ProducerToQueuePolicy"]["Properties"]["PolicyDocument"]["Statement"][0];
         let actions = stmt["Action"].as_array().unwrap();
@@ -997,7 +1065,7 @@ mod tests {
             }
         });
 
-        let resources = expand_sam(&template)["Resources"].clone();
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
         let stack = &resources["Nested"];
         assert_eq!(stack["Type"], json!("AWS::CloudFormation::Stack"));
         assert_eq!(
@@ -1023,10 +1091,308 @@ mod tests {
             }
         });
 
-        let resources = expand_sam(&template)["Resources"].clone();
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
         assert_eq!(
             resources["Nested"]["Properties"]["TemplateURL"],
             json!("s3://b/k/child.yaml")
         );
+    }
+
+    fn sam(resources: Value) -> Value {
+        json!({ "Transform": "AWS::Serverless-2016-10-31", "Resources": resources })
+    }
+
+    fn function(events: Value) -> Value {
+        json!({
+            "Type": "AWS::Serverless::Function",
+            "Properties": { "Handler": "i.h", "Runtime": "python3.13", "InlineCode": "x", "Events": events }
+        })
+    }
+
+    #[test]
+    fn unknown_event_type_fails_the_transform() {
+        let err = expand_sam(&sam(json!({
+            "Fn": function(json!({"E": {"Type": "Carrier", "Properties": {}}}))
+        })))
+        .unwrap_err();
+        assert!(
+            err.contains("Event type 'Carrier' is not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn api_event_must_reference_a_serverless_api_and_have_path_and_method() {
+        let err = expand_sam(&sam(json!({
+            "Native": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": "n"}},
+            "Fn": function(json!({"E": {"Type": "Api", "Properties": {"RestApiId": {"Ref": "Native"}, "Path": "/", "Method": "get"}}}))
+        })))
+        .unwrap_err();
+        assert!(err.contains("RestApiId must be a valid reference"), "{err}");
+        let err = expand_sam(&sam(json!({
+            "Fn": function(json!({"E": {"Type": "Api", "Properties": {"Path": "/x"}}}))
+        })))
+        .unwrap_err();
+        assert!(err.contains("'Path' or 'Method'"), "{err}");
+    }
+
+    #[test]
+    fn explicit_rest_api_gets_routes_auth_cors_deployment_and_stage() {
+        let expanded = expand_sam(&sam(json!({
+            "MyApi": {
+                "Type": "AWS::Serverless::Api",
+                "Properties": {
+                    "StageName": "v1",
+                    "Cors": {"AllowOrigin": "'https://example.com'", "AllowHeaders": "'Content-Type'"},
+                    "Auth": {
+                        "DefaultAuthorizer": "TokenAuth",
+                        "AddDefaultAuthorizerToCorsPreflight": false,
+                        "Authorizers": {"TokenAuth": {"FunctionArn": {"Fn::GetAtt": ["Authz", "Arn"]}}}
+                    }
+                }
+            },
+            "Fn": function(json!({
+                "Get": {"Type": "Api", "Properties": {"RestApiId": {"Ref": "MyApi"}, "Path": "/items", "Method": "get"}},
+                "Open": {"Type": "Api", "Properties": {"RestApiId": {"Ref": "MyApi"}, "Path": "/open", "Method": "post", "Auth": {"Authorizer": "NONE", "ApiKeyRequired": true}}}
+            }))
+        })))
+        .unwrap();
+        let r = &expanded["Resources"];
+        let api = &r["MyApi"];
+        assert_eq!(api["Type"], "AWS::ApiGateway::RestApi");
+        let body = &api["Properties"]["Body"];
+        assert_eq!(body["info"]["title"], json!({"Ref": "AWS::StackName"}));
+        let get = &body["paths"]["/items"]["get"];
+        assert_eq!(get["x-amazon-apigateway-integration"]["type"], "aws_proxy");
+        assert_eq!(get["security"], json!([{"TokenAuth": []}]));
+        assert_eq!(
+            body["paths"]["/open"]["post"]["security"],
+            json!([{"api_key": []}])
+        );
+        let options = &body["paths"]["/items"]["options"];
+        let params = &options["x-amazon-apigateway-integration"]["responses"]["default"]
+            ["responseParameters"];
+        assert_eq!(
+            params["method.response.header.Access-Control-Allow-Origin"],
+            "'https://example.com'"
+        );
+        assert_eq!(
+            params["method.response.header.Access-Control-Allow-Methods"],
+            "'GET,OPTIONS'"
+        );
+        assert!(options.get("security").is_none());
+        assert_eq!(
+            body["securityDefinitions"]["TokenAuth"]["x-amazon-apigateway-authorizer"]["type"],
+            "token"
+        );
+        assert_eq!(
+            r["MyApiTokenAuthAuthorizerPermission"]["Type"],
+            "AWS::Lambda::Permission"
+        );
+        let stage = &r["MyApiv1Stage"];
+        assert_eq!(stage["Properties"]["StageName"], "v1");
+        let dep_id = stage["Properties"]["DeploymentId"]["Ref"].as_str().unwrap();
+        assert!(dep_id.starts_with("MyApiDeployment"));
+        assert_eq!(r[dep_id]["Type"], "AWS::ApiGateway::Deployment");
+        assert_eq!(
+            r["FnGetPermission"]["Properties"]["Principal"],
+            "apigateway.amazonaws.com"
+        );
+        assert!(r.get("ServerlessRestApi").is_none());
+    }
+
+    #[test]
+    fn explicit_http_api_routes_with_jwt_authorizer_and_default_stage() {
+        let expanded = expand_sam(&sam(json!({
+            "Http": {
+                "Type": "AWS::Serverless::HttpApi",
+                "Properties": {
+                    "CorsConfiguration": true,
+                    "Auth": {
+                        "DefaultAuthorizer": "Jwt",
+                        "Authorizers": {"Jwt": {"JwtConfiguration": {"issuer": "https://issuer", "audience": ["a"]}, "IdentitySource": "$request.header.Authorization"}}
+                    }
+                }
+            },
+            "Fn": function(json!({
+                "Any": {"Type": "HttpApi", "Properties": {"ApiId": {"Ref": "Http"}}},
+                "Get": {"Type": "HttpApi", "Properties": {"ApiId": {"Ref": "Http"}, "Path": "/x", "Method": "GET"}}
+            }))
+        })))
+        .unwrap();
+        let r = &expanded["Resources"];
+        assert_eq!(r["Http"]["Type"], "AWS::ApiGatewayV2::Api");
+        assert_eq!(
+            r["Http"]["Properties"]["Name"],
+            json!({"Ref": "AWS::StackName"})
+        );
+        assert_eq!(
+            r["Http"]["Properties"]["CorsConfiguration"]["AllowOrigins"],
+            json!(["*"])
+        );
+        assert_eq!(
+            r["HttpApiGatewayDefaultStage"]["Properties"]["StageName"],
+            "$default"
+        );
+        assert_eq!(r["FnAnyRoute"]["Properties"]["RouteKey"], "$default");
+        assert_eq!(r["FnGetRoute"]["Properties"]["RouteKey"], "GET /x");
+        assert_eq!(r["FnGetRoute"]["Properties"]["AuthorizationType"], "JWT");
+        assert_eq!(
+            r["FnGetRoute"]["Properties"]["AuthorizerId"],
+            json!({"Ref": "HttpJwtAuthorizer"})
+        );
+        assert_eq!(
+            r["HttpJwtAuthorizer"]["Properties"]["JwtConfiguration"],
+            json!({"Issuer": "https://issuer", "Audience": ["a"]})
+        );
+    }
+
+    #[test]
+    fn auto_publish_alias_retargets_events_and_resolves_alias_refs() {
+        let expanded = expand_sam(&json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "Fn": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "Handler": "i.h", "Runtime": "python3.13", "InlineCode": "x",
+                        "AutoPublishAlias": "live",
+                        "FunctionUrlConfig": {"AuthType": "AWS_IAM"},
+                        "Events": {"Q": {"Type": "SQS", "Properties": {"Queue": "arn:aws:sqs:us-east-1:1:q"}}}
+                    }
+                }
+            },
+            "Outputs": {
+                "Alias": {"Value": {"Ref": "Fn.Alias"}},
+                "Version": {"Value": {"Fn::Sub": "${Fn.Version}"}}
+            }
+        }))
+        .unwrap();
+        let r = &expanded["Resources"];
+        assert_eq!(r["FnAliaslive"]["Type"], "AWS::Lambda::Alias");
+        let version_id = r["FnAliaslive"]["Properties"]["FunctionVersion"]["Fn::GetAtt"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(version_id.starts_with("FnVersion"));
+        assert_eq!(r[&version_id]["DeletionPolicy"], "Retain");
+        assert_eq!(
+            r["FnQEventSourceMapping"]["Properties"]["FunctionName"],
+            json!({"Ref": "FnAliaslive"})
+        );
+        assert_eq!(r["FnUrl"]["Properties"]["Qualifier"], "live");
+        assert!(r.get("FnUrlPublicPermissions").is_none());
+        assert!(r["Fn"]["Properties"].get("AutoPublishAlias").is_none());
+        assert_eq!(
+            expanded["Outputs"]["Alias"]["Value"],
+            json!({"Ref": "FnAliaslive"})
+        );
+        assert_eq!(
+            expanded["Outputs"]["Version"]["Value"],
+            json!({"Fn::Sub": format!("${{{version_id}}}")})
+        );
+    }
+
+    #[test]
+    fn alias_dependent_properties_require_auto_publish_alias() {
+        for (key, value) in [
+            ("DeploymentPreference", json!({"Type": "AllAtOnce"})),
+            (
+                "ProvisionedConcurrencyConfig",
+                json!({"ProvisionedConcurrentExecutions": 1}),
+            ),
+        ] {
+            let mut f = function(json!({}));
+            f["Properties"][key] = value;
+            let err = expand_sam(&sam(json!({ "Fn": f }))).unwrap_err();
+            assert!(
+                err.contains("AutoPublishAlias") || err.contains("AutoPublishALias"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_and_cognito_events_edit_the_referenced_resources() {
+        let expanded = expand_sam(&sam(json!({
+            "Bucket": {"Type": "AWS::S3::Bucket"},
+            "Pool": {"Type": "AWS::Cognito::UserPool"},
+            "Fn": function(json!({
+                "Up": {"Type": "S3", "Properties": {"Bucket": {"Ref": "Bucket"}, "Events": ["s3:ObjectCreated:*"], "Filter": {"S3Key": {"Rules": [{"Name": "prefix", "Value": "in/"}]}}}},
+                "Sign": {"Type": "Cognito", "Properties": {"UserPool": {"Ref": "Pool"}, "Trigger": "PreSignUp"}}
+            }))
+        })))
+        .unwrap();
+        let r = &expanded["Resources"];
+        let lc = &r["Bucket"]["Properties"]["NotificationConfiguration"]["LambdaConfigurations"][0];
+        assert_eq!(lc["Event"], "s3:ObjectCreated:*");
+        assert_eq!(lc["Function"], json!({"Fn::GetAtt": ["Fn", "Arn"]}));
+        assert_eq!(r["Bucket"]["DependsOn"], json!(["FnUpPermission"]));
+        assert_eq!(
+            r["FnUpPermission"]["Properties"]["SourceAccount"],
+            json!({"Ref": "AWS::AccountId"})
+        );
+        assert_eq!(
+            r["Pool"]["Properties"]["LambdaConfig"]["PreSignUp"],
+            json!({"Fn::GetAtt": ["Fn", "Arn"]})
+        );
+
+        let err = expand_sam(&sam(json!({
+            "Fn": function(json!({"Up": {"Type": "S3", "Properties": {"Bucket": "literal", "Events": "s3:ObjectCreated:*"}}}))
+        })))
+        .unwrap_err();
+        assert!(err.contains("S3 bucket in the same template"), "{err}");
+    }
+
+    #[test]
+    fn http_api_definition_body_absorbs_unauthenticated_event_routes() {
+        let expanded = expand_sam(&sam(json!({
+            "Http": {
+                "Type": "AWS::Serverless::HttpApi",
+                "Properties": {"DefinitionBody": {"openapi": "3.0.1", "info": {"title": "t"}, "paths": {}}}
+            },
+            "Fn": function(json!({
+                "Get": {"Type": "HttpApi", "Properties": {"ApiId": {"Ref": "Http"}, "Path": "/x", "Method": "GET"}}
+            }))
+        })))
+        .unwrap();
+        let r = &expanded["Resources"];
+        let integ = &r["Http"]["Properties"]["Body"]["paths"]["/x"]["get"]
+            ["x-amazon-apigateway-integration"];
+        assert_eq!(integ["type"], "aws_proxy");
+        assert_eq!(integ["uri"], json!({"Fn::GetAtt": ["Fn", "Arn"]}));
+        assert_eq!(integ["payloadFormatVersion"], "2.0");
+        assert!(r.get("FnGetRoute").is_none());
+        assert!(r.get("FnGetIntegration").is_none());
+        assert_eq!(r["FnGetPermission"]["Type"], "AWS::Lambda::Permission");
+    }
+
+    #[test]
+    fn api_condition_reaches_every_generated_resource() {
+        let expanded = expand_sam(&sam(json!({
+            "Rest": {"Type": "AWS::Serverless::Api", "Condition": "IsProd", "Properties": {"StageName": "p"}},
+            "Http": {"Type": "AWS::Serverless::HttpApi", "Condition": "IsProd", "Properties": {}},
+            "Fn": function(json!({
+                "A": {"Type": "Api", "Properties": {"RestApiId": {"Ref": "Rest"}, "Path": "/a", "Method": "get"}},
+                "B": {"Type": "HttpApi", "Properties": {"ApiId": {"Ref": "Http"}, "Path": "/b", "Method": "GET"}}
+            }))
+        })))
+        .unwrap();
+        let r = expanded["Resources"].as_object().unwrap();
+        for (id, res) in r {
+            if id.starts_with("Rest")
+                || id.starts_with("Http")
+                || id.starts_with("FnA")
+                || id.starts_with("FnB")
+            {
+                assert_eq!(
+                    res["Condition"], "IsProd",
+                    "{id} carries the API's Condition"
+                );
+            }
+        }
+        assert!(r.contains_key("RestpStage"));
+        assert!(r.contains_key("FnBRoute"));
+        assert!(r["Fn"].get("Condition").is_none());
     }
 }

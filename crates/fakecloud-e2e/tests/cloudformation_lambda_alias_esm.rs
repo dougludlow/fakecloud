@@ -116,8 +116,8 @@ async fn cfn_event_source_mapping_referencing_lambda_alias_provisions() {
         "Ref on the alias should resolve to the alias ARN, got {alias_arn}"
     );
 
-    // The ESM exists and is wired to the underlying function (the qualifier
-    // was stripped to resolve to the function, matching AWS).
+    // The ESM exists and invokes the alias: like CreateEventSourceMapping,
+    // a qualified FunctionName keeps its qualifier in FunctionArn.
     let listed = lambda
         .list_event_source_mappings()
         .function_name(&func_name)
@@ -133,8 +133,8 @@ async fn cfn_event_source_mapping_referencing_lambda_alias_provisions() {
         mapping
             .function_arn()
             .expect("function_arn")
-            .ends_with(":function:cfn-alias-esm-func"),
-        "ESM should resolve to the underlying function, got {:?}",
+            .ends_with(":function:cfn-alias-esm-func:live"),
+        "ESM should target the alias, got {:?}",
         mapping.function_arn()
     );
 }

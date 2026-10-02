@@ -212,9 +212,21 @@ pub(super) async fn apply_response_template(
         &integration.http_method,
         &status_code,
     );
+    // PutIntegrationResponse (and an OpenAPI import) key the response by the
+    // resource id; the resource path form is accepted too.
+    let id_key = response_key(
+        api_id,
+        &integration.resource_id,
+        &integration.http_method,
+        &status_code,
+    );
     let accounts = service.state_handle().read();
     let state = accounts.get(&req.account_id);
-    let resp_record = state.and_then(|st| st.integration_responses.get(&key));
+    let resp_record = state.and_then(|st| {
+        st.integration_responses
+            .get(&id_key)
+            .or_else(|| st.integration_responses.get(&key))
+    });
     let resp_template = resp_record
         .and_then(|v| v.get("responseTemplates"))
         .and_then(|t| t.as_object());
@@ -328,14 +340,24 @@ pub(super) async fn mock_response(
     let state = accounts.get(&req.account_id);
     // Try the selected-status response first; if absent scan for any
     // integration response registered for this method and use its status.
+    // PutIntegrationResponse (and an OpenAPI import) key the response by the
+    // resource id; the resource path form is accepted too.
+    let id_key = response_key(api_id, &integration.resource_id, method, lookup_status);
     let resp_record = state.and_then(|st| {
-        st.integration_responses.get(&key).or_else(|| {
-            let prefix = format!("{api_id}/{resource_path}/{method}/");
-            st.integration_responses
-                .iter()
-                .find(|(k, _)| k.starts_with(&prefix))
-                .map(|(_, v)| v)
-        })
+        st.integration_responses
+            .get(&id_key)
+            .or_else(|| st.integration_responses.get(&key))
+            .or_else(|| {
+                [&integration.resource_id, &resource_path.to_string()]
+                    .into_iter()
+                    .find_map(|res| {
+                        let prefix = format!("{api_id}/{res}/{method}/");
+                        st.integration_responses
+                            .iter()
+                            .find(|(k, _)| k.starts_with(&prefix))
+                            .map(|(_, v)| v)
+                    })
+            })
     });
     let (status, resp_templates) = if let Some(record) = resp_record {
         let status = record

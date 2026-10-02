@@ -206,6 +206,18 @@ impl LambdaService {
             topics,
             queues,
             source_access_configurations,
+            self_managed_event_source: body
+                .get("SelfManagedEventSource")
+                .filter(|v| v.is_object())
+                .cloned(),
+            self_managed_kafka_event_source_config: body
+                .get("SelfManagedKafkaEventSourceConfig")
+                .filter(|v| v.is_object())
+                .cloned(),
+            document_db_event_source_config: body
+                .get("DocumentDBEventSourceConfig")
+                .filter(|v| v.is_object())
+                .cloned(),
         };
 
         let response = self.event_source_mapping_json(&mapping);
@@ -384,6 +396,15 @@ impl LambdaService {
         }
         if let Some(ref dc) = mapping.destination_config {
             obj.insert("DestinationConfig".into(), dc.clone());
+        }
+        if let Some(ref src) = mapping.self_managed_event_source {
+            obj.insert("SelfManagedEventSource".into(), src.clone());
+        }
+        if let Some(ref cfg) = mapping.self_managed_kafka_event_source_config {
+            obj.insert("SelfManagedKafkaEventSourceConfig".into(), cfg.clone());
+        }
+        if let Some(ref cfg) = mapping.document_db_event_source_config {
+            obj.insert("DocumentDBEventSourceConfig".into(), cfg.clone());
         }
         out
     }

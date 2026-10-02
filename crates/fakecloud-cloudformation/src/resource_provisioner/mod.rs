@@ -52,8 +52,8 @@ use fakecloud_cognito::{
 };
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_dynamodb::{
-    AttributeDefinition, DynamoTable, KeySchemaElement, OnDemandThroughput, ProvisionedThroughput,
-    SharedDynamoDbState,
+    AttributeDefinition, DynamoTable, KeySchemaElement, KinesisDestination, OnDemandThroughput,
+    ProvisionedThroughput, SharedDynamoDbState,
 };
 use fakecloud_ecr::{Repository, SharedEcrState};
 use fakecloud_ecs::{
@@ -124,6 +124,15 @@ use crate::template::ResourceDefinition;
 /// and `RetainExceptOnCreate` all preserve it (Snapshot is treated as retain —
 /// see `delete_resource_respecting_policy`); `Delete` and `None` (the CFN
 /// default) do not. Comparison is case-insensitive to tolerate lenient input.
+/// The error a CloudFormation resource handler fails a create with when the
+/// resource's primary identifier is already taken -- e.g. a table, bucket or
+/// function a deleted stack retained under `DeletionPolicy: Retain`. The
+/// resource goes CREATE_FAILED (rolling the stack back) instead of the
+/// provisioner overwriting, and so wiping, the existing resource.
+pub(super) fn resource_already_exists(resource_type: &str, identifier: &str) -> String {
+    format!("Resource of type '{resource_type}' with identifier '{identifier}' already exists.")
+}
+
 pub(crate) fn policy_retains_physical(policy: Option<&str>) -> bool {
     matches!(
         policy.map(|p| p.trim().to_ascii_lowercase()).as_deref(),
@@ -669,11 +678,28 @@ struct LambdaEventSourceMappingProps {
     tumbling_window_in_seconds: Option<i64>,
     topics: Vec<String>,
     queues: Vec<String>,
+    source_access_configurations: Vec<serde_json::Value>,
+    self_managed_event_source: Option<serde_json::Value>,
+    self_managed_kafka_event_source_config: Option<serde_json::Value>,
+    document_db_event_source_config: Option<serde_json::Value>,
 }
 
 /// Parse the `Properties` value of an `AWS::Lambda::EventSourceMapping`
 /// resource. `EventSourceArn` is required on create; updates re-parse but
 /// the value is ignored since the field is immutable.
+/// CloudFormation spells a self-managed Kafka source's endpoint key
+/// `KafkaBootstrapServers`; the Lambda API (and so Get/List) uses
+/// `KAFKA_BOOTSTRAP_SERVERS`. Translate so the mapping reads back in the
+/// API's shape.
+fn self_managed_event_source_to_api(mut source: serde_json::Value) -> serde_json::Value {
+    if let Some(endpoints) = source.get_mut("Endpoints").and_then(|e| e.as_object_mut()) {
+        if let Some(servers) = endpoints.remove("KafkaBootstrapServers") {
+            endpoints.insert("KAFKA_BOOTSTRAP_SERVERS".to_string(), servers);
+        }
+    }
+    source
+}
+
 fn parse_lambda_event_source_mapping_props(
     props: &serde_json::Value,
 ) -> Result<LambdaEventSourceMappingProps, String> {
@@ -765,6 +791,17 @@ fn parse_lambda_event_source_mapping_props(
         })
         .unwrap_or_default();
 
+    let source_access_configurations = props
+        .get("SourceAccessConfigurations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let object = |key: &str| props.get(key).filter(|v| v.is_object()).cloned();
+    let self_managed_event_source =
+        object("SelfManagedEventSource").map(self_managed_event_source_to_api);
+    let self_managed_kafka_event_source_config = object("SelfManagedKafkaEventSourceConfig");
+    let document_db_event_source_config = object("DocumentDBEventSourceConfig");
+
     Ok(LambdaEventSourceMappingProps {
         event_source_arn,
         batch_size,
@@ -784,6 +821,10 @@ fn parse_lambda_event_source_mapping_props(
         tumbling_window_in_seconds,
         topics,
         queues,
+        source_access_configurations,
+        self_managed_event_source,
+        self_managed_kafka_event_source_config,
+        document_db_event_source_config,
     })
 }
 
@@ -980,6 +1021,7 @@ pub struct ResourceProvisioner {
     pub timestream_state: fakecloud_timestream::SharedTimestreamState,
     pub mwaa_state: fakecloud_mwaa::SharedMwaaState,
     pub amplify_state: fakecloud_amplify::SharedAmplifyState,
+    pub iot_state: fakecloud_iot::SharedIotState,
     pub appconfig_state: fakecloud_appconfig::SharedAppConfigState,
     pub cloudformation_state: SharedCloudFormationState,
     pub delivery: Arc<DeliveryBus>,
@@ -1190,9 +1232,12 @@ mod elasticbeanstalk;
 mod elbv2;
 mod emr;
 mod eventbridge;
+#[cfg(test)]
+mod fidelity_tests;
 mod firehose;
 mod glue;
 mod iam;
+mod iot;
 mod kafka;
 mod kinesis;
 mod kinesisanalyticsv2;
@@ -1316,6 +1361,7 @@ impl ResourceProvisioner {
             "AWS::Lambda::EventSourceMapping" => self.create_lambda_event_source_mapping(resource),
             "AWS::Lambda::LayerVersion" => self.create_lambda_layer_version(resource),
             "AWS::Lambda::Url" => self.create_lambda_url(resource),
+            "AWS::IoT::TopicRule" => self.create_iot_topic_rule(resource),
             "AWS::Lambda::Alias" => self.create_lambda_alias(resource),
             "AWS::Lambda::Version" => self.create_lambda_version(resource),
             "AWS::SecretsManager::Secret" => self.create_secrets_manager_secret(resource),
@@ -1705,6 +1751,7 @@ impl ResourceProvisioner {
                 Some(self.update_lambda_layer_version(existing, new_def)?)
             }
             "AWS::Lambda::Url" => Some(self.update_lambda_url(existing, new_def)?),
+            "AWS::IoT::TopicRule" => Some(self.update_iot_topic_rule(existing, new_def)?),
             "AWS::Lambda::Alias" => Some(self.update_lambda_alias(existing, new_def)?),
             "AWS::Lambda::Version" => Some(self.update_lambda_version(existing, new_def)?),
             "AWS::IAM::Role" => Some(self.update_iam_role(existing, new_def)?),
@@ -2544,6 +2591,7 @@ impl ResourceProvisioner {
             }
             "AWS::Lambda::LayerVersion" => self.delete_lambda_layer_version(&resource.physical_id),
             "AWS::Lambda::Url" => self.delete_lambda_url(&resource.physical_id),
+            "AWS::IoT::TopicRule" => self.delete_iot_topic_rule(&resource.physical_id),
             "AWS::Lambda::Alias" => self.delete_lambda_alias(&resource.physical_id),
             "AWS::Lambda::Version" => self.delete_lambda_version(&resource.physical_id),
             "AWS::SecretsManager::Secret" => {
@@ -4142,7 +4190,7 @@ mod tests {
     use super::*;
     use parking_lot::RwLock;
 
-    fn make_provisioner() -> ResourceProvisioner {
+    pub(super) fn make_provisioner() -> ResourceProvisioner {
         let mut prov = ResourceProvisioner {
             sqs_state: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
@@ -4343,6 +4391,9 @@ mod tests {
             amplify_state: Arc::new(parking_lot::RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
             )),
+            iot_state: Arc::new(parking_lot::RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+            )),
             appconfig_state: Arc::new(parking_lot::RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
             )),
@@ -4375,7 +4426,7 @@ mod tests {
         prov
     }
 
-    fn make_resource(
+    pub(super) fn make_resource(
         resource_type: &str,
         logical_id: &str,
         props: serde_json::Value,

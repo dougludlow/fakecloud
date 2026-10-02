@@ -10,7 +10,7 @@ REST APIs (v1) and HTTP APIs (v2) are independent AWS services. The v2 (HTTP API
 
 ## Supported features
 
-- **REST APIs** — CreateRestApi, GetRestApi(s), UpdateRestApi, PutRestApi (OpenAPI overwrite/merge), ImportRestApi, DeleteRestApi
+- **REST APIs** — CreateRestApi, GetRestApi(s), UpdateRestApi, PutRestApi (OpenAPI overwrite/merge), ImportRestApi (an OpenAPI 3 / Swagger 2 definition, JSON or YAML, becomes the API's resources, methods, integrations, method/integration responses, authorizers and request validators), DeleteRestApi
 - **Resources & methods** — full CRUD; nested paths; method requests/responses
 - **Integrations** — `MOCK`, `HTTP`/`HTTP_PROXY`, `AWS_PROXY` (Lambda), AWS direct service integrations (`AWS`), `VPC_LINK`; request + response templates with VTL evaluation; integration responses
 - **Deployments & stages** — CreateDeployment auto-creates a stage when `stageName` is set; cache flush operations; stage variables
