@@ -185,6 +185,10 @@ pub struct QueryExecution {
     /// `ExecutionParameters` as submitted to StartQueryExecution.
     #[serde(default)]
     pub execution_parameters: Option<Value>,
+    /// Region the query was started in; its Glue catalog lookups resolve
+    /// there. Kept so a query interrupted by a restart can be re-run.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
