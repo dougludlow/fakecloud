@@ -2745,7 +2745,7 @@ mod tests {
             );
             // Register both 200 and 201 responses; the 201 one carries a
             // static CORS header via responseParameters (H2).
-            let rk201 = response_key(TEST_API_ID, "/items", "GET", "201");
+            let rk201 = response_key(TEST_API_ID, RES_ID, "GET", "201");
             st.integration_responses.insert(
                 rk201,
                 json!({
@@ -2756,7 +2756,7 @@ mod tests {
                     "responseTemplates": {"application/json": r#"{"picked":201}"#}
                 }),
             );
-            let rk200 = response_key(TEST_API_ID, "/items", "GET", "200");
+            let rk200 = response_key(TEST_API_ID, RES_ID, "GET", "200");
             st.integration_responses.insert(
                 rk200,
                 json!({

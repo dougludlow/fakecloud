@@ -65,12 +65,54 @@ pub async fn dispatch_to_service(
     .await
 }
 
+/// awsJson content type of protocol version 1.0.
+const AWS_JSON_1_0: &str = "application/x-amz-json-1.0";
+/// awsJson content type of protocol version 1.1, the services' default.
+const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
+
 /// The main dispatch handler. All HTTP requests come through here.
 pub async fn dispatch(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Extension(registry): Extension<Arc<ServiceRegistry>>,
     Extension(config): Extension<Arc<DispatchConfig>>,
     Query(query_params): Query<HashMap<String, String>>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let json_1_0 = request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case(AWS_JSON_1_0));
+    let mut response = dispatch_inner(remote_addr, registry, config, query_params, request).await;
+    if json_1_0 {
+        answer_in_json_1_0(&mut response);
+    }
+    response
+}
+
+/// An awsJson 1.0 service (DynamoDB, SQS, CloudWatch, Step Functions, ...)
+/// answers in the content type of its protocol version, which its clients
+/// send on the request. Handlers render JSON as 1.1, so relabel the response
+/// (success or error) for a 1.0 caller.
+fn answer_in_json_1_0(response: &mut Response<Body>) {
+    let is_1_1 = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.eq_ignore_ascii_case(AWS_JSON_1_1));
+    if is_1_1 {
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static(AWS_JSON_1_0),
+        );
+    }
+}
+
+async fn dispatch_inner(
+    remote_addr: SocketAddr,
+    registry: Arc<ServiceRegistry>,
+    config: Arc<DispatchConfig>,
+    query_params: HashMap<String, String>,
     request: Request<Body>,
 ) -> Response<Body> {
     let remote_addr = Some(remote_addr);
@@ -86,6 +128,15 @@ pub async fn dispatch(
     // the raw body to the service handler. The handler spills it to
     // disk on the fly. Header-only detection covers every streaming
     // candidate (none of them rely on form-body sniffing).
+    // Smithy RPC v2 CBOR is recognized by its `smithy-protocol` header and
+    // `/service/{Service}/operation/{Op}` path before any other detection:
+    // its SigV4 scope alone would otherwise route it as the service's Query
+    // protocol.
+    let rpc_v2_cbor = if pinned.is_none() {
+        protocol::detect_rpc_v2_cbor(&parts.headers, parts.uri.path())
+    } else {
+        None
+    };
     let stream_route = streaming_route(
         &parts.method,
         parts.uri.path(),
@@ -97,6 +148,7 @@ pub async fn dispatch(
         // A pinned request is always buffered: its caller already holds the
         // whole body, and header detection must not pick its service.
         _ if pinned.is_some() => None,
+        _ if rpc_v2_cbor.is_some() => None,
         // Header-only detection agrees with the URL match — covers S3
         // PUT object (SigV4 service=s3 in Authorization).
         (Some(sr), Some(detected)) if sr.0 == detected.service => Some(detected.clone()),
@@ -142,6 +194,8 @@ pub async fn dispatch(
             action: String::new(),
             protocol: AwsProtocol::Rest,
         }
+    } else if let Some(d) = rpc_v2_cbor {
+        d
     } else if let Some(d) = stream_dispatch {
         d
     } else {
@@ -205,11 +259,15 @@ pub async fn dispatch(
                         action: String::new(),
                         protocol: AwsProtocol::Rest,
                     }
-                } else if !parts.uri.path().starts_with("/_") {
+                } else if !parts.uri.path().starts_with("/_")
+                    || parts.uri.path().starts_with("/_aws/execute-api/")
+                {
                     // Requests without AWS auth that don't match any service might be
                     // API Gateway execute API calls (plain HTTP without signatures).
                     // Route them to apigateway service which will validate if a matching
-                    // API/stage exists. Skip special FakeCloud endpoints (/_*).
+                    // API/stage exists. Skip special FakeCloud endpoints (/_*),
+                    // except LocalStack's path-style execute-api invocation URL
+                    // `/_aws/execute-api/{api-id}/{stage}/{path}`.
                     protocol::DetectedRequest {
                         service: "apigateway".to_string(),
                         action: String::new(),
@@ -535,6 +593,26 @@ pub async fn dispatch(
     // its label. `raw_path` keeps the undecoded wire form.
     let path_segments = crate::path::split_path_segments(&path);
 
+    // rpcv2Cbor: the signature above covered the CBOR wire body; from here on
+    // the request is handled on the service's JSON path, so swap in the
+    // equivalent awsJson document.
+    let body_bytes = if detected.protocol == AwsProtocol::RpcV2Cbor {
+        match crate::cbor::decode_to_json(&body_bytes) {
+            Ok(json) => Bytes::from(json.to_string()),
+            Err(e) => {
+                return build_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "SerializationException",
+                    &format!("Unable to decode CBOR request body: {e}"),
+                    &request_id,
+                    AwsProtocol::RpcV2Cbor,
+                );
+            }
+        }
+    } else {
+        body_bytes
+    };
+
     // For JSON protocol, validate that non-empty bodies are valid JSON
     if detected.protocol == AwsProtocol::Json
         && !body_bytes.is_empty()
@@ -566,7 +644,11 @@ pub async fn dispatch(
     // handlers all read the flat awsQuery param map, so when a client uses the
     // JSON protocol we flatten the JSON body into that same map, leaving the
     // handlers unchanged. The handler emits a JSON response for JSON callers.
-    if detected.protocol == AwsProtocol::Json && detected.service == "monitoring" {
+    if matches!(
+        detected.protocol,
+        AwsProtocol::Json | AwsProtocol::RpcV2Cbor
+    ) && detected.service == "monitoring"
+    {
         let body_params = protocol::flatten_json_to_query(&body_bytes);
         for (k, v) in body_params {
             all_params.entry(k).or_insert(v);
@@ -980,6 +1062,11 @@ pub async fn dispatch(
 
     match service.handle(aws_request).await {
         Ok(resp) => {
+            let resp = if detected.protocol == AwsProtocol::RpcV2Cbor {
+                rpc_v2_cbor_response(resp)
+            } else {
+                resp
+            };
             let mut builder = Response::builder()
                 .status(resp.status)
                 .header("x-amzn-requestid", &request_id)
@@ -1053,6 +1140,34 @@ pub async fn dispatch(
             resp
         }
     }
+}
+
+/// Frame a service response for an rpcv2Cbor caller. A service that renders
+/// its own CBOR (content type `application/cbor`) passes through; a JSON body
+/// is transcoded schema-lessly. Either way the response carries the
+/// `smithy-protocol` header the client checks.
+fn rpc_v2_cbor_response(mut resp: crate::service::AwsResponse) -> crate::service::AwsResponse {
+    if resp.content_type != crate::cbor::CBOR_CONTENT_TYPE {
+        if let ResponseBody::Bytes(bytes) = &resp.body {
+            let json = if bytes.is_empty() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                serde_json::from_slice(bytes).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "non-JSON response body for an rpcv2Cbor request");
+                    serde_json::Value::Object(serde_json::Map::new())
+                })
+            };
+            resp.body = ResponseBody::Bytes(Bytes::from(crate::cbor::encode(
+                &crate::cbor::json_to_cbor(&json),
+            )));
+            resp.content_type = crate::cbor::CBOR_CONTENT_TYPE.to_string();
+        }
+    }
+    resp.headers.insert(
+        http::HeaderName::from_static(crate::cbor::SMITHY_PROTOCOL_HEADER),
+        http::HeaderValue::from_static(crate::cbor::RPC_V2_CBOR),
+    );
+    resp
 }
 
 /// Configuration passed to the dispatch handler.
@@ -1500,6 +1615,11 @@ fn build_error_response_with_fields(
                 extra_fields,
             )
         }
+        (AwsProtocol::RpcV2Cbor, _) => (
+            status,
+            crate::cbor::CBOR_CONTENT_TYPE.to_string(),
+            Bytes::from(crate::cbor::error_body(code, message, extra_fields)),
+        ),
     };
 
     // S3 (and other REST-XML services) place the error code in
@@ -1523,6 +1643,12 @@ fn build_error_response_with_fields(
     }
     if let Ok(v) = http::HeaderValue::from_str(&safe_message) {
         builder = builder.header("x-amz-error-message", v);
+    }
+    if envelope.protocol == AwsProtocol::RpcV2Cbor {
+        builder = builder.header(
+            crate::cbor::SMITHY_PROTOCOL_HEADER,
+            crate::cbor::RPC_V2_CBOR,
+        );
     }
     builder.body(Body::from(body)).unwrap_or_else(|_| {
         // Builder only fails if a header is invalid; we sanitized the two

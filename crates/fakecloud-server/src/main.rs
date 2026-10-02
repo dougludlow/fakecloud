@@ -5174,7 +5174,17 @@ async fn main() {
     if let Some(h) = v1_arc.snapshot_hook() {
         cfn_snapshot_hooks.insert("apigateway", h);
     }
-    registry.register(Arc::new(ApiGatewayFacade::new(v1_arc, v2_arc)));
+    let v2_stage_state = apigatewayv2_state.clone();
+    registry.register(Arc::new(
+        ApiGatewayFacade::new(v1_arc, v2_arc).with_v2_stage_lookup(Arc::new(
+            move |account_id: &str, stage: &str| {
+                v2_stage_state
+                    .read()
+                    .get(account_id)
+                    .is_some_and(|state| state.stages.values().any(|s| s.contains_key(stage)))
+            },
+        )),
+    ));
     let bedrock_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
             let data_path = persistence_config
