@@ -153,7 +153,9 @@ async fn run_wait_state(
         }),
     );
 
-    execute_wait_state(state_def, &input).await;
+    if let Err((error, cause)) = execute_wait_state(state_def, &input).await {
+        return Advance::Fail(error, cause);
+    }
 
     add_event(
         shared_state,
@@ -330,50 +332,54 @@ async fn run_map_state(
 }
 
 /// Execute a Wait state: pause execution for a specified duration or until a timestamp.
-async fn execute_wait_state(state_def: &Value, input: &Value) {
+/// A `SecondsPath` / `TimestampPath` that matches nothing, or selects a value
+/// of the wrong type, fails the state with `States.Runtime`, as on AWS.
+async fn execute_wait_state(state_def: &Value, input: &Value) -> Result<(), (String, String)> {
     if let Some(seconds) = state_def["Seconds"].as_u64() {
         tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
-        return;
+        return Ok(());
     }
 
     if let Some(path) = state_def["SecondsPath"].as_str() {
-        let val = crate::io_processing::resolve_path(input, path);
-        if let Some(seconds) = val.as_u64() {
-            tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
-        }
-        return;
+        let val = crate::io_processing::resolve_reference(input, path)?;
+        let seconds = val.as_u64().ok_or_else(|| {
+            crate::io_processing::runtime_error(format!(
+                "The SecondsPath parameter does not reference a valid integer value: '{path}'"
+            ))
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
+        return Ok(());
     }
 
-    if let Some(ts_str) = state_def["Timestamp"].as_str() {
-        if let Ok(target) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-            let now = Utc::now();
-            let target_utc = target.with_timezone(&chrono::Utc);
-            if target_utc > now {
-                let duration = (target_utc - now).to_std().unwrap_or_default();
-                tokio::time::sleep(duration).await;
-            }
+    let target = if let Some(ts_str) = state_def["Timestamp"].as_str() {
+        chrono::DateTime::parse_from_rfc3339(ts_str).ok()
+    } else if let Some(path) = state_def["TimestampPath"].as_str() {
+        let val = crate::io_processing::resolve_reference(input, path)?;
+        let parsed = val
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        if parsed.is_none() {
+            return Err(crate::io_processing::runtime_error(format!(
+                "The TimestampPath parameter does not reference a valid ISO-8601 extended offset date-time format string: '{path}'"
+            )));
         }
-        return;
-    }
+        parsed
+    } else {
+        warn!(
+            "Wait state has no valid Seconds, SecondsPath, Timestamp, or TimestampPath — skipping wait"
+        );
+        return Ok(());
+    };
 
-    if let Some(path) = state_def["TimestampPath"].as_str() {
-        let val = crate::io_processing::resolve_path(input, path);
-        if let Some(ts_str) = val.as_str() {
-            if let Ok(target) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-                let now = Utc::now();
-                let target_utc = target.with_timezone(&chrono::Utc);
-                if target_utc > now {
-                    let duration = (target_utc - now).to_std().unwrap_or_default();
-                    tokio::time::sleep(duration).await;
-                }
-            }
+    if let Some(target) = target {
+        let now = Utc::now();
+        let target_utc = target.with_timezone(&chrono::Utc);
+        if target_utc > now {
+            let duration = (target_utc - now).to_std().unwrap_or_default();
+            tokio::time::sleep(duration).await;
         }
-        return;
     }
-
-    warn!(
-        "Wait state has no valid Seconds, SecondsPath, Timestamp, or TimestampPath — skipping wait"
-    );
+    Ok(())
 }
 
 /// Execute a Task state: invoke the resource (Lambda, SQS, SNS, EventBridge, DynamoDB),
@@ -399,7 +405,7 @@ async fn execute_task_state(
     let effective_input = if input_path == Some("null") {
         json!({})
     } else {
-        apply_input_path(input, input_path)
+        apply_input_path(input, input_path)?
     };
 
     let retriers = state_def["Retry"].as_array().cloned().unwrap_or_default();
@@ -446,8 +452,11 @@ async fn execute_task_state(
     };
 
     let task_input = if let Some(params) = state_def.get("Parameters") {
-        let ctx = task_token.as_ref().map(|(_, ctx)| ctx);
-        try_apply_parameters(params, &effective_input, ctx)?
+        if let Some((_, ctx)) = &task_token {
+            apply_parameters(params, &effective_input, Some(ctx))?
+        } else {
+            apply_parameters(params, &effective_input, None)?
+        }
     } else {
         effective_input
     };
@@ -512,7 +521,7 @@ async fn execute_task_state(
                             );
 
                             let selected = if let Some(selector) = state_def.get("ResultSelector") {
-                                apply_parameters(selector, &output, None)
+                                apply_parameters(selector, &output, None)?
                             } else {
                                 output
                             };
@@ -526,7 +535,7 @@ async fn execute_task_state(
                             let output = if output_path == Some("null") {
                                 json!({})
                             } else {
-                                apply_output_path(&after_result, output_path)
+                                apply_output_path(&after_result, output_path)?
                             };
 
                             return Ok(output);
@@ -566,7 +575,7 @@ async fn execute_task_state(
                 );
 
                 let selected = if let Some(selector) = state_def.get("ResultSelector") {
-                    apply_parameters(selector, &result, None)
+                    apply_parameters(selector, &result, None)?
                 } else {
                     result
                 };
@@ -580,7 +589,7 @@ async fn execute_task_state(
                 let output = if output_path == Some("null") {
                     json!({})
                 } else {
-                    apply_output_path(&after_result, output_path)
+                    apply_output_path(&after_result, output_path)?
                 };
 
                 return Ok(output);
@@ -625,7 +634,7 @@ async fn execute_parallel_state(
     let effective_input = if input_path == Some("null") {
         json!({})
     } else {
-        apply_input_path(input, input_path)
+        apply_input_path(input, input_path)?
     };
 
     let branches = state_def["Branches"]
@@ -672,7 +681,7 @@ async fn execute_parallel_state(
 
     // Apply ResultSelector if present
     let selected = if let Some(selector) = state_def.get("ResultSelector") {
-        apply_parameters(selector, &branch_output, None)
+        apply_parameters(selector, &branch_output, None)?
     } else {
         branch_output
     };
@@ -688,7 +697,7 @@ async fn execute_parallel_state(
     let output = if output_path == Some("null") {
         json!({})
     } else {
-        apply_output_path(&after_result, output_path)
+        apply_output_path(&after_result, output_path)?
     };
 
     Ok(output)
@@ -714,12 +723,12 @@ async fn execute_map_state(
     let effective_input = if input_path == Some("null") {
         json!({})
     } else {
-        apply_input_path(input, input_path)
+        apply_input_path(input, input_path)?
     };
 
     // Resolve MaxConcurrencyPath if present
     let max_concurrency = if let Some(path) = state_def["MaxConcurrencyPath"].as_str() {
-        crate::io_processing::resolve_path(&effective_input, path)
+        crate::io_processing::resolve_reference(&effective_input, path)?
             .as_u64()
             .unwrap_or(0)
     } else {
@@ -736,8 +745,16 @@ async fn execute_map_state(
         read_items_from_s3(item_reader, registry, execution_arn).await?
     } else {
         let items_path = state_def["ItemsPath"].as_str().unwrap_or("$");
-        let items_value = crate::io_processing::resolve_path(&effective_input, items_path);
-        items_value.as_array().cloned().unwrap_or_default()
+        let items_value = crate::io_processing::resolve_reference(&effective_input, items_path)?;
+        match items_value {
+            Value::Array(items) => items,
+            other => {
+                return Err(crate::io_processing::runtime_error(format!(
+                    "Map state input must be an array but was: {}",
+                    json_type_name(&other)
+                )))
+            }
+        }
     };
 
     // Apply ItemBatcher if present
@@ -808,11 +825,12 @@ async fn execute_map_state(
         let sem = semaphore.clone();
 
         // Apply ItemSelector if present
+        // `$` paths read the Map state's effective input; the current item
+        // is exposed through the context object as `$$.Map.Item.Value` /
+        // `$$.Map.Item.Index`, as on AWS.
         let item_input = if let Some(selector) = state_def.get("ItemSelector") {
-            let mut ctx = serde_json::Map::new();
-            ctx.insert("value".to_string(), batch_item.clone());
-            ctx.insert("index".to_string(), json!(index));
-            apply_parameters(selector, &Value::Object(ctx), None)
+            let ctx = json!({"Map": {"Item": {"Value": batch_item, "Index": index}}});
+            apply_parameters(selector, &effective_input, Some(&ctx))?
         } else {
             batch_item
         };
@@ -908,7 +926,7 @@ async fn execute_map_state(
 
     // Apply ResultSelector if present
     let selected = if let Some(selector) = state_def.get("ResultSelector") {
-        apply_parameters(selector, &map_output, None)
+        apply_parameters(selector, &map_output, None)?
     } else {
         map_output
     };
@@ -924,7 +942,7 @@ async fn execute_map_state(
     let output = if output_path == Some("null") {
         json!({})
     } else {
-        apply_output_path(&after_result, output_path)
+        apply_output_path(&after_result, output_path)?
     };
 
     Ok(output)
@@ -2172,6 +2190,18 @@ pub(crate) enum NextState {
 #[path = "interpreter_helpers.rs"]
 mod interpreter_helpers;
 pub(crate) use interpreter_helpers::*;
+
+/// JSON type name as Step Functions reports it in Map input errors.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
 
 #[cfg(test)]
 #[path = "interpreter_tests.rs"]
