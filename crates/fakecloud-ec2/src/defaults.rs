@@ -86,7 +86,12 @@ pub(crate) fn az_id_prefix(region: &str) -> String {
             "southeast" => "se",
             "southwest" => "sw",
             "gov" => "g",
-            other => &other[..1],
+            other => {
+                // First character, not first byte: the input can be any
+                // caller-supplied zone name.
+                out.extend(other.chars().next());
+                continue;
+            }
         };
         out.push_str(abbrev);
     }
@@ -94,16 +99,70 @@ pub(crate) fn az_id_prefix(region: &str) -> String {
     out
 }
 
-/// The zone id of an availability zone name (`us-east-1b -> use1-az2`), using
-/// the same letter-to-number mapping DescribeAvailabilityZones reports.
+/// Number of `-`-separated parts that make up the Region in a zone name:
+/// `us-east-1` (3) or `us-gov-west-1` (4).
+fn region_part_count(parts: &[&str]) -> usize {
+    if parts.get(1) == Some(&"gov") {
+        4
+    } else {
+        3
+    }
+}
+
+/// The zone id of an availability zone name, using the same letter-to-number
+/// mapping DescribeAvailabilityZones reports: `us-east-1b -> use1-az2`, and a
+/// Local Zone `us-west-2-lax-1a -> usw2-lax1-az1`.
 pub(crate) fn zone_id_for(zone: &str) -> String {
-    match zone.chars().last() {
-        Some(letter) if letter.is_ascii_lowercase() && zone.len() > 1 => {
-            let region = &zone[..zone.len() - 1];
-            let n = u32::from(letter) - u32::from('a') + 1;
-            format!("{}-az{n}", az_id_prefix(region))
+    let parts: Vec<&str> = zone.split('-').collect();
+    let n = region_part_count(&parts);
+    if parts.len() < n {
+        return format!("{}-az1", az_id_prefix(zone));
+    }
+    // The zone letter closes the last part: `1b`, or `1a` of `lax-1a`.
+    let mut tail = parts[n - 1..].concat();
+    let letter = match tail.pop() {
+        Some(c) if c.is_ascii_lowercase() => c,
+        Some(c) => {
+            tail.push(c);
+            'a'
         }
-        _ => format!("{}-az1", az_id_prefix(zone)),
+        None => 'a',
+    };
+    let az = u32::from(letter) - u32::from('a') + 1;
+    let region_number = &parts[n - 1];
+    let region = format!(
+        "{}-{}",
+        parts[..n - 1].join("-"),
+        region_number.trim_end_matches(|c: char| c.is_ascii_lowercase())
+    );
+    let local = &tail[region_number
+        .trim_end_matches(|c: char| c.is_ascii_lowercase())
+        .len()..];
+    if local.is_empty() {
+        format!("{}-az{az}", az_id_prefix(&region))
+    } else {
+        format!("{}-{local}-az{az}", az_id_prefix(&region))
+    }
+}
+
+/// Whether `zone` is an availability zone (or Local Zone) of `region`:
+/// `{region}{letter}`, or `{region}-{location}-{n}{letter}`.
+pub(crate) fn zone_in_region(region: &str, zone: &str) -> bool {
+    let Some(rest) = zone.strip_prefix(region) else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => chars.next().is_none(),
+        Some('-') => {
+            let local = &rest[1..];
+            local.ends_with(|c: char| c.is_ascii_lowercase())
+                && local.split('-').count() == 2
+                && local
+                    .split('-')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()))
+        }
+        _ => false,
     }
 }
 
@@ -704,6 +763,8 @@ mod tests {
     #[test]
     fn zone_ids_round_trip_through_zone_names() {
         assert_eq!(zone_id_for("us-east-1a"), "use1-az1");
+        assert_eq!(zone_id_for("us-west-2-lax-1a"), "usw2-lax1-az1");
+        assert_eq!(zone_id_for("us-gov-west-1b"), "usgw1-az2");
         assert_eq!(zone_id_for("ap-southeast-2c"), "apse2-az3");
         assert_eq!(zone_id_for("ap-south-1b"), "aps1-az2");
         assert_eq!(
@@ -714,6 +775,28 @@ mod tests {
         assert_eq!(zone_name_for_id("ap-southeast-1", "aps1-az1"), None);
         assert_eq!(zone_name_for_id("us-east-1", "use1-az0"), None);
         assert_eq!(zone_name_for_id("us-east-1", "garbage"), None);
+    }
+
+    #[test]
+    fn non_ascii_zone_names_do_not_panic() {
+        // Caller-supplied names reach these helpers; a multi-byte character
+        // must not be sliced mid-codepoint.
+        assert_eq!(az_id_prefix("us-\u{e9}-1"), "us\u{e9}1");
+        let _ = zone_id_for("us-\u{e9}-1a");
+        let _ = zone_id_for("\u{e9}");
+        assert!(!zone_in_region("us-east-1", "us-east-1\u{e9}"));
+    }
+
+    #[test]
+    fn zone_membership_follows_the_region() {
+        assert!(zone_in_region("us-east-1", "us-east-1a"));
+        assert!(zone_in_region("us-east-1", "us-east-1f"));
+        assert!(zone_in_region("us-west-2", "us-west-2-lax-1a"));
+        assert!(!zone_in_region("us-east-1", "us-west-2a"));
+        assert!(!zone_in_region("us-east-1", "us-east-1"));
+        assert!(!zone_in_region("us-east-1", "us-east-1ab"));
+        assert!(!zone_in_region("us-east-1", "us-east-12a"));
+        assert!(!zone_in_region("us-east-1", "string"));
     }
 
     #[test]

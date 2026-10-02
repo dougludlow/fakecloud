@@ -7575,3 +7575,46 @@ fn aurora_engines_run_on_their_compatible_container_engine() {
     // A prefix that is not a dot boundary is not that major.
     assert_eq!(crate::runtime::mariadb_major("11.80"), "10.6");
 }
+
+#[tokio::test]
+async fn aurora_member_joins_a_cluster_persisted_with_an_invalid_version() {
+    // Older builds stored `15.3` on every version-less cluster, aurora-mysql
+    // included. A member of such a cluster must still be creatable.
+    let svc = make_service().with_runtime(Arc::new(crate::runtime::RdsRuntime::new_stub()));
+    svc.handle_extra_action(&request(
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "legacy-my"),
+            ("Engine", "aurora-mysql"),
+            ("EngineVersion", "15.3"),
+        ],
+    ))
+    .expect("CreateDBCluster");
+
+    svc.create_db_instance(&aurora_instance_request(
+        "legacy-default",
+        "aurora-mysql",
+        Some("legacy-my"),
+    ))
+    .await
+    .expect("member of a legacy cluster");
+    let mut req = aurora_instance_request("legacy-explicit", "aurora-mysql", Some("legacy-my"));
+    req.query_params.insert(
+        "EngineVersion".to_string(),
+        "8.0.mysql_aurora.3.08.0".to_string(),
+    );
+    svc.create_db_instance(&req)
+        .await
+        .expect("member with an explicit version");
+
+    let accounts = svc.state.read();
+    let state = accounts.default_ref();
+    assert_eq!(
+        state.instances["legacy-default"].engine_version,
+        "8.0.mysql_aurora.3.04.0"
+    );
+    assert_eq!(
+        state.instances["legacy-explicit"].engine_version,
+        "8.0.mysql_aurora.3.08.0"
+    );
+}

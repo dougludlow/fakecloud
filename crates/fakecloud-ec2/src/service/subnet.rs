@@ -6,8 +6,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    ec2_arn, filter_value_matches, gen_id, indexed_list, not_found, paginate, parse_filters,
-    require, validate_enum, validate_max_results, Filter,
+    ec2_arn, filter_value_matches, gen_id, indexed_list, invalid_parameter_value, not_found,
+    paginate, parse_filters, require, validate_enum, validate_max_results, Filter,
 };
 use crate::state::{Ec2State, Subnet, SubnetCidrReservation, Tag};
 
@@ -112,21 +112,33 @@ fn subnet_ipv6_assoc_id(subnet_id: &str) -> String {
 }
 
 /// The zone a subnet request targets: `AvailabilityZone`, else the zone an
-/// `AvailabilityZoneId` names in the request's region, else the region's
-/// first zone.
-fn default_az(req: &AwsRequest) -> String {
+/// `AvailabilityZoneId` names, else the region's first zone. A zone (or zone
+/// id) outside the request's region is rejected the way AWS rejects it.
+fn default_az(req: &AwsRequest) -> Result<String, AwsServiceError> {
     let region = if req.region.is_empty() {
         "us-east-1"
     } else {
         &req.region
     };
+    let valid = || format!("{region}a, {region}b, {region}c");
     if let Some(az) = req.query_params.get("AvailabilityZone") {
-        return az.clone();
+        if !crate::defaults::zone_in_region(region, az) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({az}) for parameter availabilityZone is invalid. Subnets can currently only be created in the following availability zones: {}.",
+                valid()
+            )));
+        }
+        return Ok(az.clone());
     }
-    req.query_params
-        .get("AvailabilityZoneId")
-        .and_then(|id| crate::defaults::zone_name_for_id(region, id))
-        .unwrap_or_else(|| format!("{region}a"))
+    if let Some(id) = req.query_params.get("AvailabilityZoneId") {
+        return crate::defaults::zone_name_for_id(region, id).ok_or_else(|| {
+            invalid_parameter_value(format!(
+                "Value ({id}) for parameter availabilityZoneId is invalid. Subnets can currently only be created in the following availability zones: {}.",
+                valid()
+            ))
+        });
+    }
+    Ok(format!("{region}a"))
 }
 
 pub(crate) fn create_subnet(
@@ -139,7 +151,7 @@ pub(crate) fn create_subnet(
         .get("CidrBlock")
         .cloned()
         .unwrap_or_else(|| "10.0.0.0/24".to_string());
-    let az = default_az(req);
+    let az = default_az(req)?;
     let mut subnet = build_subnet(vpc_id, cidr, &az, false);
     // CreateSubnet may carry an IPv6 CIDR; the resource then waits for the
     // association to appear in DescribeSubnets.
@@ -194,7 +206,7 @@ pub(crate) fn create_default_subnet(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let az = default_az(req);
+    let az = default_az(req)?;
     let owner = req.account_id.clone();
     let region = req.region.clone();
     let body = {
@@ -241,7 +253,7 @@ pub(crate) fn create_secondary_subnet(
 ) -> Result<AwsResponse, AwsServiceError> {
     let _cidr = require(&req.query_params, "Ipv4CidrBlock")?;
     let network = require(&req.query_params, "SecondaryNetworkId")?;
-    let az = default_az(req);
+    let az = default_az(req)?;
     let owner = &req.account_id;
     let id = gen_id("subnet");
     let body = format!(

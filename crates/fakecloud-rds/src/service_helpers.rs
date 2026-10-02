@@ -418,6 +418,15 @@ pub(crate) fn validate_create_request(
     Ok(())
 }
 
+/// Aurora PostgreSQL majors AWS offers (Aurora has no PostgreSQL 18 yet).
+/// Each has a seeded `default.aurora-postgresql<major>` parameter group.
+pub(crate) const AURORA_POSTGRESQL_MAJORS: &[&str] = &["17", "16", "15", "14", "13"];
+
+/// MySQL majors Aurora MySQL versions are built on (`8.0.mysql_aurora.*`,
+/// `5.7.mysql_aurora.*`). Each has a seeded `default.aurora-mysql<major>`
+/// parameter group.
+pub(crate) const AURORA_MYSQL_MAJORS: &[&str] = &["8.0", "5.7"];
+
 /// Whether `engine_version` is a version string AWS issues for `engine`,
 /// on a major fakecloud runs.
 ///
@@ -435,7 +444,10 @@ pub(crate) fn validate_create_request(
 /// * db2: `11.5[.<n>.<n>.sb<8 digits>.r<n>]` (`11.5.9.0.sb00000000.r1`)
 pub(crate) fn engine_version_supported(engine: &str, engine_version: &str) -> bool {
     match engine {
-        "postgres" | "aurora-postgresql" => ["18", "17", "16", "15", "14", "13"]
+        "postgres" => ["18", "17", "16", "15", "14", "13"]
+            .iter()
+            .any(|major| version_matches_supported(engine_version, major)),
+        "aurora-postgresql" => AURORA_POSTGRESQL_MAJORS
             .iter()
             .any(|major| version_matches_supported(engine_version, major)),
         "mysql" => {
@@ -512,7 +524,7 @@ pub(crate) fn engine_version_supported(engine: &str, engine_version: &str) -> bo
             // `<mysql major>.mysql_aurora.<aurora version>`, e.g.
             // `8.0.mysql_aurora.3.04.0` / `5.7.mysql_aurora.2.11.2`, or the
             // bare MySQL major.
-            ["8.0", "5.7"].iter().any(|major| {
+            AURORA_MYSQL_MAJORS.iter().any(|major| {
                 let Some(rest) = engine_version.strip_prefix(major) else {
                     return false;
                 };
@@ -2635,6 +2647,28 @@ mod engine_version_tests {
                 v.engine, v.engine_version
             );
         }
+    }
+
+    #[test]
+    fn every_accepted_aurora_major_has_its_default_parameter_group() {
+        // An Aurora member takes `default.aurora-*<major>`; a major the
+        // version check accepts without a seeded group would fail
+        // CreateDBInstance with DBParameterGroupNotFound.
+        let groups = crate::state::default_parameter_groups("123456789012", "us-east-1");
+        for major in AURORA_POSTGRESQL_MAJORS {
+            let version = format!("{major}.4");
+            assert!(engine_version_supported("aurora-postgresql", &version));
+            let group = default_parameter_group("aurora-postgresql", &version);
+            assert!(groups.contains_key(&group), "{group} missing");
+        }
+        for major in AURORA_MYSQL_MAJORS {
+            let version = format!("{major}.mysql_aurora.3.04.0");
+            assert!(engine_version_supported("aurora-mysql", &version));
+            let group = default_parameter_group("aurora-mysql", &version);
+            assert!(groups.contains_key(&group), "{group} missing");
+        }
+        // Aurora PostgreSQL 18 is not offered, so it is not accepted either.
+        assert!(!engine_version_supported("aurora-postgresql", "18.0"));
     }
 
     #[test]

@@ -48,7 +48,8 @@ impl RdsService {
     /// For an Aurora engine, the engine version the new instance takes: an
     /// Aurora instance is a member of a DB cluster and runs the cluster's
     /// engine version, so the cluster must be named, exist, and be of the
-    /// same engine. `None` for every non-Aurora engine.
+    /// same engine. `None` for every non-Aurora engine, and for a cluster
+    /// whose stored version is not valid for its engine.
     fn aurora_member_engine_version(
         &self,
         request: &AwsRequest,
@@ -88,7 +89,15 @@ impl RdsService {
                 ),
             ));
         }
-        Ok(cluster["EngineVersion"].as_str().map(str::to_string))
+        // A cluster persisted by an older build may carry a version that is
+        // not one of its engine's (every version-less cluster used to get
+        // `15.3`, aurora-mysql included). Such a value can never start a
+        // member, so the request's EngineVersion (or the engine default)
+        // applies instead of wedging the cluster forever.
+        Ok(cluster["EngineVersion"]
+            .as_str()
+            .filter(|v| service_helpers::engine_version_supported(engine, v))
+            .map(str::to_string))
     }
 
     pub(super) async fn create_db_instance(

@@ -542,4 +542,30 @@ async fn describe_regions_and_zone_ids_follow_aws_naming() {
     let s = by_id.subnet().unwrap();
     assert_eq!(s.availability_zone(), Some("ap-southeast-2c"));
     assert_eq!(s.availability_zone_id(), Some("apse2-az3"));
+
+    // A zone or zone id outside the region is InvalidParameterValue, not a
+    // subnet silently placed in another zone (and a non-ASCII name must not
+    // crash the handler).
+    for (az, az_id) in [
+        (Some("us-east-1a"), None),
+        (Some("us-\u{e9}-1a"), None),
+        (None, Some("use1-az1")),
+        (None, Some("apse2-az99")),
+        (None, Some("garbage")),
+    ] {
+        let err = rc
+            .create_subnet()
+            .vpc_id(vpc_id)
+            .cidr_block("10.40.9.0/24")
+            .set_availability_zone(az.map(str::to_string))
+            .set_availability_zone_id(az_id.map(str::to_string))
+            .send()
+            .await
+            .expect_err("foreign zone must be rejected");
+        assert_eq!(
+            err.into_service_error().meta().code(),
+            Some("InvalidParameterValue"),
+            "{az:?} {az_id:?}"
+        );
+    }
 }
