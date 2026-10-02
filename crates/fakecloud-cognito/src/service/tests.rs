@@ -9146,6 +9146,38 @@ fn token_validity_out_of_range_is_rejected() {
 }
 
 #[test]
+fn omitted_refresh_validity_defaults_to_30_days_in_the_clients_unit() {
+    let (svc, pool_id) = setup_svc_with_pool();
+    let resp = svc
+        .create_user_pool_client(&make_req(
+            "CreateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientName": "m",
+                    "TokenValidityUnits": {"RefreshToken": "minutes"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let body = resp_json(&resp);
+    assert_eq!(
+        body["UserPoolClient"]["RefreshTokenValidity"],
+        json!(43_200)
+    );
+    let client_id = body["UserPoolClient"]["ClientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A later update that touches nothing token-related must still pass.
+    svc.update_user_pool_client(&make_req(
+        "UpdateUserPoolClient",
+        &json!({"UserPoolId": pool_id, "ClientId": client_id, "ClientName": "renamed"}).to_string(),
+    ))
+    .unwrap();
+    let accounts = svc.state.read();
+    let client = &accounts.get("123456789012").unwrap().user_pool_clients[&client_id];
+    assert_eq!(client.client_name, "renamed");
+    assert_eq!(refresh_token_validity_secs(client), 30 * 86_400);
+}
+
+#[test]
 fn stored_huge_token_validity_is_clamped_not_a_panic() {
     let (svc, pool_id, client_id) = setup_signin(json!([]), json!({}));
     {

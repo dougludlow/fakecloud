@@ -10890,6 +10890,55 @@ mod tests {
     }
 
     #[test]
+    fn cognito_user_pool_client_removed_units_reset_to_defaults() {
+        let prov = make_provisioner();
+        let pool = prov
+            .create_resource(&make_resource(
+                "AWS::Cognito::UserPool",
+                "UP",
+                serde_json::json!({"PoolName": "pool"}),
+            ))
+            .expect("pool provisions");
+        let created = prov
+            .create_resource(&make_resource(
+                "AWS::Cognito::UserPoolClient",
+                "Client",
+                serde_json::json!({
+                    "UserPoolId": pool.physical_id,
+                    "ClientName": "c1",
+                    "AccessTokenValidity": 60,
+                    "TokenValidityUnits": {"AccessToken": "minutes", "RefreshToken": "minutes"}
+                }),
+            ))
+            .expect("client provisions");
+        {
+            let cognito = prov.cognito_state.read();
+            let client =
+                &cognito.get("123456789012").unwrap().user_pool_clients[&created.physical_id];
+            // Omitted refresh validity is 30 days, in the template's minutes.
+            assert_eq!(client.refresh_token_validity, Some(43_200));
+        }
+        // The new template drops TokenValidityUnits and the validity values:
+        // they revert to Cognito's defaults instead of the stale minutes
+        // values being reinterpreted in hours/days.
+        prov.update_resource(
+            &created,
+            &make_resource(
+                "AWS::Cognito::UserPoolClient",
+                "Client",
+                serde_json::json!({"UserPoolId": pool.physical_id, "ClientName": "c1"}),
+            ),
+        )
+        .expect("update succeeds")
+        .expect("AWS::Cognito::UserPoolClient is updatable");
+        let cognito = prov.cognito_state.read();
+        let client = &cognito.get("123456789012").unwrap().user_pool_clients[&created.physical_id];
+        assert!(client.token_validity_units.is_none());
+        assert_eq!(client.access_token_validity, None);
+        assert_eq!(client.refresh_token_validity, Some(30));
+    }
+
+    #[test]
     fn sqs_queue_out_of_range_attributes_fail_create_and_update() {
         let prov = make_provisioner();
         let err = prov

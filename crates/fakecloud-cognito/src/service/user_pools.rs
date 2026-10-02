@@ -10,13 +10,13 @@ use crate::state::{
 };
 
 use super::{
-    ensure_user_pool_exists, generate_client_id, generate_client_secret, generate_pool_id,
-    parse_account_recovery_setting, parse_admin_create_user_config, parse_email_configuration,
-    parse_password_policy, parse_refresh_token_rotation, parse_schema_attribute,
-    parse_sign_in_policy, parse_sms_configuration, parse_string_array, parse_tags,
-    parse_token_validity_units, parse_verification_message_template, require_str,
-    user_pool_client_to_json, user_pool_to_json, validate_enum, validate_range,
-    validate_string_length, validate_token_validity, CognitoService,
+    default_refresh_token_validity, ensure_user_pool_exists, generate_client_id,
+    generate_client_secret, generate_pool_id, parse_account_recovery_setting,
+    parse_admin_create_user_config, parse_email_configuration, parse_password_policy,
+    parse_refresh_token_rotation, parse_schema_attribute, parse_sign_in_policy,
+    parse_sms_configuration, parse_string_array, parse_tags, parse_token_validity_units,
+    parse_verification_message_template, require_str, user_pool_client_to_json, user_pool_to_json,
+    validate_enum, validate_range, validate_string_length, validate_token_validity, CognitoService,
 };
 
 impl CognitoService {
@@ -564,18 +564,27 @@ impl CognitoService {
 
         let now = Utc::now();
 
+        let token_validity_units = parse_token_validity_units(&body["TokenValidityUnits"]);
         let client = UserPoolClient {
             client_id: client_id.clone(),
             client_name: client_name.to_string(),
             user_pool_id: pool_id.to_string(),
             client_secret,
             explicit_auth_flows: parse_string_array(&body["ExplicitAuthFlows"]),
-            token_validity_units: parse_token_validity_units(&body["TokenValidityUnits"]),
+            token_validity_units: token_validity_units.clone(),
             access_token_validity: body["AccessTokenValidity"].as_i64(),
             id_token_validity: body["IdTokenValidity"].as_i64(),
-            // AWS defaults RefreshTokenValidity to 30 (days) when unset and
-            // always reports it; access/id token validity stay unset (0).
-            refresh_token_validity: Some(body["RefreshTokenValidity"].as_i64().unwrap_or(30)),
+            // AWS defaults RefreshTokenValidity to 30 days when unset (or 0)
+            // and always reports it, in the client's refresh-token unit;
+            // access/id token validity stay unset (0).
+            refresh_token_validity: Some(
+                body["RefreshTokenValidity"]
+                    .as_i64()
+                    .filter(|v| *v != 0)
+                    .unwrap_or_else(|| {
+                        default_refresh_token_validity(token_validity_units.as_ref())
+                    }),
+            ),
             callback_urls: parse_string_array(&body["CallbackURLs"]),
             logout_urls: parse_string_array(&body["LogoutURLs"]),
             supported_identity_providers: parse_string_array(&body["SupportedIdentityProviders"]),

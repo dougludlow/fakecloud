@@ -122,6 +122,12 @@ impl ApiGatewayService {
                 // (bug-audit 2026-06-20, 1.21).
                 _ if path.starts_with("/throttle/") => {
                     let key = path.trim_start_matches("/throttle/").to_string();
+                    if op == "remove" {
+                        if let Some(m) = plan.throttle.as_mut().and_then(Value::as_object_mut) {
+                            m.remove(&key);
+                        }
+                        return;
+                    }
                     let obj = plan.throttle.get_or_insert_with(|| serde_json::json!({}));
                     if let Some(m) = obj.as_object_mut() {
                         m.insert(key, value.clone());
@@ -129,6 +135,14 @@ impl ApiGatewayService {
                 }
                 _ if path.starts_with("/quota/") => {
                     let key = path.trim_start_matches("/quota/").to_string();
+                    // `remove` clears the field (an absent offset is 0) rather
+                    // than storing a JSON null.
+                    if op == "remove" {
+                        if let Some(m) = plan.quota.as_mut().and_then(Value::as_object_mut) {
+                            m.remove(&key);
+                        }
+                        return;
+                    }
                     // Patch values arrive as strings; store the numeric
                     // fields as numbers so quota metering can read them.
                     let value = match (key.as_str(), value.as_str()) {
@@ -348,7 +362,7 @@ impl ApiGatewayService {
 /// must be 0 for `DAY`, 0-6 for `WEEK`, and 0-27 for `MONTH`. Anything else
 /// (including a non-integer) is a `BadRequestException`.
 fn validate_quota(quota: &Value) -> Result<(), AwsServiceError> {
-    let Some(offset) = quota.get("offset") else {
+    let Some(offset) = quota.get("offset").filter(|v| !v.is_null()) else {
         return Ok(());
     };
     let max = match quota.get("period").and_then(Value::as_str) {
@@ -477,9 +491,25 @@ mod usage_tests {
             &params,
         )
         .unwrap();
+        {
+            let accts = s.state.read();
+            let plan = &accts.get("123456789012").unwrap().usage_plans[&plan_id];
+            assert_eq!(plan.quota.as_ref().unwrap()["offset"], json!(3));
+            assert_eq!(plan.quota.as_ref().unwrap()["limit"], json!(50));
+        }
+
+        // Removing the offset clears it (it then defaults to 0) instead of
+        // storing a null that the range check would reject.
+        s.update_usage_plan(
+            &req(json!({"patchOperations": [
+                {"op": "remove", "path": "/quota/offset"}
+            ]})),
+            &params,
+        )
+        .unwrap();
         let accts = s.state.read();
         let plan = &accts.get("123456789012").unwrap().usage_plans[&plan_id];
-        assert_eq!(plan.quota.as_ref().unwrap()["offset"], json!(3));
+        assert!(plan.quota.as_ref().unwrap().get("offset").is_none());
         assert_eq!(plan.quota.as_ref().unwrap()["limit"], json!(50));
     }
 

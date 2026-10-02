@@ -1857,6 +1857,14 @@ pub fn validate_token_validity(
     }
 }
 
+/// The `RefreshTokenValidity` Cognito stores when the request omits it: the
+/// 30-day default expressed in the client's refresh-token unit (default
+/// `days`), so a client using `minutes` gets 43200 rather than 30 minutes.
+pub fn default_refresh_token_validity(units: Option<&TokenValidityUnits>) -> i64 {
+    DEFAULT_REFRESH_TOKEN_VALIDITY_SECS
+        / token_validity_unit_secs(units.and_then(|u| u.refresh_token.as_deref()), "days")
+}
+
 /// Resolve an app client's (access, id) token lifetimes to seconds, applying
 /// `TokenValidityUnits` (default `hours`) to the raw validity integers.
 /// Clamped to Cognito's accepted range so a client stored without validation
