@@ -106,53 +106,24 @@ pub(crate) fn vector_entry(table: &DynamoTable, index: &VectorIndex, item: &Item
 /// Bytes a DynamoDB number occupies: one byte, plus one per two significant
 /// digits on each side of the decimal point, plus one for a negative sign.
 fn number_bytes(literal: &str) -> usize {
-    let literal = literal.trim();
-    let (negative, unsigned) = match literal.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, literal.strip_prefix('+').unwrap_or(literal)),
+    // Decided from the coefficient and exponent, never by expanding the
+    // exponent into digits (an unbounded allocation for `1e100000000000000`).
+    let Some(parsed) = super::helpers::parse_number(literal) else {
+        return 1;
     };
-    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-        Some(i) => (
-            &unsigned[..i],
-            unsigned[i + 1..].parse::<i64>().unwrap_or(0),
-        ),
-        None => (unsigned, 0),
-    };
-    let (int_text, frac_text) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = format!("{int_text}{frac_text}");
-    if !digits.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+    if parsed.digits.is_empty() {
         return 1;
     }
-    let point = int_text.len() as i64 + exponent;
-    let (int_part, frac_part) = if point <= 0 {
-        (
-            String::new(),
-            format!("{}{digits}", "0".repeat((-point) as usize)),
-        )
-    } else if point as usize >= digits.len() {
-        (
-            format!("{digits}{}", "0".repeat(point as usize - digits.len())),
-            String::new(),
-        )
+    let len = parsed.digits.len();
+    let (int_significant, frac_significant) = if parsed.point <= 0 {
+        (0, len)
+    } else if parsed.point >= len as i128 {
+        (len, 0)
     } else {
-        (
-            digits[..point as usize].to_string(),
-            digits[point as usize..].to_string(),
-        )
+        let point = parsed.point as usize;
+        (point, len - point)
     };
-    let int_part = int_part.trim_start_matches('0');
-    let frac_part = frac_part.trim_end_matches('0');
-    let int_significant = if frac_part.is_empty() {
-        int_part.trim_end_matches('0').len()
-    } else {
-        int_part.len()
-    };
-    let frac_significant = if int_part.is_empty() {
-        frac_part.trim_start_matches('0').len()
-    } else {
-        frac_part.len()
-    };
-    1 + int_significant.div_ceil(2) + frac_significant.div_ceil(2) + usize::from(negative)
+    1 + int_significant.div_ceil(2) + frac_significant.div_ceil(2) + usize::from(parsed.neg)
 }
 
 fn base64_len(b64: &str) -> usize {
@@ -755,6 +726,10 @@ mod tests {
         ] {
             assert_eq!(number_bytes(literal), bytes, "{literal}");
         }
+        // A huge exponent is sized arithmetically, never expanded.
+        assert_eq!(number_bytes("1e100000000000000"), 2);
+        assert_eq!(number_bytes("1e-100000000000000"), 2);
+        assert_eq!(number_bytes("1e9223372036854775807"), 2);
     }
 
     #[test]

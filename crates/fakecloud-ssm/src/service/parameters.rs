@@ -37,12 +37,15 @@ pub(crate) enum PolicyUnit {
 }
 
 impl PolicyUnit {
-    fn to_duration(self, n: i64) -> chrono::Duration {
+    /// The window `n` units long, or `None` when it overflows `chrono`'s
+    /// duration range (`9223372036854775807 Days`). The panicking
+    /// constructors would abort the read path that evaluates policies.
+    fn to_duration(self, n: i64) -> Option<chrono::Duration> {
         match self {
-            PolicyUnit::Days => chrono::Duration::days(n),
-            PolicyUnit::Hours => chrono::Duration::hours(n),
-            PolicyUnit::Minutes => chrono::Duration::minutes(n),
-            PolicyUnit::Seconds => chrono::Duration::seconds(n),
+            PolicyUnit::Days => chrono::Duration::try_days(n),
+            PolicyUnit::Hours => chrono::Duration::try_hours(n),
+            PolicyUnit::Minutes => chrono::Duration::try_minutes(n),
+            PolicyUnit::Seconds => chrono::Duration::try_seconds(n),
         }
     }
 }
@@ -165,6 +168,11 @@ fn parse_window_attrs(
             )));
         }
     };
+    if unit.to_duration(n).is_none() {
+        return Err(invalid_policy_error(format!(
+            "{kind} policy at index {idx} has {key} {n} {unit_str} which is out of range."
+        )));
+    }
     Ok((n, unit))
 }
 
@@ -278,8 +286,15 @@ pub(crate) fn tick_policy_notifications(state: &mut SsmState) {
                         continue;
                     }
                     let Some(exp) = expiration_at else { continue };
-                    let window = unit.to_duration(*before);
-                    if now >= exp - window {
+                    // Checked arithmetic: a window reaching before the
+                    // earliest representable instant is always open, and an
+                    // unrepresentable window (persisted before validation
+                    // existed) is skipped rather than panicking every read.
+                    let Some(window) = unit.to_duration(*before) else {
+                        continue;
+                    };
+                    let opens_at = exp.checked_sub_signed(window);
+                    if opens_at.is_none_or(|opens_at| now >= opens_at) {
                         state.parameter_policy_events.push(ParameterPolicyEvent {
                             parameter_name: param.name.clone(),
                             parameter_arn: param.arn.clone(),
@@ -300,8 +315,16 @@ pub(crate) fn tick_policy_notifications(state: &mut SsmState) {
                     if param.no_change_notified {
                         continue;
                     }
-                    let window = unit.to_duration(*after);
-                    if now >= param.last_modified + window {
+                    // A threshold past the latest representable instant can
+                    // never be reached; checked arithmetic keeps it from
+                    // panicking every read path.
+                    let Some(fires_at) = unit
+                        .to_duration(*after)
+                        .and_then(|window| param.last_modified.checked_add_signed(window))
+                    else {
+                        continue;
+                    };
+                    if now >= fires_at {
                         state.parameter_policy_events.push(ParameterPolicyEvent {
                             parameter_name: param.name.clone(),
                             parameter_arn: param.arn.clone(),

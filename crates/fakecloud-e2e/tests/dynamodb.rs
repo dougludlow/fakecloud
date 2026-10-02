@@ -1909,6 +1909,111 @@ async fn dynamodb_list_backups_paginates() {
     );
 }
 
+/// Regression: a Number with a huge exponent used to be expanded into its
+/// decimal digits before the range check, so `1e100000000000000` allocated
+/// ~1e17 bytes and aborted the whole server. It must be rejected with the
+/// range ValidationException and leave the server serving requests.
+#[tokio::test]
+async fn dynamodb_huge_exponent_number_rejected_without_crashing() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    client
+        .create_table()
+        .table_name("HugeExp")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    for (n, message) in [
+        (
+            "1e100000000000000",
+            "Number overflow. Attempting to store a number with magnitude larger than supported range",
+        ),
+        (
+            "1e9223372036854775807",
+            "Number overflow. Attempting to store a number with magnitude larger than supported range",
+        ),
+        (
+            "1e-100000000000000",
+            "Number underflow. Attempting to store a number with magnitude smaller than supported range",
+        ),
+    ] {
+        let err = client
+            .put_item()
+            .table_name("HugeExp")
+            .item("pk", AttributeValue::S("a".into()))
+            .item("n", AttributeValue::N(n.into()))
+            .send()
+            .await
+            .expect_err("out-of-range number must be rejected")
+            .into_service_error();
+        assert_eq!(err.meta().code(), Some("ValidationException"), "{n}");
+        assert_eq!(err.meta().message(), Some(message), "{n}");
+
+        let err = client
+            .update_item()
+            .table_name("HugeExp")
+            .key("pk", AttributeValue::S("a".into()))
+            .update_expression("ADD n :v")
+            .expression_attribute_values(":v", AttributeValue::N(n.into()))
+            .send()
+            .await
+            .expect_err("out-of-range ADD operand must be rejected")
+            .into_service_error();
+        assert_eq!(err.meta().code(), Some("ValidationException"), "{n}");
+        assert_eq!(err.meta().message(), Some(message), "{n}");
+    }
+
+    // The boundary values are accepted, and the server is still alive.
+    client
+        .put_item()
+        .table_name("HugeExp")
+        .item("pk", AttributeValue::S("a".into()))
+        .item(
+            "max",
+            AttributeValue::N("9.9999999999999999999999999999999999999E+125".into()),
+        )
+        .item("min", AttributeValue::N("1E-130".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = client
+        .get_item()
+        .table_name("HugeExp")
+        .key("pk", AttributeValue::S("a".into()))
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(
+        item["max"],
+        AttributeValue::N(format!(
+            "99999999999999999999999999999999999999{}",
+            "0".repeat(88)
+        ))
+    );
+    assert_eq!(
+        item["min"],
+        AttributeValue::N(format!("0.{}1", "0".repeat(129)))
+    );
+}
+
 /// Regression: BatchWriteItem duplicate-key detection must be numeric-aware.
 /// `{"N":"1"}` and `{"N":"1.0"}` are the same DynamoDB key, so a batch with
 /// both must be rejected with ValidationException (a raw JSON compare missed
