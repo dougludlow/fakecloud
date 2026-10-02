@@ -54,6 +54,10 @@ fn decode_word(word: &str) -> Option<String> {
     let charset = parts.next()?;
     let encoding = parts.next()?;
     let text = parts.next()?;
+    // RFC 2047 requires at least one encoded character.
+    if text.is_empty() {
+        return None;
+    }
     // RFC 2231 allows a `*language` suffix on the charset.
     let charset = charset.split('*').next()?.to_ascii_lowercase();
     let bytes = match encoding {
@@ -103,6 +107,12 @@ mod tests {
         assert_eq!(encode("AMAZONS3"), "AMAZONS3");
         assert_eq!(decode(b"AMAZONS3"), "AMAZONS3");
         assert_eq!(decode(b""), "");
+    }
+
+    #[test]
+    fn empty_encoded_word_is_kept_literally() {
+        assert_eq!(decode(b"=?UTF-8?B??="), "=?UTF-8?B??=");
+        assert_eq!(decode(b"=?UTF-8?Q??="), "=?UTF-8?Q??=");
     }
 
     #[test]
