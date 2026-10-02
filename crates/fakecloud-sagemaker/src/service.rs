@@ -273,6 +273,23 @@ pub(crate) fn not_found(msg: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::NOT_FOUND, "ResourceNotFound", msg)
 }
 
+/// The error for an operation whose target resource does not exist: the
+/// operation's declared `ResourceNotFound` when its model lists one, otherwise
+/// the `ValidationException` SageMaker returns for those operations (for
+/// example `StopNotebookInstance` on an unknown instance answers
+/// `ValidationException: RecordNotFound`).
+pub(crate) fn missing(meta: &OpMeta, msg: impl Into<String>) -> AwsServiceError {
+    if meta.errors.contains(&"ResourceNotFound") {
+        not_found(msg)
+    } else {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            crate::validate::VALIDATION_ERROR,
+            "RecordNotFound",
+        )
+    }
+}
+
 pub(crate) fn in_use(msg: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::CONFLICT, "ResourceInUse", msg)
 }

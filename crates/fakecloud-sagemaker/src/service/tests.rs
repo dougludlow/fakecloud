@@ -1739,12 +1739,30 @@ fn start_stop_on_missing_resource_is_not_found() {
         json!({"TrainingJobName": "nope"}),
     ));
     assert_eq!(status_code(err), "ResourceNotFound");
-    let err = expect_err(run(
-        &s,
-        "StartNotebookInstance",
-        json!({"NotebookInstanceName": "nope"}),
-    ));
-    assert_eq!(status_code(err), "ResourceNotFound");
+    // Ops whose model declares no ResourceNotFound answer the way SageMaker
+    // does for them: ValidationException "RecordNotFound".
+    for (op, body) in [
+        (
+            "StartNotebookInstance",
+            json!({"NotebookInstanceName": "nope"}),
+        ),
+        (
+            "StopNotebookInstance",
+            json!({"NotebookInstanceName": "nope"}),
+        ),
+        (
+            "StopEdgePackagingJob",
+            json!({"EdgePackagingJobName": "nope"}),
+        ),
+    ] {
+        match expect_err(run(&s, op, body)) {
+            AwsServiceError::AwsError { code, message, .. } => {
+                assert_eq!(code, "ValidationException", "{op}");
+                assert_eq!(message, "RecordNotFound", "{op}");
+            }
+            other => panic!("{op}: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -2063,4 +2081,161 @@ fn cluster_node_volume_attach_detach_round_trip() {
         body("i-00000000deadbeef0", "vol-0123456789abcdef2"),
     ));
     assert_eq!(status_code(err), "ResourceNotFound");
+}
+
+#[test]
+fn search_defaults_to_last_modified_time_descending() {
+    let s = svc();
+    for name in ["e1", "e2"] {
+        run(&s, "CreateExperiment", json!({"ExperimentName": name})).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    run(
+        &s,
+        "UpdateExperiment",
+        json!({"ExperimentName": "e1", "Description": "touched"}),
+    )
+    .unwrap();
+    let out = resp_json(&run(&s, "Search", json!({"Resource": "Experiment"})).unwrap());
+    let names: Vec<&str> = out["Results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["Experiment"]["ExperimentName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["e1", "e2"], "{out}");
+}
+
+#[test]
+fn query_lineage_accepts_any_stored_resource_as_start() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateTrainingJob",
+            json!({
+                "TrainingJobName": "tj",
+                "AlgorithmSpecification": {"TrainingInputMode": "File"},
+                "RoleArn": "arn:aws:iam::000000000000:role/r",
+                "OutputDataConfig": {"S3OutputPath": "s3://b/o"},
+                "ResourceConfig": {"VolumeSizeInGB": 1},
+                "StoppingCondition": {},
+            }),
+        )
+        .unwrap(),
+    );
+    let arn = created["TrainingJobArn"].as_str().unwrap().to_string();
+    let out = resp_json(&run(&s, "QueryLineage", json!({"StartArns": [arn]})).unwrap());
+    assert_eq!(out["Vertices"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["Vertices"][0]["Arn"], arn.as_str());
+    assert!(out["Edges"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn edge_deployment_stages_live_on_the_plan() {
+    let s = svc();
+    run(
+        &s,
+        "CreateEdgeDeploymentPlan",
+        json!({
+            "EdgeDeploymentPlanName": "p",
+            "ModelConfigs": [{"ModelHandle": "h", "EdgePackagingJobName": "j"}],
+            "DeviceFleetName": "f",
+            "Stages": [{"StageName": "s1", "DeviceSelectionConfig": {"DeviceSubsetType": "ALL"}}],
+        }),
+    )
+    .unwrap();
+    run(
+        &s,
+        "CreateEdgeDeploymentStage",
+        json!({"EdgeDeploymentPlanName": "p",
+               "Stages": [{"StageName": "s2", "DeviceSelectionConfig": {"DeviceSubsetType": "ALL"}}]}),
+    )
+    .unwrap();
+    let names = |s: &SageMakerService| -> Vec<String> {
+        let d = resp_json(
+            &run(
+                s,
+                "DescribeEdgeDeploymentPlan",
+                json!({"EdgeDeploymentPlanName": "p"}),
+            )
+            .unwrap(),
+        );
+        d["Stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|st| st["StageName"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&s), vec!["s1", "s2"]);
+
+    // A stage added by CreateEdgeDeploymentStage can be started.
+    run(
+        &s,
+        "StartEdgeDeploymentStage",
+        json!({"EdgeDeploymentPlanName": "p", "StageName": "s2"}),
+    )
+    .unwrap();
+    let d = resp_json(
+        &run(
+            &s,
+            "DescribeEdgeDeploymentPlan",
+            json!({"EdgeDeploymentPlanName": "p"}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        d["Stages"][1]["DeploymentStatus"]["StageStatus"],
+        "DEPLOYED"
+    );
+
+    // Duplicate stage names and unknown plans are rejected.
+    let err = expect_err(run(
+        &s,
+        "CreateEdgeDeploymentStage",
+        json!({"EdgeDeploymentPlanName": "p", "Stages": [{"StageName": "s1"}]}),
+    ));
+    assert_eq!(status_code(err), "ValidationException");
+    let err = expect_err(run(
+        &s,
+        "CreateEdgeDeploymentStage",
+        json!({"EdgeDeploymentPlanName": "nope", "Stages": [{"StageName": "x"}]}),
+    ));
+    assert_eq!(status_code(err), "ValidationException");
+
+    // Delete removes only the named stage.
+    run(
+        &s,
+        "DeleteEdgeDeploymentStage",
+        json!({"EdgeDeploymentPlanName": "p", "StageName": "s1"}),
+    )
+    .unwrap();
+    assert_eq!(names(&s), vec!["s2"]);
+    let err = expect_err(run(
+        &s,
+        "StopEdgeDeploymentStage",
+        json!({"EdgeDeploymentPlanName": "p", "StageName": "s1"}),
+    ));
+    assert_eq!(status_code(err), "ValidationException");
+}
+
+#[test]
+fn legacy_edge_stage_records_fold_into_plan() {
+    let mut d = crate::state::SageMakerData::default();
+    d.resources
+        .entry("EdgeDeploymentPlan".into())
+        .or_default()
+        .insert(
+            "p".into(),
+            json!({"EdgeDeploymentPlanName": "p", "Stages": [{"StageName": "s1"}]}),
+        );
+    d.resources.entry("EdgeDeploymentStage".into()).or_default().insert(
+        "p".into(),
+        json!({"EdgeDeploymentPlanName": "p", "Stages": [{"StageName": "s1"}, {"StageName": "s2"}]}),
+    );
+    d.migrate_edge_stages();
+    assert!(!d.resources.contains_key("EdgeDeploymentStage"));
+    let stages = d.get_resource("EdgeDeploymentPlan", "p").unwrap()["Stages"].clone();
+    assert_eq!(stages, json!([{"StageName": "s1"}, {"StageName": "s2"}]));
 }

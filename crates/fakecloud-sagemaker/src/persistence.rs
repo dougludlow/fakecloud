@@ -42,6 +42,7 @@ pub fn load_into(
     let mut accounts_state = snapshot.accounts;
     for (_, data) in accounts_state.iter_mut() {
         data.migrate_inline_tags();
+        data.migrate_edge_stages();
     }
     let accounts = accounts_state.account_count();
     *state.write() = accounts_state;

@@ -765,4 +765,16 @@ async fn sagemaker_search_and_missing_lifecycle_target() {
         err.into_service_error().meta().code(),
         Some("ResourceNotFound")
     );
+
+    // StopNotebookInstance declares no ResourceNotFound: SageMaker answers
+    // ValidationException "RecordNotFound".
+    let err = client
+        .stop_notebook_instance()
+        .notebook_instance_name("never-created")
+        .send()
+        .await
+        .expect_err("stop on missing notebook must fail");
+    let err = err.into_service_error();
+    assert_eq!(err.meta().code(), Some("ValidationException"));
+    assert_eq!(err.meta().message(), Some("RecordNotFound"));
 }

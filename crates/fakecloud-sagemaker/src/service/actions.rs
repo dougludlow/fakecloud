@@ -11,7 +11,7 @@ use fakecloud_core::service::{AwsResponse, AwsServiceError};
 use crate::generated::OpMeta;
 
 use super::special::{cluster_aliases, find_cluster_node, str_member, CLUSTER_NODE_FAMILY};
-use super::{engine, not_found, now_epoch, ok_json, Ctx, SageMakerService};
+use super::{engine, missing, not_found, now_epoch, ok_json, Ctx, SageMakerService};
 
 // ── Training plan extensions ─────────────────────────────────────────────
 
@@ -27,9 +27,13 @@ const DEFAULT_EXTENSION_HOURS: i64 = 24;
 /// `TrainingPlanExtensionDurationHours` upper bound.
 const MAX_EXTENSION_HOURS: i64 = 4368;
 
-fn resolve_plan(data: &crate::state::SageMakerData, plan: &str) -> Result<String, AwsServiceError> {
+fn resolve_plan(
+    data: &crate::state::SageMakerData,
+    meta: &OpMeta,
+    plan: &str,
+) -> Result<String, AwsServiceError> {
     data.resolve_key(TRAINING_PLAN_FAMILY, plan)
-        .ok_or_else(|| not_found(format!("Training plan '{plan}' does not exist.")))
+        .ok_or_else(|| missing(meta, format!("Training plan '{plan}' does not exist.")))
 }
 
 fn as_f64(v: Option<&Value>) -> Option<f64> {
@@ -53,7 +57,7 @@ pub(super) fn search_training_plan_offerings(
     };
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
-    let key = resolve_plan(data, plan_arn)?;
+    let key = resolve_plan(data, meta, plan_arn)?;
     let plan = data
         .get_resource(TRAINING_PLAN_FAMILY, &key)
         .cloned()
@@ -109,7 +113,7 @@ pub(super) fn search_training_plan_offerings(
 pub(super) fn extend_training_plan(
     svc: &SageMakerService,
     ctx: &Ctx,
-    _meta: &OpMeta,
+    meta: &OpMeta,
     body: &Map<String, Value>,
 ) -> Result<(AwsResponse, bool), AwsServiceError> {
     let offering_id = str_member(body, "TrainingPlanExtensionOfferingId");
@@ -128,7 +132,7 @@ pub(super) fn extend_training_plan(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let key = resolve_plan(data, &plan_arn)?;
+    let key = resolve_plan(data, meta, &plan_arn)?;
     let hours = offering
         .get("DurationHours")
         .and_then(Value::as_i64)
@@ -191,13 +195,14 @@ pub(super) fn extend_training_plan(
 pub(super) fn describe_training_plan_extension_history(
     svc: &SageMakerService,
     ctx: &Ctx,
+    meta: &OpMeta,
     body: &Map<String, Value>,
 ) -> Result<(AwsResponse, bool), AwsServiceError> {
     let plan_arn = str_member(body, "TrainingPlanArn");
     let g = svc.state.read();
     let empty = crate::state::SageMakerData::default();
     let data = g.get(&ctx.account).unwrap_or(&empty);
-    let key = resolve_plan(data, &plan_arn)?;
+    let key = resolve_plan(data, meta, &plan_arn)?;
     let history = data
         .get_resource(TRAINING_PLAN_FAMILY, &key)
         .and_then(|p| p.get(PLAN_EXTENSIONS))
@@ -408,12 +413,127 @@ pub(super) fn start_cluster_health_check(
 
 // ── Edge deployment stages ───────────────────────────────────────────────
 
+const EDGE_PLAN_FAMILY: &str = "EdgeDeploymentPlan";
+
+/// The stored plan key for `plan`, or the op's not-found error.
+fn resolve_edge_plan(
+    data: &crate::state::SageMakerData,
+    meta: &OpMeta,
+    plan: &str,
+) -> Result<String, AwsServiceError> {
+    data.resolve_key(EDGE_PLAN_FAMILY, plan).ok_or_else(|| {
+        missing(
+            meta,
+            format!("Edge deployment plan '{plan}' does not exist."),
+        )
+    })
+}
+
+/// The plan's `Stages` list (the one store every stage operation and
+/// `DescribeEdgeDeploymentPlan` share), created empty if absent.
+fn plan_stages<'a>(
+    data: &'a mut crate::state::SageMakerData,
+    key: &str,
+) -> Option<&'a mut Vec<Value>> {
+    let obj = data
+        .get_resource_mut(EDGE_PLAN_FAMILY, key)
+        .and_then(Value::as_object_mut)?;
+    if !obj.get("Stages").is_some_and(Value::is_array) {
+        obj.insert("Stages".to_string(), Value::Array(Vec::new()));
+    }
+    obj.get_mut("Stages").and_then(Value::as_array_mut)
+}
+
+fn stage_name(stage: &Value) -> Option<&str> {
+    stage.get("StageName").and_then(Value::as_str)
+}
+
+/// `CreateEdgeDeploymentStage`: append stages to an existing plan's `Stages`,
+/// so `DescribeEdgeDeploymentPlan`, Start / Stop and Delete all see them. An
+/// unknown plan, or a stage name the plan already has, is rejected.
+pub(super) fn create_edge_deployment_stage(
+    svc: &SageMakerService,
+    ctx: &Ctx,
+    meta: &OpMeta,
+    body: &Map<String, Value>,
+) -> Result<(AwsResponse, bool), AwsServiceError> {
+    let plan = str_member(body, "EdgeDeploymentPlanName");
+    let incoming = body
+        .get("Stages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut g = svc.state.write();
+    let data = g.get_or_create(&ctx.account);
+    let key = resolve_edge_plan(data, meta, &plan)?;
+    let stages = plan_stages(data, &key).ok_or_else(|| {
+        missing(
+            meta,
+            format!("Edge deployment plan '{plan}' does not exist."),
+        )
+    })?;
+    let mut names: Vec<String> = stages
+        .iter()
+        .filter_map(stage_name)
+        .map(str::to_string)
+        .collect();
+    for st in &incoming {
+        let name = stage_name(st).unwrap_or_default().to_string();
+        if names.contains(&name) {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                crate::validate::VALIDATION_ERROR,
+                format!("Stage '{name}' already exists in edge deployment plan '{plan}'."),
+            ));
+        }
+        names.push(name);
+    }
+    stages.extend(incoming);
+    if let Some(obj) = data
+        .get_resource_mut(EDGE_PLAN_FAMILY, &key)
+        .and_then(Value::as_object_mut)
+    {
+        obj.insert("LastModifiedTime".to_string(), now_epoch());
+    }
+    Ok((ok_json(Value::Object(Map::new())), true))
+}
+
+/// `DeleteEdgeDeploymentStage`: remove one named stage from the plan. An
+/// unknown plan or stage is rejected.
+pub(super) fn delete_edge_deployment_stage(
+    svc: &SageMakerService,
+    ctx: &Ctx,
+    meta: &OpMeta,
+    body: &Map<String, Value>,
+) -> Result<(AwsResponse, bool), AwsServiceError> {
+    let plan = str_member(body, "EdgeDeploymentPlanName");
+    let stage = str_member(body, "StageName");
+    let mut g = svc.state.write();
+    let data = g.get_or_create(&ctx.account);
+    let key = resolve_edge_plan(data, meta, &plan)?;
+    let stages = plan_stages(data, &key).ok_or_else(|| {
+        missing(
+            meta,
+            format!("Edge deployment plan '{plan}' does not exist."),
+        )
+    })?;
+    let Some(pos) = stages
+        .iter()
+        .position(|s| stage_name(s) == Some(stage.as_str()))
+    else {
+        return Err(missing(
+            meta,
+            format!("Stage '{stage}' does not exist in edge deployment plan '{plan}'."),
+        ));
+    };
+    stages.remove(pos);
+    Ok((ok_json(Value::Object(Map::new())), true))
+}
+
 /// `StartEdgeDeploymentStage` / `StopEdgeDeploymentStage`: the plan and the
-/// named stage must exist (`ResourceNotFound` otherwise). The stage's
+/// named stage must exist (the op's not-found error otherwise). The stage's
 /// `DeploymentStatus.StageStatus` moves to `DEPLOYED` (start) or `STOPPED`
-/// (stop), which `DescribeEdgeDeploymentPlan` reports. Stages live on the plan
-/// record (`CreateEdgeDeploymentPlan`) or on the stage record
-/// `CreateEdgeDeploymentStage` stores under the plan name.
+/// (stop), which `DescribeEdgeDeploymentPlan` reports.
 pub(super) fn edge_deployment_stage_transition(
     svc: &SageMakerService,
     ctx: &Ctx,
@@ -429,52 +549,34 @@ pub(super) fn edge_deployment_stage_transition(
     };
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
-    let plan_key = data
-        .resolve_key("EdgeDeploymentPlan", &plan)
-        .ok_or_else(|| not_found(format!("Edge deployment plan '{plan}' does not exist.")))?;
-    let mut updated = false;
-    for family in ["EdgeDeploymentPlan", "EdgeDeploymentStage"] {
-        let key = if family == "EdgeDeploymentPlan" {
-            plan_key.clone()
-        } else {
-            plan.clone()
-        };
-        let Some(stages) = data
-            .get_resource_mut(family, &key)
-            .and_then(|r| r.get_mut("Stages"))
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        for s in stages.iter_mut() {
-            if s.get("StageName").and_then(Value::as_str) != Some(stage.as_str()) {
-                continue;
-            }
-            if let Some(obj) = s.as_object_mut() {
-                let mut ds = obj
-                    .get("DeploymentStatus")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                ds.insert("StageStatus".to_string(), Value::String(status.to_string()));
-                ds.entry("EdgeDeploymentSuccessInStage".to_string())
-                    .or_insert(json!(0));
-                ds.entry("EdgeDeploymentPendingInStage".to_string())
-                    .or_insert(json!(0));
-                ds.entry("EdgeDeploymentFailedInStage".to_string())
-                    .or_insert(json!(0));
-                if status == "DEPLOYED" {
-                    ds.insert("EdgeDeploymentStageStartTime".to_string(), now_epoch());
-                }
-                obj.insert("DeploymentStatus".to_string(), Value::Object(ds));
-                updated = true;
-            }
-        }
+    let key = resolve_edge_plan(data, meta, &plan)?;
+    let not_found_stage = || {
+        missing(
+            meta,
+            format!("Stage '{stage}' does not exist in edge deployment plan '{plan}'."),
+        )
+    };
+    let stages = plan_stages(data, &key).ok_or_else(not_found_stage)?;
+    let obj = stages
+        .iter_mut()
+        .find(|s| stage_name(s) == Some(stage.as_str()))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(not_found_stage)?;
+    let mut ds = obj
+        .get("DeploymentStatus")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    ds.insert("StageStatus".to_string(), Value::String(status.to_string()));
+    ds.entry("EdgeDeploymentSuccessInStage".to_string())
+        .or_insert(json!(0));
+    ds.entry("EdgeDeploymentPendingInStage".to_string())
+        .or_insert(json!(0));
+    ds.entry("EdgeDeploymentFailedInStage".to_string())
+        .or_insert(json!(0));
+    if status == "DEPLOYED" {
+        ds.insert("EdgeDeploymentStageStartTime".to_string(), now_epoch());
     }
-    if !updated {
-        return Err(not_found(format!(
-            "Stage '{stage}' does not exist in edge deployment plan '{plan}'."
-        )));
-    }
+    obj.insert("DeploymentStatus".to_string(), Value::Object(ds));
     Ok((ok_json(Value::Object(Map::new())), true))
 }

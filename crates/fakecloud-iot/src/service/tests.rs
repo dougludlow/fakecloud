@@ -1794,3 +1794,58 @@ fn inline_tags_migrate_into_tag_store() {
         .get("tags")
         .is_none());
 }
+
+#[test]
+fn package_versions_with_equal_names_have_distinct_arns_and_tags() {
+    let s = svc();
+    for pkg in ["fw-a", "fw-b"] {
+        run(&s, "PUT", &format!("/packages/{pkg}"), &[], json!({})).unwrap();
+    }
+    let a = body_of(
+        &run(
+            &s,
+            "PUT",
+            "/packages/fw-a/versions/1.0",
+            &[],
+            json!({"tags": {"owner": "a"}}),
+        )
+        .unwrap(),
+    );
+    let arn_a = a["packageVersionArn"].as_str().unwrap().to_string();
+    assert!(arn_a.ends_with(":package/fw-a/version/1.0"), "{arn_a}");
+    let b = body_of(&run(&s, "PUT", "/packages/fw-b/versions/1.0", &[], json!({})).unwrap());
+    let arn_b = b["packageVersionArn"].as_str().unwrap().to_string();
+    assert!(arn_b.ends_with(":package/fw-b/version/1.0"), "{arn_b}");
+
+    // Creating / deleting fw-b 1.0 leaves fw-a 1.0's tags alone.
+    assert_eq!(
+        list_tags_of(&s, &arn_a),
+        json!([{"Key": "owner", "Value": "a"}])
+    );
+    run(
+        &s,
+        "DELETE",
+        "/packages/fw-b/versions/1.0",
+        &[],
+        Value::Null,
+    )
+    .unwrap();
+    assert_eq!(
+        list_tags_of(&s, &arn_a),
+        json!([{"Key": "owner", "Value": "a"}])
+    );
+}
+
+#[test]
+fn static_and_dynamic_thing_groups_share_one_namespace() {
+    let s = svc();
+    run(&s, "POST", "/thing-groups/g", &[], json!({})).unwrap();
+    let err = expect_err(run(
+        &s,
+        "POST",
+        "/dynamic-thing-groups/g",
+        &[],
+        json!({"queryString": "attributes.a:1"}),
+    ));
+    assert!(is_code(&err, "ResourceAlreadyExistsException"));
+}

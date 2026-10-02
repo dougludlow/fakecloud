@@ -51,7 +51,9 @@ tokens, and enforces referential rules:
 - **Tagging** — `TagResource` / `UntagResource` / `ListTagsForResource` keyed
   by ARN. Tags passed at create time (the `TagList`, the software-package
   `TagMap`, or `CreateTopicRule`'s `x-amz-tagging` header) land in the same
-  store, and deleting a resource drops its tags.
+  store, and deleting a resource drops its tags. Software package versions
+  carry their full `package/<pkg>/version/<ver>` ARN, and static and dynamic
+  thing groups share one name namespace.
 
 Input validation is model-derived: required members, string `@length`, numeric
 `@range`, and `@enum` constraints are enforced with each operation's declared

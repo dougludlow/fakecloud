@@ -463,6 +463,11 @@ pub fn resource_arn(region: &str, account: &str, rtype: &str, name: &str) -> Str
     iot_arn(region, account, &format!("{}{}", arn_path(rtype), name))
 }
 
+/// The ARN of version `ver` of software package `pkg`.
+pub fn package_version_arn(region: &str, account: &str, pkg: &str, ver: &str) -> String {
+    iot_arn(region, account, &format!("package/{pkg}/version/{ver}"))
+}
+
 pub fn cert_arn(region: &str, account: &str, cert_id: &str) -> String {
     iot_arn(region, account, &format!("cert/{cert_id}"))
 }

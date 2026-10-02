@@ -107,7 +107,7 @@ pub(super) fn dispatch(
             svc, ctx, meta, body,
         )?)),
         "DescribeTrainingPlanExtensionHistory" => Ok(Some(
-            super::actions::describe_training_plan_extension_history(svc, ctx, body)?,
+            super::actions::describe_training_plan_extension_history(svc, ctx, meta, body)?,
         )),
         "AttachClusterNodeVolume" => Ok(Some(super::actions::attach_cluster_node_volume(
             svc, ctx, body,
@@ -117,6 +117,12 @@ pub(super) fn dispatch(
         )?)),
         "StartClusterHealthCheck" => Ok(Some(super::actions::start_cluster_health_check(
             svc, ctx, body,
+        )?)),
+        "CreateEdgeDeploymentStage" => Ok(Some(super::actions::create_edge_deployment_stage(
+            svc, ctx, meta, body,
+        )?)),
+        "DeleteEdgeDeploymentStage" => Ok(Some(super::actions::delete_edge_deployment_stage(
+            svc, ctx, meta, body,
         )?)),
         "StartEdgeDeploymentStage" | "StopEdgeDeploymentStage" => Ok(Some(
             super::actions::edge_deployment_stage_transition(svc, ctx, meta, body)?,
@@ -385,7 +391,7 @@ fn lifecycle_transition(
 
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
-    let missing = || super::not_found(format!("Resource '{ident}' does not exist."));
+    let missing = || super::missing(meta, format!("Resource '{ident}' does not exist."));
     let key = data.resolve_key(meta.family, &ident).ok_or_else(missing)?;
     let obj = data
         .get_resource_mut(meta.family, &key)

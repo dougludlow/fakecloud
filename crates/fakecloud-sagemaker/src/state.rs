@@ -156,6 +156,41 @@ impl SageMakerData {
         removed
     }
 
+    /// One-time migration for snapshots written before edge deployment stages
+    /// had a single home: fold every legacy `EdgeDeploymentStage` record (keyed
+    /// by plan name) into its plan's `Stages`, skipping names the plan already
+    /// has, and drop records whose plan no longer exists.
+    pub fn migrate_edge_stages(&mut self) {
+        let Some(legacy) = self.resources.remove("EdgeDeploymentStage") else {
+            return;
+        };
+        for (plan, rec) in legacy {
+            let Some(obj) = self
+                .get_resource_mut("EdgeDeploymentPlan", &plan)
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            let mut stages = obj
+                .get("Stages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for st in rec
+                .get("Stages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let name = st.get("StageName");
+                if !stages.iter().any(|s| s.get("StageName") == name) {
+                    stages.push(st.clone());
+                }
+            }
+            obj.insert("Stages".to_string(), Value::Array(stages));
+        }
+    }
+
     /// One-time migration for snapshots written before tags had a single home:
     /// move every record's inline `Tags` list into the ARN-keyed tag store
     /// (merged under any tags already stored for that ARN, which are newer).
@@ -215,6 +250,18 @@ impl SageMakerData {
             }
         }
         None
+    }
+
+    /// The stored resource whose canonical `{Family}Arn` is `arn`, across every
+    /// family, as `(family, record)`.
+    pub fn find_by_arn(&self, arn: &str) -> Option<(&str, &Value)> {
+        self.resources.iter().find_map(|(family, records)| {
+            let member = format!("{family}Arn");
+            records
+                .values()
+                .find(|r| r.get(&member).and_then(Value::as_str) == Some(arn))
+                .map(|r| (family.as_str(), r))
+        })
     }
 
     /// All records of a family as `(id, record)` pairs, ordered by id.

@@ -56,7 +56,15 @@ round-trips on read / list / update:
 - **Jobs** — training, processing, transform, labeling, compilation, AutoML
   (v1 + v2), and hyper-parameter-tuning jobs are created, persisted, described,
   and listed; `Stop*` / `Start*` move the stored status (a Describe reflects
-  it) and return `ResourceNotFound` for a resource that does not exist.
+  it). For a resource that does not exist they return the operation's
+  declared `ResourceNotFound`, or SageMaker's `ValidationException`
+  (`RecordNotFound`) for operations that declare none, such as
+  `StopNotebookInstance`.
+- **Edge deployment stages**: a plan's stages live on the plan:
+  `CreateEdgeDeploymentStage` appends to it (an unknown plan or a duplicate
+  stage name is rejected), `DeleteEdgeDeploymentStage` removes one stage, and
+  `Start` / `StopEdgeDeploymentStage` move its status, all visible in
+  `DescribeEdgeDeploymentPlan`.
 - **Model packages** (+ groups), **pipelines**, **feature groups**, **domains**,
   **user profiles**, **spaces**, **apps**, **images** (+ versions),
   **experiments**, **trials** (+ components), **actions**, **artifacts**,
@@ -84,12 +92,14 @@ round-trips on read / list / update:
 - **Search**: evaluates the `SearchExpression` (filters with every
   operator, nested filters, sub-expressions, `And` / `Or`, `Tags.<key>`
   properties) over the stored resources of the requested type, sorts by
-  `SortBy` / `SortOrder`, paginates, and projects each hit onto its
+  `SortBy` / `SortOrder` (default `LastModifiedTime`, `Descending`), paginates, and projects each hit onto its
   `SearchRecord` member with an exact `TotalHits`.
 - **QueryLineage**: walks the stored `AddAssociation` edges from the start
   entities (`Ascendants` / `Descendants` / `Both`, `MaxDepth`, `Filters`),
   returning the reached vertices with their lineage type and entity type plus
-  the traversed edges. An unknown start entity is `ResourceNotFound`.
+  the traversed edges. Any stored SageMaker resource is a valid start entity
+  (one with no associations comes back as a lone vertex); an unknown start
+  ARN is `ResourceNotFound`.
 - **Tags**: ARN-keyed `AddTags` / `ListTags` / `DeleteTags`. Tags passed to
   a `Create*` land in the same store, so `ListTags` returns them right away;
   Describe outputs that carry `Tags` (for example `DescribeLabelingJob`)

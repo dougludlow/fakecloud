@@ -327,12 +327,12 @@ pub(super) fn search(
         docs.retain(|d| eval_filter(d, &filter));
     }
 
-    // Sort: `SortBy` property (default `CreationTime`), `SortOrder`
+    // Sort: `SortBy` property (default `LastModifiedTime`), `SortOrder`
     // (default `Descending`). Documents missing the property sort last.
     let sort_by = body
         .get("SortBy")
         .and_then(Value::as_str)
-        .unwrap_or("CreationTime")
+        .unwrap_or("LastModifiedTime")
         .to_string();
     let ascending = body.get("SortOrder").and_then(Value::as_str) == Some("Ascending");
     docs.sort_by(|a, b| {
@@ -424,6 +424,15 @@ fn lineage_entity(data: &SageMakerData, arn: &str) -> Entity {
                 entity_type,
             };
         }
+    }
+    // Any other stored SageMaker resource (a training job, a model, ...) is a
+    // valid start entity too: a vertex typed by its resource family.
+    if let Some((family, record)) = data.find_by_arn(arn) {
+        return Entity {
+            record: Some(record.clone()),
+            lineage_type: None,
+            entity_type: Some(family.to_string()),
+        };
     }
     // An ARN only referenced by an association: infer the lineage type from
     // its resource path.
