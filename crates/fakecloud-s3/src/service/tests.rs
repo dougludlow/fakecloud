@@ -7799,3 +7799,67 @@ fn bucket_location_constraints_cover_the_model() {
         );
     }
 }
+
+fn lock_config(retention: &str) -> Vec<u8> {
+    format!(
+        "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+         <Rule><DefaultRetention><Mode>GOVERNANCE</Mode>{retention}</DefaultRetention></Rule>\
+         </ObjectLockConfiguration>"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn object_lock_default_retention_is_range_checked_and_never_overflows() {
+    let svc = make_service();
+    let mut req = make_request(Method::PUT, "/olr", &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, "olr").unwrap();
+
+    for (retention, code) in [
+        ("<Days>9223372036854775807</Days>", "InvalidArgument"),
+        ("<Days>36501</Days>", "InvalidArgument"),
+        ("<Days>0</Days>", "InvalidArgument"),
+        ("<Years>101</Years>", "InvalidArgument"),
+        ("<Years>-1</Years>", "InvalidArgument"),
+        ("<Days>1</Days><Years>1</Years>", "MalformedXML"),
+    ] {
+        let put = make_request(
+            Method::PUT,
+            "/olr",
+            &[("object-lock", "")],
+            &lock_config(retention),
+        );
+        assert_aws_err(
+            svc.put_object_lock_config("123456789012", &put, "olr"),
+            code,
+        );
+    }
+    let put = make_request(
+        Method::PUT,
+        "/olr",
+        &[("object-lock", "")],
+        &lock_config("<Years>100</Years>"),
+    );
+    svc.put_object_lock_config("123456789012", &put, "olr")
+        .unwrap();
+
+    // A configuration persisted before the range check existed must not
+    // panic PutObject's retain-until arithmetic.
+    {
+        let mut accts = svc.state.write();
+        let b = accts
+            .get_mut("123456789012")
+            .unwrap()
+            .buckets
+            .get_mut("olr")
+            .unwrap();
+        b.object_lock_config =
+            Some(String::from_utf8(lock_config("<Years>9223372036854775807</Years>")).unwrap());
+    }
+    let put_req = make_request(Method::PUT, "/olr/k", &[], b"hello");
+    svc.put_object("123456789012", &put_req, "olr", "k")
+        .await
+        .unwrap();
+}

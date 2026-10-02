@@ -303,6 +303,7 @@ impl ManagedBlockchainService {
     // ------------------------------ Networks ----------------------------
 
     fn create_network(&self, ctx: &Ctx, body: &Value) -> Result<AwsResponse, AwsServiceError> {
+        validate_voting_policy(body)?;
         let now = shared::iso_now();
         let network_id = shared::new_network_id();
         let framework = str_or(body, "Framework", "HYPERLEDGER_FABRIC");
@@ -1433,7 +1434,42 @@ fn threshold_policy(network: Option<&Value>) -> (i64, String) {
     (threshold, comparator)
 }
 
+/// AWS bounds for `ApprovalThresholdPolicy.ProposalDurationInHours`.
+const PROPOSAL_DURATION_HOURS: std::ops::RangeInclusive<i64> = 1..=168;
+/// AWS bounds for `ApprovalThresholdPolicy.ThresholdPercentage`.
+const THRESHOLD_PERCENTAGE: std::ops::RangeInclusive<i64> = 0..=100;
+
+/// Reject a CreateNetwork `VotingPolicy` whose approval-threshold numbers are
+/// outside the ranges the service model allows, as AWS does with
+/// `InvalidRequestException`.
+fn validate_voting_policy(body: &Value) -> Result<(), AwsServiceError> {
+    let Some(policy) = body
+        .get("VotingPolicy")
+        .and_then(|v| v.get("ApprovalThresholdPolicy"))
+    else {
+        return Ok(());
+    };
+    for (field, range) in [
+        ("ProposalDurationInHours", PROPOSAL_DURATION_HOURS),
+        ("ThresholdPercentage", THRESHOLD_PERCENTAGE),
+    ] {
+        let Some(v) = policy.get(field) else {
+            continue;
+        };
+        if !v.as_i64().is_some_and(|n| range.contains(&n)) {
+            return Err(invalid_request(&format!(
+                "Invalid {field} {v}: the value must be an integer between {} and {}.",
+                range.start(),
+                range.end()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The `ProposalDurationInHours` from a network's voting policy (default 24).
+/// Clamped to the AWS range so a value stored before CreateNetwork validated
+/// it cannot overflow the proposal-expiration arithmetic.
 fn proposal_duration_hours(network: Option<&Value>) -> i64 {
     network
         .and_then(|n| n.get("VotingPolicy"))
@@ -1441,6 +1477,10 @@ fn proposal_duration_hours(network: Option<&Value>) -> i64 {
         .and_then(|p| p.get("ProposalDurationInHours"))
         .and_then(Value::as_i64)
         .unwrap_or(24)
+        .clamp(
+            *PROPOSAL_DURATION_HOURS.start(),
+            *PROPOSAL_DURATION_HOURS.end(),
+        )
 }
 
 /// Number of members eligible to vote in a network (not deleted).
@@ -1895,6 +1935,68 @@ mod tests {
         s.delete_node(&ctx(), &net_id, &node_id).unwrap();
         let g2 = body_of(&s.get_node(&ctx(), &net_id, &node_id).unwrap());
         assert_eq!(g2["Node"]["Status"], "DELETED");
+    }
+
+    #[test]
+    fn voting_policy_out_of_range_is_rejected_and_stored_extremes_do_not_panic() {
+        let s = svc();
+        for (field, bad) in [
+            ("ProposalDurationInHours", json!(0)),
+            ("ProposalDurationInHours", json!(169)),
+            ("ProposalDurationInHours", json!(i64::MAX)),
+            ("ThresholdPercentage", json!(101)),
+            ("ThresholdPercentage", json!(-1)),
+        ] {
+            let mut policy = json!({
+                "ThresholdPercentage": 50,
+                "ProposalDurationInHours": 24,
+                "ThresholdComparator": "GREATER_THAN"
+            });
+            policy[field] = bad.clone();
+            let err = expect_err(s.create_network(
+                &ctx(),
+                &json!({
+                    "Name": "net",
+                    "Framework": "HYPERLEDGER_FABRIC",
+                    "FrameworkVersion": "2.2",
+                    "VotingPolicy": { "ApprovalThresholdPolicy": policy },
+                }),
+            ));
+            assert!(
+                format!("{err:?}").contains("InvalidRequestException"),
+                "{field}={bad}: {err:?}"
+            );
+        }
+
+        // A network persisted with an absurd duration (before validation
+        // existed) still accepts proposals, with the duration clamped to 168h.
+        let (net_id, member_id) = fabric_network(&s);
+        {
+            let mut guard = s.state.write();
+            let data = guard.get_or_create("000000000000");
+            data.networks.get_mut(&net_id).unwrap()["VotingPolicy"]["ApprovalThresholdPolicy"]
+                ["ProposalDurationInHours"] = json!(i64::MAX);
+        }
+        let prop = body_of(
+            &s.create_proposal(
+                &ctx(),
+                &net_id,
+                &json!({
+                    "ClientRequestToken": "huge",
+                    "MemberId": member_id,
+                    "Actions": { "Invitations": [ { "Principal": "111111111111" } ] }
+                }),
+            )
+            .unwrap(),
+        );
+        let proposal_id = prop["ProposalId"].as_str().unwrap().to_string();
+        let g = body_of(&s.get_proposal(&ctx(), &net_id, &proposal_id).unwrap());
+        let exp =
+            chrono::DateTime::parse_from_rfc3339(g["Proposal"]["ExpirationDate"].as_str().unwrap())
+                .unwrap();
+        let hours =
+            (exp.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_minutes() as f64 / 60.0;
+        assert!((167.0..=168.1).contains(&hours), "{hours}");
     }
 
     #[test]

@@ -23,12 +23,7 @@ impl EcsService {
         // AWS rejects a negative desiredCount with InvalidParameterException
         // rather than silently defaulting it to 1.
         let desired_count = match body.get("desiredCount").and_then(|v| v.as_i64()) {
-            Some(n) if n >= 0 => n as i32,
-            Some(n) => {
-                return Err(invalid_parameter(format!(
-                    "desiredCount cannot be negative. desiredCount={n}"
-                )))
-            }
+            Some(n) => validate_desired_count(n)?,
             None => 1,
         };
         let launch_type = opt_str(&body, "launchType")
@@ -356,17 +351,15 @@ impl EcsService {
         let service_name = service_name_from_ref(service_ref);
         let cluster_ref = opt_str(&body, "cluster");
         let cluster_name = EcsState::resolve_cluster_name(cluster_ref);
-        let new_desired = body.get("desiredCount").and_then(|v| v.as_i64());
         // AWS rejects a negative desiredCount with InvalidParameterException
         // rather than silently clamping it to 0 (which would scale the service
-        // to zero and cause a silent outage). Matches CreateService's message.
-        if let Some(n) = new_desired {
-            if n < 0 {
-                return Err(invalid_parameter(format!(
-                    "desiredCount cannot be negative. desiredCount={n}"
-                )));
-            }
-        }
+        // to zero and cause a silent outage), and one above the per-service
+        // task quota. Matches CreateService's messages.
+        let new_desired = body
+            .get("desiredCount")
+            .and_then(|v| v.as_i64())
+            .map(validate_desired_count)
+            .transpose()?;
         let new_td_ref = opt_str(&body, "taskDefinition");
         let update_lifecycle_hooks: Vec<Value> = body
             .get("deploymentConfiguration")
@@ -512,8 +505,6 @@ impl EcsService {
                 }
 
                 if let Some(n) = new_desired {
-                    // Negatives are already rejected above; n is >= 0 here.
-                    let n = n as i32;
                     svc.desired_count = n;
                     if svc.deployment_controller != "CODE_DEPLOY" {
                         if let Some(d) = svc.deployments.iter_mut().find(|d| d.status == "PRIMARY")

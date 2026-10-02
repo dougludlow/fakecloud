@@ -138,7 +138,8 @@ async fn lifecycle_tag_pattern_list_prunes_matching() {
                 "tagStatus": "tagged",
                 "tagPatternList": ["release-*"],
                 "countType": "imageCountMoreThan",
-                "countNumber": 0,
+                // AWS rejects countNumber 0; keep one matching image.
+                "countNumber": 1,
             },
             "action": {"type": "expire"}
         }]
@@ -165,13 +166,13 @@ async fn lifecycle_tag_pattern_list_prunes_matching() {
         remaining_tags.iter().any(|t| t == "hotfix-2025"),
         "hotfix-2025 missing from {remaining_tags:?}"
     );
-    assert!(
-        !remaining_tags.iter().any(|t| t == "release-2024"),
-        "release-2024 should have been pruned"
-    );
-    assert!(
-        !remaining_tags.iter().any(|t| t == "release-2025"),
-        "release-2025 should have been pruned"
+    let releases = remaining_tags
+        .iter()
+        .filter(|t| t.starts_with("release-"))
+        .count();
+    assert_eq!(
+        releases, 1,
+        "exactly one release-* image should survive: {remaining_tags:?}"
     );
 }
 

@@ -204,7 +204,10 @@ pub(crate) fn run_pass_state(
         }),
     );
 
-    let result = execute_pass_state(state_def, &input);
+    let result = match execute_pass_state(state_def, &input) {
+        Ok(r) => r,
+        Err((error, cause)) => return Advance::Fail(error, cause),
+    };
 
     add_event(
         shared_state,
@@ -351,7 +354,10 @@ pub(crate) fn run_choice_state(
 }
 
 /// Execute a Pass state: apply InputPath, use Result if present, apply ResultPath and OutputPath.
-pub(crate) fn execute_pass_state(state_def: &Value, input: &Value) -> Value {
+pub(crate) fn execute_pass_state(
+    state_def: &Value,
+    input: &Value,
+) -> Result<Value, (String, String)> {
     let input_path = state_def["InputPath"].as_str();
     let result_path = state_def["ResultPath"].as_str();
     let output_path = state_def["OutputPath"].as_str();
@@ -366,7 +372,7 @@ pub(crate) fn execute_pass_state(state_def: &Value, input: &Value) -> Value {
     // from the effective input (and intrinsics). It transforms the effective
     // input before Result/ResultPath; previously it was ignored entirely.
     let transformed = if let Some(params) = state_def.get("Parameters") {
-        apply_parameters(params, &effective_input, None)
+        try_apply_parameters(params, &effective_input, None)?
     } else {
         effective_input
     };
@@ -384,9 +390,9 @@ pub(crate) fn execute_pass_state(state_def: &Value, input: &Value) -> Value {
     };
 
     if output_path == Some("null") {
-        json!({})
+        Ok(json!({}))
     } else {
-        apply_output_path(&after_result, output_path)
+        Ok(apply_output_path(&after_result, output_path))
     }
 }
 
@@ -1139,6 +1145,14 @@ pub(crate) fn cleanup_token(
     }
 }
 
+/// `now + secs` as a monotonic deadline, or `None` when the sum is not
+/// representable (a timeout that far out never fires in practice). Avoids the
+/// `Instant + Duration` overflow panic on absurd `TimeoutSeconds` values that
+/// may already be persisted in a state machine definition.
+pub(crate) fn deadline_after_secs(secs: u64) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(std::time::Duration::from_secs(secs))
+}
+
 /// Poll a task token until the worker calls `SendTaskSuccess`,
 /// `SendTaskFailure`, or the heartbeat / timeout windows expire.
 /// Mirrors the polling loop used by `invoke_activity` but is shared
@@ -1150,8 +1164,7 @@ pub(crate) async fn poll_task_token(
     timeout_seconds: Option<u64>,
     heartbeat_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
-    let absolute_deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds.unwrap_or(3600));
+    let absolute_deadline = deadline_after_secs(timeout_seconds.unwrap_or(3600));
     loop {
         let now_ts = chrono::Utc::now();
         let snapshot = {
@@ -1189,7 +1202,7 @@ pub(crate) async fn poll_task_token(
         if entry.status == "IN_PROGRESS" {
             if let Some(hb) = heartbeat_seconds {
                 let last = entry.last_heartbeat_at.unwrap_or(entry.created_at);
-                if (now_ts - last).num_seconds() > hb as i64 {
+                if (now_ts - last).num_seconds() > i64::try_from(hb).unwrap_or(i64::MAX) {
                     cleanup_token(shared_state, account_id, token);
                     return Err((
                         "States.HeartbeatTimeout".to_string(),
@@ -1198,7 +1211,7 @@ pub(crate) async fn poll_task_token(
                 }
             }
         }
-        if std::time::Instant::now() >= absolute_deadline {
+        if absolute_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             cleanup_token(shared_state, account_id, token);
             let secs = timeout_seconds.unwrap_or(3600);
             return Err((
@@ -1230,15 +1243,8 @@ pub(crate) fn apply_parameters(template: &Value, input: &Value, context: Option<
                                 tracing::warn!(error = %err, "States intrinsic failed");
                                 Value::Null
                             })
-                        } else if expr.starts_with("$$.") {
-                            if let Some(ctx) = context {
-                                let path = expr.strip_prefix("$$.").unwrap_or(expr);
-                                crate::io_processing::resolve_path(ctx, path)
-                            } else {
-                                Value::Null
-                            }
                         } else {
-                            crate::io_processing::resolve_path(input, expr)
+                            resolve_reference(expr, input, context)
                         };
                         result.insert(stripped.to_string(), resolved);
                     }
@@ -1254,6 +1260,60 @@ pub(crate) fn apply_parameters(template: &Value, input: &Value, context: Option<
                 .collect(),
         ),
         other => other.clone(),
+    }
+}
+
+/// Like [`apply_parameters`], but an intrinsic function that fails (for
+/// example `States.ArrayRange` past its 1000-item cap) is returned as a
+/// `States.IntrinsicFailure` error, as AWS fails the state, instead of being
+/// replaced by `null`.
+pub(crate) fn try_apply_parameters(
+    template: &Value,
+    input: &Value,
+    context: Option<&Value>,
+) -> Result<Value, (String, String)> {
+    match template {
+        Value::Object(map) => {
+            let mut result = serde_json::Map::new();
+            for (key, value) in map {
+                if let Some(stripped) = key.strip_suffix(".$") {
+                    if let Some(expr) = value.as_str() {
+                        let resolved = if crate::intrinsics::is_intrinsic_call(expr) {
+                            crate::intrinsics::evaluate(expr, input)
+                                .map_err(|err| ("States.IntrinsicFailure".to_string(), err.0))?
+                        } else {
+                            resolve_reference(expr, input, context)
+                        };
+                        result.insert(stripped.to_string(), resolved);
+                    }
+                } else {
+                    result.insert(key.clone(), try_apply_parameters(value, input, context)?);
+                }
+            }
+            Ok(Value::Object(result))
+        }
+        Value::Array(arr) => Ok(Value::Array(
+            arr.iter()
+                .map(|v| try_apply_parameters(v, input, context))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Ok(other.clone()),
+    }
+}
+
+/// Resolve a `.$` reference: `$$.`-rooted paths read the context object (when
+/// one is supplied), everything else reads the state input.
+fn resolve_reference(expr: &str, input: &Value, context: Option<&Value>) -> Value {
+    if expr.starts_with("$$.") {
+        match context {
+            Some(ctx) => {
+                let path = expr.strip_prefix("$$.").unwrap_or(expr);
+                crate::io_processing::resolve_path(ctx, path)
+            }
+            None => Value::Null,
+        }
+    } else {
+        crate::io_processing::resolve_path(input, expr)
     }
 }
 
@@ -1748,7 +1808,7 @@ mod tests {
             "End": true,
         });
         let input = json!({"value": 99, "ignored": "x"});
-        let out = execute_pass_state(&state_def, &input);
+        let out = execute_pass_state(&state_def, &input).unwrap();
         assert_eq!(out["renamed"], json!(99));
         assert_eq!(out["constant"], json!("fixed"));
         // The non-templated field is dropped (Parameters builds a new payload).
@@ -1764,8 +1824,27 @@ mod tests {
             "OutputPath": "$.a",
             "End": true,
         });
-        let out = execute_pass_state(&state_def, &json!({"n": 7}));
+        let out = execute_pass_state(&state_def, &json!({"n": 7})).unwrap();
         assert_eq!(out, json!(7));
+    }
+
+    #[test]
+    fn pass_and_task_parameters_intrinsic_failure_is_states_intrinsic_failure() {
+        let state_def = json!({
+            "Type": "Pass",
+            "Parameters": {"r.$": "States.ArrayRange(1, 5000, 1)"},
+            "End": true,
+        });
+        let (error, cause) = execute_pass_state(&state_def, &json!({})).unwrap_err();
+        assert_eq!(error, "States.IntrinsicFailure");
+        assert!(cause.contains("1000"), "{cause}");
+        let (error, _) = try_apply_parameters(
+            &json!({"nested": [{"r.$": "States.ArrayRange(1, 5000, 1)"}]}),
+            &json!({}),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "States.IntrinsicFailure");
     }
 }
 

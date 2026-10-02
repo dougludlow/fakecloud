@@ -1471,6 +1471,113 @@ mod service_validation_tests {
     }
 
     #[test]
+    fn desired_count_above_task_quota_is_invalid_parameter() {
+        let svc = fresh_service();
+        service_ready(&svc);
+        for n in [json!(5001), json!(i32::MAX), json!(i64::MAX)] {
+            let err = svc
+                .update_service(&make_request(
+                    "UpdateService",
+                    json!({"service": "web", "desiredCount": n}),
+                ))
+                .err()
+                .unwrap_or_else(|| panic!("UpdateService accepted desiredCount {n}"));
+            assert_eq!(err.code(), "InvalidParameterException");
+            let err = svc
+                .create_service(&make_request(
+                    "CreateService",
+                    json!({"serviceName": "big", "taskDefinition": "web", "desiredCount": n}),
+                ))
+                .err()
+                .unwrap_or_else(|| panic!("CreateService accepted desiredCount {n}"));
+            assert_eq!(err.code(), "InvalidParameterException");
+        }
+        // The quota itself is accepted.
+        svc.update_service(&make_request(
+            "UpdateService",
+            json!({"service": "web", "desiredCount": crate::state::MAX_TASKS_PER_SERVICE}),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn spawn_service_tasks_clamps_a_persisted_huge_desired_count() {
+        let svc = fresh_service();
+        service_ready(&svc);
+        let mut accounts = svc.state.write();
+        let state = accounts.get_mut("000000000000").unwrap();
+        let key = EcsState::service_key("default", "web");
+        let service = state.services.get(&key).unwrap().clone();
+        let ids = spawn_service_tasks(state, "us-east-1", &service, i32::MAX, "", "FARGATE", None);
+        assert_eq!(ids.len(), crate::state::MAX_TASKS_PER_SERVICE as usize);
+    }
+
+    #[test]
+    fn update_task_protection_validates_expires_in_minutes() {
+        let svc = fresh_service();
+        svc.register_task_definition(&make_request(
+            "RegisterTaskDefinition",
+            json!({"family": "web", "containerDefinitions": [{"name": "app", "image": "alpine"}]}),
+        ))
+        .unwrap();
+        let resp = svc
+            .run_task(&make_request(
+                "RunTask",
+                json!({"cluster": "default", "taskDefinition": "web"}),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let task_arn = body["tasks"][0]["taskArn"].as_str().unwrap().to_string();
+
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(2881),
+            json!(i64::MAX),
+            json!(i64::MIN),
+        ] {
+            let err = svc
+                .update_task_protection(&make_request(
+                    "UpdateTaskProtection",
+                    json!({"cluster": "default", "tasks": [task_arn], "protectionEnabled": true,
+                           "expiresInMinutes": bad}),
+                ))
+                .err()
+                .unwrap_or_else(|| panic!("accepted expiresInMinutes {bad}"));
+            assert_eq!(err.code(), "InvalidParameterException", "{bad}");
+        }
+
+        let expiry_minutes = |body: Value| {
+            let exp = body["protectedTasks"][0]["expirationDate"]
+                .as_i64()
+                .unwrap();
+            (exp - chrono::Utc::now().timestamp() + 30) / 60
+        };
+        let resp = svc
+            .update_task_protection(&make_request(
+                "UpdateTaskProtection",
+                json!({"cluster": "default", "tasks": [task_arn], "protectionEnabled": true,
+                       "expiresInMinutes": 2880}),
+            ))
+            .unwrap();
+        assert_eq!(
+            expiry_minutes(serde_json::from_slice(resp.body.expect_bytes()).unwrap()),
+            2880
+        );
+        // Omitted: AWS protects for 120 minutes.
+        let resp = svc
+            .update_task_protection(&make_request(
+                "UpdateTaskProtection",
+                json!({"cluster": "default", "tasks": [task_arn], "protectionEnabled": true}),
+            ))
+            .unwrap();
+        assert_eq!(
+            expiry_minutes(serde_json::from_slice(resp.body.expect_bytes()).unwrap()),
+            120
+        );
+    }
+
+    #[test]
     fn update_service_on_inactive_service_is_service_not_active() {
         let svc = fresh_service();
         service_ready(&svc);

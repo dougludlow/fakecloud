@@ -9089,6 +9089,152 @@ fn token_validity_honored_from_client_config() {
 }
 
 #[test]
+fn token_validity_out_of_range_is_rejected() {
+    let (svc, pool_id) = setup_svc_with_pool();
+    let bad = [
+        json!({"AccessTokenValidity": i64::MAX, "TokenValidityUnits": {"AccessToken": "days"}}),
+        json!({"AccessTokenValidity": 86400}), // hours by default: far over 1 day
+        json!({"IdTokenValidity": 4, "TokenValidityUnits": {"IdToken": "minutes"}}),
+        json!({"RefreshTokenValidity": 3651}), // days: over 10 years
+        json!({"RefreshTokenValidity": 59, "TokenValidityUnits": {"RefreshToken": "minutes"}}),
+        json!({"AccessTokenValidity": -1}),
+    ];
+    for extra in &bad {
+        let mut body = json!({"UserPoolId": pool_id, "ClientName": "c"});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let err = svc
+            .create_user_pool_client(&make_req("CreateUserPoolClient", &body.to_string()))
+            .err()
+            .unwrap_or_else(|| panic!("accepted {extra}"));
+        assert_eq!(err.code(), "InvalidParameterException", "{extra}");
+        assert_eq!(err.message(), "Invalid range for token validity.");
+    }
+    // Boundaries and the RefreshTokenValidity=0 default are accepted.
+    let resp = svc
+        .create_user_pool_client(&make_req(
+            "CreateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientName": "ok",
+                    "AccessTokenValidity": 1, "IdTokenValidity": 5,
+                    "RefreshTokenValidity": 0,
+                    "TokenValidityUnits": {"AccessToken": "days", "IdToken": "minutes"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let client_id = resp_json(&resp)["UserPoolClient"]["ClientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // UpdateUserPoolClient validates the effective values and leaves the
+    // client untouched on failure.
+    let err = svc
+        .update_user_pool_client(&make_req(
+            "UpdateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientId": client_id, "ClientName": "renamed",
+                    "AccessTokenValidity": i64::MAX})
+            .to_string(),
+        ))
+        .err()
+        .expect("huge AccessTokenValidity accepted on update");
+    assert_eq!(err.code(), "InvalidParameterException");
+    let accounts = svc.state.read();
+    let client = &accounts.get("123456789012").unwrap().user_pool_clients[&client_id];
+    assert_eq!(client.client_name, "ok");
+    assert_eq!(client.access_token_validity, Some(1));
+    assert_eq!(refresh_token_validity_secs(client), 30 * 86_400);
+}
+
+#[test]
+fn omitted_refresh_validity_defaults_to_30_days_in_the_clients_unit() {
+    let (svc, pool_id) = setup_svc_with_pool();
+    let resp = svc
+        .create_user_pool_client(&make_req(
+            "CreateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientName": "m",
+                    "TokenValidityUnits": {"RefreshToken": "minutes"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let body = resp_json(&resp);
+    assert_eq!(
+        body["UserPoolClient"]["RefreshTokenValidity"],
+        json!(43_200)
+    );
+    let client_id = body["UserPoolClient"]["ClientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A later update that touches nothing token-related must still pass.
+    svc.update_user_pool_client(&make_req(
+        "UpdateUserPoolClient",
+        &json!({"UserPoolId": pool_id, "ClientId": client_id, "ClientName": "renamed"}).to_string(),
+    ))
+    .unwrap();
+    let accounts = svc.state.read();
+    let client = &accounts.get("123456789012").unwrap().user_pool_clients[&client_id];
+    assert_eq!(client.client_name, "renamed");
+    assert_eq!(refresh_token_validity_secs(client), 30 * 86_400);
+}
+
+#[test]
+fn update_user_pool_client_resets_omitted_validity_in_the_new_units() {
+    let (svc, pool_id) = setup_svc_with_pool();
+    let resp = svc
+        .create_user_pool_client(&make_req(
+            "CreateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientName": "m",
+                    "AccessTokenValidity": 30,
+                    "TokenValidityUnits": {"AccessToken": "minutes", "RefreshToken": "minutes"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let client_id = resp_json(&resp)["UserPoolClient"]["ClientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Units switch to days with RefreshTokenValidity omitted: the stored
+    // 43200 (minutes) must not be reread as 43200 days.
+    let resp = svc
+        .update_user_pool_client(&make_req(
+            "UpdateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientId": client_id,
+                    "TokenValidityUnits": {"RefreshToken": "days"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let c = &resp_json(&resp)["UserPoolClient"];
+    assert_eq!(c["RefreshTokenValidity"], json!(30));
+    // Omitted AccessTokenValidity resets to the default (unset, 1 hour).
+    assert!(c
+        .get("AccessTokenValidity")
+        .is_none_or(|v| v.is_null() || v == 0));
+    let accounts = svc.state.read();
+    let client = &accounts.get("123456789012").unwrap().user_pool_clients[&client_id];
+    assert_eq!(client.access_token_validity, None);
+    assert_eq!(refresh_token_validity_secs(client), 30 * 86_400);
+}
+
+#[test]
+fn stored_huge_token_validity_is_clamped_not_a_panic() {
+    let (svc, pool_id, client_id) = setup_signin(json!([]), json!({}));
+    {
+        let mut accounts = svc.state.write();
+        let client = accounts
+            .get_mut("123456789012")
+            .unwrap()
+            .user_pool_clients
+            .get_mut(&client_id)
+            .unwrap();
+        client.access_token_validity = Some(i64::MAX);
+        client.id_token_validity = Some(i64::MAX);
+        client.refresh_token_validity = Some(i64::MAX);
+    }
+    let result = admin_signin(&svc, &pool_id, &client_id, "signinuser");
+    assert_eq!(result["AuthenticationResult"]["ExpiresIn"], 86_400);
+}
+
+#[test]
 fn token_validity_defaults_to_one_hour() {
     let (svc, pool_id, client_id) = setup_signin(json!([]), json!({}));
     let result = admin_signin(&svc, &pool_id, &client_id, "signinuser");

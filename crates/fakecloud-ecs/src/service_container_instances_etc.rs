@@ -595,10 +595,19 @@ impl EcsService {
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
         let protect = req_bool(&body, "protectionEnabled")?;
-        let expires_in_minutes = body
-            .get("expiresInMinutes")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2880);
+        // AWS: expiresInMinutes is 1..=2880 (48 hours); when omitted the
+        // task is protected for 120 minutes (2 hours).
+        let expires_in_minutes = match body.get("expiresInMinutes") {
+            None | Some(Value::Null) => 120,
+            Some(v) => v
+                .as_i64()
+                .filter(|m| (1..=2880).contains(m))
+                .ok_or_else(|| {
+                    invalid_parameter(format!(
+                        "Invalid expiresInMinutes value {v}. The value must be between 1 and 2880."
+                    ))
+                })?,
+        };
         let expiration = if protect {
             Some(Utc::now() + chrono::Duration::minutes(expires_in_minutes))
         } else {

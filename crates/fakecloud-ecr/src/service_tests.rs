@@ -97,6 +97,31 @@ fn lifecycle_count_more_than_tagged() {
 }
 
 #[test]
+fn lifecycle_extreme_count_numbers_do_not_panic() {
+    let r = repo_with_images(&[("sha256:a", &["v1"], 50), ("sha256:b", &[], 10)]);
+    for n in [
+        "9223372036854775807",
+        "-9223372036854775808",
+        "18446744073709551615",
+    ] {
+        for (ty, unit) in [
+            ("sinceImagePushed", "days"),
+            ("sinceImagePushed", "hours"),
+            ("imageCountMoreThan", "days"),
+        ] {
+            let policy = format!(
+                r#"{{"rules":[{{"rulePriority":1,"selection":{{"tagStatus":"any","countType":"{ty}","countUnit":"{unit}","countNumber":{n}}}}}]}}"#
+            );
+            let prune = evaluate_lifecycle_policy(&r, &policy);
+            // i64::MAX days/hours or keep-i64::MAX images: nothing is pruned.
+            if n == "9223372036854775807" {
+                assert!(prune.is_empty(), "{ty}/{unit}/{n}: {prune:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn lifecycle_untagged_only() {
     let r = repo_with_images(&[("sha256:tagged", &["v1"], 60), ("sha256:untag", &[], 30)]);
     let policy = r#"{"rules":[{
@@ -1332,6 +1357,43 @@ mod lifecycle_timestamp_tests {
             body.get("repositoryName").and_then(|v| v.as_str()),
             Some("app")
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_policy_count_number_out_of_range_is_rejected() {
+        let (svc, _state) = fixture();
+        for n in [
+            json!(0),
+            json!(-1),
+            json!(2147483648_i64),
+            json!(i64::MAX),
+            json!(1.5),
+        ] {
+            let policy = json!({
+                "rules": [{
+                    "rulePriority": 1,
+                    "selection": {
+                        "tagStatus": "any",
+                        "countType": "sinceImagePushed",
+                        "countUnit": "days",
+                        "countNumber": n
+                    },
+                    "action": {"type": "expire"}
+                }]
+            })
+            .to_string();
+            for action in ["PutLifecyclePolicy", "StartLifecyclePolicyPreview"] {
+                let req = make_request(
+                    action,
+                    json!({"repositoryName": "app", "lifecyclePolicyText": policy}),
+                );
+                let err = <EcrService as fakecloud_core::service::AwsService>::handle(&svc, req)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{action} accepted countNumber {n}"));
+                assert_eq!(err.code(), "InvalidParameterException", "{action} {n}");
+            }
+        }
     }
 
     #[tokio::test]

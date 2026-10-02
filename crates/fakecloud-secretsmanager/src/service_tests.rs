@@ -1763,6 +1763,36 @@ async fn describe_secret_with_rotation_and_next_date() {
 }
 
 #[tokio::test]
+async fn describe_secret_with_huge_persisted_rotation_days_does_not_panic() {
+    let state = make_state();
+    let svc = SecretsManagerService::new(state.clone());
+    let req = make_request(
+        "CreateSecret",
+        r#"{"Name": "rot-huge", "SecretString": "pw"}"#,
+    );
+    svc.handle(req).await.unwrap();
+    {
+        let mut accounts = state.write();
+        let secret = accounts
+            .default_mut()
+            .secrets
+            .values_mut()
+            .find(|s| s.name == "rot-huge")
+            .unwrap();
+        secret.rotation_enabled = Some(true);
+        secret.rotation_rules = Some(crate::state::RotationRules {
+            automatically_after_days: Some(i64::MAX),
+            duration: None,
+            schedule_expression: None,
+        });
+    }
+    let req = make_request("DescribeSecret", r#"{"SecretId": "rot-huge"}"#);
+    let resp = svc.handle(req).await.unwrap();
+    let b: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert!(b.get("NextRotationDate").is_none());
+}
+
+#[tokio::test]
 async fn describe_secret_deleted_shows_deletion_date() {
     let state = make_state();
     let svc = SecretsManagerService::new(state);

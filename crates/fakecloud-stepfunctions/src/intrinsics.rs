@@ -274,6 +274,9 @@ fn fn_array_contains(args: &[Value]) -> Result<Value, IntrinsicError> {
     Ok(Value::Bool(arr.iter().any(|v| v == &args[1])))
 }
 
+/// AWS: "The array returned by States.ArrayRange can contain up to 1000 items."
+const ARRAY_RANGE_MAX_ITEMS: i128 = 1000;
+
 fn fn_array_range(args: &[Value]) -> Result<Value, IntrinsicError> {
     need_args(args, 3, "States.ArrayRange")?;
     let start = arg_as_i64(&args[0])?;
@@ -282,19 +285,22 @@ fn fn_array_range(args: &[Value]) -> Result<Value, IntrinsicError> {
     if step == 0 {
         return Err(IntrinsicError("ArrayRange step must be != 0".into()));
     }
-    let mut out = Vec::new();
-    let mut i = start;
-    if step > 0 {
-        while i <= end {
-            out.push(json!(i));
-            i += step;
-        }
+    // Compute the element count in i128 so extreme operands cannot overflow,
+    // and enforce the AWS cap before allocating anything.
+    let span = i128::from(end) - i128::from(start);
+    let count: i128 = if (step > 0 && span < 0) || (step < 0 && span > 0) {
+        0
     } else {
-        while i >= end {
-            out.push(json!(i));
-            i += step;
-        }
+        span / i128::from(step) + 1
+    };
+    if count > ARRAY_RANGE_MAX_ITEMS {
+        return Err(IntrinsicError(format!(
+            "ArrayRange result exceeds the maximum of {ARRAY_RANGE_MAX_ITEMS} items"
+        )));
     }
+    let out: Vec<Value> = (0..count)
+        .map(|k| json!((i128::from(start) + k * i128::from(step)) as i64))
+        .collect();
     Ok(Value::Array(out))
 }
 
@@ -645,5 +651,37 @@ mod tests {
     fn unknown_intrinsic_errors() {
         let err = evaluate("States.NoSuchFunction()", &Value::Null).unwrap_err();
         assert!(format!("{err}").contains("unknown"));
+    }
+
+    #[test]
+    fn array_range_extreme_operands_do_not_panic() {
+        let input = json!({"min": i64::MIN, "max": i64::MAX, "near": i64::MAX - 1});
+        // Unbounded span is rejected by the 1000-item cap, not by OOM.
+        let err = evaluate("States.ArrayRange($.min, $.max, 1)", &input).unwrap_err();
+        assert!(format!("{err}").contains("1000"), "{err}");
+        // A step that would overflow `i += step` yields the in-range items only.
+        assert_eq!(
+            evaluate("States.ArrayRange($.near, $.max, $.max)", &input).unwrap(),
+            json!([i64::MAX - 1])
+        );
+        assert_eq!(
+            evaluate("States.ArrayRange($.min, $.max, $.max)", &input).unwrap(),
+            json!([i64::MIN, -1, i64::MAX - 1])
+        );
+        // Negative step down to i64::MIN.
+        assert_eq!(
+            evaluate("States.ArrayRange($.max, $.min, $.min)", &input).unwrap(),
+            json!([i64::MAX, -1])
+        );
+        // Exactly 1000 items is allowed; 1001 is not.
+        let ok = evaluate("States.ArrayRange(1, 1000, 1)", &Value::Null).unwrap();
+        assert_eq!(ok.as_array().unwrap().len(), 1000);
+        assert!(evaluate("States.ArrayRange(1, 1001, 1)", &Value::Null).is_err());
+        // Wrong direction is an empty array.
+        assert_eq!(
+            evaluate("States.ArrayRange(5, 1, 1)", &Value::Null).unwrap(),
+            json!([])
+        );
+        assert!(evaluate("States.ArrayRange(1, 5, 0)", &Value::Null).is_err());
     }
 }

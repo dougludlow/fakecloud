@@ -282,21 +282,23 @@ impl ResourceProvisioner {
         };
 
         let now = Utc::now();
+        let validity = fakecloud_cognito::resolve_token_validity(
+            props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
+            props.get("IdTokenValidity").and_then(|v| v.as_i64()),
+            props.get("RefreshTokenValidity").and_then(|v| v.as_i64()),
+            parse_cfn_token_validity_units(props.get("TokenValidityUnits")),
+        )
+        .map_err(str::to_string)?;
         let client = UserPoolClient {
             client_id: client_id.clone(),
             client_name,
             user_pool_id: pool_id.clone(),
             client_secret: client_secret.clone(),
             explicit_auth_flows: parse_cognito_string_array(props.get("ExplicitAuthFlows")),
-            token_validity_units: None,
-            access_token_validity: props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
-            id_token_validity: props.get("IdTokenValidity").and_then(|v| v.as_i64()),
-            refresh_token_validity: Some(
-                props
-                    .get("RefreshTokenValidity")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(30),
-            ),
+            token_validity_units: validity.units,
+            access_token_validity: validity.access,
+            id_token_validity: validity.id,
+            refresh_token_validity: Some(validity.refresh),
             callback_urls: parse_cognito_string_array(props.get("CallbackURLs")),
             logout_urls: parse_cognito_string_array(props.get("LogoutURLs")),
             supported_identity_providers: parse_cognito_string_array(
@@ -371,19 +373,25 @@ impl ResourceProvisioner {
             .get_mut(client_id)
             .ok_or_else(|| format!("User pool client {client_id} not yet provisioned"))?;
 
+        // CloudFormation updates replace the whole resource model: a removed
+        // TokenValidityUnits reverts to Cognito's default units (hours/days),
+        // and removed validity values revert to their defaults (unset access/id,
+        // 30-day refresh), so stale values are never reinterpreted in new units.
+        let validity = fakecloud_cognito::resolve_token_validity(
+            props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
+            props.get("IdTokenValidity").and_then(|v| v.as_i64()),
+            props.get("RefreshTokenValidity").and_then(|v| v.as_i64()),
+            parse_cfn_token_validity_units(props.get("TokenValidityUnits")),
+        )
+        .map_err(str::to_string)?;
+        client.token_validity_units = validity.units;
+        client.access_token_validity = validity.access;
+        client.id_token_validity = validity.id;
+        client.refresh_token_validity = Some(validity.refresh);
         if let Some(name) = props.get("ClientName").and_then(|v| v.as_str()) {
             client.client_name = name.to_string();
         }
         client.explicit_auth_flows = parse_cognito_string_array(props.get("ExplicitAuthFlows"));
-        if let Some(v) = props.get("AccessTokenValidity").and_then(|v| v.as_i64()) {
-            client.access_token_validity = Some(v);
-        }
-        if let Some(v) = props.get("IdTokenValidity").and_then(|v| v.as_i64()) {
-            client.id_token_validity = Some(v);
-        }
-        if let Some(v) = props.get("RefreshTokenValidity").and_then(|v| v.as_i64()) {
-            client.refresh_token_validity = Some(v);
-        }
         client.callback_urls = parse_cognito_string_array(props.get("CallbackURLs"));
         client.logout_urls = parse_cognito_string_array(props.get("LogoutURLs"));
         client.supported_identity_providers =
@@ -748,4 +756,19 @@ impl ResourceProvisioner {
         state.identity_pool_role_attachments.remove(physical_id);
         Ok(())
     }
+}
+
+/// `TokenValidityUnits` (`AccessToken` / `IdToken` / `RefreshToken`) from a
+/// template, so the validity integers are interpreted in the units the
+/// template names rather than Cognito's defaults.
+fn parse_cfn_token_validity_units(
+    v: Option<&serde_json::Value>,
+) -> Option<fakecloud_cognito::TokenValidityUnits> {
+    let v = v.filter(|v| v.is_object())?;
+    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    Some(fakecloud_cognito::TokenValidityUnits {
+        access_token: field("AccessToken"),
+        id_token: field("IdToken"),
+        refresh_token: field("RefreshToken"),
+    })
 }

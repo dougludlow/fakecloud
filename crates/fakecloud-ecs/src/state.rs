@@ -985,6 +985,10 @@ where
     Ok(normalized)
 }
 
+/// ECS service quota "Tasks per service" (not adjustable): the most tasks a
+/// single service may run, and so the largest `desiredCount` ECS accepts.
+pub const MAX_TASKS_PER_SERVICE: i32 = 5000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

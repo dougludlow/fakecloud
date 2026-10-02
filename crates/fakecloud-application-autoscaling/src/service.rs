@@ -1236,10 +1236,15 @@ fn synth_forecast(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(DateTime<Utc
         let h = cursor.timestamp().rem_euclid(86_400) / 3600;
         let v = 30 + ((h * 5) as i32 % 60).abs();
         out.push((cursor, v));
-        cursor += step;
         if out.len() >= 168 {
             break; // cap at one week of hourly buckets
         }
+        // A window ending near the maximum representable DateTime must stop
+        // rather than overflow the cursor.
+        let Some(next) = cursor.checked_add_signed(step) else {
+            break;
+        };
+        cursor = next;
     }
     out
 }
@@ -1417,6 +1422,16 @@ mod tests {
     use super::*;
     use http::Method;
     use std::collections::HashMap;
+
+    #[test]
+    fn synth_forecast_near_max_datetime_does_not_overflow() {
+        let end = DateTime::<Utc>::MAX_UTC;
+        let start = end - Duration::minutes(90);
+        let buckets = synth_forecast(start, end);
+        assert_eq!(buckets.len(), 2);
+        // Still capped at a week for an unbounded window.
+        assert_eq!(synth_forecast(DateTime::<Utc>::MIN_UTC, end).len(), 168);
+    }
 
     #[test]
     fn default_roles_are_the_documented_service_linked_roles() {

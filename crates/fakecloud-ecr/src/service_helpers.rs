@@ -464,6 +464,32 @@ pub(crate) fn registry_policy_not_found() -> AwsServiceError {
     )
 }
 
+/// ECR rejects a lifecycle policy whose `selection.countNumber` is not a
+/// positive 32-bit integer with `InvalidParameterException` at
+/// PutLifecyclePolicy / StartLifecyclePolicyPreview.
+pub(crate) fn validate_lifecycle_policy_counts(policy: &Value) -> Result<(), AwsServiceError> {
+    let Some(rules) = policy.get("rules").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for rule in rules {
+        let Some(n) = rule.get("selection").and_then(|s| s.get("countNumber")) else {
+            continue;
+        };
+        let ok = n
+            .as_u64()
+            .is_some_and(|v| (1..=i32::MAX as u64).contains(&v));
+        if !ok {
+            return Err(invalid_parameter(format!(
+                "Invalid parameter at 'LifecyclePolicyText' failed to satisfy constraint: \
+                 'Lifecycle policy validation failure: countNumber {n} must be an integer \
+                 between 1 and {}'",
+                i32::MAX
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Apply lifecycle-policy rules to this repo's stored images and
 /// return the digests that should be pruned. Covers the four AWS
 /// selection dimensions in use today: `tagStatus` (tagged/untagged/any),
@@ -565,22 +591,24 @@ pub fn evaluate_lifecycle_policy(repo: &crate::state::Repository, policy: &str) 
         match count_type {
             "imageCountMoreThan" => {
                 // Keep the newest N, prune the rest.
-                let total = candidates.len() as i64;
-                if total > count_number {
-                    let prune_count = (total - count_number) as usize;
-                    for img in candidates.into_iter().take(prune_count) {
-                        to_delete.insert(img.image_digest.clone());
-                    }
+                // Policies are validated at write time, but persisted state
+                // may predate that: clamp instead of overflowing.
+                let keep = usize::try_from(count_number.max(0)).unwrap_or(usize::MAX);
+                let prune_count = candidates.len().saturating_sub(keep);
+                for img in candidates.into_iter().take(prune_count) {
+                    to_delete.insert(img.image_digest.clone());
                 }
             }
             "sinceImagePushed" => {
-                let now = chrono::Utc::now();
                 let delta = match count_unit {
-                    "days" => chrono::Duration::days(count_number),
-                    "hours" => chrono::Duration::hours(count_number),
-                    _ => chrono::Duration::days(count_number),
+                    "hours" => chrono::Duration::try_hours(count_number),
+                    _ => chrono::Duration::try_days(count_number),
                 };
-                let threshold = now - delta;
+                // An age too large to represent means no image is old enough.
+                let Some(threshold) = delta.and_then(|d| chrono::Utc::now().checked_sub_signed(d))
+                else {
+                    continue;
+                };
                 for img in candidates {
                     if img.image_pushed_at < threshold {
                         to_delete.insert(img.image_digest.clone());

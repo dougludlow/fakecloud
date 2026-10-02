@@ -248,14 +248,7 @@ impl SqsService {
                 ));
             }
 
-            let delay: i64 = raw_delay
-                .or_else(|| {
-                    queue
-                        .attributes
-                        .get("DelaySeconds")
-                        .and_then(|s| s.parse().ok())
-                })
-                .unwrap_or(0);
+            let delay: i64 = raw_delay.or_else(|| queue.delay_secs()).unwrap_or(0);
             let now = Utc::now();
             let visible_at = if delay > 0 {
                 Some(now + chrono::Duration::seconds(delay))
@@ -506,14 +499,8 @@ impl SqsService {
             .get_mut(&resolved_url)
             .ok_or_else(queue_not_found)?;
 
-        let visibility_timeout: i64 = req_visibility_timeout
-            .or_else(|| {
-                queue
-                    .attributes
-                    .get("VisibilityTimeout")
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(30);
+        let visibility_timeout: i64 =
+            req_visibility_timeout.unwrap_or_else(|| queue.visibility_timeout_secs());
 
         let is_fifo = queue.is_fifo;
         let now = Utc::now();

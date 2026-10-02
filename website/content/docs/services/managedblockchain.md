@@ -58,7 +58,8 @@ behave exactly as against AWS, but no ledger is committed.
   `DeleteNode`, `GetNode`, `ListNodes`.
 - **Proposals + voting** - `CreateProposal` mints `p-...`, stores the `Actions`
   (`Invitations` / `Removals`), sets `IN_PROGRESS`, and derives an
-  `ExpirationDate` from the network's `ProposalDurationInHours`. `VoteOnProposal`
+  `ExpirationDate` from the network's `ProposalDurationInHours` (validated to
+  1-168 at `CreateNetwork`, with `ThresholdPercentage` 0-100). `VoteOnProposal`
   records a `YES` / `NO` vote per member; when the `ApprovalThresholdPolicy`
   threshold is met the proposal transitions to `APPROVED` -- materialising each
   invitation into a real `Invitation` in the invited principal's account and

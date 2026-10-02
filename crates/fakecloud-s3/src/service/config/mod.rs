@@ -191,6 +191,7 @@ impl S3Service {
                 "The XML you provided was not well-formed or did not validate against our published schema",
             ));
         }
+        validate_default_retention(&body_str)?;
 
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
@@ -1325,6 +1326,44 @@ fn list_named_config(
         entries = entries.join(""),
     );
     Ok(s3_xml(StatusCode::OK, body))
+}
+
+/// S3's bounds on an Object Lock default retention period: `Days` 1-36500 or
+/// `Years` 1-100, never both. An unbounded value would otherwise be applied to
+/// every later PutObject's retain-until date.
+fn validate_default_retention(body: &str) -> Result<(), AwsServiceError> {
+    let days = extract_xml_value(body, "Days");
+    let years = extract_xml_value(body, "Years");
+    if days.is_some() && years.is_some() {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+        ));
+    }
+    for (value, max) in [(days, 36_500_i64), (years, 100)] {
+        let Some(value) = value else {
+            continue;
+        };
+        match value.trim().parse::<i64>() {
+            Ok(n) if n > max => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Default retention period is too large.",
+                ))
+            }
+            Ok(n) if n >= 1 => {}
+            _ => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Default retention period must be a positive integer value.",
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

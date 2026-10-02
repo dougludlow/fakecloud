@@ -235,6 +235,14 @@ impl ResourceProvisioner {
             .get("RotationRules")
             .and_then(|v| v.get("AutomaticallyAfterDays"))
             .and_then(|v| v.as_i64());
+        // Same bound RotateSecret enforces.
+        if let Some(days) = automatically_after_days {
+            if !(1..=1000).contains(&days) {
+                return Err(format!(
+                    "RotationRules.AutomaticallyAfterDays must be within 1-1000, got {days}."
+                ));
+            }
+        }
         let rotation_duration = props
             .get("RotationRules")
             .and_then(|v| v.get("Duration"))

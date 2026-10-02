@@ -48,10 +48,7 @@ impl BatchSendConfig {
                 .get("MaximumMessageSize")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(262144),
-            queue_delay: queue
-                .attributes
-                .get("DelaySeconds")
-                .and_then(|s| s.parse().ok()),
+            queue_delay: queue.delay_secs(),
             now,
         }
     }

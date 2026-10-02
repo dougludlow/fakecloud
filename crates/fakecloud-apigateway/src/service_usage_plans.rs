@@ -15,6 +15,9 @@ impl ApiGatewayService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
+        if let Some(q) = body.get("quota") {
+            validate_quota(q)?;
+        }
         let plan = UsagePlan {
             id: make_id(),
             name: body
@@ -92,10 +95,14 @@ impl ApiGatewayService {
         let id = params.get("usagePlanId").cloned().unwrap_or_default();
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request_account(req));
-        let plan = state
+        let stored = state
             .usage_plans
             .get_mut(&id)
             .ok_or_else(|| not_found("UsagePlan not found"))?;
+        // Patch a copy so a patch set that leaves the quota invalid is
+        // rejected without partially applying.
+        let mut patched = stored.clone();
+        let plan = &mut patched;
         apply_patch_operations(req, |op, path, value| {
             // `remove` must fall through too — the /apiStages/<id>:<stage>
             // detach arm below is a remove op (previously dead code because
@@ -115,6 +122,12 @@ impl ApiGatewayService {
                 // (bug-audit 2026-06-20, 1.21).
                 _ if path.starts_with("/throttle/") => {
                     let key = path.trim_start_matches("/throttle/").to_string();
+                    if op == "remove" {
+                        if let Some(m) = plan.throttle.as_mut().and_then(Value::as_object_mut) {
+                            m.remove(&key);
+                        }
+                        return;
+                    }
                     let obj = plan.throttle.get_or_insert_with(|| serde_json::json!({}));
                     if let Some(m) = obj.as_object_mut() {
                         m.insert(key, value.clone());
@@ -122,9 +135,26 @@ impl ApiGatewayService {
                 }
                 _ if path.starts_with("/quota/") => {
                     let key = path.trim_start_matches("/quota/").to_string();
+                    // `remove` clears the field (an absent offset is 0) rather
+                    // than storing a JSON null.
+                    if op == "remove" {
+                        if let Some(m) = plan.quota.as_mut().and_then(Value::as_object_mut) {
+                            m.remove(&key);
+                        }
+                        return;
+                    }
+                    // Patch values arrive as strings; store the numeric
+                    // fields as numbers so quota metering can read them.
+                    let value = match (key.as_str(), value.as_str()) {
+                        ("limit" | "offset", Some(s)) => s
+                            .parse::<i64>()
+                            .map(|n| json!(n))
+                            .unwrap_or_else(|_| value.clone()),
+                        _ => value.clone(),
+                    };
                     let obj = plan.quota.get_or_insert_with(|| serde_json::json!({}));
                     if let Some(m) = obj.as_object_mut() {
-                        m.insert(key, value.clone());
+                        m.insert(key, value);
                     }
                 }
                 // apiStages were dropped, so the standard "create plan, then
@@ -149,7 +179,11 @@ impl ApiGatewayService {
                 _ => {}
             }
         });
-        ok(usage_plan_to_json(plan))
+        if let Some(q) = &patched.quota {
+            validate_quota(q)?;
+        }
+        *stored = patched;
+        ok(usage_plan_to_json(stored))
     }
 
     pub(super) fn create_usage_plan_key(
@@ -324,6 +358,30 @@ impl ApiGatewayService {
     }
 }
 
+/// API Gateway accepts a quota `offset` only inside the chosen period: it
+/// must be 0 for `DAY`, 0-6 for `WEEK`, and 0-27 for `MONTH`. Anything else
+/// (including a non-integer) is a `BadRequestException`.
+fn validate_quota(quota: &Value) -> Result<(), AwsServiceError> {
+    let Some(offset) = quota.get("offset").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let max = match quota.get("period").and_then(Value::as_str) {
+        Some("DAY") => 0,
+        Some("WEEK") => 6,
+        _ => 27,
+    };
+    let n = offset
+        .as_i64()
+        .or_else(|| offset.as_str().and_then(|s| s.parse::<i64>().ok()));
+    match n {
+        Some(n) if (0..=max).contains(&n) => Ok(()),
+        _ => Err(bad_request(format!(
+            "Invalid quota offset {offset}: the offset must be between 0 and {max} for the \
+             specified period"
+        ))),
+    }
+}
+
 /// Resolve a usage plan's quota limit, defaulting to a large value when
 /// the plan has no quota configured.
 fn quota_limit_for(plan: &crate::state::UsagePlan) -> i64 {
@@ -368,6 +426,91 @@ mod usage_tests {
             access_key_id: None,
             principal: None,
         }
+    }
+
+    #[test]
+    fn quota_offset_must_fall_inside_the_period() {
+        let s = svc();
+        for (period, bad) in [
+            ("DAY", json!(1)),
+            ("WEEK", json!(7)),
+            ("MONTH", json!(28)),
+            ("MONTH", json!(-1)),
+            ("MONTH", json!(i64::MAX)),
+            ("DAY", json!("x")),
+        ] {
+            let err = s
+                .create_usage_plan(&req(json!({"name": "p",
+                    "quota": {"limit": 10, "period": period, "offset": bad}})))
+                .err()
+                .unwrap_or_else(|| panic!("{period} offset {bad} accepted"));
+            assert_eq!(err.code(), "BadRequestException", "{period} {bad}");
+        }
+        for (period, ok) in [("DAY", 0), ("WEEK", 6), ("MONTH", 27)] {
+            s.create_usage_plan(&req(
+                json!({"name": "p", "quota": {"limit": 10, "period": period, "offset": ok}}),
+            ))
+            .unwrap();
+        }
+
+        // UpdateUsagePlan: an out-of-range patched offset is rejected and the
+        // stored plan is left untouched; a valid string offset is stored as a
+        // number so metering can read it.
+        let resp = s
+            .create_usage_plan(&req(
+                json!({"name": "p", "quota": {"limit": 10, "period": "WEEK", "offset": 0}}),
+            ))
+            .unwrap();
+        let plan_id = serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let params = BTreeMap::from([("usagePlanId".to_string(), plan_id.clone())]);
+        let err = s
+            .update_usage_plan(
+                &req(json!({"patchOperations": [
+                    {"op": "replace", "path": "/quota/offset", "value": "9223372036854775807"},
+                    {"op": "replace", "path": "/name", "value": "renamed"}
+                ]})),
+                &params,
+            )
+            .err()
+            .expect("huge patched offset accepted");
+        assert_eq!(err.code(), "BadRequestException");
+        {
+            let accts = s.state.read();
+            let plan = &accts.get("123456789012").unwrap().usage_plans[&plan_id];
+            assert_eq!(plan.name, "p");
+            assert_eq!(plan.quota.as_ref().unwrap()["offset"], json!(0));
+        }
+        s.update_usage_plan(
+            &req(json!({"patchOperations": [
+                {"op": "replace", "path": "/quota/offset", "value": "3"},
+                {"op": "replace", "path": "/quota/limit", "value": "50"}
+            ]})),
+            &params,
+        )
+        .unwrap();
+        {
+            let accts = s.state.read();
+            let plan = &accts.get("123456789012").unwrap().usage_plans[&plan_id];
+            assert_eq!(plan.quota.as_ref().unwrap()["offset"], json!(3));
+            assert_eq!(plan.quota.as_ref().unwrap()["limit"], json!(50));
+        }
+
+        // Removing the offset clears it (it then defaults to 0) instead of
+        // storing a null that the range check would reject.
+        s.update_usage_plan(
+            &req(json!({"patchOperations": [
+                {"op": "remove", "path": "/quota/offset"}
+            ]})),
+            &params,
+        )
+        .unwrap();
+        let accts = s.state.read();
+        let plan = &accts.get("123456789012").unwrap().usage_plans[&plan_id];
+        assert!(plan.quota.as_ref().unwrap().get("offset").is_none());
+        assert_eq!(plan.quota.as_ref().unwrap()["limit"], json!(50));
     }
 
     /// 1.24: UpdateUsage applies the patch and GetUsage reflects the

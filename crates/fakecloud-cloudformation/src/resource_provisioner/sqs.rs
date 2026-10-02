@@ -36,6 +36,9 @@ impl ResourceProvisioner {
             .queues
             .get_mut(url)
             .ok_or_else(|| format!("Queue {url} not yet provisioned"))?;
+        // Apply to a copy and validate it the way SetQueueAttributes does, so
+        // an out-of-range attribute fails the update instead of being stored.
+        let mut attributes = queue.attributes.clone();
         if let Some(obj) = props.as_object() {
             for (k, v) in obj {
                 if k == "QueueName" || k == "Tags" {
@@ -50,9 +53,11 @@ impl ResourceProvisioner {
                     }
                     serde_json::Value::Null => continue,
                 };
-                queue.attributes.insert(k.clone(), value);
+                attributes.insert(k.clone(), value);
             }
         }
+        fakecloud_sqs::validate_create_queue_attributes(&attributes).map_err(|e| e.to_string())?;
+        queue.attributes = attributes;
         if queue
             .attributes
             .get("KmsMasterKeyId")
@@ -140,6 +145,7 @@ impl ResourceProvisioner {
                 attributes.insert(k.clone(), value);
             }
         }
+        fakecloud_sqs::validate_create_queue_attributes(&attributes).map_err(|e| e.to_string())?;
         // A KMS key implies SSE-KMS, so managed SSE is off (mirrors the native
         // create_queue mutual-exclusion).
         if attributes

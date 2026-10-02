@@ -10,4 +10,5 @@ pub use service::{
 pub use state::{
     ecs_arn, CapacityProvider, Cluster, EcsSnapshot, EcsState, LifecycleEvent, Service,
     SharedEcsState, TagEntry, Task, TaskDefinition, ECS_SNAPSHOT_SCHEMA_VERSION,
+    MAX_TASKS_PER_SERVICE,
 };

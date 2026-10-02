@@ -1801,26 +1801,143 @@ fn token_validity_unit_secs(unit: Option<&str>, default: &str) -> i64 {
     }
 }
 
+/// Cognito's accepted access / ID token lifetime, in seconds (5 min - 1 day).
+const ACCESS_ID_TOKEN_VALIDITY_SECS: std::ops::RangeInclusive<i64> = 300..=86_400;
+/// Cognito's accepted refresh token lifetime, in seconds (60 min - 10 years).
+const REFRESH_TOKEN_VALIDITY_SECS: std::ops::RangeInclusive<i64> = 3_600..=315_360_000;
+/// Cognito's default refresh token lifetime (30 days), also used when
+/// `RefreshTokenValidity` is 0.
+const DEFAULT_REFRESH_TOKEN_VALIDITY_SECS: i64 = 30 * 86_400;
+
+/// `value * unit` in seconds, or `None` when the product overflows.
+fn validity_secs(value: i64, unit: Option<&str>, default_unit: &str) -> Option<i64> {
+    value.checked_mul(token_validity_unit_secs(unit, default_unit))
+}
+
+/// Validate an app client's token lifetimes the way Cognito does at
+/// CreateUserPoolClient / UpdateUserPoolClient: access and ID tokens must last
+/// 5 minutes to 1 day and refresh tokens 60 minutes to 10 years once
+/// `TokenValidityUnits` is applied (a refresh value of 0 means the default).
+/// Returns Cognito's error message on failure.
+pub fn validate_token_validity(
+    access: Option<i64>,
+    id: Option<i64>,
+    refresh: Option<i64>,
+    units: Option<&TokenValidityUnits>,
+) -> Result<(), &'static str> {
+    const MSG: &str = "Invalid range for token validity.";
+    let in_range = |v: Option<i64>,
+                    unit: Option<&str>,
+                    default_unit: &str,
+                    range: &std::ops::RangeInclusive<i64>| {
+        v.is_none_or(|v| validity_secs(v, unit, default_unit).is_some_and(|s| range.contains(&s)))
+    };
+    let access_ok = in_range(
+        access,
+        units.and_then(|u| u.access_token.as_deref()),
+        "hours",
+        &ACCESS_ID_TOKEN_VALIDITY_SECS,
+    );
+    let id_ok = in_range(
+        id,
+        units.and_then(|u| u.id_token.as_deref()),
+        "hours",
+        &ACCESS_ID_TOKEN_VALIDITY_SECS,
+    );
+    let refresh_ok = in_range(
+        refresh.filter(|v| *v != 0),
+        units.and_then(|u| u.refresh_token.as_deref()),
+        "days",
+        &REFRESH_TOKEN_VALIDITY_SECS,
+    );
+    if access_ok && id_ok && refresh_ok {
+        Ok(())
+    } else {
+        Err(MSG)
+    }
+}
+
+/// The `RefreshTokenValidity` Cognito stores when the request omits it: the
+/// 30-day default expressed in the client's refresh-token unit (default
+/// `days`), so a client using `minutes` gets 43200 rather than 30 minutes.
+pub fn default_refresh_token_validity(units: Option<&TokenValidityUnits>) -> i64 {
+    DEFAULT_REFRESH_TOKEN_VALIDITY_SECS
+        / token_validity_unit_secs(units.and_then(|u| u.refresh_token.as_deref()), "days")
+}
+
+/// An app client's token-lifetime settings after Cognito's defaults are applied.
+#[derive(Debug, Clone)]
+pub struct ResolvedTokenValidity {
+    pub units: Option<TokenValidityUnits>,
+    pub access: Option<i64>,
+    pub id: Option<i64>,
+    pub refresh: i64,
+}
+
+/// Resolve the token-lifetime fields of a CreateUserPoolClient /
+/// UpdateUserPoolClient request (or a CloudFormation resource model) the way
+/// Cognito does: omitted fields take their defaults rather than keeping a
+/// previous value (UpdateUserPoolClient resets omitted fields), units default
+/// to hours/days, access/id validity stay unset (1 hour), and refresh validity
+/// defaults to 30 days expressed in the effective refresh-token unit. The
+/// result is range-checked with [`validate_token_validity`].
+pub fn resolve_token_validity(
+    access: Option<i64>,
+    id: Option<i64>,
+    refresh: Option<i64>,
+    units: Option<TokenValidityUnits>,
+) -> Result<ResolvedTokenValidity, &'static str> {
+    let refresh = refresh
+        .filter(|v| *v != 0)
+        .unwrap_or_else(|| default_refresh_token_validity(units.as_ref()));
+    validate_token_validity(access, id, Some(refresh), units.as_ref())?;
+    Ok(ResolvedTokenValidity {
+        units,
+        access,
+        id,
+        refresh,
+    })
+}
+
 /// Resolve an app client's (access, id) token lifetimes to seconds, applying
 /// `TokenValidityUnits` (default `hours`) to the raw validity integers.
+/// Clamped to Cognito's accepted range so a client stored without validation
+/// (an older snapshot, or a template value) cannot overflow token-expiry
+/// arithmetic.
 fn client_token_validity(client: &UserPoolClient) -> (Option<i64>, Option<i64>) {
     let units = client.token_validity_units.as_ref();
-    let access = client.access_token_validity.map(|v| {
-        v * token_validity_unit_secs(units.and_then(|u| u.access_token.as_deref()), "hours")
-    });
+    let clamp = |v: i64, unit: Option<&str>| {
+        validity_secs(v, unit, "hours")
+            .unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
+            .clamp(
+                *ACCESS_ID_TOKEN_VALIDITY_SECS.start(),
+                *ACCESS_ID_TOKEN_VALIDITY_SECS.end(),
+            )
+    };
+    let access = client
+        .access_token_validity
+        .map(|v| clamp(v, units.and_then(|u| u.access_token.as_deref())));
     let id = client
         .id_token_validity
-        .map(|v| v * token_validity_unit_secs(units.and_then(|u| u.id_token.as_deref()), "hours"));
+        .map(|v| clamp(v, units.and_then(|u| u.id_token.as_deref())));
     (access, id)
 }
 
 /// Resolve an app client's refresh-token lifetime to seconds, applying
 /// `TokenValidityUnits` (default `days`). Cognito's documented default is 30
-/// days when `RefreshTokenValidity` is unset.
+/// days when `RefreshTokenValidity` is unset or 0. Clamped to the accepted
+/// range for the same reason as [`client_token_validity`].
 pub(crate) fn refresh_token_validity_secs(client: &UserPoolClient) -> i64 {
     let units = client.token_validity_units.as_ref();
-    let v = client.refresh_token_validity.unwrap_or(30);
-    v * token_validity_unit_secs(units.and_then(|u| u.refresh_token.as_deref()), "days")
+    match client.refresh_token_validity.filter(|v| *v != 0) {
+        None => DEFAULT_REFRESH_TOKEN_VALIDITY_SECS,
+        Some(v) => validity_secs(v, units.and_then(|u| u.refresh_token.as_deref()), "days")
+            .unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
+            .clamp(
+                *REFRESH_TOKEN_VALIDITY_SECS.start(),
+                *REFRESH_TOKEN_VALIDITY_SECS.end(),
+            ),
+    }
 }
 
 /// Group names a user belongs to, ordered by Precedence (ascending; groups

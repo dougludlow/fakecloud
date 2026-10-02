@@ -44,7 +44,9 @@ pub async fn check_and_rotate(
                 let rules = secret.rotation_rules.as_ref()?;
                 let days = rules.automatically_after_days?;
                 let last = secret.last_rotated_at?;
-                let due_at = last + chrono::Duration::days(days);
+                // Never due if the interval is not representable.
+                let due_at =
+                    chrono::Duration::try_days(days).and_then(|d| last.checked_add_signed(d))?;
                 if now < due_at {
                     return None;
                 }
@@ -297,6 +299,19 @@ mod tests {
             .secrets
             .insert("not-due".to_string(), secret);
 
+        let rotated = check_and_rotate(&state, None, None).await;
+        assert!(rotated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn huge_persisted_rotation_interval_is_never_due_and_does_not_panic() {
+        let state = make_state();
+        let secret = make_secret("huge", true, Some(i64::MAX), Some(1));
+        state
+            .write()
+            .default_mut()
+            .secrets
+            .insert("huge".to_string(), secret);
         let rotated = check_and_rotate(&state, None, None).await;
         assert!(rotated.is_empty());
     }

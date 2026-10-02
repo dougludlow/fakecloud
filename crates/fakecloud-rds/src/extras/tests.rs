@@ -93,6 +93,24 @@ fn describe_events_returns_emitted_events() {
     assert!(body.contains("DB instance created"));
 }
 
+/// A huge `Duration` look-back must not overflow the window arithmetic; it
+/// covers every event instead.
+#[test]
+fn describe_events_huge_duration_does_not_panic() {
+    let svc = svc();
+    create_cluster(&svc, "clu-huge");
+    for d in [
+        "9223372036854775807",
+        "-9223372036854775808",
+        "153722867280912930",
+    ] {
+        let body = body_of_action(&svc, "DescribeEvents", &[("Duration", d)]);
+        if !d.starts_with('-') {
+            assert!(body.contains("clu-huge"), "Duration={d}: {body}");
+        }
+    }
+}
+
 /// The SourceType list must track the model's enum.
 ///
 /// It had drifted: `db-shard-group` and `zero-etl` are real values that

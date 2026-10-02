@@ -1013,6 +1013,15 @@ fn parse_flexible_time_window(v: Option<&Value>) -> Result<FlexibleTimeWindow, A
             "FlexibleTimeWindow.MaximumWindowInMinutes is required when Mode is FLEXIBLE",
         ));
     }
+    if let Some(m) = maximum_window_in_minutes {
+        if !(1..=1440).contains(&m) {
+            return Err(validation(format!(
+                "1 validation error detected: Value '{m}' at \
+                 'flexibleTimeWindow.maximumWindowInMinutes' failed to satisfy constraint: \
+                 Member must have value between 1 and 1440"
+            )));
+        }
+    }
     Ok(FlexibleTimeWindow {
         mode,
         maximum_window_in_minutes,
@@ -1240,6 +1249,21 @@ mod tests {
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn flexible_window_minutes_is_range_checked() {
+        for bad in [0, 1441, i64::MAX, -1] {
+            let v = serde_json::json!({"Mode": "FLEXIBLE", "MaximumWindowInMinutes": bad});
+            let err = parse_flexible_time_window(Some(&v))
+                .err()
+                .unwrap_or_else(|| panic!("accepted {bad}"));
+            assert_eq!(err.code(), "ValidationException");
+        }
+        for ok in [1, 1440] {
+            let v = serde_json::json!({"Mode": "FLEXIBLE", "MaximumWindowInMinutes": ok});
+            assert!(parse_flexible_time_window(Some(&v)).is_ok());
+        }
+    }
 
     fn make_state() -> SharedSchedulerState {
         Arc::new(RwLock::new(
