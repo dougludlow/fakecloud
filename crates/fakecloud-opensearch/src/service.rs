@@ -964,8 +964,14 @@ impl AwsService for OpenSearchService {
         };
 
         validate_input(api, action, &labels, &req)?;
+        let page = crate::pagination::validate(api, action, &req)?;
 
-        let result = self.dispatch(action, api, &labels, &req);
+        let result = self
+            .dispatch(action, api, &labels, &req)
+            .map(|resp| match page {
+                Some(page) => crate::pagination::apply(resp, page),
+                None => resp,
+            });
 
         if is_mutating(action) && matches!(result.as_ref(), Ok(r) if r.status.is_success()) {
             self.save_snapshot().await;
@@ -3126,7 +3132,7 @@ impl OpenSearchService {
             .and_then(|st| st.domains.get(&dom))
             .ok_or_else(|| not_found_domain(&dom))?;
         let list: Vec<Value> = d.maintenances.values().cloned().collect();
-        Ok(ok(json!({ "DomainMaintenanceList": list })))
+        Ok(ok(json!({ "DomainMaintenances": list })))
     }
 }
 

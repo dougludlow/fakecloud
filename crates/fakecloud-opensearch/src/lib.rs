@@ -10,6 +10,8 @@
 //! `ElasticsearchDomainStatus` shape, the 2021 API via the superset
 //! `DomainStatus` shape).
 
+mod pagination;
+mod pagination_gen;
 pub mod persistence;
 pub(crate) mod service;
 pub mod state;

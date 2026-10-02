@@ -71,9 +71,125 @@ pub fn paginate_checked<T: Clone>(
     Ok((result, token))
 }
 
+/// Parse a client-supplied offset token (as minted by [`paginate`] /
+/// [`paginate_checked`] / [`page_json_response`]). Absent or empty is offset 0.
+pub fn parse_offset_token(token: Option<&str>) -> Result<usize, InvalidNextToken> {
+    match token.filter(|t| !t.is_empty()) {
+        None => Ok(0),
+        Some(t) => t.parse().map_err(|_| InvalidNextToken),
+    }
+}
+
+/// Page a successful JSON list response in place: the array at `items` is
+/// sliced to `[start, start + size)` (`size` of `None` keeps everything from
+/// `start`), and `token_key` is set to the offset token of the next page when
+/// items remain, or removed when none do (AWS omits an exhausted token rather
+/// than sending it empty). Responses that are not JSON objects with an array
+/// at `items` are returned unchanged.
+///
+/// This lets a handler render its full, stably ordered listing and a service
+/// apply `MaxResults` / `NextToken` uniformly at its dispatch boundary.
+pub fn page_json_response(
+    resp: crate::service::AwsResponse,
+    items: &str,
+    token_key: &str,
+    start: usize,
+    size: Option<usize>,
+) -> crate::service::AwsResponse {
+    use crate::service::ResponseBody;
+    if !resp.status.is_success() {
+        return resp;
+    }
+    let ResponseBody::Bytes(bytes) = &resp.body else {
+        return resp;
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return resp;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return resp;
+    };
+    let Some(list) = obj.get_mut(items).and_then(|v| v.as_array_mut()) else {
+        return resp;
+    };
+    let total = list.len();
+    let start = start.min(total);
+    let end = size.map_or(total, |n| start.saturating_add(n).min(total));
+    let page: Vec<serde_json::Value> = list.drain(start..end).collect();
+    *list = page;
+    if end < total {
+        obj.insert(
+            token_key.to_string(),
+            serde_json::Value::String(end.to_string()),
+        );
+    } else {
+        obj.remove(token_key);
+    }
+    crate::service::AwsResponse {
+        body: ResponseBody::Bytes(bytes::Bytes::from(
+            serde_json::to_vec(&value).expect("serde_json::Value serialization is infallible"),
+        )),
+        ..resp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json_body(resp: &crate::service::AwsResponse) -> serde_json::Value {
+        match &resp.body {
+            crate::service::ResponseBody::Bytes(b) => serde_json::from_slice(b).unwrap(),
+            _ => panic!("not bytes"),
+        }
+    }
+
+    #[test]
+    fn page_json_response_slices_and_sets_or_clears_the_token() {
+        let full = || {
+            crate::service::AwsResponse::ok_json(
+                serde_json::json!({"Things": [0, 1, 2, 3, 4], "NextToken": ""}),
+            )
+        };
+        let p1 = json_body(&page_json_response(
+            full(),
+            "Things",
+            "NextToken",
+            0,
+            Some(2),
+        ));
+        assert_eq!(p1["Things"], serde_json::json!([0, 1]));
+        assert_eq!(p1["NextToken"], "2");
+        let p3 = json_body(&page_json_response(
+            full(),
+            "Things",
+            "NextToken",
+            4,
+            Some(2),
+        ));
+        assert_eq!(p3["Things"], serde_json::json!([4]));
+        assert!(p3.get("NextToken").is_none(), "{p3}");
+        let all = json_body(&page_json_response(full(), "Things", "NextToken", 0, None));
+        assert_eq!(all["Things"].as_array().unwrap().len(), 5);
+        assert!(all.get("NextToken").is_none());
+        // A response without the list is left alone.
+        let other = json_body(&page_json_response(
+            crate::service::AwsResponse::ok_json(serde_json::json!({"X": 1})),
+            "Things",
+            "NextToken",
+            0,
+            Some(1),
+        ));
+        assert_eq!(other, serde_json::json!({"X": 1}));
+    }
+
+    #[test]
+    fn parse_offset_token_rejects_non_offsets() {
+        assert_eq!(parse_offset_token(None), Ok(0));
+        assert_eq!(parse_offset_token(Some("")), Ok(0));
+        assert_eq!(parse_offset_token(Some("7")), Ok(7));
+        assert_eq!(parse_offset_token(Some("abc")), Err(InvalidNextToken));
+    }
 
     #[test]
     fn first_page() {
