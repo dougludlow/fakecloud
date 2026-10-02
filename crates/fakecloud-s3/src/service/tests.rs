@@ -7540,7 +7540,6 @@ fn bucket_location_constraints_cover_the_model() {
         );
     }
 }
-||||||| parent of 42750b04b (fix: bound user numerics that overflowed duration and count arithmetic)
 
 fn lock_config(retention: &str) -> Vec<u8> {
     format!(
