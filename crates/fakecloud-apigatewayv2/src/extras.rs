@@ -886,7 +886,7 @@ impl ApiGatewayV2Service {
                         .get(domain)
                         .map(|m| m.values().cloned().collect())
                         .unwrap_or_default();
-                    ok(json!({"RoutingRules": rules}))
+                    ok(json!({"routingRules": rules}))
                 })
             }
             "DeleteRoutingRule" => {

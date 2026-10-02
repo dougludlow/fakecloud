@@ -198,7 +198,16 @@ impl AwsService for XrayService {
                 format!("Unknown operation: {} {}", req.method, req.raw_path),
             ));
         };
-        let result = self.dispatch(action, &req);
+        // Every `NextToken`-paginated operation pages its full listing here.
+        let page = fakecloud_core::pagination::validate_json_page(
+            crate::pagination_gen::PAGED_OPS,
+            action,
+            &req,
+        )?;
+        let result = self.dispatch(action, &req).map(|resp| match page {
+            Some(page) => fakecloud_core::pagination::apply_json_page(resp, page),
+            None => resp,
+        });
         let success = matches!(result.as_ref(), Ok(resp) if resp.status.is_success());
         if MUTATING.contains(&action) && success {
             self.save().await;
@@ -1729,5 +1738,37 @@ mod tests {
             rule["SamplingRule"]["RuleARN"],
             "arn:aws-cn:xray:cn-north-1:000000000000:sampling-rule/Default"
         );
+    }
+
+    /// GetGroups pages by the body `NextToken`, emitting it only while groups
+    /// remain, and rejects a foreign token with the declared
+    /// `InvalidRequestException`.
+    #[tokio::test]
+    async fn get_groups_pages_by_next_token() {
+        let s = svc();
+        let call = |body: Value| {
+            let mut r = req("/Groups");
+            r.body = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+            r
+        };
+        for i in 0..4 {
+            let mut r = req("/CreateGroup");
+            r.body = bytes::Bytes::from(
+                serde_json::to_vec(&json!({ "GroupName": format!("g{i}") })).unwrap(),
+            );
+            s.handle(r).await.unwrap();
+        }
+        let all = body_json(&s.handle(call(json!({}))).await.unwrap());
+        let total = all["Groups"].as_array().unwrap().len();
+        assert!(total >= 4, "{all}");
+        assert!(all.get("NextToken").is_none());
+
+        // GetGroups models no page size, so a token resumes from its offset.
+        let rest = body_json(&s.handle(call(json!({ "NextToken": "2" }))).await.unwrap());
+        assert_eq!(rest["Groups"].as_array().unwrap().len(), total - 2);
+        assert_eq!(rest["Groups"][0], all["Groups"][2]);
+
+        let err = err_of(s.handle(call(json!({ "NextToken": "bogus" }))).await);
+        assert_eq!(err.code(), "InvalidRequestException");
     }
 }

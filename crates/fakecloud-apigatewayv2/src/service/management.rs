@@ -38,6 +38,12 @@ impl ApiGatewayV2Service {
             || action == "PublishPortal"
             || action == "ResetAuthorizersCache";
 
+        // Every `NextToken`-paginated operation pages its full listing here.
+        let page = fakecloud_core::pagination::validate_json_page(
+            crate::pagination_gen::PAGED_OPS,
+            action,
+            &req,
+        )?;
         let result = match action {
             "CreateApi" => self.create_api(&req),
             "GetApi" => self.get_api(&req, api_id.as_deref()),
@@ -81,6 +87,10 @@ impl ApiGatewayV2Service {
                 self.handle_extra_action(other, &req, api_id.as_deref(), resource_id.as_deref())
             }
         };
+        let result = result.map(|resp| match page {
+            Some(page) => fakecloud_core::pagination::apply_json_page(resp, page),
+            None => resp,
+        });
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
         }
