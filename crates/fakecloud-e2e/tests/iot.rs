@@ -551,3 +551,74 @@ async fn iot_security_profile_attach_detach_reflected() {
         "detach must remove the target"
     );
 }
+
+/// Create-time tags are visible to ListTagsForResource, UntagResource acts on
+/// the same set, and a deleted + re-created group starts untagged.
+#[tokio::test]
+async fn iot_create_time_tags_share_list_tags_store() {
+    use aws_sdk_iot::types::Tag;
+    let server = TestServer::start().await;
+    let client = iot_client(&server).await;
+    let created = client
+        .create_thing_group()
+        .thing_group_name("tagged-group")
+        .tags(Tag::builder().key("env").value("prod").build().unwrap())
+        .send()
+        .await
+        .expect("create_thing_group");
+    let arn = created.thing_group_arn().unwrap().to_string();
+    let tags = client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .expect("list_tags_for_resource");
+    let tags = tags.tags();
+    assert_eq!(tags.len(), 1, "create-time tags missing: {tags:?}");
+    assert_eq!(tags[0].key(), "env");
+    assert_eq!(tags[0].value(), Some("prod"));
+
+    client
+        .untag_resource()
+        .resource_arn(&arn)
+        .tag_keys("env")
+        .send()
+        .await
+        .expect("untag_resource");
+    assert!(client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .unwrap()
+        .tags()
+        .is_empty());
+
+    client
+        .tag_resource()
+        .resource_arn(&arn)
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .expect("tag_resource");
+    client
+        .delete_thing_group()
+        .thing_group_name("tagged-group")
+        .send()
+        .await
+        .expect("delete_thing_group");
+    client
+        .create_thing_group()
+        .thing_group_name("tagged-group")
+        .send()
+        .await
+        .expect("re-create");
+    assert!(client
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .unwrap()
+        .tags()
+        .is_empty());
+}

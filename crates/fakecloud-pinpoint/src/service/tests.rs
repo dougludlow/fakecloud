@@ -596,3 +596,119 @@ fn china_region_arns_use_the_aws_cn_partition() {
         "arn:aws-cn:mobiletargeting:cn-north-1:000000000000:templates/cn-tmpl/EMAIL"
     );
 }
+
+// Tags have one home: create-time tags show in ListTagsForResource, Tag /
+// Untag show in Get*, Delete drops them.
+#[test]
+fn app_tags_share_one_store_both_directions() {
+    let svc = service();
+    let ctx = ctx();
+    let created = body_of(
+        &svc.create_app(&ctx, &json!({ "Name": "t", "tags": { "env": "prod" } }))
+            .unwrap(),
+    );
+    assert_eq!(created["tags"], json!({ "env": "prod" }));
+    let id = created["Id"].as_str().unwrap().to_string();
+    let arn = created["Arn"].as_str().unwrap().to_string();
+
+    let listed = body_of(&svc.list_tags_for_resource(&ctx, &arn).unwrap());
+    assert_eq!(listed["tags"], json!({ "env": "prod" }));
+
+    svc.tag_resource(&ctx, &arn, &json!({ "tags": { "team": "growth" } }))
+        .unwrap();
+    svc.untag_resource(&ctx, &arn, &[("tagKeys".to_string(), "env".to_string())])
+        .unwrap();
+    let got = body_of(&svc.get_app(&ctx, &id).unwrap());
+    assert_eq!(got["tags"], json!({ "team": "growth" }));
+    let apps = body_of(&svc.get_apps(&ctx, &[]).unwrap());
+    assert_eq!(apps["Item"][0]["tags"], json!({ "team": "growth" }));
+
+    svc.delete_app(&ctx, &id).unwrap();
+    let listed = body_of(&svc.list_tags_for_resource(&ctx, &arn).unwrap());
+    assert!(listed["tags"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn campaign_segment_template_tags_share_one_store() {
+    let svc = service();
+    let ctx = ctx();
+    let app = new_app(&svc, &ctx, "c");
+
+    let camp = body_of(
+        &svc.create_campaign(
+            &ctx,
+            &app,
+            &json!({ "Name": "c1", "SegmentId": "s", "tags": { "a": "1" } }),
+        )
+        .unwrap(),
+    );
+    let cid = camp["Id"].as_str().unwrap().to_string();
+    let carn = camp["Arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        body_of(&svc.list_tags_for_resource(&ctx, &carn).unwrap())["tags"],
+        json!({ "a": "1" })
+    );
+    // An update (tags deprecated there) keeps the stored tags; TagResource
+    // shows through GetCampaign.
+    svc.update_campaign(&ctx, &app, &cid, &json!({ "Name": "c2" }))
+        .unwrap();
+    svc.tag_resource(&ctx, &carn, &json!({ "tags": { "b": "2" } }))
+        .unwrap();
+    let got = body_of(&svc.get_campaign(&ctx, &app, &cid).unwrap());
+    assert_eq!(got["tags"], json!({ "a": "1", "b": "2" }));
+    svc.delete_campaign(&ctx, &app, &cid).unwrap();
+    assert!(
+        body_of(&svc.list_tags_for_resource(&ctx, &carn).unwrap())["tags"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+
+    let seg = body_of(
+        &svc.create_segment(&ctx, &app, &json!({ "Name": "s1", "tags": { "c": "3" } }))
+            .unwrap(),
+    );
+    let sid = seg["Id"].as_str().unwrap().to_string();
+    let sarn = seg["Arn"].as_str().unwrap().to_string();
+    svc.untag_resource(&ctx, &sarn, &[("tagKeys".to_string(), "c".to_string())])
+        .unwrap();
+    let got = body_of(&svc.get_segment(&ctx, &app, &sid).unwrap());
+    assert!(got.get("tags").is_none(), "{got}");
+
+    let t = body_of(
+        &svc.create_template(
+            &ctx,
+            "tm",
+            "EMAIL",
+            &json!({ "Subject": "s", "tags": { "d": "4" } }),
+        )
+        .unwrap(),
+    );
+    let tarn = t["Arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        body_of(&svc.list_tags_for_resource(&ctx, &tarn).unwrap())["tags"],
+        json!({ "d": "4" })
+    );
+    let got = body_of(&svc.get_template(&ctx, "tm", "EMAIL", &[]).unwrap());
+    assert_eq!(got["tags"], json!({ "d": "4" }));
+    svc.delete_template(&ctx, "tm", "EMAIL").unwrap();
+    svc.create_template(&ctx, "tm", "EMAIL", &json!({ "Subject": "s" }))
+        .unwrap();
+    let got = body_of(&svc.get_template(&ctx, "tm", "EMAIL", &[]).unwrap());
+    assert!(got.get("tags").is_none(), "re-create inherited tags: {got}");
+}
+
+#[test]
+fn inline_tags_migrate_into_tag_store() {
+    let mut d = crate::state::PinpointData::default();
+    d.apps.insert(
+        "a1".into(),
+        crate::state::App {
+            record: json!({ "Id": "a1", "Arn": "arn:a1", "tags": { "k": "v" } }),
+            ..Default::default()
+        },
+    );
+    d.migrate_inline_tags();
+    assert_eq!(d.tags["arn:a1"]["k"], "v");
+    assert!(d.apps["a1"].record.get("tags").is_none());
+}

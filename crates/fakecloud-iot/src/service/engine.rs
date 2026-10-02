@@ -173,10 +173,27 @@ pub(super) fn create(
         }
         // No declared conflict error: treat create as idempotent overwrite.
     }
-    let record = build_record(ctx, meta, &rtype, &key, labels, query, body);
+    let mut record = build_record(ctx, meta, &rtype, &key, labels, query, body);
+    // Create-time `tags` live in the ARN-keyed tag store ListTagsForResource /
+    // TagResource / UntagResource share, not inline on the record (where no
+    // read would see them and Describe wrappers would leak them). The set
+    // replaces any tags a previous same-name resource left behind.
+    let tags = record
+        .as_object_mut()
+        .and_then(|o| o.remove("tags"))
+        .map(|t| super::parse_tags(&t))
+        .unwrap_or_default();
+    data.set_tags(&tag_arn(ctx, &rtype, &key), tags);
     let out = build_output(meta, &record);
     data.put_resource(&rtype, &key, record);
     Ok(ok_json(out))
+}
+
+/// The ARN a resource is tagged under: the ARN its create mints for the
+/// resource's primary name (the last label component of the storage key).
+pub(super) fn tag_arn(ctx: &Ctx, rtype: &str, key: &str) -> String {
+    let primary = key.rsplit('/').next().unwrap_or(key);
+    mint_arn(ctx, rtype, primary)
 }
 
 pub(super) fn update(
@@ -211,12 +228,17 @@ pub(super) fn update(
 
 pub(super) fn delete(
     data: &mut IotData,
+    ctx: &Ctx,
     meta: &OpMeta,
     labels: &HashMap<String, String>,
 ) -> AwsResponse {
     let rtype = resource_type(meta);
     let key = storage_key(meta, labels);
-    data.remove_resource(&rtype, &key);
+    if data.remove_resource(&rtype, &key).is_some() {
+        // The resource's tags go with it, so a same-name re-create starts
+        // untagged.
+        data.remove_tags(&tag_arn(ctx, &rtype, &key));
+    }
     // AWS delete operations are idempotent: deleting an absent resource is a
     // success. The output shapes carry no required members.
     ok_json(Value::Object(Map::new()))

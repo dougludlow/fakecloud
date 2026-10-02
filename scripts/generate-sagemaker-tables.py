@@ -463,6 +463,41 @@ for name in sorted(meta):
             "true" if m["list_scalar"] else "false", req_out_s, req_elem_s))
 out.append("];")
 out.append("")
+# `Search` result entities: each `SearchRecord` member names the structure a
+# matching resource is projected onto. Emit each structure's top-level members
+# (for projection) and its required-member tree (for completion), plus the
+# `Model` structure nested inside `ModelDashboardModel`.
+search_shapes = {}
+search_record = []
+for mn, m in struct_members(NS + "SearchRecord"):
+    tgt = m["target"]
+    search_record.append((mn, sn(tgt)))
+    search_shapes[sn(tgt)] = tgt
+for mn, m in struct_members(NS + "ModelDashboardModel"):
+    if mn == "Model":
+        search_shapes[sn(m["target"])] = m["target"]
+out.append("/// A structure a `Search` result is projected onto: its top-level members")
+out.append("/// and its required-member tree.")
+out.append("pub struct SearchShape {")
+out.append("    pub name: &'static str,")
+out.append("    pub members: &'static [(&'static str, K)],")
+out.append("    pub req: &'static [Field],")
+out.append("}")
+out.append("")
+out.append("/// `SearchRecord` member -> the structure shape it carries.")
+out.append("pub static SEARCH_RECORD: &[(&str, &str)] = &[")
+for mn, shp in search_record:
+    out.append("    (%s, %s)," % (rs(mn), rs(shp)))
+out.append("];")
+out.append("")
+out.append("pub static SEARCH_SHAPES: &[SearchShape] = &[")
+for name in sorted(search_shapes):
+    tid = search_shapes[name]
+    mems = "&[" + ", ".join(f"({rs(mn)}, {kind(kind_of(m['target']))})" for mn, m in struct_members(tid)) + "]"
+    req = render_fields(required_tree(tid, [tid], 0))
+    out.append("    SearchShape { name: %s, members: %s, req: %s }," % (rs(name), mems, req))
+out.append("];")
+out.append("")
 out.append("pub static ACTIONS: &[&str] = &[")
 for name in sorted(meta):
     out.append("    %s," % rs(name))

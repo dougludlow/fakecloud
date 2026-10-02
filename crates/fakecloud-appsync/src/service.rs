@@ -537,13 +537,13 @@ impl AppSyncService {
         let api = self.build_graphql_api(ctx, &api_id, body);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if let Some(tags) = body.get("tags").and_then(Value::as_object) {
-            let arn = graphql_api_arn(&ctx.region, &ctx.account, &api_id);
-            data.tags.insert(api_id.clone(), string_map(tags));
-            data.tags.insert(arn, string_map(tags));
-        }
+        // Create-time tags live in the ARN-keyed tag store the reads render.
+        data.set_tags(
+            &graphql_api_arn(&ctx.region, &ctx.account, &api_id),
+            body.get("tags"),
+        );
         data.graphql_apis.insert(api_id, api.clone());
-        Ok(ok(json!({ "graphqlApi": api })))
+        Ok(ok(json!({ "graphqlApi": data.render(&api, "arn") })))
     }
 
     fn build_graphql_api(&self, ctx: &Ctx, api_id: &str, body: &Value) -> Value {
@@ -590,7 +590,6 @@ impl AppSyncService {
                 "queryDepthLimit",
                 "resolverCountLimit",
                 "enhancedMetricsConfig",
-                "tags",
             ],
         );
         Value::Object(api)
@@ -601,8 +600,7 @@ impl AppSyncService {
         let guard = self.state.read();
         let api = guard
             .get(&ctx.account)
-            .and_then(|d| d.graphql_apis.get(api_id))
-            .cloned()
+            .and_then(|d| d.graphql_apis.get(api_id).map(|a| d.render(a, "arn")))
             .ok_or_else(|| not_found(&format!("GraphQL API {api_id} not found.")))?;
         Ok(ok(json!({ "graphqlApi": api })))
     }
@@ -611,7 +609,12 @@ impl AppSyncService {
         let guard = self.state.read();
         let apis: Vec<Value> = guard
             .get(&ctx.account)
-            .map(|d| d.graphql_apis.values().cloned().collect())
+            .map(|d| {
+                d.graphql_apis
+                    .values()
+                    .map(|a| d.render(a, "arn"))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(ok(json!({ "graphqlApis": apis })))
     }
@@ -625,21 +628,30 @@ impl AppSyncService {
         require_label(api_id, "apiId")?;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.graphql_apis.contains_key(api_id) {
-            return Err(not_found(&format!("GraphQL API {api_id} not found.")));
+        let api = data
+            .graphql_apis
+            .get_mut(api_id)
+            .ok_or_else(|| not_found(&format!("GraphQL API {api_id} not found.")))?;
+        // Merge only the members `UpdateGraphqlApi` can change onto the stored
+        // API. Identity (apiId / arn / uris / dns / owner) and the create-only
+        // `apiType` / `visibility` are kept; tags stay in the tag store.
+        if let Some(obj) = api.as_object_mut() {
+            copy_keys(obj, body, GRAPHQL_API_UPDATABLE);
         }
-        // Rebuild preserving apiId/arn/uris identity, applying the update body.
-        let api = self.build_graphql_api(ctx, api_id, body);
-        data.graphql_apis.insert(api_id.to_string(), api.clone());
-        Ok(ok(json!({ "graphqlApi": api })))
+        let api = api.clone();
+        Ok(ok(json!({ "graphqlApi": data.render(&api, "arn") })))
     }
 
     fn delete_graphql_api(&self, ctx: &Ctx, api_id: &str) -> Result<AwsResponse, AwsServiceError> {
         require_label(api_id, "apiId")?;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if data.graphql_apis.remove(api_id).is_none() {
+        let Some(api) = data.graphql_apis.remove(api_id) else {
             return Err(not_found(&format!("GraphQL API {api_id} not found.")));
+        };
+        // The API's tags go with it.
+        if let Some(arn) = api.get("arn").and_then(Value::as_str) {
+            data.remove_tags(arn);
         }
         data.api_keys.remove(api_id);
         data.data_sources.remove(api_id);
@@ -1395,8 +1407,13 @@ impl AppSyncService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         let cfg = build_domain_name(ctx, &domain, body);
+        if let Some(arn) = cfg.get("domainNameArn").and_then(Value::as_str) {
+            data.set_tags(arn, body.get("tags"));
+        }
         data.domain_names.insert(domain, cfg.clone());
-        Ok(ok(json!({ "domainNameConfig": cfg })))
+        Ok(ok(
+            json!({ "domainNameConfig": data.render(&cfg, "domainNameArn") }),
+        ))
     }
 
     fn get_domain_name(&self, ctx: &Ctx, domain: &str) -> Result<AwsResponse, AwsServiceError> {
@@ -1404,8 +1421,11 @@ impl AppSyncService {
         let guard = self.state.read();
         let cfg = guard
             .get(&ctx.account)
-            .and_then(|d| d.domain_names.get(domain))
-            .cloned()
+            .and_then(|d| {
+                d.domain_names
+                    .get(domain)
+                    .map(|c| d.render(c, "domainNameArn"))
+            })
             .ok_or_else(|| not_found(&format!("Domain name {domain} not found.")))?;
         Ok(ok(json!({ "domainNameConfig": cfg })))
     }
@@ -1414,7 +1434,12 @@ impl AppSyncService {
         let guard = self.state.read();
         let items: Vec<Value> = guard
             .get(&ctx.account)
-            .map(|d| d.domain_names.values().cloned().collect())
+            .map(|d| {
+                d.domain_names
+                    .values()
+                    .map(|c| d.render(c, "domainNameArn"))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(ok(json!({ "domainNameConfigs": items })))
     }
@@ -1437,7 +1462,9 @@ impl AppSyncService {
             obj.insert("description".into(), desc.clone());
         }
         data.domain_names.insert(domain.to_string(), cfg.clone());
-        Ok(ok(json!({ "domainNameConfig": cfg })))
+        Ok(ok(
+            json!({ "domainNameConfig": data.render(&cfg, "domainNameArn") }),
+        ))
     }
 
     fn delete_domain_name(&self, ctx: &Ctx, domain: &str) -> Result<AwsResponse, AwsServiceError> {
@@ -1445,8 +1472,11 @@ impl AppSyncService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         match data.domain_names.remove(domain) {
-            Some(_) => {
+            Some(cfg) => {
                 data.api_associations.remove(domain);
+                if let Some(arn) = cfg.get("domainNameArn").and_then(Value::as_str) {
+                    data.remove_tags(arn);
+                }
                 Ok(ok(json!({})))
             }
             None => Err(not_found(&format!("Domain name {domain} not found."))),
@@ -1504,8 +1534,11 @@ impl AppSyncService {
         let api = build_event_api(ctx, &api_id, body);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
+        if let Some(arn) = api.get("apiArn").and_then(Value::as_str) {
+            data.set_tags(arn, body.get("tags"));
+        }
         data.apis.insert(api_id, api.clone());
-        Ok(ok(json!({ "api": api })))
+        Ok(ok(json!({ "api": data.render(&api, "apiArn") })))
     }
 
     fn get_api(&self, ctx: &Ctx, api_id: &str) -> Result<AwsResponse, AwsServiceError> {
@@ -1513,8 +1546,7 @@ impl AppSyncService {
         let guard = self.state.read();
         let api = guard
             .get(&ctx.account)
-            .and_then(|d| d.apis.get(api_id))
-            .cloned()
+            .and_then(|d| d.apis.get(api_id).map(|a| d.render(a, "apiArn")))
             .ok_or_else(|| not_found(&format!("API {api_id} not found.")))?;
         Ok(ok(json!({ "api": api })))
     }
@@ -1523,7 +1555,7 @@ impl AppSyncService {
         let guard = self.state.read();
         let items: Vec<Value> = guard
             .get(&ctx.account)
-            .map(|d| d.apis.values().cloned().collect())
+            .map(|d| d.apis.values().map(|a| d.render(a, "apiArn")).collect())
             .unwrap_or_default();
         Ok(ok(json!({ "apis": items })))
     }
@@ -1537,12 +1569,17 @@ impl AppSyncService {
         require_label(api_id, "apiId")?;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.apis.contains_key(api_id) {
-            return Err(not_found(&format!("API {api_id} not found.")));
+        let api = data
+            .apis
+            .get_mut(api_id)
+            .ok_or_else(|| not_found(&format!("API {api_id} not found.")))?;
+        // Merge only the members `UpdateApi` can change; identity and the
+        // `created` timestamp are kept, tags stay in the tag store.
+        if let Some(obj) = api.as_object_mut() {
+            copy_keys(obj, body, &["name", "ownerContact", "eventConfig"]);
         }
-        let api = build_event_api(ctx, api_id, body);
-        data.apis.insert(api_id.to_string(), api.clone());
-        Ok(ok(json!({ "api": api })))
+        let api = api.clone();
+        Ok(ok(json!({ "api": data.render(&api, "apiArn") })))
     }
 
     fn delete_api(&self, ctx: &Ctx, api_id: &str) -> Result<AwsResponse, AwsServiceError> {
@@ -1550,8 +1587,18 @@ impl AppSyncService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         match data.apis.remove(api_id) {
-            Some(_) => {
-                data.channel_namespaces.remove(api_id);
+            Some(api) => {
+                // The API's tags, and its channel namespaces' tags, go with it.
+                if let Some(arn) = api.get("apiArn").and_then(Value::as_str) {
+                    data.remove_tags(arn);
+                }
+                if let Some(namespaces) = data.channel_namespaces.remove(api_id) {
+                    for ns in namespaces.values() {
+                        if let Some(arn) = ns.get("channelNamespaceArn").and_then(Value::as_str) {
+                            data.remove_tags(arn);
+                        }
+                    }
+                }
                 Ok(ok(json!({})))
             }
             None => Err(not_found(&format!("API {api_id} not found."))),
@@ -1583,11 +1630,16 @@ impl AppSyncService {
             ));
         }
         let ns = build_channel_namespace(ctx, api_id, &name, body);
+        if let Some(arn) = ns.get("channelNamespaceArn").and_then(Value::as_str) {
+            data.set_tags(arn, body.get("tags"));
+        }
         data.channel_namespaces
             .entry(api_id.to_string())
             .or_default()
             .insert(name, ns.clone());
-        Ok(ok(json!({ "channelNamespace": ns })))
+        Ok(ok(
+            json!({ "channelNamespace": data.render(&ns, "channelNamespaceArn") }),
+        ))
     }
 
     fn get_channel_namespace(
@@ -1600,9 +1652,12 @@ impl AppSyncService {
         let guard = self.state.read();
         let ns = guard
             .get(&ctx.account)
-            .and_then(|d| d.channel_namespaces.get(api_id))
-            .and_then(|m| m.get(name))
-            .cloned()
+            .and_then(|d| {
+                d.channel_namespaces
+                    .get(api_id)
+                    .and_then(|m| m.get(name))
+                    .map(|n| d.render(n, "channelNamespaceArn"))
+            })
             .ok_or_else(|| not_found(&format!("Channel namespace {name} not found.")))?;
         Ok(ok(json!({ "channelNamespace": ns })))
     }
@@ -1623,7 +1678,11 @@ impl AppSyncService {
         let items: Vec<Value> = data
             .channel_namespaces
             .get(api_id)
-            .map(|m| m.values().cloned().collect())
+            .map(|m| {
+                m.values()
+                    .map(|n| data.render(n, "channelNamespaceArn"))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(ok(json!({ "channelNamespaces": items })))
     }
@@ -1638,20 +1697,31 @@ impl AppSyncService {
         require_label(name, "name")?;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data
+        let ns = data
             .channel_namespaces
-            .get(api_id)
-            .map(|m| m.contains_key(name))
-            .unwrap_or(false)
-        {
-            return Err(not_found(&format!("Channel namespace {name} not found.")));
+            .get_mut(api_id)
+            .and_then(|m| m.get_mut(name))
+            .ok_or_else(|| not_found(&format!("Channel namespace {name} not found.")))?;
+        // Merge only the members `UpdateChannelNamespace` can change; identity
+        // and `created` are kept, `lastModified` advances, tags stay in the
+        // tag store.
+        if let Some(obj) = ns.as_object_mut() {
+            copy_keys(
+                obj,
+                body,
+                &[
+                    "subscribeAuthModes",
+                    "publishAuthModes",
+                    "codeHandlers",
+                    "handlerConfigs",
+                ],
+            );
+            obj.insert("lastModified".into(), json!(now_epoch()));
         }
-        let ns = build_channel_namespace(ctx, api_id, name, body);
-        data.channel_namespaces
-            .entry(api_id.to_string())
-            .or_default()
-            .insert(name.to_string(), ns.clone());
-        Ok(ok(json!({ "channelNamespace": ns })))
+        let ns = ns.clone();
+        Ok(ok(
+            json!({ "channelNamespace": data.render(&ns, "channelNamespaceArn") }),
+        ))
     }
 
     fn delete_channel_namespace(
@@ -1668,7 +1738,12 @@ impl AppSyncService {
             .get_mut(api_id)
             .and_then(|m| m.remove(name))
         {
-            Some(_) => Ok(ok(json!({}))),
+            Some(ns) => {
+                if let Some(arn) = ns.get("channelNamespaceArn").and_then(Value::as_str) {
+                    data.remove_tags(arn);
+                }
+                Ok(ok(json!({})))
+            }
             None => Err(not_found(&format!("Channel namespace {name} not found."))),
         }
     }
@@ -2207,7 +2282,7 @@ fn build_domain_name(ctx: &Ctx, domain: &str, body: &Value) -> Value {
         "domainNameArn".into(),
         json!(appsync_arn(ctx, &format!("domainnames/{domain}"))),
     );
-    copy_keys(&mut c, body, &["description", "certificateArn", "tags"]);
+    copy_keys(&mut c, body, &["description", "certificateArn"]);
     Value::Object(c)
 }
 
@@ -2227,11 +2302,7 @@ fn build_event_api(ctx: &Ctx, api_id: &str, body: &Value) -> Value {
             "HTTP": format!("{api_id}.appsync-api.{}.amazonaws.com", ctx.region),
         }),
     );
-    copy_keys(
-        &mut api,
-        body,
-        &["name", "ownerContact", "tags", "eventConfig"],
-    );
+    copy_keys(&mut api, body, &["name", "ownerContact", "eventConfig"]);
     Value::Object(api)
 }
 
@@ -2255,7 +2326,6 @@ fn build_channel_namespace(ctx: &Ctx, api_id: &str, name: &str, body: &Value) ->
             "subscribeAuthModes",
             "publishAuthModes",
             "codeHandlers",
-            "tags",
             "handlerConfigs",
         ],
     );
@@ -2345,6 +2415,25 @@ fn copy_keys(dst: &mut Map<String, Value>, src: &Value, keys: &[&str]) {
         }
     }
 }
+
+/// The `GraphqlApi` members `UpdateGraphqlApi` can change (its request members
+/// minus the `apiId` label).
+const GRAPHQL_API_UPDATABLE: &[&str] = &[
+    "name",
+    "logConfig",
+    "authenticationType",
+    "userPoolConfig",
+    "openIDConnectConfig",
+    "additionalAuthenticationProviders",
+    "xrayEnabled",
+    "lambdaAuthorizerConfig",
+    "mergedApiExecutionRoleArn",
+    "ownerContact",
+    "introspectionConfig",
+    "queryDepthLimit",
+    "resolverCountLimit",
+    "enhancedMetricsConfig",
+];
 
 fn string_map(obj: &Map<String, Value>) -> std::collections::BTreeMap<String, String> {
     obj.iter()
@@ -2783,5 +2872,160 @@ mod tests {
             "CreateApi"
         );
         assert!(AppSyncService::resolve_action(&req(Method::GET, "/v1/nope")).is_none());
+    }
+
+    // Tags have one home: create-time tags show in ListTagsForResource,
+    // Tag / Untag show in the Get / List outputs, Delete drops them.
+    #[test]
+    fn graphql_api_tags_share_one_store_and_update_merges() {
+        let s = svc();
+        let created = body_json(
+            &s.create_graphql_api(
+                &ctx(),
+                &json!({ "name": "m", "authenticationType": "API_KEY", "apiType": "MERGED",
+                         "visibility": "PRIVATE", "mergedApiExecutionRoleArn": "arn:aws:iam::000000000000:role/r",
+                         "tags": { "env": "prod" } }),
+            )
+            .unwrap(),
+        );
+        let api_id = created["graphqlApi"]["apiId"].as_str().unwrap().to_string();
+        let arn = created["graphqlApi"]["arn"].as_str().unwrap().to_string();
+        assert_eq!(created["graphqlApi"]["tags"], json!({ "env": "prod" }));
+
+        s.tag_resource(&ctx(), &arn, &json!({ "tags": { "team": "x" } }))
+            .unwrap();
+        s.untag_resource(&ctx(), &arn, &[("tagKeys".to_string(), "env".to_string())])
+            .unwrap();
+        let got = body_json(&s.get_graphql_api(&ctx(), &api_id).unwrap());
+        assert_eq!(got["graphqlApi"]["tags"], json!({ "team": "x" }));
+
+        // Update merges: apiType / visibility / tags survive, name changes.
+        let updated = body_json(
+            &s.update_graphql_api(
+                &ctx(),
+                &api_id,
+                &json!({ "name": "m2", "authenticationType": "API_KEY" }),
+            )
+            .unwrap(),
+        );
+        let api = &updated["graphqlApi"];
+        assert_eq!(api["name"], json!("m2"));
+        assert_eq!(api["apiType"], json!("MERGED"));
+        assert_eq!(api["visibility"], json!("PRIVATE"));
+        assert_eq!(
+            api["mergedApiExecutionRoleArn"],
+            json!("arn:aws:iam::000000000000:role/r")
+        );
+        assert_eq!(api["tags"], json!({ "team": "x" }));
+
+        s.delete_graphql_api(&ctx(), &api_id).unwrap();
+        let listed = body_json(&s.list_tags_for_resource(&ctx(), &arn).unwrap());
+        assert_eq!(listed["tags"], json!({}));
+    }
+
+    #[test]
+    fn event_api_domain_and_namespace_tags_share_one_store() {
+        let s = svc();
+        let api = body_json(
+            &s.create_api(
+                &ctx(),
+                &json!({ "name": "ev", "eventConfig": {}, "tags": { "a": "1" } }),
+            )
+            .unwrap(),
+        );
+        let api_id = api["api"]["apiId"].as_str().unwrap().to_string();
+        let api_arn = api["api"]["apiArn"].as_str().unwrap().to_string();
+        let created_at = api["api"]["created"].clone();
+        assert_eq!(
+            body_json(&s.list_tags_for_resource(&ctx(), &api_arn).unwrap())["tags"],
+            json!({ "a": "1" })
+        );
+        // UpdateApi keeps `created` and the tags.
+        let updated = body_json(
+            &s.update_api(&ctx(), &api_id, &json!({ "name": "ev2" }))
+                .unwrap(),
+        );
+        assert_eq!(updated["api"]["name"], json!("ev2"));
+        assert_eq!(updated["api"]["created"], created_at);
+        assert_eq!(updated["api"]["tags"], json!({ "a": "1" }));
+
+        let ns = body_json(
+            &s.create_channel_namespace(
+                &ctx(),
+                &api_id,
+                &json!({ "name": "chat", "tags": { "b": "2" } }),
+            )
+            .unwrap(),
+        );
+        let ns_arn = ns["channelNamespace"]["channelNamespaceArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ns_created = ns["channelNamespace"]["created"].clone();
+        assert_eq!(
+            body_json(&s.list_tags_for_resource(&ctx(), &ns_arn).unwrap())["tags"],
+            json!({ "b": "2" })
+        );
+        s.tag_resource(&ctx(), &ns_arn, &json!({ "tags": { "c": "3" } }))
+            .unwrap();
+        let updated = body_json(
+            &s.update_channel_namespace(&ctx(), &api_id, "chat", &json!({ "codeHandlers": "x" }))
+                .unwrap(),
+        );
+        assert_eq!(updated["channelNamespace"]["created"], ns_created);
+        assert_eq!(updated["channelNamespace"]["codeHandlers"], json!("x"));
+        assert_eq!(
+            updated["channelNamespace"]["tags"],
+            json!({ "b": "2", "c": "3" })
+        );
+
+        let dom = body_json(
+            &s.create_domain_name(
+                &ctx(),
+                &json!({ "domainName": "api.example.com",
+                         "certificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/x",
+                         "tags": { "d": "4" } }),
+            )
+            .unwrap(),
+        );
+        let dom_arn = dom["domainNameConfig"]["domainNameArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            body_json(&s.list_tags_for_resource(&ctx(), &dom_arn).unwrap())["tags"],
+            json!({ "d": "4" })
+        );
+        s.untag_resource(
+            &ctx(),
+            &dom_arn,
+            &[("tagKeys".to_string(), "d".to_string())],
+        )
+        .unwrap();
+        let got = body_json(&s.get_domain_name(&ctx(), "api.example.com").unwrap());
+        assert!(got["domainNameConfig"].get("tags").is_none(), "{got}");
+
+        // Deleting the Event API drops its tags and its namespaces' tags.
+        s.delete_api(&ctx(), &api_id).unwrap();
+        assert_eq!(
+            body_json(&s.list_tags_for_resource(&ctx(), &api_arn).unwrap())["tags"],
+            json!({})
+        );
+        assert_eq!(
+            body_json(&s.list_tags_for_resource(&ctx(), &ns_arn).unwrap())["tags"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn inline_tags_migrate_into_tag_store() {
+        let mut d = AppSyncData::default();
+        d.graphql_apis.insert(
+            "a1".into(),
+            json!({ "apiId": "a1", "arn": "arn:a1", "tags": { "k": "v" } }),
+        );
+        d.migrate_inline_tags();
+        assert_eq!(d.tags["arn:a1"]["k"], "v");
+        assert!(d.graphql_apis["a1"].get("tags").is_none());
     }
 }

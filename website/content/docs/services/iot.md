@@ -49,7 +49,9 @@ tokens, and enforces referential rules:
   host for every endpoint type (`iot:Data-ATS`, `iot:CredentialProvider`,
   `iot:Jobs`, ...).
 - **Tagging** — `TagResource` / `UntagResource` / `ListTagsForResource` keyed
-  by ARN.
+  by ARN. Tags passed at create time (the `TagList`, the software-package
+  `TagMap`, or `CreateTopicRule`'s `x-amz-tagging` header) land in the same
+  store, and deleting a resource drops its tags.
 
 Input validation is model-derived: required members, string `@length`, numeric
 `@range`, and `@enum` constraints are enforced with each operation's declared

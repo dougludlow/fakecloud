@@ -24,7 +24,9 @@ use crate::generated::{OpMeta, Verb, OPS};
 use crate::persistence::save_snapshot;
 use crate::state::SharedSageMakerState;
 
+mod actions;
 mod engine;
+mod search;
 mod special;
 #[cfg(test)]
 mod tests;

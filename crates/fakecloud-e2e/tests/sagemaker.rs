@@ -590,3 +590,179 @@ async fn sagemaker_send_pipeline_step_success_returns_execution_arn() {
         out.pipeline_execution_arn()
     );
 }
+
+/// A tagged Create is visible to ListTags; AddTags / DeleteTags are visible to
+/// DescribeLabelingJob's `Tags`; delete + same-name re-create starts untagged.
+#[tokio::test]
+async fn sagemaker_create_time_tags_share_list_tags_store() {
+    use aws_sdk_sagemaker::types::{
+        HumanTaskConfig, LabelingJobDataSource, LabelingJobInputConfig, LabelingJobOutputConfig,
+        LabelingJobS3DataSource, UiConfig,
+    };
+    let server = TestServer::start().await;
+    let client = sagemaker_client(&server).await;
+    let role = "arn:aws:iam::000000000000:role/SageMakerRole";
+
+    let created = client
+        .create_model()
+        .model_name("tagged-model")
+        .execution_role_arn(role)
+        .tags(Tag::builder().key("env").value("prod").build())
+        .send()
+        .await
+        .expect("create_model");
+    let model_arn = created.model_arn().unwrap().to_string();
+    let tags = client
+        .list_tags()
+        .resource_arn(&model_arn)
+        .send()
+        .await
+        .expect("list_tags");
+    let tags = tags.tags();
+    assert_eq!(tags.len(), 1, "create-time tags missing: {tags:?}");
+    assert_eq!(tags[0].key(), Some("env"));
+    assert_eq!(tags[0].value(), Some("prod"));
+
+    client
+        .delete_model()
+        .model_name("tagged-model")
+        .send()
+        .await
+        .expect("delete_model");
+    client
+        .create_model()
+        .model_name("tagged-model")
+        .execution_role_arn(role)
+        .send()
+        .await
+        .expect("re-create model");
+    let tags = client
+        .list_tags()
+        .resource_arn(&model_arn)
+        .send()
+        .await
+        .expect("list_tags after re-create");
+    assert!(tags.tags().is_empty(), "re-create inherited tags");
+
+    // Describe reflects AddTags / DeleteTags.
+    let lj = client
+        .create_labeling_job()
+        .labeling_job_name("lj")
+        .label_attribute_name("label")
+        .role_arn(role)
+        .input_config(
+            LabelingJobInputConfig::builder()
+                .data_source(
+                    LabelingJobDataSource::builder()
+                        .s3_data_source(
+                            LabelingJobS3DataSource::builder()
+                                .manifest_s3_uri("s3://b/manifest")
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .output_config(
+            LabelingJobOutputConfig::builder()
+                .s3_output_path("s3://b/out")
+                .build(),
+        )
+        .human_task_config(
+            HumanTaskConfig::builder()
+                .workteam_arn("arn:aws:sagemaker:us-east-1:000000000000:workteam/private-crowd/w")
+                .ui_config(
+                    UiConfig::builder()
+                        .ui_template_s3_uri("s3://b/t.html")
+                        .build(),
+                )
+                .pre_human_task_lambda_arn("arn:aws:lambda:us-east-1:000000000000:function:pre")
+                .task_title("t")
+                .task_description("d")
+                .number_of_human_workers_per_data_object(1)
+                .task_time_limit_in_seconds(60)
+                .build(),
+        )
+        .tags(Tag::builder().key("a").value("1").build())
+        .send()
+        .await
+        .expect("create_labeling_job");
+    let lj_arn = lj.labeling_job_arn().expect("labeling_job_arn").to_string();
+    client
+        .add_tags()
+        .resource_arn(&lj_arn)
+        .tags(Tag::builder().key("b").value("2").build())
+        .send()
+        .await
+        .expect("add_tags");
+    client
+        .delete_tags()
+        .resource_arn(&lj_arn)
+        .tag_keys("a")
+        .send()
+        .await
+        .expect("delete_tags");
+    let described = client
+        .describe_labeling_job()
+        .labeling_job_name("lj")
+        .send()
+        .await
+        .expect("describe_labeling_job");
+    let keys: Vec<&str> = described.tags().iter().filter_map(|t| t.key()).collect();
+    assert_eq!(keys, vec!["b"]);
+}
+
+/// Search runs over real stored resources; Stop on a missing job is
+/// ResourceNotFound.
+#[tokio::test]
+async fn sagemaker_search_and_missing_lifecycle_target() {
+    use aws_sdk_sagemaker::types::{Filter, Operator, ResourceType, SearchExpression};
+    let server = TestServer::start().await;
+    let client = sagemaker_client(&server).await;
+    for (name, env) in [("m-prod", "prod"), ("m-dev", "dev")] {
+        client
+            .create_model()
+            .model_name(name)
+            .execution_role_arn("arn:aws:iam::000000000000:role/r")
+            .tags(Tag::builder().key("env").value(env).build())
+            .send()
+            .await
+            .expect("create_model");
+    }
+    let out = client
+        .search()
+        .resource(ResourceType::Model)
+        .search_expression(
+            SearchExpression::builder()
+                .filters(
+                    Filter::builder()
+                        .name("Tags.env")
+                        .operator(Operator::Equals)
+                        .value("prod")
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("search");
+    let names: Vec<&str> = out
+        .results()
+        .iter()
+        .filter_map(|r| r.model())
+        .filter_map(|m| m.model())
+        .filter_map(|m| m.model_name())
+        .collect();
+    assert_eq!(names, vec!["m-prod"]);
+
+    let err = client
+        .stop_training_job()
+        .training_job_name("never-created")
+        .send()
+        .await
+        .expect_err("stop on missing job must fail");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("ResourceNotFound")
+    );
+}

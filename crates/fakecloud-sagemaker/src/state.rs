@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
@@ -54,14 +54,91 @@ impl SageMakerData {
     }
 
     /// Insert / replace a resource record.
-    pub fn put_resource(&mut self, family: &str, id: &str, record: Value) {
+    ///
+    /// Tags have exactly one home: the ARN-keyed [`Self::tags`] map that
+    /// `AddTags` / `ListTags` / `DeleteTags` operate on. A record that arrives
+    /// carrying a `Tags` list (a tagged `Create*`, or a CloudFormation resource
+    /// with a `Tags` property) has that list moved into the tag store under the
+    /// record's `{Family}Arn`, *replacing* any prior tag set for that ARN, and
+    /// the list is not kept inline. Reads re-attach the tags through
+    /// [`Self::record_with_tags`], so Describe, List and ListTags all see the
+    /// same set.
+    pub fn put_resource(&mut self, family: &str, id: &str, mut record: Value) {
+        if let Some(obj) = record.as_object_mut() {
+            self.absorb_inline_tags(family, obj, true);
+        }
         self.resources
             .entry(family.to_string())
             .or_default()
             .insert(id.to_string(), record);
     }
 
-    /// Remove a resource record, returning it if present.
+    /// Move a record's inline `Tags` list (`[{Key, Value}]`) into the ARN-keyed
+    /// tag store. With `replace`, the list becomes the ARN's entire tag set;
+    /// otherwise its entries are merged over the existing set. A record without
+    /// a `{Family}Arn` keeps its list inline (there is no ARN to key it by).
+    fn absorb_inline_tags(&mut self, family: &str, obj: &mut Map<String, Value>, replace: bool) {
+        let Some(arn) = record_arn(family, obj) else {
+            return;
+        };
+        let Some(Value::Array(list)) = obj.remove("Tags") else {
+            return;
+        };
+        self.apply_tag_list(&arn, &list, replace);
+    }
+
+    /// Apply a `[{Key, Value}]` tag list to `arn`'s tag set, either replacing
+    /// it or merging over it. An emptied set is removed entirely.
+    pub fn apply_tag_list(&mut self, arn: &str, list: &[Value], replace: bool) {
+        let mut set = if replace {
+            BTreeMap::new()
+        } else {
+            self.tags.remove(arn).unwrap_or_default()
+        };
+        for t in list {
+            if let Some(key) = t.get("Key").and_then(Value::as_str) {
+                let val = t.get("Value").and_then(Value::as_str).unwrap_or_default();
+                set.insert(key.to_string(), val.to_string());
+            }
+        }
+        if set.is_empty() {
+            self.tags.remove(arn);
+        } else {
+            self.tags.insert(arn.to_string(), set);
+        }
+    }
+
+    /// The tag set stored for `arn` as an AWS `[{Key, Value}]` list.
+    pub fn tag_list(&self, arn: &str) -> Vec<Value> {
+        self.tags
+            .get(arn)
+            .map(|set| {
+                set.iter()
+                    .map(|(k, v)| serde_json::json!({"Key": k, "Value": v}))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A read view of a stored record with its tags (from the ARN-keyed tag
+    /// store) re-attached as the `Tags` member, so Describe / List / Search
+    /// outputs that model `Tags` reflect `AddTags` / `DeleteTags`. Records with
+    /// no tags are returned unchanged.
+    pub fn record_with_tags(&self, family: &str, record: &Value) -> Value {
+        let mut out = record.clone();
+        if let Some(obj) = out.as_object_mut() {
+            if let Some(arn) = record_arn(family, obj) {
+                let tags = self.tag_list(&arn);
+                if !tags.is_empty() {
+                    obj.insert("Tags".to_string(), Value::Array(tags));
+                }
+            }
+        }
+        out
+    }
+
+    /// Remove a resource record, returning it if present. The resource's tags
+    /// go with it, so a same-name re-create starts untagged.
     pub fn remove_resource(&mut self, family: &str, id: &str) -> Option<Value> {
         let removed = self.resources.get_mut(family).and_then(|m| m.remove(id));
         if let Some(m) = self.resources.get(family) {
@@ -69,7 +146,41 @@ impl SageMakerData {
                 self.resources.remove(family);
             }
         }
+        if let Some(arn) = removed
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|o| record_arn(family, o))
+        {
+            self.tags.remove(&arn);
+        }
         removed
+    }
+
+    /// One-time migration for snapshots written before tags had a single home:
+    /// move every record's inline `Tags` list into the ARN-keyed tag store
+    /// (merged under any tags already stored for that ARN, which are newer).
+    pub fn migrate_inline_tags(&mut self) {
+        let mut moved: Vec<(String, Vec<Value>)> = Vec::new();
+        for (family, records) in self.resources.iter_mut() {
+            for rec in records.values_mut() {
+                let Some(obj) = rec.as_object_mut() else {
+                    continue;
+                };
+                let Some(arn) = record_arn(family, obj) else {
+                    continue;
+                };
+                if let Some(Value::Array(list)) = obj.remove("Tags") {
+                    moved.push((arn, list));
+                }
+            }
+        }
+        for (arn, list) in moved {
+            let existing = self.tags.remove(&arn).unwrap_or_default();
+            self.apply_tag_list(&arn, &list, true);
+            if !existing.is_empty() {
+                self.tags.entry(arn).or_default().extend(existing);
+            }
+        }
     }
 
     /// Resolve a caller-supplied identifier value to a stored key within a
@@ -119,6 +230,15 @@ impl SageMakerData {
         self.seq += 1;
         self.seq
     }
+}
+
+/// The resource ARN a stored record is tagged under: its canonical
+/// `{Family}Arn` member.
+fn record_arn(family: &str, obj: &Map<String, Value>) -> Option<String> {
+    obj.get(&format!("{family}Arn"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 impl AccountState for SageMakerData {

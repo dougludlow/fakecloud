@@ -1641,3 +1641,156 @@ fn required_body_omission_is_rejected_for_every_op() {
         failures.join("\n")
     );
 }
+
+// ---------- create-time tags share the ListTagsForResource store ----------
+
+fn list_tags_of(s: &IotService, arn: &str) -> Value {
+    body_of(
+        &run(
+            s,
+            "GET",
+            &format!("/tags?resourceArn={arn}"),
+            &[],
+            Value::Null,
+        )
+        .unwrap(),
+    )["tags"]
+        .clone()
+}
+
+#[test]
+fn create_time_tags_visible_to_list_tags_and_cleared_on_delete() {
+    let s = svc();
+    let created = body_of(
+        &run(
+            &s,
+            "POST",
+            "/thing-groups/g1",
+            &[],
+            json!({"tags": [{"Key": "env", "Value": "prod"}]}),
+        )
+        .unwrap(),
+    );
+    let arn = created["thingGroupArn"].as_str().unwrap().to_string();
+    assert_eq!(
+        list_tags_of(&s, &arn),
+        json!([{"Key": "env", "Value": "prod"}])
+    );
+
+    // TagResource / UntagResource act on the same set.
+    run(
+        &s,
+        "POST",
+        "/tags",
+        &[],
+        json!({"resourceArn": arn, "tags": [{"Key": "team", "Value": "iot"}]}),
+    )
+    .unwrap();
+    run(
+        &s,
+        "POST",
+        "/untag",
+        &[],
+        json!({"resourceArn": arn, "tagKeys": ["env"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        list_tags_of(&s, &arn),
+        json!([{"Key": "team", "Value": "iot"}])
+    );
+
+    // Delete drops the tags; a same-name re-create starts untagged.
+    run(&s, "DELETE", "/thing-groups/g1", &[], Value::Null).unwrap();
+    assert_eq!(list_tags_of(&s, &arn), json!([]));
+    run(&s, "POST", "/thing-groups/g1", &[], json!({})).unwrap();
+    assert_eq!(list_tags_of(&s, &arn), json!([]));
+}
+
+#[test]
+fn special_creates_store_tags() {
+    let s = svc();
+    // CreatePolicy (TagList).
+    let p = body_of(
+        &run(
+            &s,
+            "POST",
+            "/policies/p1",
+            &[],
+            json!({"policyDocument": "{}", "tags": [{"Key": "a", "Value": "1"}]}),
+        )
+        .unwrap(),
+    );
+    let arn = p["policyArn"].as_str().unwrap().to_string();
+    assert_eq!(list_tags_of(&s, &arn), json!([{"Key": "a", "Value": "1"}]));
+
+    // CreatePackage (TagMap).
+    let pkg = body_of(
+        &run(
+            &s,
+            "PUT",
+            "/packages/pkg1",
+            &[],
+            json!({"tags": {"b": "2"}}),
+        )
+        .unwrap(),
+    );
+    let arn = pkg["packageArn"].as_str().unwrap().to_string();
+    assert_eq!(list_tags_of(&s, &arn), json!([{"Key": "b", "Value": "2"}]));
+
+    // CreateTopicRule (x-amz-tagging header).
+    run(
+        &s,
+        "POST",
+        "/rules/r1",
+        &[("x-amz-tagging", "c=3&d=4")],
+        json!({"sql": "SELECT * FROM 't'", "actions": []}),
+    )
+    .unwrap();
+    let rule = body_of(&run(&s, "GET", "/rules/r1", &[], Value::Null).unwrap());
+    let arn = rule["ruleArn"].as_str().unwrap().to_string();
+    assert_eq!(
+        list_tags_of(&s, &arn),
+        json!([{"Key": "c", "Value": "3"}, {"Key": "d", "Value": "4"}])
+    );
+}
+
+#[test]
+fn describe_wrapper_does_not_leak_inline_tags() {
+    let s = svc();
+    run(
+        &s,
+        "POST",
+        "/role-aliases/ra1",
+        &[],
+        json!({"roleArn": "arn:aws:iam::000000000000:role/r", "tags": [{"Key": "a", "Value": "1"}]}),
+    )
+    .unwrap();
+    let d = body_of(&run(&s, "GET", "/role-aliases/ra1", &[], Value::Null).unwrap());
+    assert!(d["roleAliasDescription"].get("tags").is_none(), "{d}");
+}
+
+#[test]
+fn inline_tags_migrate_into_tag_store() {
+    let mut d = crate::state::IotData::default();
+    d.resources
+        .entry("thing-groups".into())
+        .or_default()
+        .insert(
+            "g1".into(),
+            json!({
+                "thingGroupName": "g1",
+                "thingGroupArn": "arn:aws:iot:us-east-1:000000000000:thinggroup/g1",
+                "tags": [{"Key": "k", "Value": "v"}],
+            }),
+        );
+    d.migrate_inline_tags();
+    assert_eq!(
+        d.tags["arn:aws:iot:us-east-1:000000000000:thinggroup/g1"]["k"],
+        "v"
+    );
+    assert!(d
+        .get_resource("thing-groups", "g1")
+        .unwrap()
+        .get("tags")
+        .is_none());
+}

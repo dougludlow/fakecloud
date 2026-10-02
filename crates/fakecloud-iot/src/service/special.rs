@@ -312,7 +312,8 @@ pub(super) fn dispatch(
 
         // Topic rules: the rule payload is the request body (`@httpPayload`);
         // GetTopicRule nests it under `rule` alongside the `ruleArn`.
-        "CreateTopicRule" | "ReplaceTopicRule" => Ok(Some(put_topic_rule(svc, ctx, labels, body))),
+        "CreateTopicRule" => Ok(Some(put_topic_rule(svc, ctx, labels, body, Some(headers)))),
+        "ReplaceTopicRule" => Ok(Some(put_topic_rule(svc, ctx, labels, body, None))),
         "GetTopicRule" => Ok(Some(get_topic_rule(svc, ctx, meta, labels)?)),
         "EnableTopicRule" => Ok(Some(set_topic_rule_disabled(svc, ctx, labels, false))),
         "DisableTopicRule" => Ok(Some(set_topic_rule_disabled(svc, ctx, labels, true))),
@@ -545,6 +546,12 @@ fn register_certificate(
     let seq = { svc.state.write().get_or_create(&ctx.account).next_seq() };
     let cert_id = mint_hex64(&format!("{}:reg:{}:{seq}", ctx.account, pem));
     let arn = store_certificate(svc, ctx, rtype, &cert_id, false);
+    if body.contains_key("tags") {
+        svc.state
+            .write()
+            .get_or_create(&ctx.account)
+            .set_tags(&arn, tags_member(body));
+    }
     (
         ok_json(json!({ "certificateArn": arn, "certificateId": cert_id })),
         true,
@@ -612,6 +619,11 @@ fn handle_singleton(
 }
 
 // ---------- tags ----------
+
+/// A create request's `tags` member as a tag map (empty when absent).
+fn tags_member(body: &Map<String, Value>) -> std::collections::BTreeMap<String, String> {
+    body.get("tags").map(super::parse_tags).unwrap_or_default()
+}
 
 fn tag_resource(svc: &IotService, ctx: &Ctx, body: &Map<String, Value>) -> (AwsResponse, bool) {
     let arn = body_str(body, "resourceArn").unwrap_or("").to_string();
@@ -925,6 +937,7 @@ fn put_topic_rule(
     ctx: &Ctx,
     labels: &HashMap<String, String>,
     body: &Map<String, Value>,
+    create_headers: Option<&HeaderMap>,
 ) -> (AwsResponse, bool) {
     let Some(name) = labels.get("ruleName") else {
         return (ok_json(Value::Object(Map::new())), false);
@@ -954,6 +967,17 @@ fn put_topic_rule(
     let mut g = svc.state.write();
     let data = g.get_or_create(&ctx.account);
     data.put_resource("rules", name, Value::Object(record));
+    // CreateTopicRule carries its tags in the `x-amz-tagging` header
+    // (`k1=v1&k2=v2`); they replace whatever a deleted same-name rule had.
+    // ReplaceTopicRule leaves the rule's tags alone.
+    if let Some(headers) = create_headers {
+        let tags = headers
+            .get("x-amz-tagging")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| super::parse_tags(&Value::String(s.to_string())))
+            .unwrap_or_default();
+        data.set_tags(&mint_arn(ctx, "rules", name), tags);
+    }
     (ok_json(Value::Object(Map::new())), true)
 }
 
@@ -1484,6 +1508,7 @@ fn create_policy(
         "generationId": "1",
     });
     data.put_resource("policies", &name, policy_rec);
+    data.set_tags(&arn, tags_member(body));
     store_policy_version(data, &name, &arn, &document, "1", true);
     Ok((
         ok_json(json!({
@@ -1747,6 +1772,7 @@ fn create_provisioning_template(
     rec.insert("creationDate".to_string(), super::now_epoch());
     rec.insert("lastModifiedDate".to_string(), super::now_epoch());
     data.put_resource("provisioning-templates", &name, Value::Object(rec));
+    data.set_tags(&arn, tags_member(body));
     store_provisioning_version(data, &name, 1, &template_body, true);
     Ok((
         ok_json(json!({

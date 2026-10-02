@@ -176,7 +176,7 @@ impl IotService {
             Verb::Delete => {
                 let mut g = self.state.write();
                 let data = g.get_or_create(&ctx.account);
-                Ok((engine::delete(data, meta, labels), true))
+                Ok((engine::delete(data, &ctx, meta, labels), true))
             }
             Verb::Get => {
                 let g = self.state.read();
@@ -331,6 +331,47 @@ pub(crate) fn parse_body(body: &[u8]) -> Map<String, Value> {
 pub(crate) fn now_epoch() -> Value {
     let millis = chrono::Utc::now().timestamp_millis();
     Value::from(millis as f64 / 1000.0)
+}
+
+/// Parse a create request's `tags` member into a tag map. IoT models it three
+/// ways: a `TagList` (`[{Key, Value}]`), a `TagMap` (`{key: value}`, the
+/// software package operations) or, for `CreateTopicRule`, the
+/// `x-amz-tagging` header's URL-query string (`k1=v1&k2=v2`).
+pub(crate) fn parse_tags(v: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    match v {
+        Value::Array(list) => {
+            for t in list {
+                let k = t
+                    .get("Key")
+                    .or_else(|| t.get("key"))
+                    .and_then(Value::as_str);
+                let val = t
+                    .get("Value")
+                    .or_else(|| t.get("value"))
+                    .and_then(Value::as_str);
+                if let Some(k) = k {
+                    out.insert(k.to_string(), val.unwrap_or("").to_string());
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (k, val) in map {
+                if let Some(val) = val.as_str() {
+                    out.insert(k.clone(), val.to_string());
+                }
+            }
+        }
+        Value::String(s) => {
+            for (k, val) in parse_query(s) {
+                if !k.is_empty() {
+                    out.insert(k, val);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 pub(crate) fn query_get<'a>(q: &'a [(String, String)], key: &str) -> Option<&'a str> {

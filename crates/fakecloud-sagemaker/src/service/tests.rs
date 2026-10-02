@@ -1600,3 +1600,467 @@ fn china_region_arns_use_aws_cn_partition_and_resolve() {
         "arn:aws-cn:sagemaker:cn-north-1:000000000000:pipeline/p1"
     );
 }
+
+fn status_code(e: AwsServiceError) -> String {
+    match e {
+        AwsServiceError::AwsError { code, .. } => code,
+        other => panic!("non-AWS error {other:?}"),
+    }
+}
+
+// Tags have one home. A tagged Create is visible to ListTags, AddTags /
+// DeleteTags are visible to the Describe outputs that model `Tags`, Delete
+// drops the tags, and a same-name re-create starts untagged.
+#[test]
+fn create_time_tags_share_the_list_tags_store() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateLabelingJob",
+            json!({
+                "LabelingJobName": "lj1",
+                "LabelAttributeName": "label",
+                "InputConfig": {"DataSource": {"S3DataSource": {"ManifestS3Uri": "s3://b/m"}}},
+                "OutputConfig": {"S3OutputPath": "s3://b/o"},
+                "RoleArn": "arn:aws:iam::000000000000:role/r",
+                "HumanTaskConfig": {},
+                "Tags": [{"Key": "env", "Value": "prod"}],
+            }),
+        )
+        .unwrap(),
+    );
+    let arn = created["LabelingJobArn"].as_str().unwrap().to_string();
+
+    let listed = resp_json(&run(&s, "ListTags", json!({"ResourceArn": arn})).unwrap());
+    assert_eq!(listed["Tags"], json!([{"Key": "env", "Value": "prod"}]));
+
+    run(
+        &s,
+        "AddTags",
+        json!({"ResourceArn": arn, "Tags": [{"Key": "team", "Value": "ml"}]}),
+    )
+    .unwrap();
+    run(
+        &s,
+        "DeleteTags",
+        json!({"ResourceArn": arn, "TagKeys": ["env"]}),
+    )
+    .unwrap();
+    let described =
+        resp_json(&run(&s, "DescribeLabelingJob", json!({"LabelingJobName": "lj1"})).unwrap());
+    assert_eq!(described["Tags"], json!([{"Key": "team", "Value": "ml"}]));
+
+    // The record itself no longer carries an inline copy.
+    {
+        let g = s.state.read();
+        let d = g.get("000000000000").unwrap();
+        assert!(d
+            .get_resource("LabelingJob", "lj1")
+            .unwrap()
+            .get("Tags")
+            .is_none());
+    }
+
+    // Delete + same-name re-create does not inherit the old tags.
+    run(
+        &s,
+        "CreateModel",
+        json!({"ModelName": "m1", "Tags": [{"Key": "a", "Value": "1"}]}),
+    )
+    .unwrap();
+    let model_arn = s
+        .state
+        .read()
+        .get("000000000000")
+        .unwrap()
+        .get_resource("Model", "m1")
+        .unwrap()["ModelArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run(&s, "DeleteModel", json!({"ModelName": "m1"})).unwrap();
+    let listed = resp_json(&run(&s, "ListTags", json!({"ResourceArn": model_arn})).unwrap());
+    assert!(listed["Tags"].as_array().unwrap().is_empty(), "{listed}");
+    run(&s, "CreateModel", json!({"ModelName": "m1"})).unwrap();
+    let listed = resp_json(&run(&s, "ListTags", json!({"ResourceArn": model_arn})).unwrap());
+    assert!(listed["Tags"].as_array().unwrap().is_empty(), "{listed}");
+}
+
+// Update* `Tags` (UpdateProject) merge into the same store.
+#[test]
+fn update_tags_merge_into_tag_store() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateProject",
+            json!({"ProjectName": "p1", "Tags": [{"Key": "a", "Value": "1"}]}),
+        )
+        .unwrap(),
+    );
+    let arn = created["ProjectArn"].as_str().unwrap().to_string();
+    run(
+        &s,
+        "UpdateProject",
+        json!({"ProjectName": "p1", "Tags": [{"Key": "b", "Value": "2"}]}),
+    )
+    .unwrap();
+    let listed = resp_json(&run(&s, "ListTags", json!({"ResourceArn": arn})).unwrap());
+    assert_eq!(
+        listed["Tags"],
+        json!([{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}])
+    );
+}
+
+// Snapshots written before the fix carry tags inline on the record; loading
+// migrates them into the tag store.
+#[test]
+fn inline_tags_migrate_into_tag_store() {
+    let mut d = crate::state::SageMakerData::default();
+    d.resources.entry("Model".into()).or_default().insert(
+        "m1".into(),
+        json!({"ModelName": "m1", "ModelArn": "arn:m1", "Tags": [{"Key": "k", "Value": "v"}]}),
+    );
+    d.migrate_inline_tags();
+    assert_eq!(
+        d.tag_list("arn:m1"),
+        vec![json!({"Key": "k", "Value": "v"})]
+    );
+    assert!(d.get_resource("Model", "m1").unwrap().get("Tags").is_none());
+}
+
+#[test]
+fn start_stop_on_missing_resource_is_not_found() {
+    let s = svc();
+    let err = expect_err(run(
+        &s,
+        "StopTrainingJob",
+        json!({"TrainingJobName": "nope"}),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+    let err = expect_err(run(
+        &s,
+        "StartNotebookInstance",
+        json!({"NotebookInstanceName": "nope"}),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+}
+
+#[test]
+fn search_evaluates_expression_over_stored_resources() {
+    let s = svc();
+    for (name, env) in [("job-a", "prod"), ("job-b", "dev"), ("other", "prod")] {
+        run(
+            &s,
+            "CreateTrainingJob",
+            json!({
+                "TrainingJobName": name,
+                "AlgorithmSpecification": {"TrainingInputMode": "File"},
+                "RoleArn": "arn:aws:iam::000000000000:role/r",
+                "OutputDataConfig": {"S3OutputPath": "s3://b/o"},
+                "ResourceConfig": {"VolumeSizeInGB": 1},
+                "StoppingCondition": {},
+                "HyperParameters": {"lr": "0.1"},
+                "Tags": [{"Key": "env", "Value": env}],
+            }),
+        )
+        .unwrap();
+    }
+    let out = resp_json(
+        &run(
+            &s,
+            "Search",
+            json!({
+                "Resource": "TrainingJob",
+                "SearchExpression": {
+                    "Filters": [
+                        {"Name": "TrainingJobName", "Operator": "Contains", "Value": "job-"},
+                        {"Name": "Tags.env", "Operator": "Equals", "Value": "prod"},
+                    ],
+                },
+            }),
+        )
+        .unwrap(),
+    );
+    let results = out["Results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{out}");
+    assert_eq!(results[0]["TrainingJob"]["TrainingJobName"], "job-a");
+    assert_eq!(
+        results[0]["TrainingJob"]["Tags"],
+        json!([{"Key": "env", "Value": "prod"}])
+    );
+    assert_eq!(out["TotalHits"]["Value"], 1);
+
+    // OR across sub-expressions, ascending by name.
+    let out = resp_json(
+        &run(
+            &s,
+            "Search",
+            json!({
+                "Resource": "TrainingJob",
+                "SortBy": "TrainingJobName",
+                "SortOrder": "Ascending",
+                "SearchExpression": {
+                    "Operator": "Or",
+                    "Filters": [
+                        {"Name": "TrainingJobName", "Value": "other"},
+                        {"Name": "Tags.env", "Value": "dev"},
+                    ],
+                },
+            }),
+        )
+        .unwrap(),
+    );
+    let names: Vec<&str> = out["Results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["TrainingJob"]["TrainingJobName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["job-b", "other"]);
+
+    // A resource type with nothing stored matches nothing.
+    let out = resp_json(&run(&s, "Search", json!({"Resource": "Endpoint"})).unwrap());
+    assert!(out["Results"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn query_lineage_walks_stored_associations() {
+    let s = svc();
+    let mk = |name: &str, ty: &str| -> String {
+        let out = resp_json(
+            &run(
+                &s,
+                "CreateArtifact",
+                json!({
+                    "ArtifactName": name,
+                    "Source": {"SourceUri": format!("s3://b/{name}")},
+                    "ArtifactType": ty,
+                }),
+            )
+            .unwrap(),
+        );
+        out["ArtifactArn"].as_str().unwrap().to_string()
+    };
+    let data = mk("data", "DataSet");
+    let model = mk("model", "Model");
+    let image = mk("image", "Image");
+    for (src, dst) in [(&data, &model), (&model, &image)] {
+        run(
+            &s,
+            "AddAssociation",
+            json!({"SourceArn": src, "DestinationArn": dst, "AssociationType": "ContributedTo"}),
+        )
+        .unwrap();
+    }
+    let out = resp_json(
+        &run(
+            &s,
+            "QueryLineage",
+            json!({"StartArns": [data], "Direction": "Descendants"}),
+        )
+        .unwrap(),
+    );
+    let arns: Vec<&str> = out["Vertices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["Arn"].as_str().unwrap())
+        .collect();
+    assert_eq!(arns, vec![data.as_str(), model.as_str(), image.as_str()]);
+    assert_eq!(out["Vertices"][1]["Type"], "Model");
+    assert_eq!(out["Vertices"][1]["LineageType"], "Artifact");
+    assert_eq!(out["Edges"].as_array().unwrap().len(), 2);
+
+    // Depth 1 stops after the first hop; a type filter narrows the vertices.
+    let out = resp_json(
+        &run(
+            &s,
+            "QueryLineage",
+            json!({"StartArns": [data], "Direction": "Descendants", "MaxDepth": 1,
+                   "Filters": {"Types": ["Model"]}}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(out["Vertices"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["Vertices"][0]["Arn"], model.as_str());
+
+    let err = expect_err(run(
+        &s,
+        "QueryLineage",
+        json!({"StartArns": ["arn:aws:sagemaker:us-east-1:000000000000:artifact/missing"]}),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+}
+
+#[test]
+fn extend_training_plan_redeems_offering_and_records_history() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateTrainingPlan",
+            json!({"TrainingPlanName": "tp1", "TrainingPlanOfferingId": "tpo-1"}),
+        )
+        .unwrap(),
+    );
+    let plan_arn = created["TrainingPlanArn"].as_str().unwrap().to_string();
+
+    let err = expect_err(run(
+        &s,
+        "ExtendTrainingPlan",
+        json!({"TrainingPlanExtensionOfferingId": "tpeo-unknown"}),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+
+    let offers = resp_json(
+        &run(
+            &s,
+            "SearchTrainingPlanOfferings",
+            json!({"TrainingPlanArn": plan_arn, "DurationHours": 48}),
+        )
+        .unwrap(),
+    );
+    let offering = &offers["TrainingPlanExtensionOfferings"][0];
+    assert_eq!(offering["DurationHours"], 48);
+    let id = offering["TrainingPlanExtensionOfferingId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ext = resp_json(
+        &run(
+            &s,
+            "ExtendTrainingPlan",
+            json!({"TrainingPlanExtensionOfferingId": id}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        ext["TrainingPlanExtensions"][0]["TrainingPlanExtensionOfferingId"],
+        id.as_str()
+    );
+
+    let plan = resp_json(
+        &run(
+            &s,
+            "DescribeTrainingPlan",
+            json!({"TrainingPlanName": "tp1"}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(plan["DurationHours"], 48);
+    assert_eq!(plan["EndTime"], offering["EndDate"]);
+
+    let hist = resp_json(
+        &run(
+            &s,
+            "DescribeTrainingPlanExtensionHistory",
+            json!({"TrainingPlanArn": plan_arn}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(hist["TrainingPlanExtensions"].as_array().unwrap().len(), 1);
+
+    // The offering is consumed.
+    let err = expect_err(run(
+        &s,
+        "ExtendTrainingPlan",
+        json!({"TrainingPlanExtensionOfferingId": id}),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+}
+
+#[test]
+fn cluster_node_volume_attach_detach_round_trip() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateCluster",
+            json!({"ClusterName": "c1", "InstanceGroups": []}),
+        )
+        .unwrap(),
+    );
+    let cluster_arn = created["ClusterArn"].as_str().unwrap().to_string();
+    run(
+        &s,
+        "BatchAddClusterNodes",
+        json!({"ClusterName": "c1", "NodesToAdd": [{"InstanceGroupName": "g", "IncrementTargetCountBy": 2}]}),
+    )
+    .unwrap();
+    let nodes = resp_json(&run(&s, "ListClusterNodes", json!({"ClusterName": "c1"})).unwrap());
+    let instance_ids: Vec<String> = {
+        let g = s.state.read();
+        let d = g.get("000000000000").unwrap();
+        nodes["ClusterNodeSummaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                let k = n["NodeLogicalId"].as_str().unwrap();
+                d.get_resource("ClusterNode", k).unwrap()["InstanceId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let body =
+        |node: &str, vol: &str| json!({"ClusterArn": cluster_arn, "NodeId": node, "VolumeId": vol});
+
+    let a = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeVolume",
+            body(&instance_ids[0], "vol-0123456789abcdef0"),
+        )
+        .unwrap(),
+    );
+    assert_eq!(a["Status"], "ATTACHING");
+    assert_eq!(a["DeviceName"], "/dev/sdf");
+    let b = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeVolume",
+            body(&instance_ids[0], "vol-0123456789abcdef1"),
+        )
+        .unwrap(),
+    );
+    assert_eq!(b["DeviceName"], "/dev/sdg");
+
+    // Already attached (to any node) is a conflict.
+    let err = expect_err(run(
+        &s,
+        "AttachClusterNodeVolume",
+        body(&instance_ids[1], "vol-0123456789abcdef0"),
+    ));
+    assert_eq!(status_code(err), "ConflictException");
+
+    let d = resp_json(
+        &run(
+            &s,
+            "DetachClusterNodeVolume",
+            body(&instance_ids[0], "vol-0123456789abcdef0"),
+        )
+        .unwrap(),
+    );
+    assert_eq!(d["Status"], "DETACHING");
+    assert_eq!(d["DeviceName"], "/dev/sdf");
+    assert_eq!(d["AttachTime"], a["AttachTime"]);
+
+    // Detaching again (no longer attached) and unknown nodes are not found.
+    let err = expect_err(run(
+        &s,
+        "DetachClusterNodeVolume",
+        body(&instance_ids[0], "vol-0123456789abcdef0"),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+    let err = expect_err(run(
+        &s,
+        "AttachClusterNodeVolume",
+        body("i-00000000deadbeef0", "vol-0123456789abcdef2"),
+    ));
+    assert_eq!(status_code(err), "ResourceNotFound");
+}

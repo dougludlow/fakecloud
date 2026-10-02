@@ -23,25 +23,25 @@ impl PinpointService {
         record.insert("Arn".into(), json!(arn));
         record.insert("Name".into(), json!(name));
         record.insert("CreationDate".into(), json!(shared::now_iso()));
-        if let Some(tags) = body.get("tags") {
-            if tags.is_object() {
-                record.insert("tags".into(), tags.clone());
-            }
-        }
         let record = Value::Object(record);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
+        // Create-time tags live in the ARN-keyed tag store, which GetApp /
+        // GetApps render and TagResource / UntagResource mutate.
+        data.set_tags(&arn, body.get("tags"));
         let app = App {
             record: record.clone(),
             ..App::default()
         };
         data.apps.insert(id, app);
-        created(record)
+        created(data.render(&record))
     }
 
     pub(super) fn get_app(&self, ctx: &Ctx, app_id: &str) -> Result<AwsResponse, AwsServiceError> {
-        self.with_app(&ctx.account, app_id, |app| Ok(app.record.clone()))
-            .and_then(ok)
+        self.with_app_data(&ctx.account, app_id, |data, app| {
+            Ok(data.render(&app.record))
+        })
+        .and_then(ok)
     }
 
     pub(super) fn delete_app(
@@ -52,7 +52,35 @@ impl PinpointService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         match data.apps.remove(app_id) {
-            Some(app) => ok(app.record),
+            Some(app) => {
+                let out = data.render(&app.record);
+                // The app's tags, and those of every resource scoped under it,
+                // go with it.
+                let mut arns: Vec<String> = Vec::new();
+                for rec in std::iter::once(&app.record).chain(
+                    app.campaigns
+                        .values()
+                        .chain(app.segments.values())
+                        .map(|v| &v.current),
+                ) {
+                    if let Some(arn) = rec.get("Arn").and_then(Value::as_str) {
+                        arns.push(arn.to_string());
+                    }
+                }
+                for jid in app.journeys.keys() {
+                    arns.push(shared::nested_arn(
+                        &ctx.region,
+                        &ctx.account,
+                        app_id,
+                        "journeys",
+                        jid,
+                    ));
+                }
+                for arn in arns {
+                    data.remove_tags(&arn);
+                }
+                ok(out)
+            }
             None => Err(not_found_app(app_id)),
         }
     }
@@ -65,7 +93,7 @@ impl PinpointService {
         let guard = self.state.read();
         let items: Vec<Value> = guard
             .get(&ctx.account)
-            .map(|d| d.apps.values().map(|a| a.record.clone()).collect())
+            .map(|d| d.apps.values().map(|a| d.render(&a.record)).collect())
             .unwrap_or_default();
         let (page, next) = paginate(items, q)?;
         let mut out = Map::new();

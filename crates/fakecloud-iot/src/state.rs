@@ -95,6 +95,60 @@ impl IotData {
             .unwrap_or_default()
     }
 
+    /// Replace `arn`'s whole tag set (an empty set removes the entry). Tags have
+    /// exactly one home, this ARN-keyed map, which TagResource / UntagResource /
+    /// ListTagsForResource and every tagged `Create*` share.
+    pub fn set_tags(&mut self, arn: &str, tags: BTreeMap<String, String>) {
+        if tags.is_empty() {
+            self.tags.remove(arn);
+        } else {
+            self.tags.insert(arn.to_string(), tags);
+        }
+    }
+
+    /// Drop every tag stored for `arn` (the resource was deleted).
+    pub fn remove_tags(&mut self, arn: &str) {
+        self.tags.remove(arn);
+    }
+
+    /// One-time migration for snapshots written before tags had a single home:
+    /// move each record's inline `tags` member into the ARN-keyed tag store,
+    /// keyed by the record's own IoT ARN member (the `*Arn` naming this
+    /// resource's primary name). Tags already in the store win on conflict.
+    pub fn migrate_inline_tags(&mut self) {
+        let mut moved: Vec<(String, Value)> = Vec::new();
+        for records in self.resources.values_mut() {
+            for (key, rec) in records.iter_mut() {
+                let Some(obj) = rec.as_object_mut() else {
+                    continue;
+                };
+                if !obj.contains_key("tags") {
+                    continue;
+                }
+                let primary = key.rsplit('/').next().unwrap_or(key);
+                let suffix = format!("/{primary}");
+                let arn = obj
+                    .iter()
+                    .filter(|(k, _)| k.ends_with("Arn"))
+                    .filter_map(|(_, v)| v.as_str())
+                    .find(|v| v.starts_with("arn:") && v.contains(":iot:") && v.ends_with(&suffix))
+                    .map(str::to_string);
+                if let Some(arn) = arn {
+                    if let Some(tags) = obj.remove("tags") {
+                        moved.push((arn, tags));
+                    }
+                }
+            }
+        }
+        for (arn, tags) in moved {
+            let mut set = crate::service::parse_tags(&tags);
+            if let Some(existing) = self.tags.remove(&arn) {
+                set.extend(existing);
+            }
+            self.set_tags(&arn, set);
+        }
+    }
+
     /// Next unique sequence value for id minting.
     pub fn next_seq(&mut self) -> u64 {
         self.seq += 1;

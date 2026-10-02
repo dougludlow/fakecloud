@@ -53,6 +53,13 @@ attributes, and round-trips on read / list / update with paginating
 - **Resource positions** — `UpdateResourcePosition` / `GetResourcePosition`
   store and return the raw GeoJSON `@httpPayload` blob.
 - **Tags** — ARN-keyed `TagResource` / `ListTagsForResource` / `UntagResource`.
+  Tags passed to a `Create*` (or to the import-task / partner-account
+  operations) land in the same store, and deleting a resource drops its tags.
+
+`Update*` on a resource that does not exist returns
+`ResourceNotFoundException` rather than materialising it; only the
+identifier-attached configurations (`UpdatePosition`,
+`UpdateResourceEventConfiguration`) are written by the update itself.
 
 Input validation is model-derived: `required` members (including a required
 `@httpPayload`), string `@length`, numeric `@range`, and `@enum` constraints are

@@ -116,14 +116,27 @@ pub(super) fn create(
         .entry("CreationTime".to_string())
         .or_insert_with(now_epoch);
 
+    // Create-time `Tags` live in the ARN-keyed tag store ListTagsForResource /
+    // TagResource / UntagResource share, not inline on the record. The set
+    // replaces whatever a previous same-key resource left behind.
+    let tags = record.remove("Tags");
+    data.set_tag_list(&mint_arn(ctx, &rtype, &key), tags.as_ref());
+
     let out = build_output(meta, &Value::Object(record.clone()));
     data.put_resource(&rtype, &key, Value::Object(record));
     Ok(ok_json(out))
 }
 
-/// Update is an upsert: IoT Wireless round-trip tests drive `Update*` against a
-/// resource that may not have been explicitly created in the same test, so an
-/// absent record is materialised from the request rather than 404'd.
+/// Families whose `Update*` writes a configuration attached to an identifier
+/// (a resource position, a resource event configuration) rather than mutating
+/// a resource some `Create*` made. No operation creates these records, so the
+/// update itself is what stores them.
+const CONFIG_FAMILIES: &[&str] = &["positions", "event-configurations"];
+
+/// Update merges the request onto the stored resource. Updating a resource
+/// that does not exist is a `ResourceNotFoundException` (it never materialises
+/// a phantom record), except for the identifier-attached configuration
+/// families in [`CONFIG_FAMILIES`], which are written by the update itself.
 pub(super) fn update(
     data: &mut IotWirelessData,
     ctx: &Ctx,
@@ -131,15 +144,15 @@ pub(super) fn update(
     labels: &HashMap<String, String>,
     query: &[(String, String)],
     body: &Map<String, Value>,
-) -> AwsResponse {
+) -> Result<AwsResponse, AwsServiceError> {
     let rtype = resource_type(meta);
     let key = storage_key(meta, labels);
 
-    let mut record: Map<String, Value> = data
-        .get_resource(&rtype, &key)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let mut record: Map<String, Value> = match data.get_resource(&rtype, &key) {
+        Some(existing) => existing.as_object().cloned().unwrap_or_default(),
+        None if CONFIG_FAMILIES.contains(&rtype.as_str()) => Map::new(),
+        None => return Err(not_found(meta, &key)),
+    };
 
     // Overlay path labels (the resource's identifier field) and query params.
     for (name, val) in labels {
@@ -167,7 +180,7 @@ pub(super) fn update(
 
     let out = build_output(meta, &Value::Object(record.clone()));
     data.put_resource(&rtype, &key, Value::Object(record));
-    ok_json(out)
+    Ok(ok_json(out))
 }
 
 /// Reshape update-only request members into the shape the family's Get reads.
@@ -254,12 +267,17 @@ fn nest_into_lorawan(record: &mut Map<String, Value>, keys: &[&str]) {
 
 pub(super) fn delete(
     data: &mut IotWirelessData,
+    ctx: &Ctx,
     meta: &OpMeta,
     labels: &HashMap<String, String>,
 ) -> AwsResponse {
     let rtype = resource_type(meta);
     let key = storage_key(meta, labels);
-    data.remove_resource(&rtype, &key);
+    if data.remove_resource(&rtype, &key).is_some() {
+        // The resource's tags go with it, so a same-key re-create starts
+        // untagged.
+        data.remove_tags(&mint_arn(ctx, &rtype, &key));
+    }
     // AWS delete operations are idempotent: deleting an absent resource is a
     // success. The output shapes carry no required members.
     ok_json(Value::Object(Map::new()))

@@ -25,7 +25,8 @@ impl PinpointService {
             .and_then(|d| d.apps.get_mut(app_id))
             .ok_or_else(|| super::not_found_app(app_id))?;
         app.journeys.insert(id, record.clone());
-        created(record)
+        drop(guard);
+        created(self.render_journey(ctx, app_id, &record))
     }
 
     pub(super) fn get_journey(
@@ -34,10 +35,10 @@ impl PinpointService {
         app_id: &str,
         jid: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        self.with_app(&ctx.account, app_id, |app| {
+        self.with_app_data(&ctx.account, app_id, |data, app| {
             app.journeys
                 .get(jid)
-                .cloned()
+                .map(|r| data.render_as(r, &journey_arn(ctx, app_id, jid)))
                 .ok_or_else(|| not_found_journey(jid))
         })
         .and_then(ok)
@@ -66,7 +67,8 @@ impl PinpointService {
             .to_string();
         let record = build_journey(app_id, jid, &state, body);
         app.journeys.insert(jid.to_string(), record.clone());
-        ok(record)
+        drop(guard);
+        ok(self.render_journey(ctx, app_id, &record))
     }
 
     pub(super) fn update_journey_state(
@@ -94,7 +96,9 @@ impl PinpointService {
             obj.insert("State".into(), json!(new_state));
             obj.insert("LastModifiedDate".into(), json!(shared::now_iso()));
         }
-        ok(journey.clone())
+        let record = journey.clone();
+        drop(guard);
+        ok(self.render_journey(ctx, app_id, &record))
     }
 
     pub(super) fn delete_journey(
@@ -104,12 +108,21 @@ impl PinpointService {
         jid: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        let app = guard
+        let data = guard
             .get_mut(&ctx.account)
-            .and_then(|d| d.apps.get_mut(app_id))
+            .filter(|d| d.apps.contains_key(app_id))
             .ok_or_else(|| not_found_app(app_id))?;
-        match app.journeys.remove(jid) {
-            Some(rec) => ok(rec),
+        let removed = data
+            .apps
+            .get_mut(app_id)
+            .and_then(|app| app.journeys.remove(jid));
+        match removed {
+            Some(rec) => {
+                let arn = journey_arn(ctx, app_id, jid);
+                let out = data.render_as(&rec, &arn);
+                data.remove_tags(&arn);
+                ok(out)
+            }
             None => Err(not_found_journey(jid)),
         }
     }
@@ -120,8 +133,12 @@ impl PinpointService {
         app_id: &str,
         q: &[(String, String)],
     ) -> Result<AwsResponse, AwsServiceError> {
-        let items = self.with_app(&ctx.account, app_id, |app| {
-            Ok(app.journeys.values().cloned().collect::<Vec<_>>())
+        let items = self.with_app_data(&ctx.account, app_id, |data, app| {
+            Ok(app
+                .journeys
+                .iter()
+                .map(|(jid, r)| data.render_as(r, &journey_arn(ctx, app_id, jid)))
+                .collect::<Vec<_>>())
         })?;
         let (page, next) = paginate(items, q)?;
         let mut out = Map::new();
@@ -241,6 +258,24 @@ impl PinpointService {
             "Metrics": {},
         }))
     }
+}
+
+impl PinpointService {
+    /// A journey response with its `tags` rendered from the tag store.
+    fn render_journey(&self, ctx: &Ctx, app_id: &str, record: &Value) -> Value {
+        let jid = record.get("Id").and_then(Value::as_str).unwrap_or_default();
+        let arn = journey_arn(ctx, app_id, jid);
+        let guard = self.state.read();
+        match guard.get(&ctx.account) {
+            Some(data) => data.render_as(record, &arn),
+            None => record.clone(),
+        }
+    }
+}
+
+/// A journey's ARN (`JourneyResponse` carries none, but TagResource takes it).
+fn journey_arn(ctx: &Ctx, app_id: &str, jid: &str) -> String {
+    shared::nested_arn(&ctx.region, &ctx.account, app_id, "journeys", jid)
 }
 
 fn not_found_journey(jid: &str) -> AwsServiceError {

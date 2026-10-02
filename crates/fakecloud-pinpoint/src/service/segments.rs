@@ -18,19 +18,25 @@ impl PinpointService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = shared::hex_id();
         let mut guard = self.state.write();
-        let app = guard
+        let data = guard
             .get_mut(&ctx.account)
-            .and_then(|d| d.apps.get_mut(app_id))
+            .filter(|d| d.apps.contains_key(app_id))
             .ok_or_else(|| super::not_found_app(app_id))?;
         let record = build_segment(ctx, app_id, &id, 1, body);
-        app.segments.insert(
-            id,
-            Versioned {
-                current: record.clone(),
-                versions: vec![record.clone()],
-            },
-        );
-        created(record)
+        // Create-time tags live in the ARN-keyed tag store the reads render.
+        if let Some(arn) = record.get("Arn").and_then(Value::as_str) {
+            data.set_tags(arn, body.get("tags"));
+        }
+        if let Some(app) = data.apps.get_mut(app_id) {
+            app.segments.insert(
+                id,
+                Versioned {
+                    current: record.clone(),
+                    versions: vec![record.clone()],
+                },
+            );
+        }
+        created(data.render(&record))
     }
 
     pub(super) fn get_segment(
@@ -39,10 +45,10 @@ impl PinpointService {
         app_id: &str,
         sid: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        self.with_app(&ctx.account, app_id, |app| {
+        self.with_app_data(&ctx.account, app_id, |data, app| {
             app.segments
                 .get(sid)
-                .map(|v| v.current.clone())
+                .map(|v| data.render(&v.current))
                 .ok_or_else(|| not_found_segment(sid))
         })
         .and_then(ok)
@@ -56,19 +62,22 @@ impl PinpointService {
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        let app = guard
+        let data = guard
             .get_mut(&ctx.account)
-            .and_then(|d| d.apps.get_mut(app_id))
+            .filter(|d| d.apps.contains_key(app_id))
             .ok_or_else(|| not_found_app(app_id))?;
-        let seg = app
-            .segments
-            .get_mut(sid)
+        let seg = data
+            .apps
+            .get_mut(app_id)
+            .and_then(|app| app.segments.get_mut(sid))
             .ok_or_else(|| not_found_segment(sid))?;
         let version = seg.versions.len() as i64 + 1;
+        // `tags` on an update is deprecated and ignored by AWS: the segment
+        // keeps the tags in the tag store.
         let record = build_segment(ctx, app_id, sid, version, body);
         seg.versions.push(record.clone());
         seg.current = record.clone();
-        ok(record)
+        ok(data.render(&record))
     }
 
     pub(super) fn delete_segment(
@@ -78,12 +87,22 @@ impl PinpointService {
         sid: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        let app = guard
+        let data = guard
             .get_mut(&ctx.account)
-            .and_then(|d| d.apps.get_mut(app_id))
+            .filter(|d| d.apps.contains_key(app_id))
             .ok_or_else(|| not_found_app(app_id))?;
-        match app.segments.remove(sid) {
-            Some(v) => ok(v.current),
+        let removed = data
+            .apps
+            .get_mut(app_id)
+            .and_then(|app| app.segments.remove(sid));
+        match removed {
+            Some(v) => {
+                let out = data.render(&v.current);
+                if let Some(arn) = v.current.get("Arn").and_then(Value::as_str) {
+                    data.remove_tags(arn);
+                }
+                ok(out)
+            }
             None => Err(not_found_segment(sid)),
         }
     }
@@ -94,11 +113,11 @@ impl PinpointService {
         app_id: &str,
         q: &[(String, String)],
     ) -> Result<AwsResponse, AwsServiceError> {
-        let items = self.with_app(&ctx.account, app_id, |app| {
+        let items = self.with_app_data(&ctx.account, app_id, |data, app| {
             Ok(app
                 .segments
                 .values()
-                .map(|v| v.current.clone())
+                .map(|v| data.render(&v.current))
                 .collect::<Vec<_>>())
         })?;
         segments_page(items, q)
@@ -111,10 +130,16 @@ impl PinpointService {
         sid: &str,
         q: &[(String, String)],
     ) -> Result<AwsResponse, AwsServiceError> {
-        let items = self.with_app(&ctx.account, app_id, |app| {
+        let items = self.with_app_data(&ctx.account, app_id, |data, app| {
             app.segments
                 .get(sid)
-                .map(|v| v.versions.iter().rev().cloned().collect::<Vec<_>>())
+                .map(|v| {
+                    v.versions
+                        .iter()
+                        .rev()
+                        .map(|r| data.render(r))
+                        .collect::<Vec<_>>()
+                })
                 .ok_or_else(|| not_found_segment(sid))
         })?;
         segments_page(items, q)
@@ -127,7 +152,7 @@ impl PinpointService {
         sid: &str,
         ver: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        self.with_app(&ctx.account, app_id, |app| {
+        self.with_app_data(&ctx.account, app_id, |data, app| {
             let seg = app
                 .segments
                 .get(sid)
@@ -137,7 +162,7 @@ impl PinpointService {
                 .map_err(|_| not_found(&format!("Segment version '{ver}' does not exist.")))?;
             seg.versions
                 .get(n.wrapping_sub(1))
-                .cloned()
+                .map(|r| data.render(r))
                 .ok_or_else(|| not_found(&format!("Segment version '{ver}' does not exist.")))
         })
         .and_then(ok)
@@ -213,6 +238,8 @@ fn build_segment(ctx: &Ctx, app_id: &str, id: &str, version: i64, body: &Value) 
     // Name / tags / ImportDefinition, ...) so GetSegment round-trips it, then
     // overlay server-authoritative members.
     merge_body(&mut out, body);
+    // Tags live in the ARN-keyed tag store, never inline on the record.
+    out.remove("tags");
     out.insert("Id".into(), json!(id));
     out.insert("ApplicationId".into(), json!(app_id));
     out.insert(
