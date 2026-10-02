@@ -23,6 +23,7 @@ mod acl;
 mod annotations;
 mod buckets;
 pub(crate) mod config;
+mod control_tags;
 mod lock;
 mod multipart;
 pub(crate) mod notifications;
@@ -521,7 +522,11 @@ impl AwsService for S3Service {
         // flagged (PutObjectTagging, PutObjectAcl, PutObjectRetention,
         // PutObjectLegalHold, CopyObject, …) reads a small XML/JSON
         // body from `req.body`, so drain the stream for them.
+        // S3 Control (`s3-control` host) shares this handler; its PUTs
+        // (CreateAccessPoint, ...) carry an XML body, never object data.
+        let is_control = fakecloud_core::protocol::is_s3_control_host(&req.headers);
         let is_put_to_key = req.method == Method::PUT
+            && !is_control
             && req.path_segments.len() >= 2
             && req
                 .path_segments
@@ -555,13 +560,7 @@ impl AwsService for S3Service {
 
         let account_id = req.account_id.as_str();
 
-        // S3 Control endpoint (access point management).
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let is_control = host.to_ascii_lowercase().contains("s3-control");
+        // S3 Control endpoint (access point management, resource tagging).
         if is_control {
             let v1 = req.path_segments.first().map(|s| s.as_str());
             let v2 = req.path_segments.get(1).map(|s| s.as_str());
@@ -576,6 +575,11 @@ impl AwsService for S3Service {
                     }
                 } else if req.method == Method::GET {
                     return self.list_access_points(account_id, &req);
+                }
+            }
+            if v1 == Some("v20180820") && v2 == Some("tags") {
+                if let Some(result) = self.handle_control_tags(account_id, &req) {
+                    return result;
                 }
             }
         }
@@ -1612,15 +1616,28 @@ impl AwsService for S3Service {
         // ListAccessPoints actions — NOT the object-level GetObject/PutObject/
         // DeleteObject the generic method-based detection would pick, which made
         // access-point policies ineffective.
-        let host = request
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if host.to_ascii_lowercase().contains("s3-control")
-            && request.path_segments.first().map(|s| s.as_str()) == Some("v20180820")
-            && request.path_segments.get(1).map(|s| s.as_str()) == Some("accesspoint")
-        {
+        let is_control = fakecloud_core::protocol::is_s3_control_host(&request.headers)
+            && request.path_segments.first().map(|s| s.as_str()) == Some("v20180820");
+        // S3 Control resource tagging is authorized as s3:TagResource /
+        // UntagResource / ListTagsForResource on the tagged resource's ARN.
+        if is_control && request.path_segments.get(1).map(|s| s.as_str()) == Some("tags") {
+            let action = match request.method.as_str() {
+                "GET" => Some("ListTagsForResource"),
+                "POST" => Some("TagResource"),
+                "DELETE" => Some("UntagResource"),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let resource = control_tags::resource_arn_from_path(request)
+                    .unwrap_or_else(|| "*".to_string());
+                return Some(fakecloud_core::auth::IamAction {
+                    service: "s3",
+                    action,
+                    resource,
+                });
+            }
+        }
+        if is_control && request.path_segments.get(1).map(|s| s.as_str()) == Some("accesspoint") {
             let has_name = request.path_segments.get(2).is_some();
             let ap_action = match (request.method.as_str(), has_name) {
                 ("PUT", true) => Some("CreateAccessPoint"),
@@ -4310,6 +4327,47 @@ mod partition_tests {
             let action = svc.iam_action_for(&r).unwrap();
             assert_eq!(action.action, "GetAccessPoint");
             assert_eq!(action.resource, want);
+        }
+    }
+
+    #[test]
+    fn control_tagging_iam_action_targets_resource_arn() {
+        let svc = S3Service::new(
+            Arc::new(RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            Arc::new(DeliveryBus::new()),
+        );
+        for (method, want_action, path, want_resource) in [
+            (
+                Method::GET,
+                "ListTagsForResource",
+                "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Amy-bucket",
+                "arn:aws:s3:::my-bucket",
+            ),
+            (
+                Method::POST,
+                "TagResource",
+                "/v20180820/tags/arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+            ),
+            (
+                Method::DELETE,
+                "UntagResource",
+                "/v20180820/tags/arn:aws:s3:::my-bucket",
+                "arn:aws:s3:::my-bucket",
+            ),
+        ] {
+            let mut r = request(method, "us-east-1", path);
+            r.headers
+                .insert("host", "123456789012.s3-control.localhost".parse().unwrap());
+            let action = svc.iam_action_for(&r).unwrap();
+            assert_eq!(action.action, want_action);
+            assert_eq!(action.resource, want_resource);
         }
     }
 

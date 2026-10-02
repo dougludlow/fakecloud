@@ -256,6 +256,8 @@ pub struct S3AccessPoint {
     pub creation_date: DateTime<Utc>,
     pub public_access_block: Option<String>,
     pub bucket_account_id: Option<String>,
+    /// Tags set through S3 Control `TagResource` on the access point ARN.
+    pub tags: BTreeMap<String, String>,
 }
 
 pub struct S3State {

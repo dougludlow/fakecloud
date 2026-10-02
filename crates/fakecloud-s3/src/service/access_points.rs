@@ -129,6 +129,7 @@ impl S3Service {
             creation_date: Utc::now(),
             public_access_block,
             bucket_account_id: Some(account_id.to_string()),
+            tags: Default::default(),
         };
 
         let arn = Arn::s3_access_point(&req.region, account_id, name);

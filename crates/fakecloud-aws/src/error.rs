@@ -176,6 +176,38 @@ pub fn s3_xml_error_response_with_fields(
     (status, "application/xml".to_string(), Bytes::from(buffer))
 }
 
+/// Build an S3 Control XML error response. S3 Control is served by the S3
+/// handler but, unlike S3's bare `<Error>`, wraps its errors in an
+/// un-namespaced `<ErrorResponse>`; the S3 Control SDKs only find the code
+/// inside that wrapper.
+///
+/// ```xml
+/// <ErrorResponse>
+///   <Error><Code>..</Code><Message>..</Message>..</Error>
+///   <RequestId>..</RequestId>
+/// </ErrorResponse>
+/// ```
+pub fn s3_control_xml_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    request_id: &str,
+    extra_fields: &[(String, String)],
+) -> (StatusCode, String, Bytes) {
+    let mut buffer =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ErrorResponse><Error>");
+    buffer.push_str(&format!("<Code>{}</Code>", xml_escape(code)));
+    buffer.push_str(&format!("<Message>{}</Message>", xml_escape(message)));
+    for (key, value) in extra_fields {
+        buffer.push_str(&format!("<{}>{}</{}>", key, xml_escape(value), key));
+    }
+    buffer.push_str(&format!(
+        "</Error><RequestId>{}</RequestId></ErrorResponse>",
+        xml_escape(request_id)
+    ));
+    (status, "application/xml".to_string(), Bytes::from(buffer))
+}
+
 use crate::xml::xml_escape;
 
 #[cfg(test)]
@@ -206,6 +238,28 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["__type"], "ValidationException");
         assert_eq!(v["message"], "bad input");
+    }
+
+    #[test]
+    fn s3_control_xml_error_is_wrapped() {
+        let (status, _, body) = s3_control_xml_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            "req-c",
+            &[("BucketName".to_string(), "b<1>".to_string())],
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains(
+                "<ErrorResponse><Error><Code>NoSuchBucket</Code>\
+                 <Message>The specified bucket does not exist</Message>\
+                 <BucketName>b&lt;1&gt;</BucketName></Error>\
+                 <RequestId>req-c</RequestId></ErrorResponse>"
+            ),
+            "{body}"
+        );
     }
 
     #[test]

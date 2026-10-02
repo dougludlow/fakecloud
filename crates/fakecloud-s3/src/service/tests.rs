@@ -6614,6 +6614,7 @@ fn access_point_data_plane_routes_to_bucket() {
                 creation_date: chrono::Utc::now(),
                 public_access_block: None,
                 bucket_account_id: Some("000000000000".to_string()),
+                tags: Default::default(),
             },
         );
     }
