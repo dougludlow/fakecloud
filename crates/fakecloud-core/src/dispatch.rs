@@ -1713,13 +1713,7 @@ fn unresolved_credential_response(
             "The security token included in the request is invalid",
         )
     };
-    build_error_response(
-        StatusCode::FORBIDDEN,
-        code,
-        message,
-        request_id,
-        envelope,
-    )
+    build_error_response(StatusCode::FORBIDDEN, code, message, request_id, envelope)
 }
 
 fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<String> {
