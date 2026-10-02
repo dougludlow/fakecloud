@@ -1078,6 +1078,160 @@ async fn describe_addon_versions_catalog_is_non_empty() {
     assert_eq!(addons[0]["addonName"], "coredns");
 }
 
+async fn addon_versions(svc: &EksService, query: &str) -> Vec<Value> {
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            &format!("/addons/supported-versions?{query}"),
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    v["addons"].as_array().unwrap().clone()
+}
+
+/// The version flagged `defaultVersion` for `cluster_version`, the way the
+/// Terraform `aws_eks_addon_version` data source picks it.
+fn default_version_of(addon: &Value, cluster_version: &str) -> Option<String> {
+    addon["addonVersions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ver| {
+            ver["compatibilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["clusterVersion"] == cluster_version && c["defaultVersion"] == true)
+        })
+        .map(|ver| ver["addonVersion"].as_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn describe_addon_versions_lists_pod_identity_agent_for_cluster_version() {
+    let svc = EksService::new(make_state());
+    let addons = addon_versions(
+        &svc,
+        "addonName=eks-pod-identity-agent&kubernetesVersion=1.32",
+    )
+    .await;
+    assert_eq!(addons.len(), 1);
+    let a = &addons[0];
+    assert_eq!(a["type"], "security");
+    assert_eq!(a["owner"], "aws");
+    assert_eq!(a["publisher"], "eks");
+    assert_eq!(a["defaultNamespace"], "kube-system");
+    assert!(!a["addonVersions"].as_array().unwrap().is_empty());
+    // Every compatibility is scoped to the requested cluster version.
+    for ver in a["addonVersions"].as_array().unwrap() {
+        for c in ver["compatibilities"].as_array().unwrap() {
+            assert_eq!(c["clusterVersion"], "1.32");
+        }
+    }
+    assert_eq!(
+        default_version_of(a, "1.32").as_deref(),
+        Some("v1.3.4-eksbuild.1")
+    );
+}
+
+#[tokio::test]
+async fn describe_addon_versions_catalog_covers_aws_and_community_addons() {
+    let svc = EksService::new(make_state());
+    let addons = addon_versions(&svc, "kubernetesVersion=1.31").await;
+    let names: Vec<&str> = addons
+        .iter()
+        .map(|a| a["addonName"].as_str().unwrap())
+        .collect();
+    for want in [
+        "eks-pod-identity-agent",
+        "metrics-server",
+        "snapshot-controller",
+        "amazon-cloudwatch-observability",
+        "aws-guardduty-agent",
+        "aws-mountpoint-s3-csi-driver",
+        "adot",
+        "eks-node-monitoring-agent",
+        "aws-network-flow-monitoring-agent",
+    ] {
+        assert!(names.contains(&want), "missing {want}");
+    }
+    // Every add-on has exactly one default version for the cluster version.
+    for a in &addons {
+        let defaults = a["addonVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|ver| ver["compatibilities"][0]["defaultVersion"] == true)
+            .count();
+        assert_eq!(defaults, 1, "{}", a["addonName"]);
+    }
+
+    // `owners` / `types` filters.
+    let community = addon_versions(&svc, "kubernetesVersion=1.31&owners=community").await;
+    assert!(!community.is_empty());
+    assert!(community.iter().all(|a| a["owner"] == "community"));
+    let security = addon_versions(&svc, "types=security").await;
+    assert!(security
+        .iter()
+        .any(|a| a["addonName"] == "eks-pod-identity-agent"));
+    assert!(security.iter().all(|a| a["type"] == "security"));
+    // Repeated list keys OR together.
+    let mixed = addon_versions(&svc, "types=security&types=storage").await;
+    assert!(mixed.iter().any(|a| a["type"] == "security"));
+    assert!(mixed.iter().any(|a| a["type"] == "storage"));
+    assert!(mixed
+        .iter()
+        .all(|a| a["type"] == "security" || a["type"] == "storage"));
+
+    // A Kubernetes version EKS does not offer has no add-ons.
+    assert!(addon_versions(&svc, "kubernetesVersion=1.99")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn describe_addon_versions_tracks_kubernetes_minor() {
+    let svc = EksService::new(make_state());
+    let kp = addon_versions(&svc, "addonName=kube-proxy&kubernetesVersion=1.33").await;
+    assert_eq!(
+        default_version_of(&kp[0], "1.33").as_deref(),
+        Some("v1.33.0-eksbuild.2")
+    );
+    // Without a kubernetesVersion every catalog cluster version is covered.
+    let all = addon_versions(&svc, "addonName=coredns").await;
+    let compat_versions: Vec<String> = all[0]["addonVersions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|ver| ver["compatibilities"].as_array().unwrap().clone())
+        .map(|c| c["clusterVersion"].as_str().unwrap().to_string())
+        .collect();
+    for cv in ["1.28", "1.31", "1.34"] {
+        assert!(compat_versions.iter().any(|v| v == cv), "missing {cv}");
+    }
+    assert_eq!(
+        default_version_of(&all[0], "1.34").as_deref(),
+        Some("v1.12.1-eksbuild.2")
+    );
+}
+
+#[tokio::test]
+async fn create_addon_defaults_to_catalog_default_version() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c1/addons",
+            &json!({ "addonName": "eks-pod-identity-agent" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addon"]["addonVersion"], "v1.3.4-eksbuild.1");
+}
+
 #[tokio::test]
 async fn describe_addon_configuration_returns_schema() {
     let svc = EksService::new(make_state());
