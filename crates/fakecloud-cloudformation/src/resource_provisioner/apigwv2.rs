@@ -56,42 +56,67 @@ fn parse_cfn_tag_map(v: Option<&serde_json::Value>) -> Option<BTreeMap<String, S
     None
 }
 
-/// Whether every route `routes` (built from a definition) describes is already
-/// on the API with the same integration, i.e. re-importing it would change
-/// nothing about the imported routes.
-fn definition_routes_present(
-    state: &fakecloud_apigatewayv2::ApiGatewayV2State,
+/// SHA-256 (hex) of a definition document, as recorded for change detection.
+fn definition_sha256(definition: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(definition.to_string().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Apply `definition` to the API `api_id` as a stack's `Body` /
+/// `BodyS3Location`: remove the routes and integrations the previous import
+/// created (and only those), import the new definition's, set the API's
+/// name / description / version from it, and record the import. `None`
+/// (the template dropped the definition) just removes the previous import.
+fn apply_http_api_definition(
+    state: &mut fakecloud_apigatewayv2::ApiGatewayV2State,
     api_id: &str,
-    routes: &BTreeMap<String, ApiGwV2Route>,
-    integrations: &BTreeMap<String, ApiGwV2Integration>,
-) -> bool {
-    let existing_routes = state.routes.get(api_id);
-    let existing_integrations = state.integrations.get(api_id);
-    let integration_of =
-        |target: Option<&String>, pool: Option<&BTreeMap<String, ApiGwV2Integration>>| {
-            target
-                .and_then(|t| t.strip_prefix("integrations/"))
-                .and_then(|id| pool.and_then(|p| p.get(id)))
-                .map(|i| {
-                    (
-                        i.integration_type.clone(),
-                        i.integration_uri.clone(),
-                        i.payload_format_version.clone(),
-                        i.timeout_in_millis,
-                        i.integration_method.clone(),
-                    )
-                })
-        };
-    routes.values().all(|wanted| {
-        let want = integration_of(wanted.target.as_ref(), Some(integrations));
-        existing_routes
-            .into_iter()
-            .flat_map(|m| m.values())
-            .any(|have| {
-                have.route_key == wanted.route_key
-                    && integration_of(have.target.as_ref(), existing_integrations) == want
-            })
-    })
+    definition: Option<&serde_json::Value>,
+    region: &str,
+) -> Result<(), String> {
+    if let Some(previous) = state.definition_imports.remove(api_id) {
+        if let Some(routes) = state.routes.get_mut(api_id) {
+            for id in &previous.route_ids {
+                routes.remove(id);
+            }
+        }
+        if let Some(integrations) = state.integrations.get_mut(api_id) {
+            for id in &previous.integration_ids {
+                integrations.remove(id);
+            }
+        }
+    }
+    let Some(definition) = definition else {
+        return Ok(());
+    };
+    let (spec_api, routes, integrations) =
+        fakecloud_apigatewayv2::extras::build_api_from_spec(definition, api_id.to_string(), region);
+    let api = state
+        .apis
+        .get_mut(api_id)
+        .ok_or_else(|| format!("Api {api_id} no longer exists in state"))?;
+    api.name = spec_api.name;
+    api.description = spec_api.description;
+    api.version = spec_api.version;
+    let record = fakecloud_apigatewayv2::DefinitionImport {
+        definition_sha256: definition_sha256(definition),
+        route_ids: routes.keys().cloned().collect(),
+        integration_ids: integrations.keys().cloned().collect(),
+    };
+    state
+        .routes
+        .entry(api_id.to_string())
+        .or_default()
+        .extend(routes);
+    state
+        .integrations
+        .entry(api_id.to_string())
+        .or_default()
+        .extend(integrations);
+    state.definition_imports.insert(api_id.to_string(), record);
+    Ok(())
 }
 
 impl ResourceProvisioner {
@@ -200,26 +225,24 @@ impl ResourceProvisioner {
             });
         }
 
-        let imported = definition.as_ref().map(|definition| {
-            let (spec_api, routes, integrations) =
-                fakecloud_apigatewayv2::extras::build_api_from_spec(
-                    definition,
-                    id.clone(),
-                    &self.region,
-                );
-            if api.description.is_none() {
-                api.description = spec_api.description;
-            }
-            api.version = spec_api.version;
-            (routes, integrations)
-        });
         let api_endpoint = api.api_endpoint.clone();
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        // The template's own Name / Description win over the definition's
+        // `info`.
+        let explicit_description = api.description.clone();
+        let explicit_name = props.get("Name").and_then(|v| v.as_str());
         state.apis.insert(id.clone(), api);
-        if let Some((routes, integrations)) = imported {
-            state.routes.insert(id.clone(), routes);
-            state.integrations.insert(id.clone(), integrations);
+        if definition.is_some() {
+            apply_http_api_definition(state, &id, definition.as_ref(), &self.region)?;
+            if let Some(api) = state.apis.get_mut(&id) {
+                if let Some(name) = explicit_name {
+                    api.name = name.to_string();
+                }
+                if explicit_description.is_some() {
+                    api.description = explicit_description;
+                }
+            }
         }
 
         Ok(ProvisionResult::new(id.clone())
@@ -1030,35 +1053,17 @@ impl ResourceProvisioner {
         let definition = self.apigw_rest_api_definition(props)?;
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        // A changed definition rebuilds the routes and integrations, as
-        // ReimportApi does. An unchanged one (the update touched other
-        // properties) leaves them alone, so routes other stack resources added
-        // to the API (separate AWS::ApiGatewayV2::Route resources, which the
-        // update does not reprovision) survive.
-        let changed = definition.as_ref().is_some_and(|definition| {
-            let (_, routes, integrations) = fakecloud_apigatewayv2::extras::build_api_from_spec(
-                definition,
-                api_id.clone(),
-                &self.region,
-            );
-            !definition_routes_present(state, &api_id, &routes, &integrations)
-        });
-        if let Some(definition) = definition.as_ref().filter(|_| changed) {
-            let (spec_api, routes, integrations) =
-                fakecloud_apigatewayv2::extras::build_api_from_spec(
-                    definition,
-                    api_id.clone(),
-                    &self.region,
-                );
-            let api = state
-                .apis
-                .get_mut(&api_id)
-                .ok_or_else(|| format!("Api {api_id} no longer exists in state"))?;
-            api.name = spec_api.name;
-            api.description = spec_api.description;
-            api.version = spec_api.version;
-            state.routes.insert(api_id.clone(), routes);
-            state.integrations.insert(api_id.clone(), integrations);
+        // A definition that differs from the one last applied is re-imported
+        // in full (replacing only what that import created, as recorded); an
+        // unchanged one is left alone. Routes and integrations other stack
+        // resources own survive either way.
+        let applied = state
+            .definition_imports
+            .get(&api_id)
+            .map(|r| r.definition_sha256.clone());
+        let wanted = definition.as_ref().map(definition_sha256);
+        if applied != wanted {
+            apply_http_api_definition(state, &api_id, definition.as_ref(), &self.region)?;
         }
         let api = state
             .apis

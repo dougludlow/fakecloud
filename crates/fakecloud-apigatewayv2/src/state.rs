@@ -126,6 +126,23 @@ pub struct ApiGatewayV2State {
     pub product_pages: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     #[serde(default)]
     pub product_rest_endpoint_pages: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    /// The OpenAPI definition last imported into each API by a stack
+    /// (`AWS::ApiGatewayV2::Api` `Body` / `BodyS3Location`) and the routes and
+    /// integrations that import created, keyed by API id. A changed
+    /// definition replaces exactly those; routes and integrations created
+    /// any other way are left alone.
+    #[serde(default)]
+    pub definition_imports: BTreeMap<String, DefinitionImport>,
+}
+
+/// One API's applied definition import; see
+/// [`ApiGatewayV2State::definition_imports`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DefinitionImport {
+    /// SHA-256 of the definition document as applied.
+    pub definition_sha256: String,
+    pub route_ids: Vec<String>,
+    pub integration_ids: Vec<String>,
 }
 
 pub const APIGATEWAYV2_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
@@ -164,6 +181,7 @@ impl ApiGatewayV2State {
             portal_product_sharing_policies: BTreeMap::new(),
             product_pages: BTreeMap::new(),
             product_rest_endpoint_pages: BTreeMap::new(),
+            definition_imports: BTreeMap::new(),
         }
     }
 
@@ -188,6 +206,7 @@ impl ApiGatewayV2State {
         self.portal_product_sharing_policies.clear();
         self.product_pages.clear();
         self.product_rest_endpoint_pages.clear();
+        self.definition_imports.clear();
     }
 }
 

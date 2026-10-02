@@ -365,7 +365,12 @@ Resources:
     }
 }
 
-fn http_definition_template(description: &str) -> String {
+fn http_definition_template(description: &str, open2: bool) -> String {
+    let open2 = if open2 {
+        "        Open2:\n          Type: HttpApi\n          Properties:\n            ApiId: !Ref Http\n            Path: /open2\n            Method: GET\n"
+    } else {
+        ""
+    };
     format!(
         r#"
 Transform: AWS::Serverless-2016-10-31
@@ -409,21 +414,21 @@ Resources:
             Method: GET
             Auth:
               Authorizer: Jwt
-"#
+{open2}"#
     )
 }
 
 /// An HttpApi with a DefinitionBody keeps its event routes across a stack
-/// update that only changes another property: the unauthenticated route is
-/// part of the definition, and the JWT-secured route (a separate resource)
-/// is not wiped by re-importing an unchanged definition.
+/// update: unauthenticated event routes are part of the definition, and
+/// adding one re-imports it without wiping the JWT-secured route, which is a
+/// separate resource.
 #[tokio::test]
 async fn sam_http_api_definition_body_keeps_event_routes_on_update() {
     let server = TestServer::start().await;
     let cfn = server.cloudformation_client().await;
     cfn.create_stack()
         .stack_name("sam-http-def")
-        .template_body(http_definition_template("first"))
+        .template_body(http_definition_template("first", false))
         .capabilities(Capability::CapabilityNamedIam)
         .capabilities(Capability::CapabilityAutoExpand)
         .send()
@@ -451,7 +456,7 @@ async fn sam_http_api_definition_body_keeps_event_routes_on_update() {
 
     cfn.update_stack()
         .stack_name("sam-http-def")
-        .template_body(http_definition_template("second"))
+        .template_body(http_definition_template("second", true))
         .capabilities(Capability::CapabilityNamedIam)
         .capabilities(Capability::CapabilityAutoExpand)
         .send()
@@ -461,5 +466,10 @@ async fn sam_http_api_definition_body_keeps_event_routes_on_update() {
     assert_eq!(status, "UPDATE_COMPLETE", "{reason}");
     let api = v2.get_api().api_id(&api_id).send().await.unwrap();
     assert_eq!(api.description(), Some("second"));
-    assert_eq!(route_keys().await, vec!["GET /open", "GET /secured"]);
+    // The new /open2 event changed the definition, which was re-imported;
+    // the JWT-secured route (a separate resource) survived it.
+    assert_eq!(
+        route_keys().await,
+        vec!["GET /open", "GET /open2", "GET /secured"]
+    );
 }

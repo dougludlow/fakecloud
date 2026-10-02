@@ -199,6 +199,7 @@ impl ApiGatewayV2Service {
         // Drop the ARN-keyed tags alongside the API so a re-created API with the
         // same id doesn't inherit stale tags.
         state.tags.remove(&api_resource_arn(&req.region, api_id));
+        state.definition_imports.remove(api_id);
 
         Ok(AwsResponse::json(StatusCode::NO_CONTENT, vec![]))
     }

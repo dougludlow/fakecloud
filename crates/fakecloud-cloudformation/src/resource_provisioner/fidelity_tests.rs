@@ -734,8 +734,42 @@ fn http_api_update_that_keeps_the_body_preserves_other_routes() {
             .as_deref(),
         Some("two")
     );
-    // A changed definition is re-imported.
+    // A changed definition is re-imported: the old path's route goes, the
+    // new one arrives, and the separately owned route survives.
     prov.update_resource(&api, &api_def("two", "/other"))
         .unwrap();
-    assert_eq!(route_keys(&prov), vec!["GET /other"]);
+    assert_eq!(route_keys(&prov), vec!["GET /extra", "GET /other"]);
+    // The previous import's integration went with its route; the separately
+    // owned integration is still there.
+    let st = prov.apigatewayv2_state.read();
+    let integrations = &st.get(ACCT).unwrap().integrations[&api.physical_id];
+    assert!(integrations.contains_key(&integ.physical_id));
+    assert_eq!(integrations.len(), 2);
+}
+
+#[test]
+fn http_api_body_change_renames_and_drops_removed_paths() {
+    let prov = make_provisioner();
+    let body = |title: &str, paths: &[&str]| {
+        let mut b =
+            json!({"openapi": "3.0.1", "info": {"title": title, "version": "1"}, "paths": {}});
+        for p in paths {
+            b["paths"][*p] = json!({"get": {"x-amazon-apigateway-integration": {
+                "type": "aws_proxy", "httpMethod": "POST", "payloadFormatVersion": "2.0",
+                "uri": "arn:aws:lambda:us-east-1:123456789012:function:f"}}});
+        }
+        make_resource("AWS::ApiGatewayV2::Api", "H", json!({"Body": b}))
+    };
+    let api = prov.create_resource(&body("first", &["/a", "/b"])).unwrap();
+    prov.update_resource(&api, &body("renamed", &["/a"]))
+        .unwrap();
+    let st = prov.apigatewayv2_state.read();
+    let st = st.get(ACCT).unwrap();
+    assert_eq!(st.apis[&api.physical_id].name, "renamed");
+    let keys: Vec<&str> = st.routes[&api.physical_id]
+        .values()
+        .map(|r| r.route_key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["GET /a"]);
+    assert_eq!(st.integrations[&api.physical_id].len(), 1);
 }
