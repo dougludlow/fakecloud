@@ -1731,17 +1731,21 @@ impl EksService {
     fn describe_addon_versions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let max_results = validate_max_results(req)?;
         let next_token = req.query_params.get("nextToken").cloned();
-        let addon_filter = req.query_params.get("addonName").cloned();
-        let k8s_version = req
-            .query_params
-            .get("kubernetesVersion")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_K8S_VERSION.to_string());
+        let q = |key: &str| req.query_params.get(key).map(String::as_str);
+        // `types`, `publishers` and `owners` are list members sent as a
+        // repeated query key; an add-on matches when any value equals it.
+        let matches_list = |key: &str, field: &Value| {
+            let wanted = req.query_param_all(key);
+            wanted.is_empty() || wanted.iter().any(|w| field == w.as_str())
+        };
 
-        let catalog = addon_catalog(&k8s_version);
+        let catalog = addon_catalog(q("kubernetesVersion"));
         let filtered: Vec<Value> = catalog
             .into_iter()
-            .filter(|a| addon_filter.as_deref().is_none_or(|f| a["addonName"] == f))
+            .filter(|a| q("addonName").is_none_or(|f| a["addonName"] == f))
+            .filter(|a| matches_list("types", &a["type"]))
+            .filter(|a| matches_list("publishers", &a["publisher"]))
+            .filter(|a| matches_list("owners", &a["owner"]))
             .collect();
 
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)

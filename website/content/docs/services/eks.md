@@ -30,8 +30,18 @@ in persistent mode.
   `selectors`, their own `CREATING` -> `ACTIVE` transition.
 - **Add-ons** — `CreateAddon`, `DescribeAddon`, `ListAddons`, `DeleteAddon`,
   `UpdateAddon` (tracked version updates), plus the read-only catalogue ops
-  `DescribeAddonVersions` (vpc-cni, coredns, kube-proxy, aws-ebs-csi-driver,
-  aws-efs-csi-driver) and `DescribeAddonConfiguration`.
+  `DescribeAddonVersions` and `DescribeAddonConfiguration`. The catalogue
+  carries the AWS-owned add-ons (vpc-cni, coredns, kube-proxy, the EBS/EFS/FSx/
+  Mountpoint for S3 CSI drivers, snapshot-controller, eks-pod-identity-agent,
+  aws-guardduty-agent, aws-secrets-store-csi-driver-provider,
+  amazon-cloudwatch-observability, adot, eks-node-monitoring-agent,
+  aws-network-flow-monitoring-agent) and the EKS-published community add-ons
+  (metrics-server, kube-state-metrics, prometheus-node-exporter, cert-manager,
+  external-dns), each with versions and per-Kubernetes-version compatibilities
+  flagging the default version (coredns and kube-proxy track the cluster's
+  Kubernetes minor). `kubernetesVersion`, `addonName`, `types`, `owners`, and
+  `publishers` filter it, and `CreateAddon` without an `addonVersion` installs
+  the default for the cluster's version.
 - **Access entries** — `CreateAccessEntry`, `DescribeAccessEntry`,
   `ListAccessEntries`, `DeleteAccessEntry`, `UpdateAccessEntry`, plus
   `AssociateAccessPolicy`, `DisassociateAccessPolicy`,
