@@ -818,6 +818,34 @@ mod attr_value_validation_tests {
         assert!(validate_attribute_value(&json!({ "N": small })).is_ok());
     }
 
+    // A huge exponent must be rejected from the coefficient and exponent alone:
+    // expanding `1e100000000000000` into digits allocates ~1e17 bytes and aborts
+    // the whole process.
+    #[test]
+    fn rejects_huge_exponents_without_expanding_them() {
+        for (n, prefix) in [
+            ("1e100000000000000", "Number overflow"),
+            ("1e9223372036854775807", "Number overflow"),
+            ("1e-100000000000000", "Number underflow"),
+            ("1e-9223372036854775808", "Number underflow"),
+        ] {
+            let err = err_of(json!({ "N": n }));
+            assert_eq!(err.code(), "ValidationException", "{n}");
+            assert!(err.message().starts_with(prefix), "{n}: {}", err.message());
+            let err = err_of(json!({ "NS": ["1", n] }));
+            assert!(
+                err.message().starts_with(prefix),
+                "NS {n}: {}",
+                err.message()
+            );
+        }
+        assert!(validate_attribute_value(
+            &json!({ "N": "9.9999999999999999999999999999999999999E+125" })
+        )
+        .is_ok());
+        assert!(validate_attribute_value(&json!({ "N": "1E-130" })).is_ok());
+    }
+
     fn err_of(v: serde_json::Value) -> AwsServiceError {
         let item: HashMap<String, AttributeValue> = HashMap::from([("a".to_string(), v)]);
         validate_item_attribute_values(&item).unwrap_err()

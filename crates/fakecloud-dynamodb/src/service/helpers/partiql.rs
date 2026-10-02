@@ -4,46 +4,185 @@
 
 use super::*;
 
+/// A DynamoDB Number literal decomposed without expanding its exponent:
+/// value = `(-1)^neg * 0.<digits> * 10^point`.
+///
+/// `digits` carries no leading or trailing zeros (empty means zero, which is
+/// never negative), so the significant-digit count and the magnitude are plain
+/// arithmetic on `digits.len()` and `point`. Expanding `1e100000000000000`
+/// into its decimal digits would allocate ~1e17 bytes and abort the process,
+/// so every check runs on this form and only an in-range number is expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedNumber {
+    pub(crate) neg: bool,
+    pub(crate) digits: String,
+    pub(crate) point: i128,
+}
+
+/// Largest `|point|` a number may have and still be expanded into plain
+/// decimal digits. DynamoDB's supported range spans 10^-130 to 10^126, so any
+/// storable number (and the sum of two of them) sits well inside this bound.
+const MAX_EXPANDED_POINT: i128 = 1024;
+
+/// Largest decimal exponent (in scientific notation, `d.ddd E+n`) DynamoDB
+/// stores: `9.9999999999999999999999999999999999999E+125`.
+pub(crate) const MAX_SCIENTIFIC_EXPONENT: i128 = 125;
+/// Smallest decimal exponent DynamoDB stores: `1E-130`.
+pub(crate) const MIN_SCIENTIFIC_EXPONENT: i128 = -130;
+
+impl ParsedNumber {
+    fn is_zero(&self) -> bool {
+        self.digits.is_empty()
+    }
+
+    /// The exponent in scientific notation (`d.ddd E+n`), or `None` for zero.
+    pub(crate) fn scientific_exponent(&self) -> Option<i128> {
+        (!self.is_zero()).then(|| self.point - 1)
+    }
+
+    /// Whether the plain-decimal expansion is small enough to materialize.
+    fn expandable(&self) -> bool {
+        self.is_zero() || self.point.abs() <= MAX_EXPANDED_POINT
+    }
+
+    /// Plain-decimal `(int_digits, frac_digits)` with insignificant zeros
+    /// stripped. Callers must check [`Self::expandable`] first.
+    fn expand(&self) -> (String, String) {
+        debug_assert!(self.expandable());
+        let len = self.digits.len() as i128;
+        if self.is_zero() {
+            (String::new(), String::new())
+        } else if self.point <= 0 {
+            let pad = "0".repeat((-self.point) as usize);
+            (String::new(), format!("{pad}{}", self.digits))
+        } else if self.point >= len {
+            let pad = "0".repeat((self.point - len) as usize);
+            (format!("{}{pad}", self.digits), String::new())
+        } else {
+            let (i, f) = self.digits.split_at(self.point as usize);
+            (i.to_string(), f.to_string())
+        }
+    }
+
+    /// Compare magnitudes (ignoring sign).
+    fn cmp_magnitude(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self.is_zero(), other.is_zero()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            // Neither side has leading or trailing zeros, so once the
+            // positions of the leading digits agree a plain lexical compare
+            // of the digit strings orders them (`"12" < "125"`).
+            (false, false) => self
+                .point
+                .cmp(&other.point)
+                .then_with(|| self.digits.cmp(&other.digits)),
+        }
+    }
+}
+
+/// Parse an exponent's digits, saturating rather than failing past `i64`, so
+/// `1e99999999999999999999` reads as a (wildly out-of-range) number instead of
+/// a malformed one.
+fn parse_exponent(e: &str) -> Option<i128> {
+    let (neg, digits) = match e.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, e.strip_prefix('+').unwrap_or(e)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits
+        .parse::<i64>()
+        .map_or(i128::from(i64::MAX), i128::from);
+    Some(if neg { -magnitude } else { magnitude })
+}
+
+/// Decompose a DynamoDB Number literal without expanding its exponent.
+/// Returns `None` for non-numeric input; negative zero normalizes to positive.
+pub(crate) fn parse_number(s: &str) -> Option<ParsedNumber> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (mantissa, exp) = match rest.split_once(['e', 'E']) {
+        Some((m, e)) => (m, parse_exponent(e)?),
+        None => (rest, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|c| c.is_ascii_digit())
+        || !frac_part.bytes().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let all = format!("{int_part}{frac_part}");
+    let leading = all.len() - all.trim_start_matches('0').len();
+    let digits = all
+        .trim_start_matches('0')
+        .trim_end_matches('0')
+        .to_string();
+    if digits.is_empty() {
+        return Some(ParsedNumber {
+            neg: false,
+            digits,
+            point: 0,
+        });
+    }
+    // Lengths are bounded by the request size; the exponent is an i64 at most,
+    // so the i128 sum cannot overflow.
+    let point = int_part.len() as i128 - leading as i128 + exp;
+    Some(ParsedNumber { neg, digits, point })
+}
+
 /// Compare two DynamoDB numeric attribute strings with full precision.
 ///
 /// DynamoDB numbers are arbitrary-precision decimals; parsing to `f64`
 /// rounds past 2^53. This compares the decimal representations directly:
-/// sign, then integer magnitude (by length, then lexically), then the
-/// fractional part. Falls back to `Equal` only if both sides are
-/// unparseable. Handles exponent notation and negative zero.
+/// sign, then magnitude (leading-digit position, then digits). Falls back to
+/// `Equal` only if either side is unparseable. Handles exponent notation and
+/// negative zero without expanding the exponent.
 pub(crate) fn compare_number_strings(x: &str, y: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // A malformed Number string has no defined ordering; callers that care about
     // equality (values_equal) pre-check validity, so leaving this Equal keeps
     // range/order comparisons undefined rather than inventing a lexical order.
-    let (xn, xd) = match normalize_decimal(x) {
-        Some(v) => v,
-        None => return Ordering::Equal,
+    let Some(xp) = parse_number(x) else {
+        return Ordering::Equal;
     };
-    let (yn, yd) = match normalize_decimal(y) {
-        Some(v) => v,
-        None => return Ordering::Equal,
+    let Some(yp) = parse_number(y) else {
+        return Ordering::Equal;
     };
-    // (is_negative_x, is_negative_y): a negative value is always less than a
-    // non-negative one. Only decide by sign when the signs actually differ.
-    match (xn, yn) {
+    // A negative value is always less than a non-negative one. Only decide by
+    // sign when the signs actually differ.
+    match (xp.neg, yp.neg) {
         (true, false) => return Ordering::Less,
         (false, true) => return Ordering::Greater,
         _ => {}
     }
-    let mag = compare_magnitude(&xd, &yd);
-    if xn {
+    let mag = xp.cmp_magnitude(&yp);
+    if xp.neg {
         mag.reverse()
     } else {
         mag
     }
 }
 
-/// Whether `s` is a well-formed DynamoDB Number literal (a decimal string that
-/// `normalize_decimal` can parse). Used to reject malformed `{"N":...}` operands
-/// before they are persisted (ADD on a new attribute, bug-hunt 2026-07-01).
+/// Whether `s` is a well-formed DynamoDB Number literal. Used to reject
+/// malformed `{"N":...}` operands before they are persisted (ADD on a new
+/// attribute, bug-hunt 2026-07-01).
 pub(crate) fn is_valid_number(s: &str) -> bool {
-    normalize_decimal(s).is_some()
+    parse_number(s).is_some()
 }
 
 /// Number of significant digits in a DynamoDB Number literal, or `None` if the
@@ -53,21 +192,31 @@ pub(crate) fn is_valid_number(s: &str) -> bool {
 /// is a single significant digit while `1234...` with 39 non-zero digits is 39.
 /// AWS rejects a Number with more than 38 significant digits.
 pub(crate) fn significant_digit_count(s: &str) -> Option<usize> {
-    let (_, (int_norm, frac_norm)) = normalize_decimal(s)?;
-    // `int_norm` already has leading zeros stripped and `frac_norm` trailing
-    // zeros stripped; the remaining leading zeros (value < 1) and trailing
-    // zeros (integer with a zeroed tail) collapse into the exponent.
-    let coeff = format!("{int_norm}{frac_norm}");
-    Some(coeff.trim_start_matches('0').trim_end_matches('0').len())
+    parse_number(s).map(|p| p.digits.len())
 }
 
 /// Canonical decimal form of a DynamoDB Number, so numerically-equal literals
 /// (`"1"`, `"1.0"`, `"1e0"`) collapse to one key. Used to detect duplicate
 /// members in a Number Set (`NS`), which AWS compares by numeric value rather
 /// than string. Returns `None` for a malformed number.
+///
+/// A number far outside DynamoDB's range (which validation rejects before it
+/// is ever stored) is rendered in scientific form, `<d>.<ddd>E<n>`, rather than
+/// expanded, so the canonical key stays unique without materializing an
+/// arbitrarily long digit string.
 pub(crate) fn canonical_number(s: &str) -> Option<String> {
-    let (neg, (int_part, frac_part)) = normalize_decimal(s)?;
-    let sign = if neg { "-" } else { "" };
+    let parsed = parse_number(s)?;
+    let sign = if parsed.neg { "-" } else { "" };
+    if !parsed.expandable() {
+        let (lead, rest) = parsed.digits.split_at(1);
+        let exp = parsed.point - 1;
+        return Some(if rest.is_empty() {
+            format!("{sign}{lead}E{exp}")
+        } else {
+            format!("{sign}{lead}.{rest}E{exp}")
+        });
+    }
+    let (int_part, frac_part) = parsed.expand();
     let int_str = if int_part.is_empty() { "0" } else { &int_part };
     if frac_part.is_empty() {
         Some(format!("{sign}{int_str}"))
@@ -78,52 +227,15 @@ pub(crate) fn canonical_number(s: &str) -> Option<String> {
 
 /// Decompose a decimal string into `(is_negative, (int_digits, frac_digits))`
 /// with insignificant zeros stripped so the magnitude compare is purely
-/// lexical. Returns `None` for non-numeric input; negative zero normalizes
-/// to positive.
+/// lexical. Returns `None` for non-numeric input and for a number too far out
+/// of DynamoDB's range to expand safely; negative zero normalizes to positive.
 #[allow(clippy::type_complexity)]
 fn normalize_decimal(s: &str) -> Option<(bool, (String, String))> {
-    let s = s.trim();
-    if s.is_empty() {
+    let parsed = parse_number(s)?;
+    if !parsed.expandable() {
         return None;
     }
-    let (neg, rest) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (mantissa, exp) = match rest.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i64>().ok()?),
-        None => (rest, 0),
-    };
-    let (int_part, frac_part) = match mantissa.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (mantissa, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    let mut digits = format!("{int_part}{frac_part}");
-    let point = int_part.len() as i64 + exp;
-    let (int_str, frac_str) = if point <= 0 {
-        let pad = "0".repeat((-point) as usize);
-        digits = format!("{pad}{digits}");
-        (String::new(), digits)
-    } else if (point as usize) >= digits.len() {
-        let pad = "0".repeat(point as usize - digits.len());
-        digits.push_str(&pad);
-        (digits, String::new())
-    } else {
-        let (i, f) = digits.split_at(point as usize);
-        (i.to_string(), f.to_string())
-    };
-    let int_norm = int_str.trim_start_matches('0').to_string();
-    let frac_norm = frac_str.trim_end_matches('0').to_string();
-    let is_zero = int_norm.is_empty() && frac_norm.is_empty();
-    Some((neg && !is_zero, (int_norm, frac_norm)))
+    Some((parsed.neg, parsed.expand()))
 }
 
 /// Lexically compare two normalized non-negative magnitudes
@@ -142,7 +254,9 @@ fn compare_magnitude(a: &(String, String), b: &(String, String)) -> std::cmp::Or
 /// `f64` rounds past 2^53 and saturates an `as i64` cast past ~9.2e18, so a
 /// `SET #c = #c + :inc` or `ADD #c :inc` on a large counter silently corrupts
 /// the value. This works directly on the decimal digit strings instead.
-/// Returns `None` only if either operand is not a valid number.
+/// Returns `None` if either operand is not a valid number, or lies so far
+/// outside DynamoDB's range (which validation rejects up front) that expanding
+/// it into plain digits would be unbounded.
 /// bug-audit 2026-06-28.
 pub(crate) fn decimal_add_sub(a: &str, b: &str, is_add: bool) -> Option<String> {
     let (a_neg, (a_int, a_frac)) = normalize_decimal(a)?;
@@ -517,6 +631,59 @@ mod number_compare_tests {
             decimal_add_sub("9223372036854775807", "9223372036854775807", true).unwrap(),
             "18446744073709551614"
         );
+    }
+
+    // Huge exponents are compared, counted and canonicalized from the
+    // coefficient and exponent alone; nothing expands them into digits.
+    #[test]
+    fn huge_exponents_never_expand() {
+        assert_eq!(significant_digit_count("1e100000000000000"), Some(1));
+        assert_eq!(significant_digit_count("1.25e-100000000000000"), Some(3));
+        assert_eq!(significant_digit_count("1e9223372036854775807"), Some(1));
+        assert_eq!(significant_digit_count("0e9223372036854775807"), Some(0));
+        assert!(is_valid_number("1e99999999999999999999"));
+        assert!(!is_valid_number("1e"));
+        assert!(!is_valid_number("1e+"));
+        assert!(!is_valid_number("1e1.5"));
+
+        assert_eq!(
+            compare_number_strings("1e100000000000000", "9.9E+125"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_number_strings("-1e100000000000000", "-9.9E+125"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_number_strings("1e-100000000000000", "0"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_number_strings("10e9223372036854775806", "1e9223372036854775807"),
+            Ordering::Equal
+        );
+
+        assert_eq!(
+            canonical_number("1e100000000000000").as_deref(),
+            Some("1E100000000000000")
+        );
+        assert_eq!(
+            canonical_number("-12.5e-100000000000000").as_deref(),
+            Some("-1.25E-99999999999999")
+        );
+        assert_eq!(
+            canonical_number("9.9999999999999999999999999999999999999E+125"),
+            Some(format!(
+                "99999999999999999999999999999999999999{}",
+                "0".repeat(88)
+            ))
+        );
+        assert_eq!(
+            canonical_number("1E-130"),
+            Some(format!("0.{}1", "0".repeat(129)))
+        );
+        assert!(decimal_add_sub("1e100000000000000", "1", true).is_none());
+        assert!(decimal_add_sub("1", "1e-9223372036854775807", true).is_none());
     }
 
     #[test]

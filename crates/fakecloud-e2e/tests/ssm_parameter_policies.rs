@@ -272,3 +272,65 @@ async fn ssm_malformed_policies_rejected() {
         "expected InvalidPolicyAttributeException, got: {msg}"
     );
 }
+
+/// Regression: a NoChangeNotification window past chrono's range was accepted
+/// and then panicked the policy evaluator that runs on every read, poisoning
+/// the account. It must be rejected with InvalidPolicyAttributeException, and a
+/// representable but unreachable window must leave reads working.
+#[tokio::test]
+async fn ssm_out_of_range_policy_window_rejected_and_reads_survive() {
+    let server = TestServer::start().await;
+    let client = server.ssm_client().await;
+
+    let err = client
+        .put_parameter()
+        .name("/policies/huge-window")
+        .value("v1")
+        .r#type(ParameterType::String)
+        .tier(ParameterTier::Advanced)
+        .policies(policies_json(json!([{
+            "Type": "NoChangeNotification",
+            "Version": "1.0",
+            "Attributes": { "After": "9223372036854775807", "Unit": "Days" }
+        }])))
+        .send()
+        .await
+        .expect_err("an out-of-range window must be rejected")
+        .into_service_error();
+    assert!(
+        err.is_invalid_policy_attribute_exception(),
+        "expected InvalidPolicyAttributeException, got: {err:?}"
+    );
+
+    client
+        .put_parameter()
+        .name("/policies/far-window")
+        .value("v1")
+        .r#type(ParameterType::String)
+        .tier(ParameterTier::Advanced)
+        .policies(policies_json(json!([{
+            "Type": "NoChangeNotification",
+            "Version": "1.0",
+            "Attributes": { "After": "100000000", "Unit": "Days" }
+        }])))
+        .send()
+        .await
+        .unwrap();
+
+    // Every read ticks the policy evaluator; it must not panic.
+    for _ in 0..2 {
+        let got = client
+            .get_parameter()
+            .name("/policies/far-window")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(got.parameter.unwrap().value.as_deref(), Some("v1"));
+    }
+    let body = fetch_policy_events(&server).await;
+    let events = body["events"].as_array().unwrap();
+    assert!(!events
+        .iter()
+        .any(|e| e["eventType"] == "NoChangeNotification"
+            && e["parameterName"] == "/policies/far-window"));
+}

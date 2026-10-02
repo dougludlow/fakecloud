@@ -219,64 +219,56 @@ fn binary_size(encoded: &str) -> usize {
 /// digits straddling the decimal point fall into two pairs: `3.14159` costs 5
 /// where the integer `123456` costs 4.
 pub(crate) fn number_size(literal: &str) -> usize {
-    let Some(canonical) = canonical_number(literal) else {
+    let Some(parsed) = parse_number(literal) else {
         return literal.len();
     };
-    let (negative, magnitude) = match canonical.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, canonical.as_str()),
-    };
-    let (int_part, frac_part) = magnitude.split_once('.').unwrap_or((magnitude, ""));
-    let int_part = int_part.trim_start_matches('0');
-    if int_part.is_empty() && frac_part.is_empty() {
+    if parsed.digits.is_empty() {
         return 1;
     }
-    let mut digits = String::with_capacity(int_part.len() + frac_part.len() + 2);
-    if int_part.len() % 2 == 1 {
-        digits.push('0');
-    }
-    digits.push_str(int_part);
-    digits.push_str(frac_part);
-    if frac_part.len() % 2 == 1 {
-        digits.push('0');
-    }
-    let pairs: Vec<&[u8]> = digits.as_bytes().chunks(2).collect();
-    let first = pairs.iter().position(|p| *p != b"00");
-    let last = pairs.iter().rposition(|p| *p != b"00");
-    let significant = match (first, last) {
-        (Some(f), Some(l)) => l - f + 1,
-        _ => 0,
-    };
-    1 + significant + usize::from(negative)
+    // Digit `i` of the coefficient sits at power `point - 1 - i`; base-100
+    // pairs are aligned on the decimal point, so the digit at power `q` falls
+    // in pair `floor(q / 2)`. The coefficient has no leading or trailing zeros,
+    // so the pairs spanned by its first and last digits are exactly the
+    // significant ones. Computed arithmetically: expanding the exponent of an
+    // unvalidated `1e100000000000000` would allocate without bound.
+    let first_power = parsed.point - 1;
+    let last_power = parsed.point - parsed.digits.len() as i128;
+    let pairs = first_power.div_euclid(2) - last_power.div_euclid(2) + 1;
+    1 + usize::try_from(pairs).unwrap_or(usize::MAX) + usize::from(parsed.neg)
+}
+
+/// The ValidationException for a number above DynamoDB's supported range.
+fn number_overflow() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "Number overflow. Attempting to store a number with magnitude larger than supported range",
+    )
+}
+
+/// The ValidationException for a non-zero number below DynamoDB's supported
+/// range.
+fn number_underflow() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "Number underflow. Attempting to store a number with magnitude smaller than supported range",
+    )
 }
 
 /// Reject a well-formed number whose magnitude falls outside DynamoDB's
 /// supported range: above `9.9999999999999999999999999999999999999E+125` or
-/// below `1E-130`. Zero is always in range.
+/// below `1E-130`. Zero is always in range. Decided from the coefficient and
+/// exponent alone, never by expanding the number.
 pub(crate) fn check_number_range(literal: &str) -> Result<(), AwsServiceError> {
-    let Some(canonical) = canonical_number(literal) else {
+    let Some(exponent) = parse_number(literal).and_then(|p| p.scientific_exponent()) else {
         return Ok(());
     };
-    let magnitude = canonical.trim_start_matches('-');
-    let (int_part, frac_part) = magnitude.split_once('.').unwrap_or((magnitude, ""));
-    let int_part = int_part.trim_start_matches('0');
-    if !int_part.is_empty() {
-        if int_part.len() - 1 > 125 {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                "Number overflow. Attempting to store a number with magnitude larger than supported range",
-            ));
-        }
-    } else if !frac_part.is_empty() {
-        let leading_zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
-        if leading_zeros + 1 > 130 {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                "Number underflow. Attempting to store a number with magnitude smaller than supported range",
-            ));
-        }
+    if exponent > MAX_SCIENTIFIC_EXPONENT {
+        return Err(number_overflow());
+    }
+    if exponent < MIN_SCIENTIFIC_EXPONENT {
+        return Err(number_underflow());
     }
     Ok(())
 }
@@ -393,6 +385,40 @@ mod tests {
         assert!(check_number_range("-1E+126").is_err());
         let under = check_number_range("1E-131").unwrap_err();
         assert!(under.message().starts_with("Number underflow"));
+    }
+
+    // Exponents far past the range (and past i64 once the mantissa length is
+    // added) are rejected arithmetically instead of being expanded into an
+    // unbounded digit string.
+    #[test]
+    fn huge_exponents_are_range_checked_without_expansion() {
+        for over in [
+            "1e100000000000000",
+            "-1e100000000000000",
+            "1e9223372036854775807",
+            "123.456e9223372036854775807",
+            "1e99999999999999999999999",
+            "10E+125",
+        ] {
+            let err = check_number_range(over).unwrap_err();
+            assert!(err.message().starts_with("Number overflow"), "{over}");
+        }
+        for under in [
+            "1e-100000000000000",
+            "1e-9223372036854775808",
+            "0.001e-9223372036854775807",
+            "0.1E-130",
+        ] {
+            let err = check_number_range(under).unwrap_err();
+            assert!(err.message().starts_with("Number underflow"), "{under}");
+        }
+        // Zero with any exponent is zero, always in range.
+        assert!(check_number_range("0e100000000000000").is_ok());
+        assert!(check_number_range("0.000e-9223372036854775807").is_ok());
+        assert!(check_number_range("1000E+122").is_ok());
+        assert!(check_number_range("0.01E-128").is_ok());
+        assert_eq!(number_size("1e100000000000000"), 2);
+        assert_eq!(number_size("-1.5e-100000000000000"), 4);
     }
 
     #[test]

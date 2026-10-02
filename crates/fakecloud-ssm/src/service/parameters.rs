@@ -37,12 +37,15 @@ pub(crate) enum PolicyUnit {
 }
 
 impl PolicyUnit {
-    fn to_duration(self, n: i64) -> chrono::Duration {
+    /// The window `n` units long, or `None` when it overflows `chrono`'s
+    /// duration range (`9223372036854775807 Days`). The panicking
+    /// constructors would abort the read path that evaluates policies.
+    fn to_duration(self, n: i64) -> Option<chrono::Duration> {
         match self {
-            PolicyUnit::Days => chrono::Duration::days(n),
-            PolicyUnit::Hours => chrono::Duration::hours(n),
-            PolicyUnit::Minutes => chrono::Duration::minutes(n),
-            PolicyUnit::Seconds => chrono::Duration::seconds(n),
+            PolicyUnit::Days => chrono::Duration::try_days(n),
+            PolicyUnit::Hours => chrono::Duration::try_hours(n),
+            PolicyUnit::Minutes => chrono::Duration::try_minutes(n),
+            PolicyUnit::Seconds => chrono::Duration::try_seconds(n),
         }
     }
 }
@@ -69,50 +72,71 @@ pub(crate) fn parse_policies(policies_str: &str) -> Result<Vec<ParsedPolicy>, Aw
         .as_array()
         .ok_or_else(|| invalid_policy_error("Policies must be a JSON array."))?;
 
-    let mut parsed = Vec::with_capacity(arr.len());
-    for (i, policy) in arr.iter().enumerate() {
-        let kind = policy["Type"].as_str().ok_or_else(|| {
-            invalid_policy_error(format!(
-                "Policy at index {i} is missing required field 'Type'."
-            ))
-        })?;
-        let attrs = &policy["Attributes"];
-        if !attrs.is_object() {
-            return Err(invalid_policy_error(format!(
-                "Policy at index {i} is missing required field 'Attributes'."
-            )));
-        }
-        match kind {
-            "Expiration" => {
-                let ts = attrs["Timestamp"].as_str().ok_or_else(|| {
-                    invalid_policy_error(format!(
-                        "Expiration policy at index {i} requires Attributes.Timestamp."
-                    ))
-                })?;
-                let dt = chrono::DateTime::parse_from_rfc3339(ts).map_err(|e| {
-                    invalid_policy_error(format!(
-                        "Expiration policy at index {i} has invalid Timestamp: {e}"
-                    ))
-                })?;
-                parsed.push(ParsedPolicy::Expiration(dt.with_timezone(&Utc)));
-            }
-            "ExpirationNotification" => {
-                let (n, unit) = parse_window_attrs(attrs, "Before", i, kind)?;
-                parsed.push(ParsedPolicy::ExpirationNotification { before: n, unit });
-            }
-            "NoChangeNotification" => {
-                let (n, unit) = parse_window_attrs(attrs, "After", i, kind)?;
-                parsed.push(ParsedPolicy::NoChangeNotification { after: n, unit });
-            }
-            other => {
-                return Err(invalid_policy_error(format!(
-                    "Policy at index {i} has unsupported Type: {other}. \
-                     Valid types: Expiration, ExpirationNotification, NoChangeNotification."
-                )));
-            }
-        }
+    arr.iter()
+        .enumerate()
+        .map(|(i, policy)| parse_policy(i, policy))
+        .collect()
+}
+
+/// Read-path variant of [`parse_policies`]: keeps every entry that parses
+/// and skips the ones that don't. The array was accepted at write time, but
+/// state persisted before a validation existed (for example a notification
+/// window too large to represent) must not hide the remaining valid
+/// entries, or an `Expiration` next to a legacy bad window would stop
+/// expiring the parameter.
+fn parse_policies_lenient(policies_str: &str) -> Vec<ParsedPolicy> {
+    let Ok(value) = serde_json::from_str::<Value>(policies_str) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(i, policy)| parse_policy(i, policy).ok())
+        .collect()
+}
+
+/// Parse and validate one entry of the `Policies` array.
+fn parse_policy(i: usize, policy: &Value) -> Result<ParsedPolicy, AwsServiceError> {
+    let kind = policy["Type"].as_str().ok_or_else(|| {
+        invalid_policy_error(format!(
+            "Policy at index {i} is missing required field 'Type'."
+        ))
+    })?;
+    let attrs = &policy["Attributes"];
+    if !attrs.is_object() {
+        return Err(invalid_policy_error(format!(
+            "Policy at index {i} is missing required field 'Attributes'."
+        )));
     }
-    Ok(parsed)
+    match kind {
+        "Expiration" => {
+            let ts = attrs["Timestamp"].as_str().ok_or_else(|| {
+                invalid_policy_error(format!(
+                    "Expiration policy at index {i} requires Attributes.Timestamp."
+                ))
+            })?;
+            let dt = chrono::DateTime::parse_from_rfc3339(ts).map_err(|e| {
+                invalid_policy_error(format!(
+                    "Expiration policy at index {i} has invalid Timestamp: {e}"
+                ))
+            })?;
+            Ok(ParsedPolicy::Expiration(dt.with_timezone(&Utc)))
+        }
+        "ExpirationNotification" => {
+            let (n, unit) = parse_window_attrs(attrs, "Before", i, kind)?;
+            Ok(ParsedPolicy::ExpirationNotification { before: n, unit })
+        }
+        "NoChangeNotification" => {
+            let (n, unit) = parse_window_attrs(attrs, "After", i, kind)?;
+            Ok(ParsedPolicy::NoChangeNotification { after: n, unit })
+        }
+        other => Err(invalid_policy_error(format!(
+            "Policy at index {i} has unsupported Type: {other}. \
+             Valid types: Expiration, ExpirationNotification, NoChangeNotification."
+        ))),
+    }
 }
 
 /// Pull a `{<key>: number, "Unit": "Days"|"Hours"}` pair out of a
@@ -165,6 +189,11 @@ fn parse_window_attrs(
             )));
         }
     };
+    if unit.to_duration(n).is_none() {
+        return Err(invalid_policy_error(format!(
+            "{kind} policy at index {idx} has {key} {n} {unit_str} which is out of range."
+        )));
+    }
     Ok((n, unit))
 }
 
@@ -173,12 +202,12 @@ fn parse_window_attrs(
 /// malformed JSON — at this point the param was already accepted, so
 /// we don't want to re-fail the read.
 fn extract_expiration(policies_str: &str) -> Option<chrono::DateTime<Utc>> {
-    parse_policies(policies_str).ok().and_then(|policies| {
-        policies.into_iter().find_map(|p| match p {
+    parse_policies_lenient(policies_str)
+        .into_iter()
+        .find_map(|p| match p {
             ParsedPolicy::Expiration(ts) => Some(ts),
             _ => None,
         })
-    })
 }
 
 /// Returns true if the parameter has an `Expiration` policy whose timestamp
@@ -261,9 +290,7 @@ pub(crate) fn tick_policy_notifications(state: &mut SsmState) {
         let Some(policies_str) = param.policies.as_deref() else {
             continue;
         };
-        let Ok(policies) = parse_policies(policies_str) else {
-            continue;
-        };
+        let policies = parse_policies_lenient(policies_str);
 
         // Find an Expiration timestamp to anchor ExpirationNotification.
         let expiration_at = policies.iter().find_map(|p| match p {
@@ -278,8 +305,15 @@ pub(crate) fn tick_policy_notifications(state: &mut SsmState) {
                         continue;
                     }
                     let Some(exp) = expiration_at else { continue };
-                    let window = unit.to_duration(*before);
-                    if now >= exp - window {
+                    // Checked arithmetic: a window reaching before the
+                    // earliest representable instant is always open, and an
+                    // unrepresentable window (persisted before validation
+                    // existed) is skipped rather than panicking every read.
+                    let Some(window) = unit.to_duration(*before) else {
+                        continue;
+                    };
+                    let opens_at = exp.checked_sub_signed(window);
+                    if opens_at.is_none_or(|opens_at| now >= opens_at) {
                         state.parameter_policy_events.push(ParameterPolicyEvent {
                             parameter_name: param.name.clone(),
                             parameter_arn: param.arn.clone(),
@@ -300,8 +334,16 @@ pub(crate) fn tick_policy_notifications(state: &mut SsmState) {
                     if param.no_change_notified {
                         continue;
                     }
-                    let window = unit.to_duration(*after);
-                    if now >= param.last_modified + window {
+                    // A threshold past the latest representable instant can
+                    // never be reached; checked arithmetic keeps it from
+                    // panicking every read path.
+                    let Some(fires_at) = unit
+                        .to_duration(*after)
+                        .and_then(|window| param.last_modified.checked_add_signed(window))
+                    else {
+                        continue;
+                    };
+                    if now >= fires_at {
                         state.parameter_policy_events.push(ParameterPolicyEvent {
                             parameter_name: param.name.clone(),
                             parameter_arn: param.arn.clone(),
