@@ -248,6 +248,7 @@ pub(super) fn cluster_snapshot_as_source(
             .unwrap_or_else(|| "admin".to_string()),
         db_name: field("SourceDBName").or_else(|| field("DatabaseName")),
         dbi_resource_id: field("DbClusterResourceId").unwrap_or_default(),
+        source_data_volume: None,
         snapshot_type: field("SnapshotType").unwrap_or_else(|| "manual".to_string()),
         // The engines refuse to start with an empty password; a cluster
         // created before the password was persisted falls back to the
@@ -305,6 +306,9 @@ impl RdsService {
     pub(super) async fn create_final_db_snapshot(
         &self,
         db_instance_identifier: &str,
+        // The incarnation the caller validated: a replacement created under
+        // the identifier since is neither snapshotted nor marked `deleting`.
+        incarnation: &str,
         snapshot_id: &str,
         account_id: &str,
         region: &str,
@@ -320,7 +324,7 @@ impl RdsService {
             )
         })?;
 
-        let (instance_for_snapshot, db_name) = {
+        let (instance_for_snapshot, db_name, snapshot_created) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(account_id);
 
@@ -334,9 +338,13 @@ impl RdsService {
 
             let instance = state
                 .instances
-                .get(db_instance_identifier)
-                .cloned()
+                .get_mut(db_instance_identifier)
+                .filter(|i| i.dbi_resource_id == incarnation)
                 .ok_or_else(|| db_instance_not_found(db_instance_identifier))?;
+            // The instance is being deleted from here on: a concurrent rename
+            // must not move the container the deferred teardown below owns.
+            instance.db_instance_status = "deleting".to_string();
+            let instance = instance.clone();
 
             let default_db = default_db_name(&instance.engine);
             let db_name = instance
@@ -389,24 +397,39 @@ impl RdsService {
                 timezone: None,
                 storage_throughput: None,
                 snapshot_attributes: std::collections::BTreeMap::new(),
+                // The deferred teardown removes this volume; recorded so a
+                // crash before it runs still names the right one.
+                source_data_volume: Some(instance.data_volume_name(
+                    fakecloud_core::data_volume::current_scope().tag(),
+                    account_id,
+                )),
             };
+            let snapshot_created = snapshot.snapshot_create_time;
             state.snapshots.insert(snapshot_id.to_string(), snapshot);
 
-            (instance, db_name)
+            (instance, db_name, snapshot_created)
         };
 
         // Background the dump AND the source container teardown: DeleteDBInstance
         // must not stop the container until the final snapshot has read from it.
+        // The container is keyed by the instance's incarnation, so the
+        // deferred dump and stop reach this instance's container even if a
+        // new instance reuses the identifier before they run.
+        let source_key = instance_for_snapshot.dbi_resource_id.clone();
         self.spawn_finalize_snapshot(
             runtime.clone(),
             account_id.to_string(),
             snapshot_id.to_string(),
-            db_instance_identifier.to_string(),
+            snapshot_created,
+            source_key,
             instance_for_snapshot.engine.clone(),
             instance_for_snapshot.master_username.clone(),
             instance_for_snapshot.master_user_password.clone(),
             db_name,
-            true,
+            Some(instance_for_snapshot.data_volume_name(
+                fakecloud_core::data_volume::current_scope().tag(),
+                account_id,
+            )),
         );
         Ok(())
     }
@@ -493,6 +516,7 @@ impl RdsService {
                 master_username: instance.master_username.clone(),
                 db_name: instance.db_name.clone(),
                 dbi_resource_id: instance.dbi_resource_id.clone(),
+                source_data_volume: None,
                 snapshot_type: "manual".to_string(),
                 master_user_password: instance.master_user_password.clone(),
                 tags: Vec::new(),
@@ -526,12 +550,13 @@ impl RdsService {
             runtime.clone(),
             request.account_id.clone(),
             db_snapshot_identifier.clone(),
-            db_instance_identifier.clone(),
+            snapshot.snapshot_create_time,
+            instance.dbi_resource_id.clone(),
             instance.engine.clone(),
             instance.master_username.clone(),
             instance.master_user_password.clone(),
             db_name,
-            false,
+            None,
         );
 
         self.emit_event(

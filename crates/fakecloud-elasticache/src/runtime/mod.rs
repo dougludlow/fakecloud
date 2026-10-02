@@ -105,6 +105,10 @@ enum CacheBackend {
 #[derive(Debug, Clone)]
 pub struct ElastiCacheRuntime {
     backend: CacheBackend,
+    /// Backing containers (Pods) by the resource's incarnation id, never by
+    /// the reusable `(account, id)`: a delete and a recreate under the same
+    /// id are different incarnations, so one's start, stop or teardown can't
+    /// reach the other's container.
     containers: Arc<RwLock<HashMap<String, RunningCacheContainer>>>,
 }
 
@@ -131,9 +135,16 @@ impl ElastiCacheRuntime {
     /// shelling out.
     #[cfg(test)]
     pub(crate) fn new_stub() -> Self {
+        Self::new_stub_with_cli("true")
+    }
+
+    /// [`Self::new_stub`] driving `cli` (`"false"` makes every daemon call
+    /// fail, as with an unreachable daemon).
+    #[cfg(test)]
+    pub(crate) fn new_stub_with_cli(cli: &str) -> Self {
         Self {
             backend: CacheBackend::Docker(DockerCache {
-                cli: "true".to_string(),
+                cli: cli.to_string(),
                 net: fakecloud_core::container_net::HostNetworking {
                     host_alias: String::new(),
                     add_host_arg: None,
@@ -191,51 +202,87 @@ impl ElastiCacheRuntime {
         }
     }
 
+    /// Start (or replace) the Redis/Valkey container of resource incarnation
+    /// `incarnation`, mounting `data_volume` (named from the resource row).
     pub async fn ensure_redis(
         &self,
+        incarnation: &str,
+        account_id: &str,
         resource_id: &str,
+        data_volume: &str,
         rdb_path: Option<&str>,
         tags: &BTreeMap<String, String>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
         let running = match &self.backend {
             CacheBackend::Docker(d) => {
-                d.spawn_container(resource_id, CacheEngineKind::Redis, rdb_path)
-                    .await?
+                d.spawn_container(
+                    incarnation,
+                    account_id,
+                    resource_id,
+                    CacheEngineKind::Redis,
+                    rdb_path,
+                    Some(data_volume),
+                )
+                .await?
             }
             CacheBackend::K8s(k) => {
-                k.spawn_pod(resource_id, CacheEngineKind::Redis, rdb_path, tags)
-                    .await?
+                k.spawn_pod(
+                    incarnation,
+                    resource_id,
+                    CacheEngineKind::Redis,
+                    rdb_path,
+                    tags,
+                )
+                .await?
             }
         };
         self.containers
             .write()
-            .insert(resource_id.to_string(), running.clone());
+            .insert(incarnation.to_string(), running.clone());
         Ok(running)
     }
 
+    /// Start the memcached container of resource incarnation `incarnation`
+    /// (in-memory only: no data volume).
     pub async fn ensure_memcached(
         &self,
+        incarnation: &str,
+        account_id: &str,
         resource_id: &str,
         tags: &BTreeMap<String, String>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
         let running = match &self.backend {
             CacheBackend::Docker(d) => {
-                d.spawn_container(resource_id, CacheEngineKind::Memcached, None)
-                    .await?
+                d.spawn_container(
+                    incarnation,
+                    account_id,
+                    resource_id,
+                    CacheEngineKind::Memcached,
+                    None,
+                    None,
+                )
+                .await?
             }
             CacheBackend::K8s(k) => {
-                k.spawn_pod(resource_id, CacheEngineKind::Memcached, None, tags)
-                    .await?
+                k.spawn_pod(
+                    incarnation,
+                    resource_id,
+                    CacheEngineKind::Memcached,
+                    None,
+                    tags,
+                )
+                .await?
             }
         };
         self.containers
             .write()
-            .insert(resource_id.to_string(), running.clone());
+            .insert(incarnation.to_string(), running.clone());
         Ok(running)
     }
 
-    pub async fn stop_container(&self, resource_id: &str) {
-        let container = self.containers.write().remove(resource_id);
+    /// Stop and remove the backing container of incarnation `incarnation`.
+    pub async fn stop(&self, incarnation: &str) {
+        let container = self.containers.write().remove(incarnation);
         if let Some(container) = container {
             match &self.backend {
                 CacheBackend::Docker(d) => d.remove_container(&container.container_id).await,
@@ -244,27 +291,41 @@ impl ElastiCacheRuntime {
         }
     }
 
-    /// Remove the persisted redis/valkey data volume for a resource. Called on
-    /// delete so a later resource reusing the identifier starts clean instead
-    /// of reloading the deleted resource's RDB. No-op on the k8s backend (PVC
-    /// lifecycle is handled there) and for memcached (no volume).
-    pub async fn remove_data_volume(&self, resource_id: &str) {
+    /// Remove a data volume by name (named from the deleted resource's row).
+    /// No-op on the k8s backend, which has no Docker volumes.
+    pub async fn remove_data_volume_named(&self, name: &str) {
         if let CacheBackend::Docker(d) = &self.backend {
-            d.remove_data_volume(resource_id).await;
+            fakecloud_core::data_volume::remove_volume(&d.cli, name).await;
+        }
+    }
+
+    /// Whether this backend mounts named Docker volumes (not k8s), i.e.
+    /// whether a resource's volume binding matters to recovery.
+    pub fn has_data_volumes(&self) -> bool {
+        matches!(self.backend, CacheBackend::Docker(_))
+    }
+
+    /// The daemon's volume names, for resolving legacy volumes at startup.
+    /// `None` on the k8s backend or when the daemon can't answer.
+    pub async fn list_volumes(&self) -> Option<std::collections::HashSet<String>> {
+        match &self.backend {
+            CacheBackend::Docker(d) => fakecloud_core::data_volume::list_volumes(&d.cli).await,
+            CacheBackend::K8s(_) => None,
         }
     }
 
     /// Restart the underlying backing instance, mirroring real
     /// ElastiCache's RebootCacheCluster behaviour. Returns `Unavailable`
     /// if the resource has no live instance tracked here.
-    pub async fn restart_container(
+    pub async fn restart(
         &self,
+        incarnation: &str,
         resource_id: &str,
         tags: &BTreeMap<String, String>,
     ) -> Result<(), RuntimeError> {
         let running = {
             let containers = self.containers.read();
-            containers.get(resource_id).cloned()
+            containers.get(incarnation).cloned()
         };
         let running = running.ok_or(RuntimeError::Unavailable)?;
         match &self.backend {
@@ -275,25 +336,45 @@ impl ElastiCacheRuntime {
                 // recreate. The new Pod keeps the same deterministic name.
                 // Per-instance scheduling tags are re-applied to the fresh
                 // Pod so a reboot keeps the resource's node placement.
-                let updated = k.reboot_pod(resource_id, &running, tags).await?;
-                self.containers
-                    .write()
-                    .insert(resource_id.to_string(), updated);
+                let updated = k
+                    .reboot_pod(incarnation, resource_id, &running, tags)
+                    .await?;
+                if !self.retrack(incarnation, updated.clone()) {
+                    // Deleted (or reset) while the Pod was recreated: the new
+                    // Pod belongs to nothing any more.
+                    k.delete_pod(&updated.container_id).await;
+                    return Err(RuntimeError::Unavailable);
+                }
                 Ok(())
             }
+        }
+    }
+
+    /// Record a recreated instance, but only while its incarnation is still
+    /// tracked: a `stop` that ran during the recreate removed the entry, and
+    /// re-inserting it would track a deleted resource's Pod forever.
+    /// Returns whether it was recorded.
+    fn retrack(&self, incarnation: &str, running: RunningCacheContainer) -> bool {
+        let mut containers = self.containers.write();
+        match containers.get_mut(incarnation) {
+            Some(entry) => {
+                *entry = running;
+                true
+            }
+            None => false,
         }
     }
 
     /// Execute a `redis-cli` command inside a tracked instance.
     pub async fn exec_redis(
         &self,
-        resource_id: &str,
+        incarnation: &str,
         redis_args: &[String],
     ) -> Result<CacheExec, RuntimeError> {
         let container_id = {
             let containers = self.containers.read();
             containers
-                .get(resource_id)
+                .get(incarnation)
                 .map(|c| c.container_id.clone())
                 .ok_or(RuntimeError::Unavailable)?
         };
@@ -305,11 +386,11 @@ impl ElastiCacheRuntime {
 
     /// Trigger `SAVE` inside a running Redis instance and copy the
     /// resulting `dump.rdb` out to `dest_path`.
-    pub async fn dump_rdb(&self, resource_id: &str, dest_path: &str) -> Result<(), RuntimeError> {
+    pub async fn dump_rdb(&self, incarnation: &str, dest_path: &str) -> Result<(), RuntimeError> {
         let container_id = {
             let containers = self.containers.read();
             containers
-                .get(resource_id)
+                .get(incarnation)
                 .map(|c| c.container_id.clone())
                 .ok_or(RuntimeError::Unavailable)?
         };
@@ -353,9 +434,12 @@ struct DockerCache {
 impl DockerCache {
     async fn spawn_container(
         &self,
+        incarnation: &str,
+        account_id: &str,
         resource_id: &str,
         engine: CacheEngineKind,
         rdb_path: Option<&str>,
+        data_volume: Option<&str>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
         let image = engine.image();
         let container_port = engine.port();
@@ -367,6 +451,10 @@ impl DockerCache {
             "--label".to_string(),
             format!("fakecloud-elasticache={resource_id}"),
             "--label".to_string(),
+            format!("fakecloud-account={account_id}"),
+            "--label".to_string(),
+            format!("fakecloud-elasticache-resource={incarnation}"),
+            "--label".to_string(),
             format!("fakecloud-instance={}", self.instance_id),
         ];
 
@@ -374,12 +462,25 @@ impl DockerCache {
         // recreated after a fakecloud restart reloads its RDB instead of
         // coming back empty (bug-audit 2026-06-20, 4.2). A named volume (not a
         // bind mount) is daemon-managed, so it works whether or not fakecloud
-        // is itself containerized. memcached is intentionally in-memory only,
-        // matching real ElastiCache (a reboot clears it), so it gets no
-        // volume.
-        if matches!(engine, CacheEngineKind::Redis) {
+        // is itself containerized. The name is scoped to the data dir (memory
+        // mode: to this process, reaped once it exits), so another data dir or
+        // fakecloud reusing the id never reloads this RDB (#2630). memcached
+        // is intentionally in-memory only, matching real ElastiCache (a reboot
+        // clears it), so it gets no volume.
+        if let (CacheEngineKind::Redis, Some(volume)) = (engine, data_volume) {
+            let volume = volume.to_string();
+            fakecloud_core::data_volume::ensure_volume(
+                &self.cli,
+                &volume,
+                fakecloud_core::data_volume::current_scope(),
+                &[
+                    format!("fakecloud-elasticache={resource_id}"),
+                    format!("fakecloud-account={account_id}"),
+                ],
+            )
+            .await;
             args.push("-v".to_string());
-            args.push(format!("{}:/data", data_volume_name(resource_id)));
+            args.push(format!("{volume}:/data"));
         }
         args.push(image.to_string());
 
@@ -614,31 +715,29 @@ impl DockerCache {
             .output()
             .await;
     }
-
-    async fn remove_data_volume(&self, resource_id: &str) {
-        let _ = tokio::process::Command::new(&self.cli)
-            .args(["volume", "rm", "-f", &data_volume_name(resource_id)])
-            .output()
-            .await;
-    }
 }
 
-/// Deterministic Docker volume name for a resource's redis data dir. Keyed
-/// only on the resource id (NOT the per-process fakecloud instance id) so the
-/// same volume reattaches after a fakecloud restart. Characters outside
-/// Docker's `[a-zA-Z0-9_.-]` volume-name set are replaced with `-`.
-fn data_volume_name(resource_id: &str) -> String {
-    let sanitized: String = resource_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("fakecloud-elasticache-data-{sanitized}")
+/// Docker volume name for a resource's redis data dir in a volume scope
+/// (`fakecloud_core::data_volume`): stable for the same data dir across
+/// restarts, distinct for any other data dir, memory-mode process, or
+/// account.
+pub fn scoped_data_volume_name(
+    scope_tag: &str,
+    account_id: &str,
+    resource_id: &str,
+    incarnation: &str,
+) -> String {
+    fakecloud_core::data_volume::scoped_volume_name(
+        "elasticache",
+        scope_tag,
+        &[account_id, resource_id, incarnation],
+    )
+}
+
+/// The unscoped name builds before #2630 gave a resource's data volume.
+/// It carries no account: those builds shared one volume across accounts.
+pub fn legacy_data_volume_name(resource_id: &str) -> String {
+    fakecloud_core::data_volume::legacy_volume_name("elasticache", &[resource_id])
 }
 
 #[cfg(test)]
@@ -646,16 +745,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_volume_name_is_stable_and_sanitized() {
-        // Stable across calls (so recovery reattaches the same volume) and
-        // keyed only on the resource id, not the per-process instance id.
+    fn data_volume_name_is_scoped_stable_and_sanitized() {
         assert_eq!(
-            data_volume_name("my-cache"),
+            scoped_data_volume_name("d0123456789ab", "123456789012", "my-cache", "inc1"),
+            "fakecloud-elasticache-data-d0123456789ab-123456789012-my-cache-inc1"
+        );
+        // Two data dirs never share a volume for the same id.
+        assert_ne!(
+            scoped_data_volume_name("d0123456789ab", "123456789012", "my-cache", "inc1"),
+            scoped_data_volume_name("dba9876543210", "123456789012", "my-cache", "inc1")
+        );
+        // Nor do two accounts, nor a delete + recreate under the same id.
+        assert_ne!(
+            scoped_data_volume_name("d0", "111111111111", "my-cache", "inc1"),
+            scoped_data_volume_name("d0", "222222222222", "my-cache", "inc1")
+        );
+        assert_ne!(
+            scoped_data_volume_name("d0", "111111111111", "my-cache", "inc1"),
+            scoped_data_volume_name("d0", "111111111111", "my-cache", "inc2")
+        );
+        assert_eq!(
+            scoped_data_volume_name("d0", "123456789012", "weird/id:1", "inc1"),
+            "fakecloud-elasticache-data-d0-123456789012-weird-id-1-inc1"
+        );
+        // The legacy name is exactly what pre-scoping builds created.
+        assert_eq!(
+            legacy_data_volume_name("my-cache"),
             "fakecloud-elasticache-data-my-cache"
         );
-        assert_eq!(
-            data_volume_name("weird/id:1"),
-            "fakecloud-elasticache-data-weird-id-1"
-        );
+    }
+
+    /// A delete and a recreate under the same id are different incarnations:
+    /// stopping the old one never reaches the new one's container.
+    #[tokio::test]
+    async fn containers_are_tracked_by_incarnation() {
+        let rt = ElastiCacheRuntime::new_stub();
+        let running = |id: &str| RunningCacheContainer {
+            container_id: id.to_string(),
+            host_port: 0,
+            endpoint_address: "127.0.0.1".to_string(),
+            endpoint_port: 6379,
+            engine: CacheEngineKind::Redis,
+        };
+        rt.containers.write().insert("inc-old".into(), running("a"));
+        rt.containers.write().insert("inc-new".into(), running("b"));
+        rt.stop("inc-old").await;
+        let left: Vec<String> = rt
+            .containers
+            .read()
+            .values()
+            .map(|c| c.container_id.clone())
+            .collect();
+        assert_eq!(left, vec!["b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn reboot_does_not_retrack_a_stopped_incarnation() {
+        let rt = ElastiCacheRuntime::new_stub();
+        let running = |id: &str| RunningCacheContainer {
+            container_id: id.to_string(),
+            host_port: 0,
+            endpoint_address: "127.0.0.1".to_string(),
+            endpoint_port: 6379,
+            engine: CacheEngineKind::Redis,
+        };
+        rt.containers.write().insert("inc".into(), running("p1"));
+        assert!(rt.retrack("inc", running("p2")));
+        assert_eq!(rt.containers.read()["inc"].container_id, "p2");
+        // Deleted while the Pod was being recreated: not re-inserted.
+        rt.stop("inc").await;
+        assert!(!rt.retrack("inc", running("p3")));
+        assert!(rt.containers.read().is_empty());
     }
 }

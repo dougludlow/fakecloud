@@ -95,9 +95,13 @@ impl K8sCache {
     }
 
     /// Spawn a cache Pod, reading the snapshot RDB from `rdb_path` (if
-    /// any) into memory first.
+    /// any) into memory first. `pod_key` is the runtime's account-qualified
+    /// key and names the Pod, so two accounts' same-named caches get separate
+    /// Pods; the `fakecloud-elasticache` label keeps the plain `resource_id`,
+    /// matching the Docker backend.
     pub(super) async fn spawn_pod(
         &self,
+        pod_key: &str,
         resource_id: &str,
         engine: CacheEngineKind,
         rdb_path: Option<&str>,
@@ -109,17 +113,19 @@ impl K8sCache {
             })?),
             None => None,
         };
-        self.spawn_pod_bytes(resource_id, engine, rdb, tags).await
+        self.spawn_pod_bytes(pod_key, resource_id, engine, rdb, tags)
+            .await
     }
 
     async fn spawn_pod_bytes(
         &self,
+        pod_key: &str,
         resource_id: &str,
         engine: CacheEngineKind,
         rdb: Option<Vec<u8>>,
         tags: &std::collections::BTreeMap<String, String>,
     ) -> Result<RunningCacheContainer, RuntimeError> {
-        let pod_name = names::pod_name(POD_PREFIX, resource_id, resource_id);
+        let pod_name = names::pod_name(POD_PREFIX, pod_key, pod_key);
         let port = engine.port();
 
         // Stage snapshot bytes (Redis only) for the Pod to fetch, then
@@ -270,6 +276,7 @@ impl K8sCache {
     /// also what a real memcached reboot does).
     pub(super) async fn reboot_pod(
         &self,
+        pod_key: &str,
         resource_id: &str,
         running: &RunningCacheContainer,
         tags: &std::collections::BTreeMap<String, String>,
@@ -280,7 +287,7 @@ impl K8sCache {
             None
         };
         self.client.delete_pod(&running.container_id).await;
-        self.spawn_pod_bytes(resource_id, running.engine, preserved, tags)
+        self.spawn_pod_bytes(pod_key, resource_id, running.engine, preserved, tags)
             .await
     }
 

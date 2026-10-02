@@ -95,6 +95,8 @@ async fn instance_data_survives_fakecloud_restart() {
     // turns on the durable instance volume under test.
     let tmp = tempfile::tempdir().unwrap();
     let data_path = tmp.path().display().to_string();
+    // Drop the instance's durable data volume even if the test fails.
+    let volume_guard = helpers::DataVolumeGuard::new(tmp.path());
     let mut server = TestServer::start_full(
         &[
             ("FAKECLOUD_EC2_DEFAULT_IMAGE", "alpine:3"),
@@ -161,16 +163,114 @@ async fn instance_data_survives_fakecloud_restart() {
         "instance data dir should survive a fakecloud restart via the durable volume"
     );
 
+    // The volume is scoped to this data dir (#2630).
+    let volumes = volume_guard.volumes(&[&format!("fakecloud-ec2={instance_id}")]);
+    assert_eq!(volumes.len(), 1, "one scoped volume: {volumes:?}");
+
     // TerminateInstances drops the container and its durable volume.
     c.terminate_instances()
         .instance_ids(&instance_id)
         .send()
         .await
         .unwrap();
-    for _ in 0..40 {
-        if container_for(&instance_id).is_empty() {
+    let mut gone = false;
+    for _ in 0..80 {
+        if container_for(&instance_id).is_empty() && !helpers::volume_exists(&volumes[0]) {
+            gone = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    assert!(
+        gone,
+        "TerminateInstances left the container or data volume {} behind",
+        volumes[0]
+    );
+}
+
+/// A reset removes every EC2 instance's data volume, including a `stopped`
+/// instance's that the runtime doesn't track after a restart.
+#[tokio::test]
+async fn reset_removes_a_stopped_instances_volume_after_restart() {
+    let test = "reset_removes_a_stopped_instances_volume_after_restart";
+    if !require_docker_or_skip(test) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let data_path = tmp.path().display().to_string();
+    let volume_guard = helpers::DataVolumeGuard::new(tmp.path());
+    let mut server = TestServer::start_full(
+        &[
+            ("FAKECLOUD_EC2_DEFAULT_IMAGE", "alpine:3"),
+            ("FAKECLOUD_PERSIST_EC2_VOLUMES", "1"),
+        ],
+        &["--storage-mode", "persistent", "--data-path", &data_path],
+    )
+    .await;
+    let c = server.ec2_client().await;
+    let instance_id = c
+        .run_instances()
+        .image_id("ami-12345678")
+        .min_count(1)
+        .max_count(1)
+        .send()
+        .await
+        .unwrap()
+        .instances
+        .unwrap()
+        .first()
+        .unwrap()
+        .instance_id
+        .clone()
+        .unwrap();
+    wait_running_container(&c, &instance_id).await;
+    let volumes = volume_guard.volumes(&[&format!("fakecloud-ec2={instance_id}")]);
+    assert_eq!(volumes.len(), 1, "one scoped volume: {volumes:?}");
+
+    c.stop_instances()
+        .instance_ids(&instance_id)
+        .send()
+        .await
+        .unwrap();
+    let mut observed = None;
+    for _ in 0..80 {
+        let state = c
+            .describe_instances()
+            .instance_ids(&instance_id)
+            .send()
+            .await
+            .unwrap()
+            .reservations()
+            .iter()
+            .flat_map(|r| r.instances())
+            .find_map(|i| {
+                i.state()
+                    .and_then(|s| s.name())
+                    .map(|n| n.as_str().to_string())
+            });
+        observed = state;
+        if observed.as_deref() == Some("stopped") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    // The point is the stopped-instance path (no runtime record after the
+    // restart): a still-running instance would be covered trivially.
+    assert_eq!(
+        observed.as_deref(),
+        Some("stopped"),
+        "instance never stopped"
+    );
+    server.restart().await;
+
+    let reset = reqwest::Client::new()
+        .post(format!("{}/_fakecloud/reset/ec2", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200);
+    assert!(
+        !helpers::volume_exists(&volumes[0]),
+        "the stopped instance's data volume must be removed by the reset"
+    );
 }

@@ -107,8 +107,14 @@ impl K8sDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `pod_key` is the instance's incarnation id (`DbiResourceId`): it
+    /// names the Pod and keys its stored spec, so no other instance (another
+    /// account's, a renamed one's, or a recreate under the same identifier)
+    /// ever shares or deletes it. The Pod's `fakecloud-rds` label keeps the
+    /// plain identifier, matching the Docker backend.
     pub(super) async fn ensure(
         &self,
+        pod_key: &str,
         db_instance_identifier: &str,
         engine: &str,
         engine_version: &str,
@@ -129,7 +135,7 @@ impl K8sDb {
             account_id,
             region,
         )?;
-        let pod_name = names::pod_name(POD_PREFIX, db_instance_identifier, db_instance_identifier);
+        let pod_name = names::pod_name(POD_PREFIX, pod_key, pod_key);
         let mut pod = build_pod(
             self.client.namespace(),
             self.client.instance_id(),
@@ -148,7 +154,7 @@ impl K8sDb {
 
         self.specs
             .write()
-            .insert(db_instance_identifier.to_string(), (pod.clone(), cfg.port));
+            .insert(pod_key.to_string(), (pod.clone(), cfg.port));
 
         self.launch(&pod, &pod_name, &cfg, username, password, db_name)
             .await

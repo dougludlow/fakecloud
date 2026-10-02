@@ -19,6 +19,7 @@ use crate::state::{
     DbSnapshot, DbSubnetGroup, EngineVersionInfo, OrderableDbInstanceOption, RdsSnapshot, RdsState,
     RdsTag, SharedRdsState, RDS_SNAPSHOT_SCHEMA_VERSION,
 };
+use fakecloud_core::data_volume::DataVolumeBinding;
 
 const RDS_NS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 
@@ -411,6 +412,49 @@ impl RdsService {
         .await;
     }
 
+    /// Settle which data volume each persisted instance mounts before any
+    /// container is recreated. Instances persisted without a binding (state
+    /// written before volumes were scoped to the data dir) are bound against
+    /// the daemon's volumes, keeping a legacy volume when one exists, and the
+    /// bindings are persisted; every legacy binding is then registered with
+    /// the runtime. If the daemon can't list volumes, the unbound instances
+    /// stay unbound until a start where it can.
+    async fn resolve_data_volumes(&self, runtime: &RdsRuntime) {
+        let unbound = self
+            .state
+            .read()
+            .iter()
+            .any(|(_, s)| s.instances.values().any(|i| i.data_volume.is_none()));
+        if unbound {
+            if let Some(existing) = runtime.list_volumes().await {
+                let tag = fakecloud_core::data_volume::current_scope().tag();
+                let changed = {
+                    let mut accounts = self.state.write();
+                    let mut changed = false;
+                    for (_, state) in accounts.iter_mut() {
+                        changed |= state.resolve_data_volumes(tag, &existing);
+                    }
+                    changed
+                };
+                if changed {
+                    self.save_snapshot().await;
+                }
+            }
+        }
+        let accounts = self.state.read();
+        for (_, state) in accounts.iter() {
+            for (id, inst) in &state.instances {
+                if let Some(DataVolumeBinding::Legacy(volume)) = &inst.data_volume {
+                    tracing::info!(
+                        db_instance_identifier = %id,
+                        volume = %volume,
+                        "rds instance keeps its pre-scoping data volume",
+                    );
+                }
+            }
+        }
+    }
+
     /// Recreate the backing Docker/Podman containers for persisted DB
     /// instances after a fakecloud restart. Without this, persistent
     /// mode loads the row back into memory with `db_instance_status =
@@ -423,12 +467,14 @@ impl RdsService {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
+        self.resolve_data_volumes(&runtime).await;
 
         struct Pending {
             account_id: String,
             region: String,
             id: String,
-            arn: String,
+            incarnation: String,
+            volume: String,
             engine: String,
             engine_version: String,
             username: String,
@@ -462,12 +508,30 @@ impl RdsService {
                     ) {
                         continue;
                     }
+                    // Still unbound: the daemon couldn't list volumes to say
+                    // whether a pre-scoping volume holds its data. Mounting
+                    // now would create (and from then on prefer) an empty
+                    // scoped volume, so don't; report it `stopped` (it has no
+                    // container) so StartDBInstance can retry once the
+                    // daemon answers.
+                    if inst.data_volume.is_none() && runtime.has_data_volumes() {
+                        tracing::warn!(
+                            db_instance_identifier = %id,
+                            "not recovering rds instance: its data volume could not be resolved",
+                        );
+                        inst.db_instance_status = "stopped".to_string();
+                        continue;
+                    }
                     inst.db_instance_status = "starting".to_string();
                     out.push(Pending {
                         account_id: account_id.clone(),
                         region: region.clone(),
                         id: id.clone(),
-                        arn: inst.db_instance_arn.clone(),
+                        incarnation: inst.dbi_resource_id.clone(),
+                        volume: inst.data_volume_name(
+                            fakecloud_core::data_volume::current_scope().tag(),
+                            &account_id,
+                        ),
                         engine: inst.engine.clone(),
                         engine_version: inst.engine_version.clone(),
                         username: inst.master_username.clone(),
@@ -500,6 +564,7 @@ impl RdsService {
             tokio::spawn(async move {
                 match runtime
                     .ensure_postgres(
+                        &p.incarnation,
                         &p.id,
                         &p.engine,
                         &p.engine_version,
@@ -509,22 +574,33 @@ impl RdsService {
                         &p.account_id,
                         &p.region,
                         &p.tags,
+                        &p.volume,
                     )
                     .await
                 {
                     Ok(running) => {
-                        {
+                        let current = {
                             let mut accounts = state.write();
-                            if let Some(s) = accounts.get_mut(&p.account_id) {
-                                if let Some(inst) = s.instances.get_mut(&p.id) {
+                            accounts
+                                .get_mut(&p.account_id)
+                                .and_then(|s| s.instance_by_incarnation_mut(&p.incarnation))
+                                .map(|inst| {
                                     inst.db_instance_status = "available".to_string();
                                     inst.endpoint_address = running.endpoint_address.clone();
                                     inst.port = i32::from(running.endpoint_port);
                                     inst.host_port = running.host_port;
                                     inst.container_id = running.container_id;
-                                }
-                            }
-                        }
+                                    (
+                                        inst.db_instance_identifier.clone(),
+                                        inst.db_instance_arn.clone(),
+                                    )
+                                })
+                        };
+                        let Some((current_id, current_arn)) = current else {
+                            // Deleted (or reset) while recovering.
+                            reap_gone_start(&runtime, &p.incarnation, &p.volume).await;
+                            return;
+                        };
                         save_snapshot_static(
                             state.clone(),
                             snapshot_store.clone(),
@@ -534,8 +610,8 @@ impl RdsService {
                         emit_event_static(
                             delivery_bus.as_ref(),
                             RdsSourceType::DbInstance,
-                            &p.id,
-                            &p.arn,
+                            &current_id,
+                            &current_arn,
                             "RDS-EVENT-0088",
                             &["notification"],
                             "DB instance restarted after fakecloud restart",
@@ -547,13 +623,25 @@ impl RdsService {
                             db_instance_identifier = %p.id,
                             "failed to recover rds backing container after restart",
                         );
-                        {
+                        let present = {
                             let mut accounts = state.write();
-                            if let Some(s) = accounts.get_mut(&p.account_id) {
-                                if let Some(inst) = s.instances.get_mut(&p.id) {
+                            match accounts
+                                .get_mut(&p.account_id)
+                                .and_then(|s| s.instance_by_incarnation_mut(&p.incarnation))
+                            {
+                                Some(inst) => {
                                     inst.db_instance_status = "failed".to_string();
+                                    true
                                 }
+                                None => false,
                             }
+                        };
+                        if !present {
+                            // Deleted while recovering: the failed start may
+                            // still have created the volume after the delete
+                            // removed it.
+                            reap_gone_start(&runtime, &p.incarnation, &p.volume).await;
+                            return;
                         }
                         save_snapshot_static(state, snapshot_store, snapshot_lock).await;
                     }
@@ -593,30 +681,52 @@ impl RdsService {
             return;
         };
         for r in rearm {
+            tracing::info!(
+                db_instance_identifier = %r.source_id,
+                snapshot = %r.snapshot_id,
+                "re-arming an in-flight snapshot dump after restart",
+            );
+            let source_key = r.incarnation.clone();
             self.spawn_finalize_snapshot(
                 runtime.clone(),
                 r.account_id,
                 r.snapshot_id,
-                r.source_id,
+                r.snapshot_created,
+                source_key,
                 r.engine,
                 r.username,
                 r.password,
                 r.db_name,
                 // Source instance is present (a regular in-flight snapshot);
                 // no deferred teardown to run.
-                false,
+                None,
             );
         }
         for r in reap {
             // Complete the deferred final-snapshot teardown the crash
             // interrupted: reap the orphaned source container + data volume.
             // Idempotent — a no-op if the runtime already reaped them.
+            tracing::info!(
+                account_id = %r.account_id,
+                db_instance_identifier = %r.source_id,
+                dbi_resource_id = %r.dbi_resource_id,
+                "reaping the backing container of an interrupted RDS delete"
+            );
             let runtime = runtime.clone();
             tokio::spawn(async move {
-                runtime.stop_container(&r.source_id).await;
-                runtime
-                    .remove_data_volume(&r.account_id, &r.source_id)
-                    .await;
+                runtime.stop(&r.dbi_resource_id).await;
+                // The row is gone and this process never mounted the volume:
+                // the final snapshot recorded which one it was (an adopted
+                // legacy volume included); older snapshots predate that and
+                // name the scoped one from the resource id.
+                let volume = r.data_volume.unwrap_or_else(|| {
+                    crate::runtime::scoped_data_volume_name(
+                        fakecloud_core::data_volume::current_scope().tag(),
+                        &r.account_id,
+                        &r.dbi_resource_id,
+                    )
+                });
+                runtime.remove_data_volume_named(&volume).await;
             });
         }
     }
@@ -635,17 +745,48 @@ impl RdsService {
         let mut rearm = Vec::new();
         let mut reap = Vec::new();
         let mut accounts = self.state.write();
+        let tag = fakecloud_core::data_volume::current_scope().tag();
         for (_, state) in accounts.iter_mut() {
             let account_id = state.account_id.clone();
+            // An instance persisted as `deleting` was mid-DeleteDBInstance (its
+            // final snapshot recorded, the row not yet removed) when the
+            // process died. Finish the delete: drop the row and reap its
+            // container and volume. Its in-flight final snapshot can't be
+            // dumped any more and is failed below like any orphaned one.
+            let deleting: Vec<String> = state
+                .instances
+                .iter()
+                .filter(|(_, i)| i.db_instance_status == "deleting")
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in deleting {
+                if let Some(inst) = state.instances.remove(&id) {
+                    reap.push(SnapshotReap {
+                        account_id: account_id.clone(),
+                        source_id: id,
+                        dbi_resource_id: inst.dbi_resource_id.clone(),
+                        data_volume: Some(inst.data_volume_name(tag, &account_id)),
+                    });
+                }
+            }
             // Snapshot the present instance ids so the immutable borrow ends
             // before we mutate `state.snapshots`.
-            let instances: std::collections::HashSet<String> =
-                state.instances.keys().cloned().collect();
+            let instances: std::collections::HashMap<String, String> = state
+                .instances
+                .iter()
+                .map(|(id, i)| (id.clone(), i.dbi_resource_id.clone()))
+                .collect();
             for (id, snap) in state.snapshots.iter_mut() {
                 if snap.status != "creating" {
                     continue;
                 }
-                let source_present = instances.contains(&snap.db_instance_identifier);
+                // Present only as the same incarnation the snapshot was taken
+                // from: a recreate under the identifier is a different
+                // instance, which must neither be dumped into this snapshot
+                // nor keep the deleted one's volume from being reaped.
+                let source_present = instances
+                    .get(&snap.db_instance_identifier)
+                    .is_some_and(|dbi| *dbi == snap.dbi_resource_id);
                 if source_present && has_runtime {
                     let db_name = snap
                         .db_name
@@ -654,6 +795,8 @@ impl RdsService {
                     rearm.push(SnapshotRearm {
                         account_id: account_id.clone(),
                         snapshot_id: id.clone(),
+                        snapshot_created: snap.snapshot_create_time,
+                        incarnation: instances[&snap.db_instance_identifier].clone(),
                         source_id: snap.db_instance_identifier.clone(),
                         engine: snap.engine.clone(),
                         username: snap.master_username.clone(),
@@ -662,10 +805,15 @@ impl RdsService {
                     });
                 } else {
                     snap.status = "failed".to_string();
-                    if !source_present {
+                    let already_reaped = reap.iter().any(|r| {
+                        r.account_id == account_id && r.dbi_resource_id == snap.dbi_resource_id
+                    });
+                    if !source_present && !already_reaped {
                         reap.push(SnapshotReap {
                             account_id: account_id.clone(),
                             source_id: snap.db_instance_identifier.clone(),
+                            dbi_resource_id: snap.dbi_resource_id.clone(),
+                            data_volume: snap.source_data_volume.clone(),
                         });
                     }
                 }
@@ -686,37 +834,40 @@ impl RdsService {
         // declared `DBInstanceNotFoundFault` error rather than a 503 from a
         // missing container runtime. Conformance probes hit Start/Stop with
         // synthetic identifiers and expect the documented error shape.
-        let arn = {
+        let incarnation = {
             let accounts = self.state.read();
             let empty = RdsState::new(&request.account_id, &request.region);
             let state = accounts.get(&request.account_id).unwrap_or(&empty);
             state
                 .instances
                 .get(&db_instance_identifier)
-                .map(|i| i.db_instance_arn.clone())
+                .map(|i| i.dbi_resource_id.clone())
                 .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?
         };
 
         if let Some(runtime) = self.runtime.as_ref() {
-            runtime.stop_container(&db_instance_identifier).await;
+            runtime.stop(&incarnation).await;
         }
 
+        // Re-resolve by incarnation: a delete-and-recreate under the same
+        // identifier during the stop must not mark the replacement stopped.
         let instance = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
             let inst = state
-                .instances
-                .get_mut(&db_instance_identifier)
+                .instance_by_incarnation_mut(&incarnation)
                 .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?;
             inst.db_instance_status = "stopped".to_string();
             inst.container_id = String::new();
             inst.clone()
         };
 
+        // The row as it is now (a rename during the stop changed its
+        // identifier and ARN), not the values read before the await.
         self.emit_event(
             RdsSourceType::DbInstance,
-            &db_instance_identifier,
-            &arn,
+            &instance.db_instance_identifier,
+            &instance.db_instance_arn,
             "RDS-EVENT-0089",
             &["notification"],
             "DB instance stopped",
@@ -763,12 +914,18 @@ impl RdsService {
                 .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?
         };
 
+        // Every later step re-resolves the row by this incarnation, never by
+        // the reusable identifier: the awaits below can race a delete or a
+        // delete-and-recreate under the same name.
+        let incarnation = instance.dbi_resource_id.clone();
+        let prior_status = instance.db_instance_status.clone();
+
         // Flip to `starting` so concurrent DescribeDBInstances callers
         // see the in-flight state.
         {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
-            if let Some(inst) = state.instances.get_mut(&db_instance_identifier) {
+            if let Some(inst) = state.instance_by_incarnation_mut(&incarnation) {
                 inst.db_instance_status = "starting".to_string();
             }
         }
@@ -781,7 +938,7 @@ impl RdsService {
             {
                 let mut accounts = self.state.write();
                 let state = accounts.get_or_create(&request.account_id);
-                if let Some(inst) = state.instances.get_mut(&db_instance_identifier) {
+                if let Some(inst) = state.instance_by_incarnation_mut(&incarnation) {
                     inst.db_instance_status = "stopped".to_string();
                 }
             }
@@ -791,6 +948,40 @@ impl RdsService {
                 "Container runtime is not configured; cannot start DB instance",
             ));
         };
+
+        // A pre-scoping instance whose data volume couldn't be bound at startup
+        // (the daemon couldn't list volumes) is bound now; starting it on a
+        // guessed volume would shadow its legacy data with an empty one.
+        if instance.data_volume.is_none() && runtime.has_data_volumes() {
+            self.resolve_data_volumes(&runtime).await;
+        }
+
+        // Read the row back after the resolution: its binding may have just
+        // become `legacy(name)`, and the volume to mount comes from that, not
+        // from the pre-resolution copy.
+        let (instance, volume) = start_target(
+            &self.state.read(),
+            &request.account_id,
+            &incarnation,
+            fakecloud_core::data_volume::current_scope().tag(),
+        )
+        .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?;
+        if instance.data_volume.is_none() && runtime.has_data_volumes() {
+            let mut accounts = self.state.write();
+            let state = accounts.get_or_create(&request.account_id);
+            if let Some(inst) = state.instance_by_incarnation_mut(&incarnation) {
+                inst.db_instance_status = prior_status;
+            }
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidDBInstanceState",
+                format!(
+                    "DB instance {db_instance_identifier} cannot be started: its data \
+                     volume could not be resolved because the container runtime did \
+                     not list its volumes. Retry once it is reachable."
+                ),
+            ));
+        }
 
         // Background the container start + readiness wait and return
         // immediately with `starting`. `ensure_postgres` can pull a cold image
@@ -803,10 +994,11 @@ impl RdsService {
             let delivery_bus = self.delivery_bus.clone();
             let snapshot_store = self.snapshot_store.clone();
             let snapshot_lock = self.snapshot_lock.clone();
-            let id = db_instance_identifier.clone();
+            let id = instance.db_instance_identifier.clone();
             let account_id = request.account_id.clone();
             let region = request.region.clone();
             let inst = instance.clone();
+            let volume = volume.clone();
             tokio::spawn(async move {
                 let logical_db = inst
                     .db_name
@@ -814,6 +1006,7 @@ impl RdsService {
                     .unwrap_or_else(|| default_db_name(&inst.engine).to_string());
                 match runtime
                     .ensure_postgres(
+                        &inst.dbi_resource_id,
                         &id,
                         &inst.engine,
                         &inst.engine_version,
@@ -823,22 +1016,32 @@ impl RdsService {
                         &account_id,
                         &region,
                         &inst.tags,
+                        &volume,
                     )
                     .await
                 {
                     Ok(r) => {
-                        let arn = {
+                        let current = {
                             let mut accounts = state_handle.write();
                             let state = accounts.get_or_create(&account_id);
-                            let Some(inst) = state.instances.get_mut(&id) else {
-                                return;
-                            };
-                            inst.db_instance_status = "available".to_string();
-                            inst.endpoint_address = r.endpoint_address.clone();
-                            inst.port = i32::from(r.endpoint_port);
-                            inst.host_port = r.host_port;
-                            inst.container_id = r.container_id;
-                            inst.db_instance_arn.clone()
+                            state
+                                .instance_by_incarnation_mut(&inst.dbi_resource_id)
+                                .map(|row| {
+                                    row.db_instance_status = "available".to_string();
+                                    row.endpoint_address = r.endpoint_address.clone();
+                                    row.port = i32::from(r.endpoint_port);
+                                    row.host_port = r.host_port;
+                                    row.container_id = r.container_id.clone();
+                                    (
+                                        row.db_instance_identifier.clone(),
+                                        row.db_instance_arn.clone(),
+                                    )
+                                })
+                        };
+                        let Some((id, arn)) = current else {
+                            // Deleted (or reset) while starting.
+                            reap_gone_start(&runtime, &inst.dbi_resource_id, &volume).await;
+                            return;
                         };
                         emit_event_static_with_state(
                             delivery_bus.as_ref(),
@@ -856,11 +1059,22 @@ impl RdsService {
                     }
                     Err(_) => {
                         // Roll back to `stopped` so the next Describe doesn't
-                        // report a permanently-`starting` instance.
-                        let mut accounts = state_handle.write();
-                        let state = accounts.get_or_create(&account_id);
-                        if let Some(inst) = state.instances.get_mut(&id) {
-                            inst.db_instance_status = "stopped".to_string();
+                        // report a permanently-`starting` instance. If the
+                        // instance was deleted meanwhile, the failed start may
+                        // have created its volume after the delete removed it.
+                        let present = {
+                            let mut accounts = state_handle.write();
+                            let state = accounts.get_or_create(&account_id);
+                            match state.instance_by_incarnation_mut(&inst.dbi_resource_id) {
+                                Some(row) => {
+                                    row.db_instance_status = "stopped".to_string();
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if !present {
+                            reap_gone_start(&runtime, &inst.dbi_resource_id, &volume).await;
                         }
                     }
                 }
@@ -885,6 +1099,36 @@ impl RdsService {
             ),
         ))
     }
+}
+
+/// The row a StartDBInstance acts on, re-read by incarnation, and the data
+/// volume it mounts, named from the row's current binding. Read after the
+/// lazy legacy-volume resolution so a just-adopted legacy volume is mounted
+/// rather than an empty scoped one; `None` if the instance is gone.
+pub(crate) fn start_target(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<RdsState>,
+    account_id: &str,
+    incarnation: &str,
+    scope_tag: &str,
+) -> Option<(DbInstance, String)> {
+    let inst = accounts
+        .get(account_id)?
+        .instances
+        .values()
+        .find(|i| i.dbi_resource_id == incarnation)?
+        .clone();
+    let volume = inst.data_volume_name(scope_tag, account_id);
+    Some((inst, volume))
+}
+
+/// A start task's container came up, but the instance incarnation it was
+/// started for is gone (deleted or reset while it booted): remove the
+/// container, and the data volume it may have (re)created, which the delete
+/// couldn't remove while it was mounted. Keyed by incarnation, so a new
+/// instance that reuses the identifier is never reached.
+pub(crate) async fn reap_gone_start(runtime: &RdsRuntime, incarnation: &str, volume: &str) {
+    runtime.stop(incarnation).await;
+    runtime.remove_data_volume_named(volume).await;
 }
 
 /// Persist the current `RdsState` to the configured snapshot store. Free
@@ -923,11 +1167,18 @@ fn apply_snapshot_dump_result(
     state: &SharedRdsState,
     account_id: &str,
     snapshot_id: &str,
+    snapshot_created: chrono::DateTime<Utc>,
     result: Result<Vec<u8>, RuntimeError>,
 ) {
     let mut accounts = state.write();
     let s = accounts.get_or_create(account_id);
-    let Some(snapshot) = s.snapshots.get_mut(snapshot_id) else {
+    // Only the row this dump was started for: a snapshot deleted and
+    // recreated under the same id meanwhile is another snapshot.
+    let Some(snapshot) = s
+        .snapshots
+        .get_mut(snapshot_id)
+        .filter(|snap| snap.snapshot_create_time == snapshot_created && snap.status == "creating")
+    else {
         return;
     };
     match result {
@@ -948,6 +1199,11 @@ fn apply_snapshot_dump_result(
 pub(crate) struct SnapshotRearm {
     pub(crate) account_id: String,
     pub(crate) snapshot_id: String,
+    /// The snapshot row's creation time: which incarnation of the snapshot
+    /// id the re-armed dump belongs to.
+    pub(crate) snapshot_created: chrono::DateTime<Utc>,
+    /// The source instance's incarnation (`DbiResourceId`), its container key.
+    pub(crate) incarnation: String,
     pub(crate) source_id: String,
     pub(crate) engine: String,
     pub(crate) username: String,
@@ -961,6 +1217,10 @@ pub(crate) struct SnapshotRearm {
 pub(crate) struct SnapshotReap {
     pub(crate) account_id: String,
     pub(crate) source_id: String,
+    /// The source instance's resource id, which its data volume is named by.
+    pub(crate) dbi_resource_id: String,
+    /// The source instance's data volume, as its final snapshot recorded it.
+    pub(crate) data_volume: Option<String>,
 }
 
 /// no store is configured (memory-mode runs).
@@ -1065,6 +1325,7 @@ impl RdsService {
         let (event_id, event_message) = created_event;
         // Shared failure path: drop the placeholder row, reap any container the
         // runtime managed to start, persist, and emit the create-failure event.
+        #[allow(clippy::too_many_arguments)]
         async fn fail(
             state_handle: &SharedRdsState,
             snapshot_store: Option<Arc<dyn SnapshotStore>>,
@@ -1073,6 +1334,8 @@ impl RdsService {
             runtime: &Arc<RdsRuntime>,
             account_id: &str,
             id: &str,
+            incarnation: &str,
+            volume: &str,
             arn: &str,
             error: &str,
         ) {
@@ -1080,16 +1343,26 @@ impl RdsService {
             {
                 let mut accounts = state_handle.write();
                 let state = accounts.get_or_create(account_id);
-                state.instances.remove(id);
-                // A read replica registered itself against its source
-                // synchronously; drop that reverse linkage so the source
-                // doesn't keep a dangling replica id after this failure.
-                for inst in state.instances.values_mut() {
-                    inst.read_replica_db_instance_identifiers
-                        .retain(|r| r != id);
+                // Only this incarnation's row: a replacement created under the
+                // identifier meanwhile is not ours to drop.
+                if state
+                    .instances
+                    .get(id)
+                    .is_some_and(|i| i.dbi_resource_id == incarnation)
+                {
+                    state.instances.remove(id);
+                    // A read replica registered itself against its source
+                    // synchronously; drop that reverse linkage so the source
+                    // doesn't keep a dangling replica id after this failure.
+                    // Only when this incarnation's row went: a replacement
+                    // under the id owns the linkage otherwise.
+                    for inst in state.instances.values_mut() {
+                        inst.read_replica_db_instance_identifiers
+                            .retain(|r| r != id);
+                    }
                 }
             }
-            runtime.stop_container(id).await;
+            reap_gone_start(runtime, incarnation, volume).await;
             save_snapshot_static(state_handle.clone(), snapshot_store, snapshot_lock).await;
             emit_event_static(
                 delivery_bus,
@@ -1101,15 +1374,38 @@ impl RdsService {
                 &format!("DB instance failed to create: {error}"),
             );
         }
+        // The incarnation being created (its row is already published) and
+        // the source's, both pinned now: by identifier, the task could later
+        // reach a replacement or a renamed instance instead.
+        let (incarnation, volume, source_incarnation) = {
+            let accounts = self.state.read();
+            let Some(state) = accounts.get(&account_id) else {
+                return;
+            };
+            let Some(inst) = state.instances.get(&id) else {
+                return;
+            };
+            (
+                inst.dbi_resource_id.clone(),
+                inst.data_volume_name(
+                    fakecloud_core::data_volume::current_scope().tag(),
+                    &account_id,
+                ),
+                dump_source_id
+                    .as_ref()
+                    .and_then(|sid| state.instances.get(sid))
+                    .map(|src| src.dbi_resource_id.clone()),
+            )
+        };
         tokio::spawn(async move {
             // Live-dump the source instance inside the task when requested so
             // the slow mysqldump/pg_dump never blocks the request handler. On
             // failure the placeholder row is torn down like any other finalize
             // error, mirroring the inline path's `cancel_instance_creation`.
             let dump = match dump_source_id {
-                Some(source_id) => match runtime
-                    .dump_database(
-                        &source_id,
+                Some(_) => match runtime
+                    .dump(
+                        source_incarnation.as_deref().unwrap_or_default(),
                         &engine,
                         &master_username,
                         &master_user_password,
@@ -1127,6 +1423,8 @@ impl RdsService {
                             &runtime,
                             &account_id,
                             &id,
+                            &incarnation,
+                            &volume,
                             &arn,
                             &error.to_string(),
                         )
@@ -1138,6 +1436,7 @@ impl RdsService {
             };
             let running = match runtime
                 .ensure_postgres(
+                    &incarnation,
                     &id,
                     &engine,
                     &engine_version,
@@ -1147,6 +1446,7 @@ impl RdsService {
                     &account_id,
                     &region,
                     &tags,
+                    &volume,
                 )
                 .await
             {
@@ -1160,6 +1460,8 @@ impl RdsService {
                         &runtime,
                         &account_id,
                         &id,
+                        &incarnation,
+                        &volume,
                         &arn,
                         &error.to_string(),
                     )
@@ -1170,8 +1472,8 @@ impl RdsService {
 
             if let Some(dump) = dump {
                 if let Err(error) = runtime
-                    .restore_database(
-                        &id,
+                    .restore(
+                        &incarnation,
                         &engine,
                         &master_username,
                         &master_user_password,
@@ -1190,6 +1492,8 @@ impl RdsService {
                         &runtime,
                         &account_id,
                         &id,
+                        &incarnation,
+                        &volume,
                         &arn,
                         &error.to_string(),
                     )
@@ -1198,26 +1502,28 @@ impl RdsService {
                 }
             }
 
-            let instance_present = {
+            let current = {
                 let mut accounts = state_handle.write();
                 let state = accounts.get_or_create(&account_id);
-                if let Some(inst) = state.instances.get_mut(&id) {
+                state.instance_by_incarnation_mut(&incarnation).map(|inst| {
                     inst.db_instance_status = "available".to_string();
                     inst.endpoint_address = running.endpoint_address.clone();
                     inst.port = i32::from(running.endpoint_port);
                     inst.host_port = running.host_port;
                     inst.container_id = running.container_id.clone();
-                    true
-                } else {
-                    false
-                }
+                    (
+                        inst.db_instance_identifier.clone(),
+                        inst.db_instance_arn.clone(),
+                    )
+                })
             };
-            if !instance_present {
-                // Deleted while creating: reap the orphaned backing container.
-                runtime.stop_container(&id).await;
+            let Some((id, arn)) = current else {
+                // Deleted (or reset) while creating: reap the orphaned backing
+                // container and its volume.
+                reap_gone_start(&runtime, &incarnation, &volume).await;
                 save_snapshot_static(state_handle.clone(), snapshot_store, snapshot_lock).await;
                 return;
-            }
+            };
             emit_event_static_with_state(
                 delivery_bus.as_ref(),
                 Some(&state_handle),
@@ -1238,38 +1544,52 @@ impl RdsService {
     /// inserts the snapshot row synchronously with status `creating` and
     /// returns immediately; this task runs mysqldump/pg_dump (unbounded in
     /// dataset size, easily past the ~60s client read timeout) and only then
-    /// flips the row to `available` with the captured dump. `teardown_source`
+    /// flips the row to `available` with the captured dump. `teardown_volume`
     /// is set for the final-snapshot path so the source instance's container
     /// and data volume are reaped *after* the dump completes rather than
     /// before it (DeleteDBInstance can't stop the container until the snapshot
-    /// has read from it).
+    /// has read from it). It names the deleted instance's volume as captured
+    /// at delete time: by the time the dump finishes, a new instance may
+    /// reuse the identifier, and its volume must not be the one removed.
     #[allow(clippy::too_many_arguments)]
     fn spawn_finalize_snapshot(
         &self,
         runtime: Arc<RdsRuntime>,
         account_id: String,
         snapshot_id: String,
+        // The snapshot row's creation time: a snapshot deleted and recreated
+        // under the same id during the dump is a different row, which this
+        // dump must not complete.
+        snapshot_created: chrono::DateTime<Utc>,
+        // The source instance's incarnation (`DbiResourceId`): its container
+        // key, which never reaches a later instance reusing the identifier.
         source_id: String,
         engine: String,
         username: String,
         password: String,
         db_name: String,
-        teardown_source: bool,
+        teardown_volume: Option<String>,
     ) {
         let state_handle = self.state.clone();
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_lock = self.snapshot_lock.clone();
         tokio::spawn(async move {
             let result = runtime
-                .dump_database(&source_id, &engine, &username, &password, &db_name)
+                .dump(&source_id, &engine, &username, &password, &db_name)
                 .await;
-            apply_snapshot_dump_result(&state_handle, &account_id, &snapshot_id, result);
+            apply_snapshot_dump_result(
+                &state_handle,
+                &account_id,
+                &snapshot_id,
+                snapshot_created,
+                result,
+            );
             save_snapshot_static(state_handle.clone(), snapshot_store, snapshot_lock).await;
-            if teardown_source {
+            if let Some(volume) = teardown_volume {
                 // Final-snapshot path owns the deferred teardown: the source
                 // container had to stay up for the dump above.
-                runtime.stop_container(&source_id).await;
-                runtime.remove_data_volume(&account_id, &source_id).await;
+                runtime.stop(&source_id).await;
+                runtime.remove_data_volume_named(&volume).await;
             }
         });
     }

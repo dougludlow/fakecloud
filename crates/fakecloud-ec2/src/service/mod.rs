@@ -1220,6 +1220,7 @@ impl Ec2Service {
             let runtime = runtime.clone();
             let state = self.state.clone();
             handles.push(tokio::spawn(async move {
+                let _lifecycle = runtime.lock_lifecycle(&p.id).await;
                 let running = runtime
                     .run_instance(
                         &p.account_id,
@@ -1229,64 +1230,17 @@ impl Ec2Service {
                         p.network.as_ref(),
                     )
                     .await;
-                let reap = {
+                let post = {
                     let mut accounts = state.write();
-                    match (
+                    recovery_outcome(
                         accounts
                             .get_mut(&p.account_id)
                             .and_then(|s| s.instances.get_mut(&p.id)),
                         running,
-                    ) {
-                        (Some(inst), Ok(r)) => {
-                            // A concurrent Terminate (code 48) or Stop (code 80)
-                            // during the recovery window wins: don't resurrect the
-                            // instance to `running`, and drop the container we just
-                            // started (a terminated/stopped instance owns none).
-                            // Mirrors the both-terminal guard in
-                            // `instance::reconcile_started`. Guarding only code 48
-                            // let a concurrent StopInstances get clobbered back to
-                            // `running` with a fresh container (bug-hunt
-                            // restart-dataloss).
-                            if recovery_terminal_wins(inst.state_code) {
-                                true
-                            } else {
-                                inst.state_code = 16;
-                                inst.state_name = "running".to_string();
-                                inst.private_ip = r.private_ip;
-                                inst.container_id = Some(r.container_id);
-                                false
-                            }
-                        }
-                        (Some(inst), Err(error)) => {
-                            // A concurrent Terminate (code 48) or Stop (code 80)
-                            // wins over a boot failure too: leave the terminal
-                            // state as-is rather than overwriting it to `stopped`.
-                            // The unguarded write here previously clobbered a
-                            // concurrent TerminateInstances (code 48) to `stopped`
-                            // (bug-hunt restart-dataloss).
-                            if recovery_terminal_wins(inst.state_code) {
-                                false
-                            } else {
-                                tracing::error!(
-                                    %error,
-                                    instance_id = %p.id,
-                                    "failed to recover ec2 backing container after restart",
-                                );
-                                inst.state_code = 80;
-                                inst.state_name = "stopped".to_string();
-                                inst.container_id = None;
-                                false
-                            }
-                        }
-                        // Deleted during recovery: stop the container we just
-                        // started so it isn't orphaned (mirrors ElastiCache).
-                        (None, Ok(_)) => true,
-                        (None, Err(_)) => false,
-                    }
+                        &p.id,
+                    )
                 };
-                if reap {
-                    runtime.terminate_instance(&p.id).await;
-                }
+                instance::settle_started(Some(&runtime), &p.account_id, &p.id, post).await;
             }));
         }
 
@@ -1357,6 +1311,67 @@ pub async fn save_ec2_snapshot(
         Ok(Ok(())) => {}
         Ok(Err(err)) => tracing::error!(%err, "failed to write ec2 snapshot"),
         Err(err) => tracing::error!(%err, "ec2 snapshot task panicked"),
+    }
+}
+
+/// What a restart-recovery boot does with the container it started, given
+/// the instance row as it is once the boot finished (`None` if deleted), and
+/// the row update it applies. A concurrent Terminate (48) or Stop (80) wins
+/// over the recovery: a terminated instance's container and volume are
+/// reaped, but a stopped one keeps its root disk and only has its container
+/// stopped.
+fn recovery_outcome(
+    inst: Option<&mut crate::state::Instance>,
+    running: Result<crate::runtime::RunningInstance, crate::runtime::RuntimeError>,
+    id: &str,
+) -> instance::PostStart {
+    match (inst, running) {
+        (Some(inst), Ok(r)) => {
+            // A concurrent Terminate (code 48) or Stop (code 80) during the
+            // recovery window wins: don't resurrect the instance to `running`
+            // (bug-hunt restart-dataloss). Mirrors `instance::reconcile_started`:
+            // a terminated instance loses its container and volume, a stopped
+            // one keeps its root disk and only has the container stopped.
+            match inst.state_code {
+                48 => instance::PostStart::Reap,
+                80 => instance::PostStart::Stop,
+                _ => {
+                    inst.state_code = 16;
+                    inst.state_name = "running".to_string();
+                    inst.private_ip = r.private_ip;
+                    inst.container_id = Some(r.container_id);
+                    instance::PostStart::Keep
+                }
+            }
+        }
+        (Some(inst), Err(error)) => {
+            // A concurrent Terminate (code 48) or Stop (code 80)
+            // wins over a boot failure too: leave the terminal
+            // state as-is rather than overwriting it to `stopped`.
+            // The unguarded write here previously clobbered a
+            // concurrent TerminateInstances (code 48) to `stopped`
+            // (bug-hunt restart-dataloss).
+            if inst.state_code == 48 {
+                // Terminated meanwhile: its volume goes too.
+                instance::PostStart::Reap
+            } else if recovery_terminal_wins(inst.state_code) {
+                instance::PostStart::Keep
+            } else {
+                tracing::error!(
+                    %error,
+                    instance_id = %id,
+                    "failed to recover ec2 backing container after restart",
+                );
+                inst.state_code = 80;
+                inst.state_name = "stopped".to_string();
+                inst.container_id = None;
+                instance::PostStart::Keep
+            }
+        }
+        // Deleted during recovery: remove the container we just
+        // started so it isn't orphaned (mirrors ElastiCache), and
+        // its volume, which a failed boot may have created too.
+        (None, _) => instance::PostStart::Reap,
     }
 }
 
@@ -2919,36 +2934,81 @@ impl Ec2Service {
 mod recover_guard_tests {
     use super::recovery_terminal_wins;
 
-    // A minimal stand-in for the `state_code`/`state_name` fields the recovery
-    // closure mutates. Kept independent of the full `Instance` struct so this
-    // regression stays pinned to the guard behavior, not to unrelated field
-    // churn (the struct-field repo-wide-ctor hazard).
-    struct Row {
-        state_code: i64,
-        state_name: &'static str,
-    }
-
-    // Boot-success arm of `recover_persisted_containers`, driven by the guard.
-    // Returns whether the just-started container must be reaped.
-    fn apply_boot_success(row: &mut Row) -> bool {
-        if recovery_terminal_wins(row.state_code) {
-            true
-        } else {
-            row.state_code = 16;
-            row.state_name = "running";
-            false
-        }
-    }
-
-    // Boot-failure arm of `recover_persisted_containers`, driven by the guard.
-    fn apply_boot_failure(row: &mut Row) -> bool {
-        if recovery_terminal_wins(row.state_code) {
-            false
-        } else {
-            row.state_code = 80;
-            row.state_name = "stopped";
-            false
-        }
+    #[test]
+    fn recovery_stops_but_never_reaps_a_stopped_instance() {
+        use crate::service::instance::PostStart;
+        let svc = crate::service::Ec2Service::new();
+        crate::test_support::seed_instance(&svc, "i-1");
+        let ok = || {
+            Ok(crate::runtime::RunningInstance {
+                container_id: "c-1".into(),
+                private_ip: "10.0.0.9".into(),
+                network: None,
+            })
+        };
+        let outcome = |code: i64, running| {
+            let mut accounts = svc.state.write();
+            let inst = accounts
+                .get_or_create("000000000000")
+                .instances
+                .get_mut("i-1")
+                .unwrap();
+            inst.state_code = code;
+            super::recovery_outcome(Some(inst), running, "i-1")
+        };
+        // Stopped while recovering: keep the root disk, stop the container.
+        assert_eq!(outcome(80, ok()), PostStart::Stop);
+        // Terminated: container and volume go.
+        assert_eq!(outcome(48, ok()), PostStart::Reap);
+        assert_eq!(
+            outcome(
+                48,
+                Err(crate::runtime::RuntimeError::ContainerStartFailed(
+                    "boom".into()
+                ))
+            ),
+            PostStart::Reap
+        );
+        // A failed boot never clobbers a concurrent Terminate or Stop.
+        assert_eq!(
+            outcome(
+                80,
+                Err(crate::runtime::RuntimeError::ContainerStartFailed(
+                    "boom".into()
+                ))
+            ),
+            PostStart::Keep
+        );
+        // Recovered.
+        assert_eq!(outcome(0, ok()), PostStart::Keep);
+        let state_of = || {
+            let accounts = svc.state.read();
+            let inst = &accounts.get("000000000000").unwrap().instances["i-1"];
+            (inst.state_code, inst.container_id.clone())
+        };
+        assert_eq!(state_of(), (16, Some("c-1".to_string())));
+        // A failed boot with no concurrent op marks the instance stopped.
+        assert_eq!(
+            outcome(
+                0,
+                Err(crate::runtime::RuntimeError::ContainerStartFailed(
+                    "boom".into()
+                ))
+            ),
+            PostStart::Keep
+        );
+        assert_eq!(state_of(), (80, None));
+        // Deleted while recovering, even after a failed boot.
+        assert_eq!(
+            super::recovery_outcome(
+                None,
+                Err(crate::runtime::RuntimeError::ContainerStartFailed(
+                    "boom".into()
+                )),
+                "i-1"
+            ),
+            PostStart::Reap
+        );
     }
 
     // Instance state codes: 0 pending, 16 running, 48 terminated, 80 stopped.
@@ -2958,61 +3018,6 @@ mod recover_guard_tests {
         assert!(recovery_terminal_wins(80), "stopped wins");
         assert!(!recovery_terminal_wins(16), "running is recoverable");
         assert!(!recovery_terminal_wins(0), "pending is recoverable");
-    }
-
-    #[test]
-    fn boot_success_does_not_resurrect_concurrent_stop() {
-        // Concurrent StopInstances set code 80 during the recovery window.
-        let mut row = Row {
-            state_code: 80,
-            state_name: "stopped",
-        };
-        let reap = apply_boot_success(&mut row);
-        assert!(reap, "the just-started container must be reaped");
-        assert_eq!(row.state_code, 80, "stop must not be clobbered to running");
-        assert_eq!(row.state_name, "stopped");
-    }
-
-    #[test]
-    fn boot_failure_does_not_clobber_concurrent_terminate() {
-        // Concurrent TerminateInstances set code 48 during the recovery window,
-        // and the backing container failed to boot.
-        let mut row = Row {
-            state_code: 48,
-            state_name: "terminated",
-        };
-        let reap = apply_boot_failure(&mut row);
-        assert!(!reap, "boot failed: nothing to reap");
-        assert_eq!(
-            row.state_code, 48,
-            "terminate must not be overwritten to stopped"
-        );
-        assert_eq!(row.state_name, "terminated");
-    }
-
-    #[test]
-    fn boot_success_recovers_a_still_pending_instance() {
-        // No concurrent op: a persisted pending row recovers to running.
-        let mut row = Row {
-            state_code: 0,
-            state_name: "pending",
-        };
-        let reap = apply_boot_success(&mut row);
-        assert!(!reap);
-        assert_eq!(row.state_code, 16, "pending recovers to running");
-        assert_eq!(row.state_name, "running");
-    }
-
-    #[test]
-    fn boot_failure_stops_a_still_pending_instance() {
-        // No concurrent op, boot failed: a pending row is marked stopped.
-        let mut row = Row {
-            state_code: 0,
-            state_name: "pending",
-        };
-        let reap = apply_boot_failure(&mut row);
-        assert!(!reap);
-        assert_eq!(row.state_code, 80, "failed boot marks stopped");
     }
 }
 

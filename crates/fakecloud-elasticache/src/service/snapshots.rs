@@ -20,6 +20,7 @@ fn snapshot_rdb_path(
     data_dir: Option<&std::path::Path>,
     account_id: &str,
     snapshot_name: &str,
+    snapshot_created: &str,
 ) -> String {
     let base = match data_dir {
         Some(dir) => dir.join("snapshots"),
@@ -28,10 +29,13 @@ fn snapshot_rdb_path(
     // Best-effort: create the directory so the runtime's `docker cp` target
     // exists. Failures surface later when the dump write fails.
     let _ = std::fs::create_dir_all(&base);
+    // The creation time keeps a snapshot recreated under the same name from
+    // sharing (and having reaped) its predecessor's file.
     base.join(format!(
-        "fakecloud-ec-{}-{}-{}.rdb",
+        "fakecloud-ec-{}-{}-{}-{}.rdb",
         account_id,
         snapshot_name,
+        fakecloud_core::data_volume::incarnation_id(&[snapshot_created]),
         std::process::id()
     ))
     .to_string_lossy()
@@ -45,19 +49,30 @@ impl ElastiCacheService {
     /// restart recovery (`reconcile_inflight_snapshots`), which re-arms a
     /// snapshot persisted mid-dump. A snapshot deleted while the dump was in
     /// flight has its orphaned RDB file reaped.
+    ///
+    /// `snapshot_created` (the row's creation time) and `incarnation` (the
+    /// source replication group's, pinned when the snapshot was created) bind
+    /// the dump to one snapshot row and one group: a snapshot or group
+    /// deleted and recreated under the same name meanwhile is never reached.
     pub(crate) fn spawn_snapshot_dump(
         &self,
         runtime: Arc<ElastiCacheRuntime>,
         account_id: String,
         snapshot_name: String,
-        group_id: String,
+        snapshot_created: String,
+        incarnation: String,
     ) {
         let state_handle = self.state.clone();
         let snapshot_store = self.snapshot_store.clone();
         let snapshot_lock = self.snapshot_lock.clone();
-        let tmp_path = snapshot_rdb_path(self.data_dir.as_deref(), &account_id, &snapshot_name);
+        let tmp_path = snapshot_rdb_path(
+            self.data_dir.as_deref(),
+            &account_id,
+            &snapshot_name,
+            &snapshot_created,
+        );
         tokio::spawn(async move {
-            let rdb_path = match runtime.dump_rdb(&group_id, &tmp_path).await {
+            let rdb_path = match runtime.dump_rdb(&incarnation, &tmp_path).await {
                 Ok(()) => Some(tmp_path),
                 Err(err) => {
                     tracing::warn!("Failed to dump RDB for snapshot {}: {}", snapshot_name, err);
@@ -67,7 +82,9 @@ impl ElastiCacheService {
             {
                 let mut accounts = state_handle.write();
                 let state = accounts.get_or_create(&account_id);
-                match state.snapshots.get_mut(&snapshot_name) {
+                match state.snapshots.get_mut(&snapshot_name).filter(|snap| {
+                    snap.created_at == snapshot_created && snap.snapshot_status == "creating"
+                }) {
                     Some(snap) => {
                         // A dump failure falls back to a metadata-only snapshot
                         // (rdb_path stays None) rather than blocking the row; the
@@ -76,8 +93,9 @@ impl ElastiCacheService {
                         snap.snapshot_status = "available".to_string();
                     }
                     None => {
-                        // Deleted while the dump was in flight: reap the
-                        // orphaned RDB file rather than leaking it.
+                        // Deleted (or deleted and recreated) while the dump
+                        // was in flight: reap the orphaned RDB file rather
+                        // than leaking it. The path is unique to this row.
                         if let Some(path) = rdb_path {
                             let _ = std::fs::remove_file(path);
                         }
@@ -299,7 +317,7 @@ impl ElastiCacheService {
             ));
         }
 
-        let (snapshot, arn, group_id) = {
+        let (snapshot, arn) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
 
@@ -381,14 +399,17 @@ impl ElastiCacheService {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 snapshot_source: "manual".to_string(),
                 rdb_path: None,
+                source_incarnation: Some(group.incarnation()),
             };
-            (snapshot, arn, group_id)
+            (snapshot, arn)
         };
 
         // Insert synchronously so DescribeSnapshots reflects the snapshot
         // immediately; only the unbounded RDB dump (redis SAVE, easily past the
         // ~60s client read timeout) is backgrounded.
         let xml = snapshot_xml(&snapshot);
+        let snapshot_created = snapshot.created_at.clone();
+        let source_incarnation = snapshot.source_incarnation.clone().unwrap_or_default();
         {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
@@ -408,7 +429,8 @@ impl ElastiCacheService {
                 runtime,
                 request.account_id.clone(),
                 snapshot_name.clone(),
-                group_id,
+                snapshot_created,
+                source_incarnation,
             );
         }
 
@@ -561,7 +583,12 @@ impl ElastiCacheService {
         // restore source with its name permanently blocked.) Give the copy its
         // own RDB file so deleting the source can't dangle it.
         if let Some(src_rdb) = snap.rdb_path.clone() {
-            let dst_rdb = snapshot_rdb_path(self.data_dir.as_deref(), &state.account_id, &target);
+            let dst_rdb = snapshot_rdb_path(
+                self.data_dir.as_deref(),
+                &state.account_id,
+                &target,
+                &chrono::Utc::now().to_rfc3339(),
+            );
             match std::fs::copy(&src_rdb, &dst_rdb) {
                 Ok(_) => snap.rdb_path = Some(dst_rdb),
                 Err(err) => {
@@ -742,7 +769,7 @@ mod snapshot_path_tests {
         // Portability (4.4): with no durable data dir the RDB dump lives under
         // the platform temp dir, not a hardcoded `/tmp` absent on Windows /
         // some containers.
-        let path = snapshot_rdb_path(None, "123456789012", "nightly");
+        let path = snapshot_rdb_path(None, "123456789012", "nightly", "t1");
         let temp = std::env::temp_dir();
         assert!(
             Path::new(&path).starts_with(&temp),
@@ -758,7 +785,12 @@ mod snapshot_path_tests {
         // (so it survives a reboot), NOT the platform temp dir which reboot
         // clears — the path is stored in the persisted snapshot record.
         let data_dir = std::env::temp_dir().join("fakecloud-ec-datadir-test-4-1");
-        let path = snapshot_rdb_path(Some(&data_dir), "123456789012", "nightly");
+        let path = snapshot_rdb_path(Some(&data_dir), "123456789012", "nightly", "t1");
+        // A snapshot recreated under the same name gets its own file.
+        assert_ne!(
+            path,
+            snapshot_rdb_path(Some(&data_dir), "123456789012", "nightly", "t2")
+        );
         assert!(
             Path::new(&path).starts_with(data_dir.join("snapshots")),
             "{path} must root under the data dir's snapshots/ subdir"

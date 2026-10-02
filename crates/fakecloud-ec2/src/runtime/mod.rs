@@ -119,10 +119,6 @@ pub struct NetworkIsolationSummary {
 struct InstanceRecord {
     /// Docker container id, or Pod name.
     handle: String,
-    /// The owning account id, captured at `RunInstances`. Keys the durable
-    /// data volume (see [`data_volume_name`]) so `TerminateInstances` can
-    /// remove the right volume without re-consulting the control plane.
-    account_id: String,
     /// Resolved base image, captured at `RunInstances` so a recreate is
     /// identical even if `FAKECLOUD_EC2_DEFAULT_IMAGE` later changes.
     image: String,
@@ -319,6 +315,14 @@ pub struct Ec2Runtime {
     /// 2026-06-18 finding 4.3). Holding it across the whole reconcile makes the
     /// last-started reconcile the last-applied for both backends.
     reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-instance lifecycle locks. Every container-lifecycle task (boot,
+    /// start, stop, terminate, reboot, recovery) holds its instance's lock
+    /// across the runtime call and the state reconcile that follows, and
+    /// re-reads the instance's desired state once it holds it. So a stop
+    /// decided against a `stopped` row can never land on a container a later
+    /// StartInstances just started: that start waits, then sees the row it
+    /// is asked to converge to.
+    lifecycle_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Ec2Runtime {
@@ -336,6 +340,7 @@ impl Ec2Runtime {
             instances: Arc::new(RwLock::new(HashMap::new())),
             firewall: FirewallEnforcer::detect(),
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -350,6 +355,7 @@ impl Ec2Runtime {
             // k8s isolation is a NetworkPolicy concern (phase 4), not host nft.
             firewall: FirewallEnforcer::disabled(),
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -446,7 +452,6 @@ impl Ec2Runtime {
             instance_id.to_string(),
             InstanceRecord {
                 handle: running.container_id.clone(),
-                account_id: account_id.to_string(),
                 image,
                 user_data: user_data.map(str::to_string),
                 tags: tags.clone(),
@@ -533,20 +538,41 @@ impl Ec2Runtime {
         }
     }
 
-    /// Remove an instance's backing container (maps to `TerminateInstances`).
-    pub async fn terminate_instance(&self, instance_id: &str) {
+    /// Serialize lifecycle work on one instance; see `lifecycle_locks`.
+    pub async fn lock_lifecycle(&self, instance_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .lifecycle_locks
+            .lock()
+            .entry(instance_id.to_string())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
+
+    /// Remove an instance's backing container and its durable root-disk
+    /// volume (maps to `TerminateInstances`). The volume is removed by the
+    /// instance's account and id even when no runtime record exists: a boot
+    /// that failed after creating it, or an instance recovered from disk as
+    /// `stopped`, has a volume but no record. Instance ids are unique, so this
+    /// never reaches another instance's volume.
+    pub async fn terminate_instance(&self, account_id: &str, instance_id: &str) {
         let record = self.instances.write().remove(instance_id);
-        if let Some(record) = record {
-            match &self.backend {
-                InstanceBackend::Docker(d) => {
+        // Terminated is final, so its lifecycle lock is never needed again; a
+        // late task for the id creates a fresh one and only ever reaps.
+        self.lifecycle_locks.lock().remove(instance_id);
+        match &self.backend {
+            InstanceBackend::Docker(d) => {
+                if let Some(record) = record {
                     d.remove(&record.handle).await;
-                    // Drop the durable root-disk volume so a later instance
-                    // reusing this id starts clean (terminate = volume gone,
-                    // matching a deleted EBS root volume). No-op when volumes
-                    // are disabled.
-                    d.remove_data_volume(&record.account_id, instance_id).await;
                 }
-                InstanceBackend::K8s(k) => k.delete_pod(&record.handle).await,
+                // Terminate = volume gone, matching a deleted EBS root volume.
+                // No-op when volumes are disabled.
+                d.remove_data_volume(account_id, instance_id).await;
+            }
+            InstanceBackend::K8s(k) => {
+                if let Some(record) = record {
+                    k.delete_pod(&record.handle).await;
+                }
             }
         }
     }
@@ -564,6 +590,33 @@ impl Ec2Runtime {
                 InstanceBackend::Docker(d) => d.remove(&record.handle).await,
                 InstanceBackend::K8s(k) => k.delete_pod(&record.handle).await,
             }
+        }
+    }
+
+    /// Tear down the given `(account, instance_id)`s for a reset: their
+    /// containers and data volumes. Instance ids are unique per instance, so
+    /// this never reaches an instance launched after the reset; a boot still in
+    /// flight for a reset instance reaps itself once it finds its row gone.
+    /// Covers stopped instances recovered from disk too, which have no
+    /// runtime record but still have a volume.
+    pub async fn remove_instances(&self, instances: Vec<(String, String)>) {
+        for (account_id, instance_id) in instances {
+            // Wait out any lifecycle task in flight on this instance (a
+            // reboot recreating its Pod, a boot), so the teardown removes
+            // what that task leaves rather than racing it.
+            let lifecycle = self.lock_lifecycle(&instance_id).await;
+            let record = self.instances.write().remove(&instance_id);
+            if let Some(record) = record {
+                match &self.backend {
+                    InstanceBackend::Docker(d) => d.remove(&record.handle).await,
+                    InstanceBackend::K8s(k) => k.delete_pod(&record.handle).await,
+                }
+            }
+            if let InstanceBackend::Docker(d) = &self.backend {
+                d.remove_data_volume(&account_id, &instance_id).await;
+            }
+            drop(lifecycle);
+            self.lifecycle_locks.lock().remove(&instance_id);
         }
     }
 
@@ -628,38 +681,43 @@ fn instance_data_dir() -> String {
         .unwrap_or_else(|_| "/var/lib/fakecloud/ec2".to_string())
 }
 
-/// Whether EC2 instance data should survive a fakecloud restart via a durable
-/// named volume. OFF by default (ephemeral, keeping test/CI runs clean and
-/// avoiding a stale volume bleeding into a later instance that reuses an id);
-/// opt in with `FAKECLOUD_PERSIST_EC2_VOLUMES=1`. A follow-up flips this
-/// default to on in persistent storage mode by exporting the same env var.
+/// Whether EC2 instance data should survive a container being recreated via a
+/// durable named volume. The server defaults `FAKECLOUD_PERSIST_EC2_VOLUMES`
+/// on in persistent mode (volumes scoped to the data dir); unset means off, as
+/// in memory mode, where an explicit opt-in gets process-scoped volumes.
 fn ec2_volumes_enabled() -> bool {
     std::env::var("FAKECLOUD_PERSIST_EC2_VOLUMES")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(false)
 }
 
-/// Deterministic Docker volume name for an instance's data dir. Keyed only on
-/// account + instance id (NOT the per-process fakecloud instance id) so the
-/// same volume reattaches after a fakecloud restart recreates the container.
-/// Characters outside Docker's `[a-zA-Z0-9_.-]` volume-name set become `-`.
-fn data_volume_name(account_id: &str, instance_id: &str) -> String {
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
-    };
-    format!(
-        "fakecloud-ec2-data-{}-{}",
-        sanitize(account_id),
-        sanitize(instance_id)
-    )
+/// Docker volume name for an instance's data dir in a volume scope
+/// (`fakecloud_core::data_volume`): stable for the same data dir across
+/// restarts, so the recovered container reattaches it, and distinct for any
+/// other data dir or memory-mode process.
+fn scoped_data_volume_name(scope_tag: &str, account_id: &str, instance_id: &str) -> String {
+    fakecloud_core::data_volume::scoped_volume_name("ec2", scope_tag, &[account_id, instance_id])
+}
+
+/// The unscoped name builds before #2630 gave an instance's data volume.
+fn legacy_data_volume_name(account_id: &str, instance_id: &str) -> String {
+    fakecloud_core::data_volume::legacy_volume_name("ec2", &[account_id, instance_id])
+}
+
+/// Pick the volume to mount: the scoped one once it exists, else a legacy one
+/// left by a pre-scoping build for this (randomly-id'd) instance, else a new
+/// scoped one.
+fn choose_data_volume(
+    scoped: String,
+    legacy: String,
+    scoped_exists: bool,
+    legacy_exists: bool,
+) -> String {
+    if !scoped_exists && legacy_exists {
+        legacy
+    } else {
+        scoped
+    }
 }
 
 /// Keep-alive command + user-data wrapper for a base image. Shared by both
@@ -716,22 +774,25 @@ impl DockerInstances {
             format!("fakecloud-instance={}", self.instance_id),
         ];
         // Optionally back the instance's writable data directory with a durable
-        // named volume keyed on account + instance id, so the filesystem state
-        // an instance writes there survives a fakecloud restart (the recovery
-        // path recreates the container, which reattaches the same volume) and a
-        // stop/start (Docker reuses the same container, so the volume persists
-        // regardless). OFF by default to keep test/CI runs ephemeral and avoid
-        // a stale volume bleeding into a later instance that reuses an id;
-        // enabled by `FAKECLOUD_PERSIST_EC2_VOLUMES=1` (and, in a follow-up,
-        // default-on in persistent storage mode). The volume is dropped on
-        // TerminateInstances. See [`data_volume_name`] / [`instance_data_dir`].
+        // named volume keyed on the data dir + account + instance id, so the
+        // filesystem state an instance writes there survives a fakecloud
+        // restart (the recovery path recreates the container, which reattaches
+        // the same volume) and a stop/start (Docker reuses the same container,
+        // so the volume persists regardless). Default-on in persistent storage
+        // mode, off in memory mode, `FAKECLOUD_PERSIST_EC2_VOLUMES` overrides.
+        // The volume is dropped on TerminateInstances. See
+        // [`scoped_data_volume_name`] / [`instance_data_dir`].
         if ec2_volumes_enabled() {
+            let volume = self.resolve_data_volume(account_id, instance_id).await?;
+            fakecloud_core::data_volume::ensure_volume(
+                &self.cli,
+                &volume,
+                fakecloud_core::data_volume::current_scope(),
+                &[format!("fakecloud-ec2={instance_id}")],
+            )
+            .await;
             args.push("-v".to_string());
-            args.push(format!(
-                "{}:{}",
-                data_volume_name(account_id, instance_id),
-                instance_data_dir()
-            ));
+            args.push(format!("{volume}:{}", instance_data_dir()));
         }
         if let Some(name) = &attached_network {
             args.push("--network".to_string());
@@ -892,15 +953,53 @@ impl DockerInstances {
         if !ec2_volumes_enabled() {
             return;
         }
-        let _ = tokio::process::Command::new(&self.cli)
-            .args([
-                "volume",
-                "rm",
-                "-f",
-                &data_volume_name(account_id, instance_id),
-            ])
-            .output()
-            .await;
+        // Instance ids are random, so a legacy volume named after this id can
+        // only be this instance's own (adopted by `resolve_data_volume`).
+        for name in [
+            scoped_data_volume_name(
+                fakecloud_core::data_volume::current_scope().tag(),
+                account_id,
+                instance_id,
+            ),
+            legacy_data_volume_name(account_id, instance_id),
+        ] {
+            fakecloud_core::data_volume::remove_volume(&self.cli, &name).await;
+        }
+    }
+
+    /// The data volume an instance mounts. Instance ids are random, so the
+    /// unscoped name a build before data-dir scoping gave this instance can
+    /// only belong to it: an instance restored from such a data dir keeps
+    /// that legacy volume, unless its scoped one already exists. Fails when
+    /// the daemon can't list its volumes: guessing "absent" would mount an
+    /// empty scoped volume that from then on shadows the legacy data.
+    async fn resolve_data_volume(
+        &self,
+        account_id: &str,
+        instance_id: &str,
+    ) -> Result<String, RuntimeError> {
+        let scoped = scoped_data_volume_name(
+            fakecloud_core::data_volume::current_scope().tag(),
+            account_id,
+            instance_id,
+        );
+        let legacy = legacy_data_volume_name(account_id, instance_id);
+        let existing = fakecloud_core::data_volume::list_volumes(&self.cli)
+            .await
+            .ok_or_else(|| {
+                RuntimeError::ContainerStartFailed(
+                    "could not list container volumes to find the instance's data volume"
+                        .to_string(),
+                )
+            })?;
+        let scoped_exists = existing.contains(&scoped);
+        let legacy_exists = existing.contains(&legacy);
+        Ok(choose_data_volume(
+            scoped,
+            legacy,
+            scoped_exists,
+            legacy_exists,
+        ))
     }
 
     /// The container's combined stdout+stderr (`docker logs`). `None` if the
@@ -927,17 +1026,25 @@ mod volume_tests {
     use super::*;
 
     #[test]
-    fn data_volume_name_is_stable_and_sanitized() {
-        // Stable across calls (so recovery reattaches the same volume) and
-        // keyed on account + instance id, not the per-process instance id.
+    fn data_volume_name_is_scoped_stable_and_sanitized() {
         assert_eq!(
-            data_volume_name("123456789012", "i-0abc123"),
-            "fakecloud-ec2-data-123456789012-i-0abc123"
+            scoped_data_volume_name("d0123456789ab", "123456789012", "i-0abc123"),
+            "fakecloud-ec2-data-d0123456789ab-123456789012-i-0abc123"
+        );
+        // Two data dirs never share a volume.
+        assert_ne!(
+            scoped_data_volume_name("d0123456789ab", "123456789012", "i-0abc123"),
+            scoped_data_volume_name("dba9876543210", "123456789012", "i-0abc123")
         );
         // Characters outside Docker's volume-name set become '-'.
         assert_eq!(
-            data_volume_name("1234/5678", "i-0abc:1"),
-            "fakecloud-ec2-data-1234-5678-i-0abc-1"
+            scoped_data_volume_name("d0", "1234/5678", "i-0abc:1"),
+            "fakecloud-ec2-data-d0-1234-5678-i-0abc-1"
+        );
+        // The legacy name is exactly what pre-scoping builds created.
+        assert_eq!(
+            legacy_data_volume_name("123456789012", "i-0abc123"),
+            "fakecloud-ec2-data-123456789012-i-0abc123"
         );
     }
 
@@ -946,8 +1053,20 @@ mod volume_tests {
         // Two instances in the same account never share a data volume, so
         // terminating one cannot wipe another's filesystem.
         assert_ne!(
-            data_volume_name("123456789012", "i-aaaa"),
-            data_volume_name("123456789012", "i-bbbb")
+            scoped_data_volume_name("d0", "123456789012", "i-aaaa"),
+            scoped_data_volume_name("d0", "123456789012", "i-bbbb")
         );
+    }
+
+    #[test]
+    fn legacy_volume_kept_only_until_a_scoped_one_exists() {
+        let pick = |s, l| choose_data_volume("scoped".into(), "legacy".into(), s, l);
+        // Fresh instance: a new scoped volume.
+        assert_eq!(pick(false, false), "scoped");
+        // Instance restored from a pre-scoping data dir: keep its data.
+        assert_eq!(pick(false, true), "legacy");
+        // The scoped volume always wins once it exists.
+        assert_eq!(pick(true, false), "scoped");
+        assert_eq!(pick(true, true), "scoped");
     }
 }

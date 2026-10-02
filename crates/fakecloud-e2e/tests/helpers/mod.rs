@@ -9,6 +9,135 @@
 
 pub use fakecloud_testkit::{data_path_for, run_until_exit, CliOutput, TestServer};
 
+/// The container CLI the e2e server drives (`FAKECLOUD_CONTAINER_CLI`, else
+/// the same docker-then-podman detection the test server uses).
+pub fn container_cli() -> String {
+    std::env::var("FAKECLOUD_CONTAINER_CLI")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "false")
+        .unwrap_or_else(fakecloud_testkit::detect_container_cli)
+}
+
+/// Run the container CLI, or `None` when it can't run or fails, so callers
+/// never mistake an unreachable daemon for "no such volume".
+fn cli_stdout(args: &[String]) -> Option<String> {
+    let out = std::process::Command::new(container_cli())
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Removes, on drop, every container data volume fakecloud created for a
+/// persistent `--data-path` (they carry a `fakecloud-data-path=<dir>` label),
+/// plus any extra volume a test made by hand. Running on drop means a failing
+/// test cleans up too, so durable volumes never pile up on the developer's
+/// daemon. Declare it after the `TempDir` and before the `TestServer`, so the
+/// server (and the containers mounting the volumes) is gone first.
+pub struct DataVolumeGuard {
+    data_path: String,
+    extra: Vec<String>,
+}
+
+impl DataVolumeGuard {
+    pub fn new(data_path: &std::path::Path) -> Self {
+        // The server labels volumes with the canonical path.
+        let canonical = std::fs::canonicalize(data_path).unwrap_or_else(|_| data_path.into());
+        Self {
+            data_path: canonical.to_string_lossy().into_owned(),
+            extra: Vec::new(),
+        }
+    }
+
+    /// Also remove `name` on drop.
+    pub fn also_remove(&mut self, name: &str) {
+        self.extra.push(name.to_string());
+    }
+
+    /// Data volumes fakecloud created for this data dir, narrowed by extra
+    /// `key=value` label filters (e.g. `fakecloud-rds=<id>`).
+    /// Panics if the container CLI fails, so an assertion never passes on
+    /// an unreachable daemon.
+    pub fn volumes(&self, labels: &[&str]) -> Vec<String> {
+        self.try_volumes(labels)
+            .expect("container CLI failed to list volumes")
+    }
+
+    fn try_volumes(&self, labels: &[&str]) -> Option<Vec<String>> {
+        let mut args = vec![
+            "volume".to_string(),
+            "ls".to_string(),
+            "-q".to_string(),
+            "--filter".to_string(),
+            format!("label=fakecloud-data-path={}", self.data_path),
+        ];
+        for label in labels {
+            args.push("--filter".to_string());
+            args.push(format!("label={label}"));
+        }
+        Some(
+            cli_stdout(&args)?
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+}
+
+/// Whether the daemon has a volume named `name`. Panics if the container CLI
+/// fails, so a "volume is gone" poll never passes on an unreachable daemon.
+pub fn volume_exists(name: &str) -> bool {
+    let listing = cli_stdout(&[
+        "volume".to_string(),
+        "ls".to_string(),
+        "-q".to_string(),
+        "--filter".to_string(),
+        format!("name={name}"),
+    ])
+    .expect("container CLI failed to list volumes");
+    // `name=` is a substring filter: match exactly.
+    listing.lines().any(|l| l.trim() == name)
+}
+
+impl Drop for DataVolumeGuard {
+    fn drop(&mut self) {
+        let cli = container_cli();
+        // Known names are removed even if listing fails; a failed listing is
+        // reported rather than silently leaking the data dir's volumes.
+        let mut names = match self.try_volumes(&[]) {
+            Some(names) => names,
+            None => {
+                eprintln!(
+                    "DataVolumeGuard: could not list volumes for {}; they may be left behind",
+                    self.data_path
+                );
+                Vec::new()
+            }
+        };
+        names.append(&mut self.extra);
+        for name in names {
+            // A container a crashed server left behind still mounts it.
+            if let Ok(out) = std::process::Command::new(&cli)
+                .args(["ps", "-aq", "--filter", &format!("volume={name}")])
+                .output()
+            {
+                for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                    let _ = std::process::Command::new(&cli)
+                        .args(["rm", "-f", id])
+                        .output();
+                }
+            }
+            let _ = std::process::Command::new(&cli)
+                .args(["volume", "rm", "-f", &name])
+                .output();
+        }
+    }
+}
+
 /// Poll SQS ReceiveMessage until at least `n` messages have been collected
 /// across one or more calls, or the deadline elapses. Returns whatever was
 /// gathered so the caller's assertion can produce a useful failure message.

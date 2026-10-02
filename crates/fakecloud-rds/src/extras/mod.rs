@@ -2688,6 +2688,10 @@ impl RdsService {
                     green.read_replica_db_instance_identifiers = Vec::new();
                     green.read_replica_source_db_instance_identifier = Some(source_id.clone());
                     green.dbi_resource_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+                    // The green copy is a new instance: it must never mount
+                    // the blue one's adopted legacy data volume.
+                    green.data_volume =
+                        Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped);
                     state.instances.insert(target_id.clone(), green);
                     target_arn.clone()
                 } else {
@@ -2743,6 +2747,12 @@ impl RdsService {
                         std::mem::swap(&mut b.port, &mut g.port);
                         std::mem::swap(&mut b.host_port, &mut g.host_port);
                         std::mem::swap(&mut b.container_id, &mut g.container_id);
+                        // The physical instance behind each name changes too:
+                        // its resource id and data volume follow its container
+                        // (AWS keeps a DbiResourceId with the physical
+                        // instance across a switchover).
+                        std::mem::swap(&mut b.dbi_resource_id, &mut g.dbi_resource_id);
+                        std::mem::swap(&mut b.data_volume, &mut g.data_volume);
                         // Green is now the writer; clear its replica
                         // pointer back at the old blue.
                         g.read_replica_source_db_instance_identifier = None;
@@ -2790,7 +2800,22 @@ impl RdsService {
                     })?;
                 if delete_target {
                     if let Some(target_id) = entry["TargetDBInstanceIdentifier"].as_str() {
-                        state.instances.remove(target_id);
+                        // The green instance gets its own container and volume
+                        // once started or recovered; delete those with it.
+                        if let (Some(target), Some(runtime)) =
+                            (state.instances.remove(target_id), self.runtime_ref())
+                        {
+                            let incarnation = target.dbi_resource_id.clone();
+                            let volume = target.data_volume_name(
+                                fakecloud_core::data_volume::current_scope().tag(),
+                                &aid,
+                            );
+                            let runtime = runtime.clone();
+                            tokio::spawn(async move {
+                                runtime.stop(&incarnation).await;
+                                runtime.remove_data_volume_named(&volume).await;
+                            });
+                        }
                     }
                 }
                 Ok(xml_response(

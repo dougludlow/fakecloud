@@ -57,21 +57,37 @@ pub async fn cfn_ensure_cluster_container(
             .get(&cluster.arn)
             .map(|tags| tags.iter().cloned().collect())
             .unwrap_or_default();
-        ClusterSpawnParams {
-            is_memcached: cluster.engine == ENGINE_MEMCACHED,
-            rdb_path,
-            pod_tags,
-        }
+        (
+            ClusterSpawnParams {
+                is_memcached: cluster.engine == ENGINE_MEMCACHED,
+                rdb_path,
+                pod_tags,
+            },
+            cluster.incarnation(),
+            cluster.data_volume_name(
+                fakecloud_core::data_volume::current_scope().tag(),
+                &account_id,
+            ),
+        )
     };
+    let (params, incarnation, volume) = params;
 
     let result = if params.is_memcached {
         runtime
-            .ensure_memcached(&cache_cluster_id, &params.pod_tags)
+            .ensure_memcached(
+                &incarnation,
+                &account_id,
+                &cache_cluster_id,
+                &params.pod_tags,
+            )
             .await
     } else {
         runtime
             .ensure_redis(
+                &incarnation,
+                &account_id,
                 &cache_cluster_id,
+                &volume,
                 params.rdb_path.as_deref(),
                 &params.pod_tags,
             )
@@ -82,22 +98,23 @@ pub async fn cfn_ensure_cluster_container(
     {
         let mut accounts = state.write();
         if let Some(s) = accounts.get_mut(&account_id) {
-            let deleted = s.take_cache_cluster_delete_request(&cache_cluster_id);
             match &result {
-                Ok(running) if !deleted => {
-                    if let Some(c) = s.cache_clusters.get_mut(&cache_cluster_id) {
-                        c.cache_cluster_status = "available".to_string();
-                        c.endpoint_address = running.endpoint_address.clone();
-                        c.endpoint_port = running.endpoint_port;
-                        c.host_port = running.host_port;
-                        c.container_id = running.container_id.clone();
+                Ok(running) => {
+                    // Post-start presence check by incarnation.
+                    match s
+                        .cache_clusters
+                        .get_mut(&cache_cluster_id)
+                        .filter(|c| c.incarnation() == incarnation)
+                    {
+                        Some(c) => {
+                            c.cache_cluster_status = "available".to_string();
+                            c.endpoint_address = running.endpoint_address.clone();
+                            c.endpoint_port = running.endpoint_port;
+                            c.host_port = running.host_port;
+                            c.container_id = running.container_id.clone();
+                        }
+                        None => stop_container = true,
                     }
-                }
-                Ok(_) => {
-                    // Deleted while creating: drop it and reap the container.
-                    s.cancel_cache_cluster_creation(&cache_cluster_id);
-                    s.cache_clusters.remove(&cache_cluster_id);
-                    stop_container = true;
                 }
                 Err(error) => {
                     tracing::error!(
@@ -105,18 +122,30 @@ pub async fn cfn_ensure_cluster_container(
                         cache_cluster_id = %cache_cluster_id,
                         "CFN-provisioned ElastiCache cache cluster failed to start its container",
                     );
-                    if let Some(c) = s.cache_clusters.get_mut(&cache_cluster_id) {
-                        c.cache_cluster_status = "incompatible-network".to_string();
+                    match s
+                        .cache_clusters
+                        .get_mut(&cache_cluster_id)
+                        .filter(|c| c.incarnation() == incarnation)
+                    {
+                        Some(c) => c.cache_cluster_status = "incompatible-network".to_string(),
+                        // Deleted while starting: the failed start may still
+                        // have created this incarnation's volume.
+                        None => stop_container = true,
                     }
                 }
             }
         } else {
             // Whole account gone; reap a started container.
-            stop_container = result.is_ok();
+            stop_container = true;
         }
     }
     if stop_container {
-        runtime.stop_container(&cache_cluster_id).await;
+        crate::service::reap_gone_start(
+            &runtime,
+            &incarnation,
+            (!params.is_memcached).then_some(&*volume),
+        )
+        .await;
     }
 }
 
@@ -129,7 +158,7 @@ pub async fn cfn_ensure_replication_group_container(
     replication_group_id: String,
     account_id: String,
 ) {
-    let (rdb_path, pod_tags, cluster_enabled) = {
+    let (rdb_path, pod_tags, cluster_enabled, incarnation, volume) = {
         let accounts = state.read();
         let Some(st) = accounts.get(&account_id) else {
             return;
@@ -147,11 +176,27 @@ pub async fn cfn_ensure_replication_group_container(
             .get(&group.arn)
             .map(|tags| tags.iter().cloned().collect())
             .unwrap_or_default();
-        (rdb_path, pod_tags, group.cluster_enabled)
+        (
+            rdb_path,
+            pod_tags,
+            group.cluster_enabled,
+            group.incarnation(),
+            group.data_volume_name(
+                fakecloud_core::data_volume::current_scope().tag(),
+                &account_id,
+            ),
+        )
     };
 
     let result = runtime
-        .ensure_redis(&replication_group_id, rdb_path.as_deref(), &pod_tags)
+        .ensure_redis(
+            &incarnation,
+            &account_id,
+            &replication_group_id,
+            &volume,
+            rdb_path.as_deref(),
+            &pod_tags,
+        )
         .await;
 
     let mut stop_container = false;
@@ -160,7 +205,11 @@ pub async fn cfn_ensure_replication_group_container(
         if let Some(s) = accounts.get_mut(&account_id) {
             match &result {
                 Ok(running) => {
-                    if let Some(g) = s.replication_groups.get_mut(&replication_group_id) {
+                    if let Some(g) = s
+                        .replication_groups
+                        .get_mut(&replication_group_id)
+                        .filter(|g| g.incarnation() == incarnation)
+                    {
                         g.status = "available".to_string();
                         g.endpoint_address = running.endpoint_address.clone();
                         g.endpoint_port = running.endpoint_port;
@@ -182,41 +231,38 @@ pub async fn cfn_ensure_replication_group_container(
                         replication_group_id = %replication_group_id,
                         "CFN-provisioned ElastiCache replication group failed to start its container",
                     );
-                    if let Some(g) = s.replication_groups.get_mut(&replication_group_id) {
-                        g.status = "incompatible-network".to_string();
+                    match s
+                        .replication_groups
+                        .get_mut(&replication_group_id)
+                        .filter(|g| g.incarnation() == incarnation)
+                    {
+                        Some(g) => g.status = "incompatible-network".to_string(),
+                        // Deleted while starting: the failed start may still
+                        // have created this incarnation's volume.
+                        None => stop_container = true,
                     }
                 }
             }
         } else {
-            stop_container = result.is_ok();
+            stop_container = true;
         }
     }
     if stop_container {
-        runtime.stop_container(&replication_group_id).await;
+        crate::service::reap_gone_start(&runtime, &incarnation, Some(&volume)).await;
     }
 }
 
 /// Stop and reap the REAL container backing a CFN-provisioned cache cluster
-/// when its stack is deleted (or the resource is removed by a stack update).
-/// Mirrors the direct `DeleteCacheCluster` teardown (`stop_container` +
-/// `remove_data_volume`) so a stack delete does not leak the running engine
-/// container. Intended to be `tokio::spawn`ed by the CloudFormation delete
-/// drain after the in-memory record has already been removed.
-pub async fn cfn_teardown_cluster_container(
+/// or replication group when its stack is deleted (or the resource is removed
+/// by a stack update), and remove its data volume. Mirrors the direct delete
+/// teardown so a stack delete does not leak the running engine container.
+/// Intended to be `tokio::spawn`ed by the CloudFormation delete drain;
+/// `incarnation` and `volume` were captured from the removed row, so a
+/// replacement reusing the id is never reached.
+pub async fn cfn_teardown_cache_container(
     runtime: Arc<ElastiCacheRuntime>,
-    cache_cluster_id: String,
+    incarnation: String,
+    volume: Option<String>,
 ) {
-    runtime.stop_container(&cache_cluster_id).await;
-    runtime.remove_data_volume(&cache_cluster_id).await;
-}
-
-/// Stop and reap the REAL container backing a CFN-provisioned replication group
-/// when its stack is deleted. Mirrors the direct `DeleteReplicationGroup`
-/// teardown so a stack delete does not leak the running Redis container.
-pub async fn cfn_teardown_replication_group_container(
-    runtime: Arc<ElastiCacheRuntime>,
-    replication_group_id: String,
-) {
-    runtime.stop_container(&replication_group_id).await;
-    runtime.remove_data_volume(&replication_group_id).await;
+    crate::service::reap_gone_start(&runtime, &incarnation, volume.as_deref()).await;
 }

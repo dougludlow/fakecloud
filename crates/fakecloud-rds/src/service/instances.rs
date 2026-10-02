@@ -223,6 +223,7 @@ impl RdsService {
                 master_user_password: master_user_password.clone(),
                 container_id: String::new(),
                 host_port: 0,
+                data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
                 tags: request_tags,
                 read_replica_source_db_instance_identifier: None,
                 read_replica_db_instance_identifiers: Vec::new(),
@@ -311,9 +312,15 @@ impl RdsService {
             let snapshot_lock = self.snapshot_lock.clone();
             let cluster_id_for_attach = db_cluster_identifier.clone();
             let instance_tags = instance.tags.clone();
+            let incarnation = instance.dbi_resource_id.clone();
+            let volume = instance.data_volume_name(
+                fakecloud_core::data_volume::current_scope().tag(),
+                &account_id,
+            );
             tokio::spawn(async move {
                 match runtime
                     .ensure_postgres(
+                        &incarnation,
                         &id,
                         &engine,
                         &engine_version,
@@ -323,6 +330,7 @@ impl RdsService {
                         &account_id,
                         &region,
                         &instance_tags,
+                        &volume,
                     )
                     .await
                 {
@@ -336,12 +344,22 @@ impl RdsService {
                         let pending_dump = if let Some(ref cid) = cluster_id_for_attach {
                             let mut accounts = state_handle.write();
                             let state = accounts.get_or_create(&account_id);
-                            state
-                                .extras
-                                .get_mut("clusters")
-                                .and_then(|m| m.get_mut(cid))
-                                .and_then(|entry| entry.as_object_mut())
-                                .and_then(|obj| obj.remove("PendingRestoreDumpB64"))
+                            // Only while this incarnation is still a member of
+                            // the cluster: an instance deleted during its boot
+                            // must leave the dump for a replacement to consume.
+                            let member = state
+                                .instance_by_incarnation_mut(&incarnation)
+                                .is_some_and(|i| i.db_cluster_identifier.as_deref() == Some(cid));
+                            member
+                                .then(|| {
+                                    state
+                                        .extras
+                                        .get_mut("clusters")
+                                        .and_then(|m| m.get_mut(cid))
+                                        .and_then(|entry| entry.as_object_mut())
+                                        .and_then(|obj| obj.remove("PendingRestoreDumpB64"))
+                                })
+                                .flatten()
                                 .and_then(|v| v.as_str().map(str::to_string))
                                 .and_then(|b64| {
                                     use base64::Engine;
@@ -354,8 +372,8 @@ impl RdsService {
                         };
                         if let Some(dump) = pending_dump {
                             if let Err(error) = runtime
-                                .restore_database(
-                                    &id,
+                                .restore(
+                                    &incarnation,
                                     &engine,
                                     &master_username,
                                     &master_user_password,
@@ -371,36 +389,41 @@ impl RdsService {
                         let instance_present = {
                             let mut accounts = state_handle.write();
                             let state = accounts.get_or_create(&account_id);
-                            if let Some(inst) = state.instances.get_mut(&id) {
-                                inst.db_instance_status = "available".to_string();
-                                inst.endpoint_address = running.endpoint_address.clone();
-                                inst.port = i32::from(running.endpoint_port);
-                                inst.host_port = running.host_port;
-                                inst.container_id = running.container_id;
-                                // Register as cluster member so failover /
-                                // restore paths can find the writer.
-                                if let Some(ref cid) = cluster_id_for_attach {
-                                    attach_cluster_member(state, cid, &id);
+                            let current_id =
+                                state.instance_by_incarnation_mut(&incarnation).map(|inst| {
+                                    inst.db_instance_status = "available".to_string();
+                                    inst.endpoint_address = running.endpoint_address.clone();
+                                    inst.port = i32::from(running.endpoint_port);
+                                    inst.host_port = running.host_port;
+                                    inst.container_id = running.container_id.clone();
+                                    inst.db_instance_identifier.clone()
+                                });
+                            match current_id {
+                                Some(current_id) => {
+                                    // Register as cluster member so failover /
+                                    // restore paths can find the writer.
+                                    if let Some(ref cid) = cluster_id_for_attach {
+                                        attach_cluster_member(state, cid, &current_id);
+                                    }
+                                    true
                                 }
-                                true
-                            } else {
-                                false
+                                None => false,
                             }
                         };
-                        // DeleteDBInstance raced this create: it removed the
-                        // instance from state and called stop_container(id)
-                        // while ensure_postgres was still mid-flight (before
-                        // it registered the container), so that stop was a
-                        // no-op. The container the runtime just registered is
-                        // now an orphan holding a host port. Stop and remove
-                        // it here, mirroring ElastiCache's deleted-while-
-                        // creating None branch.
+                        // DeleteDBInstance (or a reset) raced this create: it
+                        // removed this incarnation's row and stopped its
+                        // container while ensure_postgres was still mid-flight
+                        // (before it registered the container), so that stop
+                        // was a no-op. The container the runtime just
+                        // registered, and the volume it mounts, are orphans.
+                        // Keyed by incarnation, so a new instance reusing the
+                        // identifier is never reached.
                         if !instance_present {
                             tracing::info!(
                                 db_instance_identifier = %id,
                                 "instance deleted during create; reaping orphaned backing container",
                             );
-                            runtime.stop_container(&id).await;
+                            super::reap_gone_start(&runtime, &incarnation, &volume).await;
                             save_snapshot_static(
                                 state_handle.clone(),
                                 snapshot_store.clone(),
@@ -422,11 +445,26 @@ impl RdsService {
                     }
                     Err(error) => {
                         tracing::error!(%error, db_instance_identifier=%id, "create_db_instance background task failed");
-                        {
+                        let (id, arn) = {
                             let mut accounts = state_handle.write();
                             let state = accounts.get_or_create(&account_id);
-                            state.instances.remove(&id);
-                        }
+                            // Only this incarnation's row (it may have been
+                            // renamed, or deleted and the identifier reused).
+                            match state
+                                .instance_by_incarnation_mut(&incarnation)
+                                .map(|i| i.db_instance_identifier.clone())
+                                .and_then(|current_id| state.instances.remove(&current_id))
+                            {
+                                Some(removed) => {
+                                    (removed.db_instance_identifier, removed.db_instance_arn)
+                                }
+                                None => (id.clone(), arn.clone()),
+                            }
+                        };
+                        // The row is gone either way now; the failed start
+                        // may already have created this incarnation's volume
+                        // (and a container), which nothing else names.
+                        super::reap_gone_start(&runtime, &incarnation, &volume).await;
                         save_snapshot_static(
                             state_handle.clone(),
                             snapshot_store.clone(),
@@ -492,8 +530,10 @@ impl RdsService {
             ));
         }
 
-        // Check deletion protection BEFORE creating snapshot or making any changes
-        {
+        // Check deletion protection BEFORE creating snapshot or making any changes.
+        // The incarnation checked here is the one removed below, never a
+        // replacement under the identifier.
+        let incarnation = {
             let accounts = self.state.read();
             let empty = RdsState::new(&request.account_id, &request.region);
             let state = accounts.get(&request.account_id).unwrap_or(&empty);
@@ -508,14 +548,16 @@ impl RdsService {
                         ),
                     ));
                 }
+                instance.dbi_resource_id.clone()
             } else {
                 return Err(db_instance_not_found(&db_instance_identifier));
             }
-        }
+        };
 
         if let Some(ref snapshot_id) = final_db_snapshot_identifier {
             self.create_final_db_snapshot(
                 &db_instance_identifier,
+                &incarnation,
                 snapshot_id,
                 &request.account_id,
                 &request.region,
@@ -526,6 +568,13 @@ impl RdsService {
         let (instance, subnet_group) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&request.account_id);
+            if state
+                .instances
+                .get(&db_instance_identifier)
+                .is_none_or(|i| i.dbi_resource_id != incarnation)
+            {
+                return Err(db_instance_not_found(&db_instance_identifier));
+            }
             let instance = state
                 .instances
                 .remove(&db_instance_identifier)
@@ -554,12 +603,15 @@ impl RdsService {
         // has read from it, so stopping it here would race the dump to empty.
         if final_db_snapshot_identifier.is_none() {
             if let Some(runtime) = &self.runtime {
-                runtime.stop_container(&db_instance_identifier).await;
+                runtime.stop(&instance.dbi_resource_id).await;
                 // Drop the persisted data volume so a future instance reusing this
                 // identifier starts clean instead of inheriting deleted data
-                // (bug-audit 2026-06-20, 4.2).
+                // (bug-audit 2026-06-20, 4.2). Named from the removed row.
                 runtime
-                    .remove_data_volume(&request.account_id, &db_instance_identifier)
+                    .remove_data_volume_named(&instance.data_volume_name(
+                        fakecloud_core::data_volume::current_scope().tag(),
+                        &request.account_id,
+                    ))
                     .await;
             }
         }
@@ -772,6 +824,27 @@ impl RdsService {
             .instances
             .get_mut(&db_instance_identifier)
             .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?;
+
+        // AWS only renames a settled instance (`available`, or `stopped`);
+        // one that is creating, starting, rebooting or being deleted is
+        // refused. Checked before mutating anything.
+        if new_db_instance_identifier
+            .as_deref()
+            .is_some_and(|new_id| new_id != db_instance_identifier)
+            && !matches!(
+                instance.db_instance_status.as_str(),
+                "available" | "stopped"
+            )
+        {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidDBInstanceState",
+                format!(
+                    "DB instance {db_instance_identifier} is {} and cannot be renamed.",
+                    instance.db_instance_status
+                ),
+            ));
+        }
 
         // Reject storage shrink / engine-version downgrade before mutating
         // anything. Real AWS surfaces these as InvalidParameterCombination;
@@ -1090,6 +1163,9 @@ impl RdsService {
                 }
                 moved.db_instance_identifier = new_id.clone();
                 moved.db_instance_arn = new_arn;
+                // The backing container and data volume are keyed by the
+                // instance's `DbiResourceId`, which a rename doesn't change, so
+                // they simply stay with it.
                 state.instances.insert(new_id.clone(), moved);
                 new_id.clone()
             }
@@ -1195,8 +1271,8 @@ impl RdsService {
                     .clone()
                     .unwrap_or_else(|| default_db_name(&inst.engine).to_string());
                 let running = match runtime
-                    .restart_container(
-                        &id,
+                    .restart(
+                        &inst.dbi_resource_id,
                         &inst.engine,
                         &inst.master_username,
                         &inst.master_user_password,
@@ -1215,14 +1291,21 @@ impl RdsService {
                         // stuck state is both cleared and observable. Mirrors the
                         // CreateDBInstance background task's Err handling.
                         tracing::error!(%error, db_instance_identifier=%id, "reboot_db_instance restart failed");
-                        let arn = {
+                        // The row as it is now: events carry its current
+                        // identifier and ARN, not the ones read before the await.
+                        let (id, arn) = {
                             let mut accounts = state_handle.write();
                             let state = accounts.get_or_create(&account_id);
-                            let Some(instance) = state.instances.get_mut(&id) else {
+                            let Some(instance) =
+                                state.instance_by_incarnation_mut(&inst.dbi_resource_id)
+                            else {
                                 return;
                             };
                             instance.db_instance_status = "available".to_string();
-                            instance.db_instance_arn.clone()
+                            (
+                                instance.db_instance_identifier.clone(),
+                                instance.db_instance_arn.clone(),
+                            )
                         };
                         save_snapshot_static(state_handle.clone(), snapshot_store, snapshot_lock)
                             .await;
@@ -1240,10 +1323,11 @@ impl RdsService {
                         return;
                     }
                 };
-                let arn = {
+                let (id, arn) = {
                     let mut accounts = state_handle.write();
                     let state = accounts.get_or_create(&account_id);
-                    let Some(instance) = state.instances.get_mut(&id) else {
+                    let Some(instance) = state.instance_by_incarnation_mut(&inst.dbi_resource_id)
+                    else {
                         return;
                     };
                     instance.host_port = running.host_port;
@@ -1253,7 +1337,10 @@ impl RdsService {
                     // in the handler; the background task only reconciles the
                     // restarted container's endpoint + flips to available.
                     instance.db_instance_status = "available".to_string();
-                    instance.db_instance_arn.clone()
+                    (
+                        instance.db_instance_identifier.clone(),
+                        instance.db_instance_arn.clone(),
+                    )
                 };
                 emit_event_static_with_state(
                     delivery_bus.as_ref(),

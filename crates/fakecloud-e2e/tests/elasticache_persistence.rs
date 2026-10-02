@@ -35,6 +35,8 @@ async fn persistence_cache_cluster_endpoint_works_after_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let data_path = tmp.path().display().to_string();
     let extra_args = ["--storage-mode", "persistent", "--data-path", &data_path];
+    // Drop the cluster's durable data volume even if the test fails.
+    let _volumes = helpers::DataVolumeGuard::new(tmp.path());
     let mut server = TestServer::start_full(&[], &extra_args).await;
     let client = server.elasticache_client().await;
 
@@ -138,6 +140,8 @@ async fn persistence_cache_data_survives_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let data_path = tmp.path().display().to_string();
     let extra_args = ["--storage-mode", "persistent", "--data-path", &data_path];
+    // Drop the cluster's durable data volume even if the test fails.
+    let volume_guard = helpers::DataVolumeGuard::new(tmp.path());
     let mut server = TestServer::start_full(&[], &extra_args).await;
     let client = server.elasticache_client().await;
 
@@ -189,6 +193,95 @@ async fn persistence_cache_data_survives_restart() {
     assert!(
         value.contains("survive-value"),
         "cached key must survive the restart via the durable /data volume, got {value:?}"
+    );
+
+    // The volume is scoped to this data dir (#2630), and DeleteCacheCluster
+    // drops it so nothing is left for a later cluster to reload.
+    let volumes = volume_guard.volumes(&["fakecloud-elasticache=data-cache"]);
+    assert_eq!(volumes.len(), 1, "one scoped volume: {volumes:?}");
+    client
+        .delete_cache_cluster()
+        .cache_cluster_id("data-cache")
+        .send()
+        .await
+        .unwrap();
+    let mut gone = false;
+    for _ in 0..60 {
+        if !helpers::volume_exists(&volumes[0]) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        gone,
+        "DeleteCacheCluster left data volume {} behind",
+        volumes[0]
+    );
+}
+
+/// Issue #2630: a fresh `--data-path` creating a cluster with an id another
+/// data dir used must not reload that data dir's RDB.
+#[tokio::test]
+async fn fresh_data_dir_does_not_reload_another_dirs_cache() {
+    if !require_docker_or_skip("fresh_data_dir_does_not_reload_another_dirs_cache") {
+        return;
+    }
+    let id = "isolated-cache";
+    let create = |client: aws_sdk_elasticache::Client| async move {
+        client
+            .create_cache_cluster()
+            .cache_cluster_id(id)
+            .engine("redis")
+            .cache_node_type("cache.t3.micro")
+            .preferred_availability_zone("us-east-1a")
+            .send()
+            .await
+            .unwrap();
+        helpers::wait_for_cache_cluster_available(&client, id, 120).await;
+        wait_cache_port(&client, id).await
+    };
+
+    let tmp_a = tempfile::tempdir().unwrap();
+    let path_a = tmp_a.path().display().to_string();
+    let _volumes_a = helpers::DataVolumeGuard::new(tmp_a.path());
+    {
+        let args = ["--storage-mode", "persistent", "--data-path", &path_a];
+        let server = TestServer::start_full(&[], &args).await;
+        let port = create(server.elasticache_client().await).await;
+        let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect redis to seed");
+        let set = redis_cmd(
+            &mut s,
+            b"*3\r\n$3\r\nSET\r\n$10\r\nonly-in-a!\r\n$1\r\n1\r\n",
+        )
+        .await;
+        assert!(set.starts_with("+OK"), "SET should succeed: {set:?}");
+        let save = redis_cmd(&mut s, b"*1\r\n$4\r\nSAVE\r\n").await;
+        assert!(save.starts_with("+OK"), "SAVE should succeed: {save:?}");
+    }
+
+    let tmp_b = tempfile::tempdir().unwrap();
+    let path_b = tmp_b.path().display().to_string();
+    let _volumes_b = helpers::DataVolumeGuard::new(tmp_b.path());
+    let args = ["--storage-mode", "persistent", "--data-path", &path_b];
+    let server = TestServer::start_full(&[], &args).await;
+    let port = create(server.elasticache_client().await).await;
+    let mut value = String::new();
+    for _ in 0..40 {
+        if let Ok(mut s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            value = redis_cmd(&mut s, b"*2\r\n$6\r\nEXISTS\r\n$10\r\nonly-in-a!\r\n").await;
+            if value.starts_with(':') {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        value.trim(),
+        ":0",
+        "a fresh data dir must not reload another data dir's cache"
     );
 }
 
@@ -376,5 +469,106 @@ async fn persistence_deletion_survives_restart() {
             .iter()
             .any(|u| u.user_id() == Some("doomed-user")),
         "deleted user should not reappear"
+    );
+}
+
+/// Cache ids are unique per account only: two accounts' caches with the same
+/// id get separate containers and data volumes, and a per-account reset tears
+/// down only its own account's cache.
+#[tokio::test]
+async fn same_cache_id_in_two_accounts_is_isolated_and_reset_per_account() {
+    if !require_docker_or_skip("same_cache_id_in_two_accounts_is_isolated_and_reset_per_account") {
+        return;
+    }
+    const ACCOUNT_B: &str = "222222222222";
+    let id = "shared-id";
+    let tmp = tempfile::tempdir().unwrap();
+    let data_path = tmp.path().display().to_string();
+    let args = ["--storage-mode", "persistent", "--data-path", &data_path];
+    let volumes = helpers::DataVolumeGuard::new(tmp.path());
+    let server = TestServer::start_full(&[], &args).await;
+    let client_a = server.elasticache_client().await;
+    let (akid, secret) = server.create_admin(ACCOUNT_B, "cache-admin").await;
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(server.endpoint())
+        .region(aws_config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_elasticache::config::Credentials::new(
+            akid,
+            secret,
+            None,
+            None,
+            "ec-multi-acct",
+        ))
+        .load()
+        .await;
+    let client_b = aws_sdk_elasticache::Client::new(&cfg);
+
+    for client in [&client_a, &client_b] {
+        client
+            .create_cache_cluster()
+            .cache_cluster_id(id)
+            .engine("redis")
+            .cache_node_type("cache.t3.micro")
+            .preferred_availability_zone("us-east-1a")
+            .send()
+            .await
+            .unwrap();
+    }
+    let port_a = wait_cache_port(&client_a, id).await;
+    let port_b = wait_cache_port(&client_b, id).await;
+    assert_ne!(port_a, port_b, "each account gets its own container");
+
+    let mut a = tokio::net::TcpStream::connect(format!("127.0.0.1:{port_a}"))
+        .await
+        .expect("connect account A's redis");
+    let set = redis_cmd(&mut a, b"*3\r\n$3\r\nSET\r\n$5\r\nonlyA\r\n$1\r\n1\r\n").await;
+    assert!(set.starts_with("+OK"), "SET should succeed: {set:?}");
+    let mut b = tokio::net::TcpStream::connect(format!("127.0.0.1:{port_b}"))
+        .await
+        .expect("connect account B's redis");
+    let exists = redis_cmd(&mut b, b"*2\r\n$6\r\nEXISTS\r\n$5\r\nonlyA\r\n").await;
+    assert_eq!(
+        exists.trim(),
+        ":0",
+        "account B must not see account A's data"
+    );
+    drop(b);
+    assert_eq!(
+        volumes
+            .volumes(&[&format!("fakecloud-elasticache={id}")])
+            .len(),
+        2,
+        "one data volume per account"
+    );
+    let vol_b = volumes.volumes(&[
+        &format!("fakecloud-elasticache={id}"),
+        &format!("fakecloud-account={ACCOUNT_B}"),
+    ]);
+    assert_eq!(vol_b.len(), 1);
+
+    // Resetting account B's ElastiCache leaves account A's cache running.
+    let reset = reqwest::Client::new()
+        .post(format!(
+            "{}/_fakecloud/reset/elasticache/{ACCOUNT_B}",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200);
+    assert!(
+        !helpers::volume_exists(&vol_b[0]),
+        "account B's volume is removed by the time reset returns"
+    );
+    let get = redis_cmd(&mut a, b"*2\r\n$3\r\nGET\r\n$5\r\nonlyA\r\n").await;
+    assert!(
+        get.contains("\r\n1\r\n"),
+        "account A's cache must survive account B's reset, got {get:?}"
+    );
+    assert_eq!(
+        volumes
+            .volumes(&[&format!("fakecloud-elasticache={id}")])
+            .len(),
+        1
     );
 }

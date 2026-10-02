@@ -206,6 +206,7 @@ impl ElastiCacheService {
             created_at: chrono::Utc::now().to_rfc3339(),
             container_id: running.container_id,
             host_port: running.host_port,
+            data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),
             member_clusters,
             snapshot_retention_limit,
             snapshot_window,
@@ -271,9 +272,37 @@ impl ElastiCacheService {
             // request (ignored on the Docker backend).
             let pod_tags: std::collections::BTreeMap<String, String> =
                 tags.iter().cloned().collect();
+            // This incarnation's id and volume, pinned now (see
+            // CreateCacheCluster).
+            let (incarnation, volume) = {
+                let accounts = self.state.read();
+                match accounts
+                    .get(&account_id)
+                    .and_then(|s| s.replication_groups.get(&id))
+                {
+                    Some(g) => (
+                        g.incarnation(),
+                        g.data_volume_name(
+                            fakecloud_core::data_volume::current_scope().tag(),
+                            &account_id,
+                        ),
+                    ),
+                    None => (String::new(), String::new()),
+                }
+            };
             tokio::spawn(async move {
+                if incarnation.is_empty() {
+                    return;
+                }
                 let result = runtime
-                    .ensure_redis(&id, rdb_path.as_deref(), &pod_tags)
+                    .ensure_redis(
+                        &incarnation,
+                        &account_id,
+                        &id,
+                        &volume,
+                        rdb_path.as_deref(),
+                        &pod_tags,
+                    )
                     .await;
                 let mut stop_container = false;
                 {
@@ -281,7 +310,11 @@ impl ElastiCacheService {
                     if let Some(s) = accounts.get_mut(&account_id) {
                         match &result {
                             Ok(running) => {
-                                if let Some(g) = s.replication_groups.get_mut(&id) {
+                                if let Some(g) = s
+                                    .replication_groups
+                                    .get_mut(&id)
+                                    .filter(|g| g.incarnation() == incarnation)
+                                {
                                     g.status = "available".to_string();
                                     g.endpoint_address = running.endpoint_address.clone();
                                     g.endpoint_port = running.endpoint_port;
@@ -293,9 +326,10 @@ impl ElastiCacheService {
                                         g.configuration_endpoint_port = Some(running.endpoint_port);
                                     }
                                 } else {
-                                    // Deleted during startup: the container came
-                                    // up but the group is gone — reap it after
-                                    // the lock is released so it isn't orphaned.
+                                    // Deleted (or reset) during startup: the
+                                    // container came up but this incarnation
+                                    // is gone — reap it after the lock is
+                                    // released so it isn't orphaned.
                                     stop_container = true;
                                 }
                             }
@@ -305,18 +339,27 @@ impl ElastiCacheService {
                                     replication_group_id = %id,
                                     "failed to start elasticache replication group container",
                                 );
-                                if let Some(g) = s.replication_groups.get_mut(&id) {
-                                    g.status = "incompatible-network".to_string();
+                                match s
+                                    .replication_groups
+                                    .get_mut(&id)
+                                    .filter(|g| g.incarnation() == incarnation)
+                                {
+                                    Some(g) => g.status = "incompatible-network".to_string(),
+                                    // Deleted while starting: the failed start may still
+                                    // have created this incarnation's volume.
+                                    None => stop_container = true,
                                 }
                             }
                         }
                     } else {
                         // Whole account gone; reap a started container.
-                        stop_container = result.is_ok();
+                        stop_container = true;
                     }
                 }
                 if stop_container {
-                    runtime.stop_container(&id).await;
+                    // Deleted (or reset) while it was starting: reap this
+                    // incarnation's container and its volume.
+                    super::reap_gone_start(&runtime, &incarnation, Some(&volume)).await;
                 }
                 save_snapshot_static(state, snapshot_store, snapshot_lock).await;
             });
@@ -585,7 +628,7 @@ impl ElastiCacheService {
         // until process exit and a later CreateReplicationGroup hits
         // port conflicts. Collect first because container teardown
         // releases the state lock asynchronously.
-        let mut to_drop: Vec<String> = Vec::new();
+        let mut to_drop: Vec<(String, String)> = Vec::new();
         for member in &group.members {
             if !retain_primary && member.role == "primary" {
                 if let Some(rg) = state
@@ -593,7 +636,13 @@ impl ElastiCacheService {
                     .remove(&member.replication_group_id)
                 {
                     state.tags.remove(&rg.arn);
-                    to_drop.push(member.replication_group_id.clone());
+                    to_drop.push((
+                        rg.incarnation(),
+                        rg.data_volume_name(
+                            fakecloud_core::data_volume::current_scope().tag(),
+                            &request.account_id,
+                        ),
+                    ));
                 }
             } else if let Some(replication_group) = state
                 .replication_groups
@@ -605,10 +654,13 @@ impl ElastiCacheService {
         }
         if !to_drop.is_empty() {
             if let Some(runtime) = self.runtime.clone() {
+                // The dropped primary groups are deleted for good: tear down
+                // their containers and data volumes by incarnation, so the
+                // background teardown never reaches a new group reusing an id.
                 let to_drop = to_drop.clone();
                 tokio::spawn(async move {
-                    for id in to_drop {
-                        runtime.stop_container(&id).await;
+                    for (incarnation, volume) in to_drop {
+                        super::reap_gone_start(&runtime, &incarnation, Some(&volume)).await;
                     }
                 });
             }
@@ -652,11 +704,16 @@ impl ElastiCacheService {
         };
 
         if let Some(ref runtime) = self.runtime {
-            runtime.stop_container(&replication_group_id).await;
-            // Drop the persisted data volume so a later group reusing this id
-            // starts clean instead of reloading deleted data (bug-audit
-            // 2026-06-20, 4.2).
-            runtime.remove_data_volume(&replication_group_id).await;
+            // Stop this incarnation's container and drop its data volume so a
+            // later group reusing this id starts clean instead of reloading
+            // deleted data (bug-audit 2026-06-20, 4.2).
+            runtime.stop(&group.incarnation()).await;
+            runtime
+                .remove_data_volume_named(&group.data_volume_name(
+                    fakecloud_core::data_volume::current_scope().tag(),
+                    &request.account_id,
+                ))
+                .await;
         }
 
         let region = self.state.read().region().to_string();
@@ -1349,6 +1406,15 @@ impl ElastiCacheService {
         let Some(runtime) = self.runtime.as_ref() else {
             return;
         };
+        let Some(incarnation) = self
+            .state
+            .read()
+            .get(account_id)
+            .and_then(|s| s.replication_groups.get(rg_id))
+            .map(|g| g.incarnation())
+        else {
+            return;
+        };
         let (users, all_known_user_ids) = {
             let accounts = self.state.read();
             let state = accounts.get(account_id);
@@ -1380,7 +1446,7 @@ impl ElastiCacheService {
         let desired: std::collections::HashSet<String> =
             users.iter().map(|u| u.user_id.clone()).collect();
         match runtime
-            .exec_redis(rg_id, &["ACL".to_string(), "USERS".to_string()])
+            .exec_redis(&incarnation, &["ACL".to_string(), "USERS".to_string()])
             .await
         {
             Ok(output) if output.success => {
@@ -1400,7 +1466,7 @@ impl ElastiCacheService {
                             "DELUSER".to_string(),
                             username.to_string(),
                         ];
-                        if let Ok(del_out) = runtime.exec_redis(rg_id, &del_args).await {
+                        if let Ok(del_out) = runtime.exec_redis(&incarnation, &del_args).await {
                             if !del_out.success {
                                 tracing::warn!(
                                     rg_id = %rg_id,
@@ -1437,7 +1503,7 @@ impl ElastiCacheService {
                 "reset".to_string(),
             ];
             args.extend(user.access_string.split_whitespace().map(|s| s.to_string()));
-            match runtime.exec_redis(rg_id, &args).await {
+            match runtime.exec_redis(&incarnation, &args).await {
                 Ok(output) if !output.success => {
                     tracing::warn!(
                         rg_id = %rg_id,

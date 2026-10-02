@@ -969,36 +969,35 @@ impl ContainerBackingHandles {
         use crate::resource_provisioner::ContainerTeardownIntent;
         for intent in intents {
             match intent {
-                ContainerTeardownIntent::RdsInstance { identifier } => {
+                ContainerTeardownIntent::RdsInstance {
+                    incarnation,
+                    data_volume,
+                } => {
                     if let Some(runtime) = self.rds_runtime.clone() {
-                        let account = self.account_id.clone();
                         tokio::spawn(async move {
                             fakecloud_rds::cfn_provision::cfn_teardown_instance_container(
-                                runtime, identifier, account,
-                            )
-                            .await;
-                        });
-                    }
-                }
-                ContainerTeardownIntent::ElastiCacheCluster { cache_cluster_id } => {
-                    if let Some(runtime) = self.elasticache_runtime.clone() {
-                        tokio::spawn(async move {
-                            fakecloud_elasticache::cfn_provision::cfn_teardown_cluster_container(
                                 runtime,
-                                cache_cluster_id,
+                                incarnation,
+                                data_volume,
                             )
                             .await;
                         });
                     }
                 }
-                ContainerTeardownIntent::ElastiCacheReplicationGroup {
-                    replication_group_id,
+                ContainerTeardownIntent::ElastiCacheCluster {
+                    incarnation,
+                    volume,
+                }
+                | ContainerTeardownIntent::ElastiCacheReplicationGroup {
+                    incarnation,
+                    volume,
                 } => {
                     if let Some(runtime) = self.elasticache_runtime.clone() {
                         tokio::spawn(async move {
-                            fakecloud_elasticache::cfn_provision::cfn_teardown_replication_group_container(
+                            fakecloud_elasticache::cfn_provision::cfn_teardown_cache_container(
                                 runtime,
-                                replication_group_id,
+                                incarnation,
+                                volume,
                             )
                             .await;
                         });

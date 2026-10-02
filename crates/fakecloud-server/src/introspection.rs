@@ -659,6 +659,7 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             container_id: "abc123".to_string(),
             host_port: 12345,
+            data_volume: None,
             member_clusters: vec![format!("{id}-001")],
             snapshot_retention_limit: 0,
             snapshot_window: "05:00-09:00".to_string(),
@@ -787,6 +788,7 @@ mod tests {
             master_user_password: "secret123".to_string(),
             container_id: "container-id".to_string(),
             host_port: 15432,
+            data_volume: None,
             tags: vec![fakecloud_rds::RdsTag {
                 key: "env".to_string(),
                 value: "test".to_string(),

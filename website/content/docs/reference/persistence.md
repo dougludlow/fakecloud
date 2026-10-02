@@ -60,14 +60,35 @@ Every implemented service persists its control-plane state in this mode — a sn
 
 ## Container-backed service data
 
-The list above covers each service's **control-plane** state. Services that run real containers (RDS, ElastiCache, EC2, ECS) also have a **data plane** — the bytes inside the database, cache, or instance filesystem. In persistent mode fakecloud keeps that data durable too, by backing each container with a named volume keyed to the resource so a container recreated after a restart reattaches the same data instead of coming back empty:
+The list above covers each service's **control-plane** state. Services that run real containers (RDS, ElastiCache, EC2, ECS) also have a **data plane**: the bytes inside the database, cache, or instance filesystem. In persistent mode fakecloud keeps that data durable too, by backing each container with a named volume keyed to the resource so a container recreated after a restart reattaches the same data instead of coming back empty:
 
-- **RDS** — postgres/mysql/mariadb data directories. A row written before a restart is still there after the backing container is recovered. (Oracle/SQL Server/Db2 manage their own state and are not volume-backed.)
-- **ElastiCache** — Redis/Valkey persist their `/data` RDB across restarts. Memcached is in-memory only, matching real ElastiCache (a reboot clears it).
-- **EC2** — each instance's data directory (`/var/lib/fakecloud/ec2` by default, see `FAKECLOUD_EC2_INSTANCE_DATA_DIR`) survives a fakecloud restart and a stop/start, the way an EBS root volume does. This persists the instance's data directory, not a full root-filesystem snapshot. The volume is removed on `TerminateInstances`, matching a deleted EBS root volume.
-- **ECS** — task storage is ephemeral, matching AWS: anonymous "Docker volumes" and `dockerVolumeConfiguration` with `scope=task` are deleted when the task stops. Host bind mounts, EFS/FSx, and `scope=shared` volumes persist independently of the task.
+- **RDS**: postgres/mysql/mariadb data directories. A row written before a restart is still there after the backing container is recovered. (Oracle/SQL Server/Db2 manage their own state and are not volume-backed.) The volume is removed on `DeleteDBInstance`.
+- **ElastiCache**: Redis/Valkey (cache clusters, replication groups, serverless caches) persist their `/data` RDB across restarts. Memcached is in-memory only, matching real ElastiCache (a reboot clears it). The volume is removed when the resource is deleted.
+- **EC2**: each instance's data directory (`/var/lib/fakecloud/ec2` by default, see `FAKECLOUD_EC2_INSTANCE_DATA_DIR`) survives a fakecloud restart and a stop/start, the way an EBS root volume does. This persists the instance's data directory, not a full root-filesystem snapshot. The volume is removed on `TerminateInstances`, matching a deleted EBS root volume.
+- **ECS**: task storage is ephemeral, matching AWS: anonymous "Docker volumes" and `dockerVolumeConfiguration` with `scope=task` are deleted when the task stops. Host bind mounts, EFS/FSx, and `scope=shared` volumes persist independently of the task.
 
-These data volumes default **on** under `--storage-mode=persistent` and **off** in memory mode (so test/CI runs stay ephemeral and isolated). Override per service with `FAKECLOUD_PERSIST_DB_VOLUMES` / `FAKECLOUD_PERSIST_EC2_VOLUMES`. The volumes are daemon-managed, so they work whether or not fakecloud itself runs in a container; on the Kubernetes backend, volume lifecycle is handled by the cluster.
+The RDS and EC2 data volumes default **on** under `--storage-mode=persistent` and **off** in memory mode (so test/CI runs stay ephemeral and isolated). Override per service with `FAKECLOUD_PERSIST_DB_VOLUMES` / `FAKECLOUD_PERSIST_EC2_VOLUMES`. ElastiCache always backs Redis/Valkey with a volume. The volumes are daemon-managed, so they work whether or not fakecloud itself runs in a container; on the Kubernetes backend, volume lifecycle is handled by the cluster.
+
+### Data volumes belong to one data directory
+
+The first time fakecloud uses a data directory it writes a random id to `<data-path>/data-volume-scope`. Every volume name carries a short hash of that id and the directory's canonical path, for example `fakecloud-rds-data-d1a2b3c4d5e6f-123456789012-db-ABC123...` (RDS volumes are keyed by the instance's `DbiResourceId` and ElastiCache volumes by the resource's ARN and creation time, so a `NewDBInstanceIdentifier` rename keeps its data and a delete followed by a recreate under the same name never reuses the old volume). Restarting against the same data directory reattaches the same volumes. A different data directory (including a copy), the same path after the directory was wiped, or a second fakecloud on the same Docker daemon using another data directory never sees them, so a fresh `--data-path` that creates a DB with an identifier another data directory used starts with an empty database. Deleting the resource, or resetting the service via `/_fakecloud/reset`, removes its volume.
+
+Because the path is part of the scope, moving or renaming a data directory starts the next run with empty data volumes (the old ones stay on the daemon until you move the directory back or remove them). Every scoped volume is labelled with the path of the data directory that created it, so you can list or clean up the ones a directory owns:
+
+```sh
+docker volume ls --filter label=fakecloud-data-path=/var/lib/fakecloud
+docker volume rm $(docker volume ls -q --filter label=fakecloud-data-path=/var/lib/fakecloud)
+```
+
+An adopted pre-scoping volume (see below) keeps its old unlabelled name, so the label filter doesn't list it; remove it by name:
+
+```sh
+docker volume rm fakecloud-rds-data-123456789012-my-db
+```
+
+In memory mode (when the volumes are on: always for ElastiCache, opt-in for RDS and EC2) the volumes are scoped to the fakecloud process instead. ElastiCache volumes and containers are also keyed by account, so same-named caches in two accounts never share data. A clean shutdown removes them, and the next fakecloud start removes any left by a process that was killed.
+
+Data directories written by builds before this scoping used unscoped volume names (`fakecloud-rds-data-<account>-<identifier>`, `fakecloud-elasticache-data-<id>`, `fakecloud-ec2-data-<account>-<instance-id>`). On the first start against such a data directory, every resource it already holds keeps the unscoped volume it was created with when that volume still exists (Docker cannot rename volumes, so it is reused in place rather than copied), and the choice is recorded in the persisted state. Deleting that resource removes the unscoped volume. Those builds named ElastiCache volumes by cache id alone, so two accounts with a same-named cache shared one volume; when an upgraded data directory holds such a cache in more than one account, none of them adopts the shared volume and each starts on its own account-scoped one (a warning names the old volume so you can recover its data by hand). Resources created afterwards always get scoped volumes, even if an unscoped volume with a matching name is lying around. If the Docker daemon can't list its volumes at startup, such a resource's container is not recreated on that start (rather than coming back on an empty volume); the next start that can list them binds and recovers it.
 
 ## Version compatibility
 

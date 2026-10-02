@@ -106,7 +106,7 @@ impl RdsService {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
 
-        let engine = {
+        let (engine, incarnation) = {
             let accounts = self.state.read();
             let state = accounts
                 .get(&request.account_id)
@@ -115,7 +115,7 @@ impl RdsService {
                 .instances
                 .get(&db_instance_identifier)
                 .ok_or_else(|| db_instance_not_found(&db_instance_identifier))?;
-            instance.engine.clone()
+            (instance.engine.clone(), instance.dbi_resource_id.clone())
         };
 
         let known_synthetic = matches!(
@@ -129,10 +129,7 @@ impl RdsService {
         let container_path = map_log_file_to_container_path(&engine, &log_file_name);
 
         let log_data = if let Some(runtime) = self.runtime.as_ref() {
-            match runtime
-                .read_log_file(&db_instance_identifier, &container_path)
-                .await
-            {
+            match runtime.read_log(&incarnation, &container_path).await {
                 Ok(bytes) => Some(bytes),
                 Err(RuntimeError::Unavailable) => None,
                 Err(RuntimeError::ContainerStartFailed(_)) if known_synthetic => Some(Vec::new()),
