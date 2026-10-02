@@ -22,15 +22,18 @@ pub use crate::service::instance::{
 /// through the RunInstances path, so a `LaunchTemplate` is resolved and merged
 /// exactly as a direct launch does; an unknown template or version is the
 /// returned error. `kms_hook` resolves the keys of encrypted block-device
-/// volumes.
+/// volumes; `quota_provider` supplies the applied security-group quotas.
 pub fn cfn_create(
     state: SharedEc2State,
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
     account_id: &str,
     region: &str,
     spec: &CfnInstanceSpec,
 ) -> Result<CfnInstanceAttrs, String> {
-    let svc = Ec2Service::with_state(state).with_kms_hook(kms_hook);
+    let svc = Ec2Service::with_state(state)
+        .with_kms_hook(kms_hook)
+        .with_quota_provider(quota_provider);
     cfn_create_instance(&svc, account_id, region, spec).map_err(|e| e.message())
 }
 

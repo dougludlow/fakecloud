@@ -128,6 +128,7 @@ CRATES=(
   fakecloud-swf                    # only core/persistence/aws deps
   fakecloud-timestream             # only core/persistence/aws deps
   fakecloud-support             # only core/persistence/aws deps
+  fakecloud-servicequotas       # depends on organizations
   fakecloud-kinesis
   fakecloud-scheduler
   fakecloud-bedrock

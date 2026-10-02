@@ -1553,8 +1553,12 @@ pub struct ManagedPrefixList {
     pub address_family: String,
     pub max_entries: i64,
     pub version: i64,
-    /// `create-complete` | `modify-complete`.
+    /// `create-complete` | `modify-complete` | `modify-failed`.
     pub state: String,
+    /// Why the last modification failed (`modify-failed`), e.g. the security
+    /// groups that cannot take a larger `MaxEntries`.
+    #[serde(default)]
+    pub state_message: Option<String>,
     #[serde(default)]
     pub entries: Vec<PrefixListEntry>,
     /// version -> entries snapshot at that version.

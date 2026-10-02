@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_lines)]
 
 use super::*;
+use crate::service::quota::RuleWeights;
 use crate::service_helpers::ec2_arn;
 
 /// Collect `<prefix>.N.Cidr` (+ optional `.Description`) into prefix-list entries.
@@ -35,10 +36,14 @@ fn managed_prefix_list_xml(
     region: &str,
 ) -> String {
     format!(
-        "{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}",
         ec2_elem("prefixListId", &p.prefix_list_id),
         ec2_elem("addressFamily", &p.address_family),
         ec2_elem("state", &p.state),
+        p.state_message
+            .as_deref()
+            .map(|m| ec2_elem("stateMessage", m))
+            .unwrap_or_default(),
         ec2_elem(
             "prefixListArn",
             &ec2_arn(region, owner, &format!("prefix-list/{}", p.prefix_list_id))
@@ -75,6 +80,7 @@ pub(crate) fn create_managed_prefix_list(
         max_entries,
         version: 1,
         state: "create-complete".to_string(),
+        state_message: None,
         entries,
         version_history,
     };
@@ -122,6 +128,7 @@ pub(crate) fn delete_managed_prefix_list(
             max_entries: 0,
             version: 1,
             state: String::new(),
+            state_message: None,
             entries: Vec::new(),
             version_history: std::collections::BTreeMap::new(),
         });
@@ -305,14 +312,44 @@ pub(crate) fn modify_managed_prefix_list(
         .query_params
         .get("MaxEntries")
         .and_then(|v| v.parse::<i64>().ok());
+    // Resolved before the EC2 lock is taken: Service Quotas answers it.
+    let rule_limit = svc.rules_per_security_group(&req.account_id, &req.region);
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
+    // A larger MaxEntries weighs more in every security group that references
+    // the list. AWS fails the resize (the list goes to `modify-failed`, naming
+    // up to ten resources in its state message) when a referencing group
+    // could not take the new size.
+    let blocked = match (new_max, state.managed_prefix_lists.get(&id)) {
+        (Some(m), Some(current)) if m > current.max_entries => {
+            groups_over_quota_at(state, &id, m, rule_limit)
+        }
+        _ => Vec::new(),
+    };
     let (pl, tags) = match state.managed_prefix_lists.get_mut(&id) {
         Some(entry) => {
             let entries_changed = !add.is_empty() || !remove.is_empty();
             if let Some(n) = new_name {
                 entry.prefix_list_name = n;
             }
+            if !blocked.is_empty() {
+                entry.state = "modify-failed".to_string();
+                entry.state_message = Some(format!(
+                    "The following resources do not support the new maximum size: {}",
+                    blocked.join(", ")
+                ));
+                let failed = entry.clone();
+                let tags = state.tags_for(&id).to_vec();
+                return Ok(Ec2Service::respond(
+                    "ModifyManagedPrefixList",
+                    &req.request_id,
+                    &format!(
+                        "<prefixList>{}</prefixList>",
+                        managed_prefix_list_xml(&failed, &tags, &owner, &region)
+                    ),
+                ));
+            }
+            entry.state_message = None;
             if let Some(m) = new_max {
                 entry.max_entries = m;
             }
@@ -344,6 +381,7 @@ pub(crate) fn modify_managed_prefix_list(
                 max_entries: new_max.unwrap_or(0),
                 version: 1,
                 state: "modify-complete".to_string(),
+                state_message: None,
                 entries: add,
                 version_history: std::collections::BTreeMap::new(),
             };
@@ -358,6 +396,34 @@ pub(crate) fn modify_managed_prefix_list(
             managed_prefix_list_xml(&pl, &tags, &owner, &region)
         ),
     ))
+}
+
+/// Security groups (at most ten, as AWS reports them) whose rules would exceed
+/// `limit` if prefix list `id` had `max_entries` entries.
+fn groups_over_quota_at(state: &Ec2State, id: &str, max_entries: i64, limit: usize) -> Vec<String> {
+    let mut lists = state.managed_prefix_lists.clone();
+    if let Some(pl) = lists.get_mut(id) {
+        pl.max_entries = max_entries;
+    }
+    let before = RuleWeights::new(&state.managed_prefix_lists);
+    let after = RuleWeights::new(&lists);
+    state
+        .security_groups
+        .values()
+        .filter(|g| {
+            g.rules
+                .iter()
+                .any(|r| r.prefix_list_id.as_deref() == Some(id))
+        })
+        // A group already over the limit at the current size is not one the
+        // resize breaks; only a group the larger size pushes over is.
+        .filter(|g| {
+            let n = after.group_rule_count(&g.rules);
+            n > limit && n > before.group_rule_count(&g.rules)
+        })
+        .map(|g| g.group_id.clone())
+        .take(10)
+        .collect()
 }
 
 pub(crate) fn restore_managed_prefix_list_version(
@@ -393,6 +459,7 @@ pub(crate) fn restore_managed_prefix_list_version(
             max_entries: 0,
             version: previous.max(1),
             state: "modify-complete".to_string(),
+            state_message: None,
             entries: Vec::new(),
             version_history: std::collections::BTreeMap::new(),
         };
@@ -406,4 +473,119 @@ pub(crate) fn restore_managed_prefix_list_version(
             managed_prefix_list_xml(&out, &tags, &owner, &region)
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{SecurityGroup, SecurityGroupRule};
+    use crate::test_support::ec2_request;
+
+    fn body(r: AwsResponse) -> String {
+        String::from_utf8(r.body.expect_bytes().to_vec()).unwrap()
+    }
+
+    fn cidr_rule(i: usize) -> SecurityGroupRule {
+        SecurityGroupRule {
+            rule_id: format!("sgr-{i}"),
+            group_id: "sg-a".into(),
+            is_egress: false,
+            ip_protocol: "tcp".into(),
+            from_port: i as i64,
+            to_port: i as i64,
+            cidr_ipv4: Some("10.0.0.0/8".into()),
+            cidr_ipv6: None,
+            prefix_list_id: None,
+            referenced_group_id: None,
+            referenced_group_name: None,
+            referenced_user_id: None,
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn resizing_a_referenced_list_past_the_rules_quota_fails() {
+        let svc = Ec2Service::new();
+        let created = body(
+            create_managed_prefix_list(
+                &svc,
+                &ec2_request(
+                    "CreateManagedPrefixList",
+                    &[
+                        ("PrefixListName", "corp"),
+                        ("MaxEntries", "1"),
+                        ("AddressFamily", "IPv4"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        let pl_id = created
+            .split("<prefixListId>")
+            .nth(1)
+            .and_then(|r| r.split('<').next())
+            .unwrap()
+            .to_string();
+        // 59 CIDR rules + one rule on the 1-entry list = 60, the default quota.
+        let mut rules: Vec<SecurityGroupRule> = (0..59).map(cidr_rule).collect();
+        let mut pl_rule = cidr_rule(59);
+        pl_rule.cidr_ipv4 = None;
+        pl_rule.prefix_list_id = Some(pl_id.clone());
+        rules.push(pl_rule);
+        svc.state
+            .write()
+            .get_or_create("000000000000")
+            .security_groups
+            .insert(
+                "sg-a".into(),
+                SecurityGroup {
+                    group_id: "sg-a".into(),
+                    group_name: "a".into(),
+                    description: "d".into(),
+                    vpc_id: "vpc-1".into(),
+                    rules,
+                },
+            );
+
+        let resize = |max: &str| {
+            body(
+                modify_managed_prefix_list(
+                    &svc,
+                    &ec2_request(
+                        "ModifyManagedPrefixList",
+                        &[("PrefixListId", pl_id.as_str()), ("MaxEntries", max)],
+                    ),
+                )
+                .unwrap(),
+            )
+        };
+        let failed = resize("1000");
+        assert!(failed.contains("<state>modify-failed</state>"), "{failed}");
+        assert!(failed.contains("<stateMessage>"), "{failed}");
+        assert!(failed.contains("sg-a"), "{failed}");
+        assert!(failed.contains("<maxEntries>1</maxEntries>"), "{failed}");
+        assert_eq!(
+            svc.state
+                .read()
+                .get("000000000000")
+                .unwrap()
+                .managed_prefix_lists[&pl_id]
+                .max_entries,
+            1
+        );
+
+        // Once the group has room, the same resize goes through.
+        svc.state
+            .write()
+            .get_or_create("000000000000")
+            .security_groups
+            .get_mut("sg-a")
+            .unwrap()
+            .rules
+            .retain(|r| r.prefix_list_id.is_some() || r.from_port < 9);
+        let ok = resize("50");
+        assert!(ok.contains("<state>modify-complete</state>"), "{ok}");
+        assert!(!ok.contains("<stateMessage>"), "{ok}");
+        assert!(ok.contains("<maxEntries>50</maxEntries>"), "{ok}");
+    }
 }

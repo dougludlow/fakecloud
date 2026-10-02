@@ -27,6 +27,16 @@ pub struct CfnReconcilePersistHooks {
     pub ec2: Option<SnapshotHook>,
 }
 
+/// Cross-service hooks a CFN-driven launch resolves through, as the direct
+/// `RunInstances` path does: KMS for encrypted volumes' keys, Service Quotas
+/// for the applied security-group quotas. `None` fields fall back to no key
+/// and the AWS default quotas.
+#[derive(Clone, Default)]
+pub struct CfnLaunchHooks {
+    pub kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    pub quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+}
+
 /// Reconcile a CFN-provisioned Auto Scaling Group to its desired capacity by
 /// launching REAL EC2 instances. No-op if the group is gone (e.g. the stack was
 /// deleted before reconciliation ran). Intended to be `tokio::spawn`ed by the
@@ -43,7 +53,7 @@ pub async fn cfn_reconcile_capacity(
     account_id: String,
     region: String,
     persist: CfnReconcilePersistHooks,
-    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    hooks: CfnLaunchHooks,
 ) {
     // The EC2 hook is set on the service so `apply_capacity` persists the REAL
     // EC2 instances it launches; the autoscaling hook is fired below to persist
@@ -53,7 +63,8 @@ pub async fn cfn_reconcile_capacity(
     // EC2 records) vanish on restart (bug-hunt restart-dataloss).
     let svc = AutoScalingService::new(asg_state)
         .with_ec2(ec2_state, ec2_runtime)
-        .with_kms_hook(kms_hook)
+        .with_kms_hook(hooks.kms_hook)
+        .with_quota_provider(hooks.quota_provider)
         .with_ec2_snapshot_hook(persist.ec2);
     svc.reconcile_group(&account_id, &group_name, &region).await;
     if let Some(hook) = persist.autoscaling {
@@ -185,7 +196,7 @@ mod tests {
                 autoscaling: asg_hook,
                 ec2: ec2_hook,
             },
-            None,
+            CfnLaunchHooks::default(),
         )
         .await;
 

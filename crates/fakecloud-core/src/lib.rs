@@ -14,6 +14,7 @@ pub mod path;
 pub mod protocol;
 pub mod query;
 pub mod query_filters;
+pub mod quota;
 pub mod registry;
 pub mod rfc2047;
 pub mod service;

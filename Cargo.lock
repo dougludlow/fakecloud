@@ -2124,6 +2124,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-servicequotas"
+version = "1.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9936d401af57ee0720fc758c85daccb147881454e25532d5b4f3aaf5c4c6cf72"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.6",
+ "aws-smithy-json 0.62.5",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ses"
 version = "1.100.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4423,6 +4447,7 @@ dependencies = [
  "fakecloud-secretsmanager",
  "fakecloud-serverlessrepo",
  "fakecloud-servicediscovery",
+ "fakecloud-servicequotas",
  "fakecloud-ses",
  "fakecloud-shield",
  "fakecloud-sns",
@@ -5526,6 +5551,7 @@ dependencies = [
  "aws-sdk-scheduler",
  "aws-sdk-secretsmanager",
  "aws-sdk-serverlessapplicationrepository",
+ "aws-sdk-servicequotas",
  "aws-sdk-ses",
  "aws-sdk-sesv2",
  "aws-sdk-sfn",
@@ -6795,6 +6821,29 @@ dependencies = [
  "fakecloud-persistence",
  "http 1.4.0",
  "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "fakecloud-servicequotas"
+version = "0.47.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "fakecloud-aws",
+ "fakecloud-core",
+ "fakecloud-organizations",
+ "fakecloud-persistence",
+ "http 1.4.0",
+ "parking_lot",
+ "rand 0.8.5",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

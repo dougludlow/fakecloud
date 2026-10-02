@@ -466,6 +466,7 @@ pub(crate) fn launch_instances(
         "InstanceInitiatedShutdownBehavior",
         &["stop", "terminate"],
     )?;
+    crate::service::quota::check_launch_groups(svc, account_id, region, params)?;
     // AWS best-effort launches MaxCount instances (>= MinCount). `min` is
     // already validated to be in 1..=MAX_INSTANCES_PER_REQUEST above, so this
     // only caps an oversized MaxCount down to the ceiling (never below MinCount,
@@ -2499,6 +2500,13 @@ pub(crate) fn modify_instance_attribute(
     // `DisableApiTermination.Value`). Validate it only when present.
     validate_enum(&req.query_params, "Attribute", ATTRIBUTE_VALUES)?;
     let p = &req.query_params;
+    crate::service::quota::check_group_count(
+        svc,
+        &req.account_id,
+        &req.region,
+        crate::service::quota::GroupHolder::Instance,
+        crate::service::quota::distinct_count(&indexed_list(p, "GroupId")),
+    )?;
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     let inst = state

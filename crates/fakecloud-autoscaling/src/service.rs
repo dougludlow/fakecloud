@@ -57,6 +57,9 @@ pub struct AutoScalingService {
     /// KMS hook the EC2 launches resolve encrypted volumes' keys through
     /// (`aws/ebs` for an encrypted mapping without a key).
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// Service Quotas, so launched instances are held to the account's
+    /// applied security-group quotas.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 impl AutoScalingService {
@@ -69,6 +72,7 @@ impl AutoScalingService {
             ec2_runtime: None,
             ec2_snapshot_hook: None,
             kms_hook: None,
+            quota_provider: None,
         }
     }
 
@@ -83,6 +87,16 @@ impl AutoScalingService {
         self
     }
 
+    /// Attach Service Quotas for the security-group quotas EC2 launches are
+    /// held to.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
+        self
+    }
+
     /// A bare EC2 service over the wired EC2 state, for the launches and
     /// terminations this group drives.
     fn ec2_service(&self) -> Option<fakecloud_ec2::Ec2Service> {
@@ -90,7 +104,8 @@ impl AutoScalingService {
         Some(
             fakecloud_ec2::Ec2Service::with_state(state)
                 .with_runtime(self.ec2_runtime.clone())
-                .with_kms_hook(self.kms_hook.clone()),
+                .with_kms_hook(self.kms_hook.clone())
+                .with_quota_provider(self.quota_provider.clone()),
         )
     }
 
@@ -190,7 +205,8 @@ impl AutoScalingService {
         }
         let svc = fakecloud_ec2::Ec2Service::with_state(ec2_state)
             .with_runtime(self.ec2_runtime.clone())
-            .with_kms_hook(self.kms_hook.clone());
+            .with_kms_hook(self.kms_hook.clone())
+            .with_quota_provider(self.quota_provider.clone());
         let mut params = std::collections::HashMap::new();
         for (n, id) in ids.iter().enumerate() {
             params.insert(format!("InstanceId.{}", n + 1), id.clone());

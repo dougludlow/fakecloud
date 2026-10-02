@@ -118,6 +118,10 @@ pub(super) fn service_protocol(service_name: &str) -> Protocol {
         "comprehend" => Protocol::Json {
             target_prefix: "Comprehend_20171127",
         },
+        // Service Quotas: awsJson1.1.
+        "servicequotas" => Protocol::Json {
+            target_prefix: "ServiceQuotasV20190624",
+        },
         // AWS Support: awsJson1.1 (support cases + Trusted Advisor control plane).
         "support" => Protocol::Json {
             target_prefix: "AWSSupport_20130415",

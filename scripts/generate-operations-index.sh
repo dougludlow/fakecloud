@@ -138,6 +138,7 @@ SERVICES=(
     "comprehend|Amazon Comprehend|comprehend"
     "swf|Amazon SWF (Simple Workflow Service)|swf"
     "timestream|Amazon Timestream (Write + Query)|timestream"
+    "servicequotas|Service Quotas|servicequotas"
     "support|AWS Support|support"
     "organizations|Organizations|organizations"
     "ec2|EC2|ec2"

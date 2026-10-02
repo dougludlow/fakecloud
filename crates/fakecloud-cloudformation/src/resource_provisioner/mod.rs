@@ -1082,6 +1082,9 @@ pub struct ResourceProvisioner {
     /// first use. `None` outside the server wiring, where default-encrypted
     /// resources then report no key.
     pub kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// Service Quotas, for the applied values of the quotas EC2 enforces.
+    /// `None` outside the server wiring, where the AWS defaults apply.
+    pub quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
     pub account_id: String,
     pub region: String,
     pub stack_id: String,
@@ -4412,6 +4415,7 @@ mod tests {
             defer_custom_invokes: false,
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
             kms_hook: None,
+            quota_provider: None,
             account_id: "123456789012".to_string(),
             region: "us-east-1".to_string(),
             stack_id: "arn:aws:cloudformation:us-east-1:123456789012:stack/test/00000000-0000-0000-0000-000000000000".to_string(),
@@ -6336,6 +6340,124 @@ mod tests {
             !ingress.iter().any(|r| r.from_port == 22),
             "old rule revoked in place"
         );
+    }
+
+    #[test]
+    fn ec2_security_group_egress_replaces_the_default_rule() {
+        // AWS CloudFormation drops the default allow-all egress rule when the
+        // template gives SecurityGroupEgress, so 60 template rules fit the
+        // default 60 rules-per-group quota.
+        let egress: Vec<serde_json::Value> = (0..60)
+            .map(|i| {
+                serde_json::json!({"IpProtocol": "tcp", "FromPort": 2000 + i,
+                    "ToPort": 2000 + i, "CidrIp": "10.0.0.0/8"})
+            })
+            .collect();
+        let prov = make_provisioner();
+        let vpc = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc",
+                serde_json::json!({ "CidrBlock": "10.5.0.0/16" }),
+            ))
+            .expect("VPC provisions");
+        let sg = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::SecurityGroup",
+                "Sg",
+                serde_json::json!({
+                    "GroupDescription": "test", "VpcId": vpc.physical_id,
+                    "SecurityGroupEgress": egress
+                }),
+            ))
+            .expect("60 egress rules fit the quota");
+        let ec2 = prov.ec2_state.read();
+        let g = &ec2.get("123456789012").unwrap().security_groups[&sg.physical_id];
+        let out: Vec<_> = g.rules.iter().filter(|r| r.is_egress).collect();
+        assert_eq!(out.len(), 60);
+        assert!(
+            !out.iter().any(|r| r.ip_protocol == "-1"),
+            "default rule removed"
+        );
+    }
+
+    #[test]
+    fn ec2_security_group_over_the_rule_quota_leaves_no_partial_state() {
+        // 61 inline ingress rules exceed the default 60 rules-per-group quota.
+        let over: Vec<serde_json::Value> = (0..61)
+            .map(|i| {
+                serde_json::json!({"IpProtocol": "tcp", "FromPort": 1000 + i,
+                    "ToPort": 1000 + i, "CidrIp": "10.0.0.0/8"})
+            })
+            .collect();
+        let prov = make_provisioner();
+        let vpc = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc",
+                serde_json::json!({ "CidrBlock": "10.4.0.0/16" }),
+            ))
+            .expect("VPC provisions");
+        let groups_before = prov
+            .ec2_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .security_groups
+            .len();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::SecurityGroup",
+                "Big",
+                serde_json::json!({
+                    "GroupDescription": "test", "VpcId": vpc.physical_id,
+                    "SecurityGroupIngress": over.clone()
+                }),
+            ))
+            .expect_err("over the rules quota");
+        assert!(err.contains("rules per security group"), "{err}");
+        assert_eq!(
+            prov.ec2_state
+                .read()
+                .get("123456789012")
+                .unwrap()
+                .security_groups
+                .len(),
+            groups_before,
+            "the rejected group is not orphaned"
+        );
+
+        // An update over the quota keeps the group's current rules.
+        let sg = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::SecurityGroup",
+                "Sg",
+                serde_json::json!({
+                    "GroupDescription": "test", "VpcId": vpc.physical_id,
+                    "SecurityGroupIngress": [
+                        {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "CidrIp": "0.0.0.0/0"}
+                    ]
+                }),
+            ))
+            .expect("SG provisions");
+        assert!(prov
+            .update_resource(
+                &sg,
+                &make_resource(
+                    "AWS::EC2::SecurityGroup",
+                    "Sg",
+                    serde_json::json!({
+                        "GroupDescription": "test", "VpcId": vpc.physical_id,
+                        "SecurityGroupIngress": over
+                    }),
+                ),
+            )
+            .is_err());
+        let ec2 = prov.ec2_state.read();
+        let g = &ec2.get("123456789012").unwrap().security_groups[&sg.physical_id];
+        let ingress: Vec<_> = g.rules.iter().filter(|r| !r.is_egress).collect();
+        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress[0].from_port, 22);
     }
 
     #[test]
