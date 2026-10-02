@@ -13,13 +13,22 @@ use crate::state::{
     SentEmail, SharedSesState, SuppressedDestination,
 };
 
-/// Shared references needed for cross-service event delivery.
+/// Shared references needed for cross-service event delivery. Deliberately
+/// carries no account or region: every send is fanned out in the sending
+/// account and region (see [`SendScope`]), never a server-wide default.
 #[derive(Clone)]
 pub struct SesDeliveryContext {
     pub ses_state: SharedSesState,
     pub delivery_bus: Arc<DeliveryBus>,
-    pub account_id: String,
-    pub region: String,
+}
+
+/// The account and region a send happens in: configuration sets, identities,
+/// the suppression list and event destinations are all looked up there, and
+/// the events it emits originate there.
+#[derive(Debug, Clone, Copy)]
+pub struct SendScope<'a> {
+    pub account_id: &'a str,
+    pub region: &'a str,
 }
 
 /// Mailbox simulator addresses.
@@ -49,6 +58,16 @@ impl SesEventType {
             SesEventType::Delivery => "DELIVERY",
             SesEventType::Bounce => "BOUNCE",
             SesEventType::Complaint => "COMPLAINT",
+        }
+    }
+
+    /// The EventBridge `detail-type` SES publishes this event under.
+    fn eventbridge_detail_type(self) -> &'static str {
+        match self {
+            SesEventType::Send => "Email Sent",
+            SesEventType::Delivery => "Email Delivered",
+            SesEventType::Bounce => "Email Bounced",
+            SesEventType::Complaint => "Email Complaint Received",
         }
     }
 
@@ -124,6 +143,66 @@ pub fn build_ses_event(event_type: SesEventType, email: &SentEmail) -> serde_jso
     event
 }
 
+/// The bare address of a From header value (`Name <a@b>` -> `a@b`).
+fn bare_address(from: &str) -> &str {
+    match (from.rfind('<'), from.rfind('>')) {
+        (Some(start), Some(end)) if start < end => &from[start + 1..end],
+        _ => from.trim(),
+    }
+}
+
+/// The verified identity a send went out under: the From address when it is
+/// itself a verified identity, otherwise its domain.
+fn sending_identity(ses_state: &SharedSesState, account_id: &str, from: &str) -> String {
+    let address = bare_address(from);
+    let domain = address.rsplit_once('@').map_or(address, |(_, d)| d);
+    let mas = ses_state.read();
+    let address_verified = mas
+        .get(account_id)
+        .is_some_and(|s| s.identities.contains_key(address));
+    if address_verified {
+        address.to_string()
+    } else {
+        domain.to_string()
+    }
+}
+
+/// Build the event published to configuration-set destinations: the base
+/// event plus the `mail` fields AWS stamps on every published event
+/// (`sendingAccountId`, `sourceArn`, `headersTruncated`, `tags` with the
+/// `ses:` auto-tags and the message tags).
+fn build_published_event(
+    ctx: &SesDeliveryContext,
+    scope: SendScope<'_>,
+    event_type: SesEventType,
+    email: &SentEmail,
+    config_set: &str,
+) -> serde_json::Value {
+    let mut event = build_ses_event(event_type, email);
+    let identity = sending_identity(&ctx.ses_state, scope.account_id, &email.from);
+    let source_arn = fakecloud_aws::arn::Arn::regional(
+        "ses",
+        scope.region,
+        scope.account_id,
+        &format!("identity/{identity}"),
+    )
+    .to_string();
+    let address = bare_address(&email.from);
+    let from_domain = address.rsplit_once('@').map_or(address, |(_, d)| d);
+    let mut tags = serde_json::Map::new();
+    tags.insert("ses:configuration-set".to_string(), json!([config_set]));
+    tags.insert("ses:from-domain".to_string(), json!([from_domain]));
+    tags.insert("ses:caller-identity".to_string(), json!([scope.account_id]));
+    for (name, value) in &email.email_tags {
+        tags.insert(name.clone(), json!([value]));
+    }
+    event["mail"]["sendingAccountId"] = json!(scope.account_id);
+    event["mail"]["sourceArn"] = json!(source_arn);
+    event["mail"]["headersTruncated"] = json!(false);
+    event["mail"]["tags"] = serde_json::Value::Object(tags);
+    event
+}
+
 /// Determine which event types to generate based on recipient addresses.
 /// Returns the list of event types to emit and whether to add to suppression list.
 pub fn classify_recipients(recipients: &[String]) -> (Vec<SesEventType>, bool) {
@@ -179,11 +258,12 @@ pub fn classify_recipients(recipients: &[String]) -> (Vec<SesEventType>, bool) {
 /// is case-insensitive. Returns the suppressed address if found.
 pub fn check_suppression_list(
     ses_state: &SharedSesState,
+    account_id: &str,
     recipients: &[String],
     config_set_name: Option<&str>,
 ) -> Option<String> {
     let mas = ses_state.read();
-    let state = mas.default_ref();
+    let state = mas.get(account_id)?;
     for addr in recipients {
         if state.suppressed_match(addr, config_set_name).is_some() {
             return Some(addr.clone());
@@ -196,6 +276,7 @@ pub fn check_suppression_list(
 /// Checks the explicit request param first, then the identity's default.
 pub fn resolve_config_set(
     ses_state: &SharedSesState,
+    account_id: &str,
     explicit_config_set: Option<&str>,
     from_address: &str,
 ) -> Option<String> {
@@ -205,7 +286,7 @@ pub fn resolve_config_set(
 
     // Check identity's default configuration set
     let mas = ses_state.read();
-    let state = mas.default_ref();
+    let state = mas.get(account_id)?;
     if let Some(identity) = state.identities.get(from_address) {
         return identity.configuration_set_name.clone();
     }
@@ -222,11 +303,14 @@ pub fn resolve_config_set(
 /// Get enabled event destinations for a configuration set that match the given event type.
 fn get_matching_destinations(
     ses_state: &SharedSesState,
+    account_id: &str,
     config_set_name: &str,
     event_type: SesEventType,
 ) -> Vec<EventDestination> {
     let mas = ses_state.read();
-    let state = mas.default_ref();
+    let Some(state) = mas.get(account_id) else {
+        return Vec::new();
+    };
     let event_type_str = event_type.as_str();
 
     state
@@ -245,11 +329,17 @@ fn get_matching_destinations(
 /// Fan out a single event to all matching destinations.
 fn deliver_event(
     ctx: &SesDeliveryContext,
+    scope: SendScope<'_>,
     event: &serde_json::Value,
     event_type: SesEventType,
     config_set_name: &str,
 ) {
-    let destinations = get_matching_destinations(&ctx.ses_state, config_set_name, event_type);
+    let destinations = get_matching_destinations(
+        &ctx.ses_state,
+        scope.account_id,
+        config_set_name,
+        event_type,
+    );
 
     let mut dispatches: Vec<EventDestinationDispatch> = Vec::new();
     let message_id = event["mail"]["messageId"]
@@ -289,25 +379,47 @@ fn deliver_event(
                 event_type = ?event_type,
                 "SES event fanout -> EventBridge"
             );
-            ctx.delivery_bus.put_event_to_eventbridge(
-                "aws.ses",
-                "SES Email Sending",
-                &detail,
-                "default",
-            );
+            // EventBridgeDestination.EventBusArn names the bus the events go
+            // to; the events originate in the sending account and region,
+            // carry the per-event detail-type and name the sending identity
+            // in `resources`.
             let target_arn = eb
                 .get("EventBusArn")
                 .and_then(|v| v.as_str())
                 .unwrap_or("default")
                 .to_string();
-            dispatches.push(EventDestinationDispatch {
-                destination_name: dest.name.clone(),
-                destination_type: "eventbridge".to_string(),
-                event_type: event_type.as_str().to_string(),
-                message_id: message_id.clone(),
-                dispatched_at: Utc::now(),
-                target_arn,
-            });
+            let resources: Vec<String> = event["mail"]["sourceArn"]
+                .as_str()
+                .map(|arn| vec![arn.to_string()])
+                .unwrap_or_default();
+            let put = ctx.delivery_bus.put_event_to_eventbridge(
+                &fakecloud_core::delivery::CrossServiceEvent {
+                    source: "aws.ses",
+                    detail_type: event_type.eventbridge_detail_type(),
+                    detail: &detail,
+                    event_bus: &target_arn,
+                    account_id: scope.account_id,
+                    region: scope.region,
+                    resources: &resources,
+                    principal_arn: None,
+                },
+            );
+            match put {
+                // Refused by the target bus: not dispatched.
+                Err(err) => tracing::warn!(
+                    event_bus = %target_arn,
+                    %err,
+                    "SES event fanout -> EventBridge refused"
+                ),
+                Ok(_) => dispatches.push(EventDestinationDispatch {
+                    destination_name: dest.name.clone(),
+                    destination_type: "eventbridge".to_string(),
+                    event_type: event_type.as_str().to_string(),
+                    message_id: message_id.clone(),
+                    dispatched_at: Utc::now(),
+                    target_arn,
+                }),
+            }
         }
 
         // Kinesis / Firehose destination
@@ -367,8 +479,8 @@ fn deliver_event(
                         "SES event fanout -> CloudWatch"
                     );
                     ctx.delivery_bus.put_cloudwatch_metric(
-                        &ctx.account_id,
-                        &ctx.region,
+                        scope.account_id,
+                        scope.region,
                         "AWS/SES2",
                         event_type.as_str(),
                         1.0,
@@ -390,7 +502,7 @@ fn deliver_event(
     }
     if !dispatches.is_empty() {
         let mut mas = ctx.ses_state.write();
-        let state = mas.default_mut();
+        let state = mas.get_or_create(scope.account_id);
         state.event_destination_dispatches.extend(dispatches);
     }
 }
@@ -460,16 +572,25 @@ fn build_delivery_insights(
 /// Returns `true` if the email was suppressed (caller should handle accordingly).
 pub fn process_send_events(
     ctx: &SesDeliveryContext,
+    scope: SendScope<'_>,
     email: &mut SentEmail,
     config_set_name: Option<&str>,
 ) -> bool {
-    let config_set = resolve_config_set(&ctx.ses_state, config_set_name, &email.from);
+    let config_set = resolve_config_set(
+        &ctx.ses_state,
+        scope.account_id,
+        config_set_name,
+        &email.from,
+    );
 
     // Check suppression list with the effective reasons filter when a config set exists
     if let Some(ref cs) = config_set {
-        if let Some(suppressed_addr) =
-            check_suppression_list(&ctx.ses_state, &email.to, Some(cs.as_str()))
-        {
+        if let Some(suppressed_addr) = check_suppression_list(
+            &ctx.ses_state,
+            scope.account_id,
+            &email.to,
+            Some(cs.as_str()),
+        ) {
             tracing::info!(
                 address = %suppressed_addr,
                 config_set = %cs,
@@ -479,11 +600,11 @@ pub fn process_send_events(
             // /_fakecloud/ses/metrics callers can observe the gate firing.
             {
                 let mut mas = ctx.ses_state.write();
-                let state = mas.default_mut();
+                let state = mas.get_or_create(scope.account_id);
                 state.suppressed_drops_total = state.suppressed_drops_total.saturating_add(1);
             }
-            let bounce_event = build_ses_event(SesEventType::Bounce, email);
-            deliver_event(ctx, &bounce_event, SesEventType::Bounce, cs);
+            let bounce_event = build_published_event(ctx, scope, SesEventType::Bounce, email, cs);
+            deliver_event(ctx, scope, &bounce_event, SesEventType::Bounce, cs);
             // Store insights: one BOUNCE event per recipient
             email.delivery_insights = build_delivery_insights(email, &[SesEventType::Bounce]);
             return true;
@@ -496,7 +617,7 @@ pub fn process_send_events(
     // Handle suppression list addition
     if add_to_suppression {
         let mut mas = ctx.ses_state.write();
-        let state = mas.default_mut();
+        let state = mas.get_or_create(scope.account_id);
         for addr in &email.to {
             if addr == SUPPRESSION_ADDR {
                 state.suppressed_destinations.insert(
@@ -514,8 +635,8 @@ pub fn process_send_events(
     // Generate and deliver events to configured destinations
     if let Some(ref cs) = config_set {
         for event_type in &event_types {
-            let event = build_ses_event(*event_type, email);
-            deliver_event(ctx, &event, *event_type, cs);
+            let event = build_published_event(ctx, scope, *event_type, email, cs);
+            deliver_event(ctx, scope, &event, *event_type, cs);
         }
     }
 
@@ -721,6 +842,7 @@ mod tests {
         );
         let hit = check_suppression_list(
             &state,
+            "123456789012",
             &[
                 "ok@example.com".to_string(),
                 "blocked@example.com".to_string(),
@@ -733,7 +855,12 @@ mod tests {
     #[test]
     fn check_suppression_list_none_when_clean() {
         let state = shared_state();
-        let hit = check_suppression_list(&state, &["ok@example.com".to_string()], None);
+        let hit = check_suppression_list(
+            &state,
+            "123456789012",
+            &["ok@example.com".to_string()],
+            None,
+        );
         assert!(hit.is_none());
     }
 
@@ -774,6 +901,7 @@ mod tests {
         }
         let hit = check_suppression_list(
             &state,
+            "123456789012",
             &["blocked@example.com".to_string()],
             Some("bounce-only"),
         );
@@ -818,6 +946,7 @@ mod tests {
         }
         let hit = check_suppression_list(
             &state,
+            "123456789012",
             &["blocked@example.com".to_string()],
             Some("passthrough"),
         );
@@ -835,7 +964,12 @@ mod tests {
                 last_update_time: Utc::now(),
             },
         );
-        let hit = check_suppression_list(&state, &["BLOCKED@example.COM".to_string()], None);
+        let hit = check_suppression_list(
+            &state,
+            "123456789012",
+            &["BLOCKED@example.COM".to_string()],
+            None,
+        );
         assert_eq!(hit.as_deref(), Some("BLOCKED@example.COM"));
     }
 
@@ -866,7 +1000,8 @@ mod tests {
     #[test]
     fn resolve_config_set_uses_explicit_arg_first() {
         let state = shared_state();
-        let resolved = resolve_config_set(&state, Some("my-cs"), "sender@example.com");
+        let resolved =
+            resolve_config_set(&state, "123456789012", Some("my-cs"), "sender@example.com");
         assert_eq!(resolved.as_deref(), Some("my-cs"));
     }
 
@@ -877,7 +1012,7 @@ mod tests {
             "sender@example.com".to_string(),
             make_identity("sender@example.com", Some("identity-cs")),
         );
-        let resolved = resolve_config_set(&state, None, "sender@example.com");
+        let resolved = resolve_config_set(&state, "123456789012", None, "sender@example.com");
         assert_eq!(resolved.as_deref(), Some("identity-cs"));
     }
 
@@ -888,14 +1023,14 @@ mod tests {
             "example.com".to_string(),
             make_identity("example.com", Some("domain-cs")),
         );
-        let resolved = resolve_config_set(&state, None, "sender@example.com");
+        let resolved = resolve_config_set(&state, "123456789012", None, "sender@example.com");
         assert_eq!(resolved.as_deref(), Some("domain-cs"));
     }
 
     #[test]
     fn resolve_config_set_none_when_nothing_set() {
         let state = shared_state();
-        assert!(resolve_config_set(&state, None, "sender@example.com").is_none());
+        assert!(resolve_config_set(&state, "123456789012", None, "sender@example.com").is_none());
     }
 
     #[test]
@@ -926,13 +1061,127 @@ mod tests {
                 },
             ],
         );
-        let dests = get_matching_destinations(&state, "cs", SesEventType::Send);
+        let dests = get_matching_destinations(&state, "123456789012", "cs", SesEventType::Send);
         assert_eq!(dests.len(), 1);
         assert_eq!(dests[0].name, "sns-dest");
-        let none = get_matching_destinations(&state, "cs", SesEventType::Delivery);
+        let none = get_matching_destinations(&state, "123456789012", "cs", SesEventType::Delivery);
         assert!(none.is_empty());
-        let missing = get_matching_destinations(&state, "unknown", SesEventType::Send);
+        let missing =
+            get_matching_destinations(&state, "123456789012", "unknown", SesEventType::Send);
         assert!(missing.is_empty());
+    }
+
+    type EbCall = (
+        String,
+        String,
+        String,
+        String,
+        Vec<String>,
+        serde_json::Value,
+    );
+
+    #[derive(Default)]
+    struct EbRecorder(std::sync::Mutex<Vec<EbCall>>);
+
+    impl fakecloud_core::delivery::EventBridgeDelivery for EbRecorder {
+        fn put_event(
+            &self,
+            e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+        ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+            self.0.lock().unwrap().push((
+                e.detail_type.to_string(),
+                e.event_bus.to_string(),
+                e.account_id.to_string(),
+                e.region.to_string(),
+                e.resources.to_vec(),
+                serde_json::from_str(e.detail).unwrap(),
+            ));
+            Ok("id".to_string())
+        }
+    }
+
+    /// A send in a non-default account/region is fanned out with that
+    /// account's configuration set; each EventBridge event carries the
+    /// per-event SES detail-type, the sending identity in `resources`, and
+    /// the published `mail` fields.
+    #[test]
+    fn eventbridge_fanout_uses_send_scope_and_aws_detail_types() {
+        let state = shared_state();
+        state
+            .write()
+            .get_or_create("111111111111")
+            .event_destinations
+            .insert(
+                "cs".to_string(),
+                vec![EventDestination {
+                    name: "eb".to_string(),
+                    enabled: true,
+                    matching_event_types: vec!["SEND".to_string(), "DELIVERY".to_string()],
+                    kinesis_firehose_destination: None,
+                    cloud_watch_destination: None,
+                    sns_destination: None,
+                    event_bridge_destination: Some(serde_json::json!({
+                        "EventBusArn": "arn:aws:events:eu-west-1:111111111111:event-bus/default"
+                    })),
+                    pinpoint_destination: None,
+                }],
+            );
+        let recorder = Arc::new(EbRecorder::default());
+        let ctx = SesDeliveryContext {
+            ses_state: state,
+            delivery_bus: Arc::new(DeliveryBus::new().with_eventbridge(recorder.clone())),
+        };
+        let mut email = SentEmail {
+            message_id: "msg-1".to_string(),
+            from: "Sender <sender@example.com>".to_string(),
+            to: vec!["recipient@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: None,
+            html_body: None,
+            text_body: None,
+            raw_data: None,
+            template_name: None,
+            template_data: None,
+            dkim_signature: None,
+            headers: Vec::new(),
+            timestamp: Utc::now(),
+            email_tags: vec![("campaign".to_string(), "fall".to_string())],
+            delivery_insights: Vec::new(),
+        };
+        process_send_events(
+            &ctx,
+            SendScope {
+                account_id: "111111111111",
+                region: "eu-west-1",
+            },
+            &mut email,
+            Some("cs"),
+        );
+        let calls = recorder.0.lock().unwrap();
+        let types: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(types, vec!["Email Sent", "Email Delivered"]);
+        let (_, bus, account, region, resources, detail) = &calls[0];
+        assert_eq!(
+            bus,
+            "arn:aws:events:eu-west-1:111111111111:event-bus/default"
+        );
+        assert_eq!(account, "111111111111");
+        assert_eq!(region, "eu-west-1");
+        let identity_arn = "arn:aws:ses:eu-west-1:111111111111:identity/example.com";
+        assert_eq!(resources, &vec![identity_arn.to_string()]);
+        assert_eq!(detail["eventType"], "Send");
+        assert_eq!(detail["mail"]["sourceArn"], identity_arn);
+        assert_eq!(detail["mail"]["sendingAccountId"], "111111111111");
+        assert_eq!(detail["mail"]["headersTruncated"], false);
+        assert_eq!(
+            detail["mail"]["tags"]["ses:configuration-set"],
+            serde_json::json!(["cs"])
+        );
+        assert_eq!(
+            detail["mail"]["tags"]["campaign"],
+            serde_json::json!(["fall"])
+        );
     }
 
     #[test]
@@ -965,8 +1214,6 @@ mod tests {
         let ctx = SesDeliveryContext {
             ses_state: state,
             delivery_bus: Arc::new(DeliveryBus::new()),
-            account_id: "123456789012".to_string(),
-            region: "us-east-1".to_string(),
         };
         let event = build_ses_event(
             SesEventType::Send,
@@ -990,6 +1237,15 @@ mod tests {
             },
         );
         // No senders wired — must not panic.
-        deliver_event(&ctx, &event, SesEventType::Send, "cs");
+        deliver_event(
+            &ctx,
+            SendScope {
+                account_id: "123456789012",
+                region: "us-east-1",
+            },
+            &event,
+            SesEventType::Send,
+            "cs",
+        );
     }
 }

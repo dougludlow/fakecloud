@@ -247,6 +247,7 @@ impl LambdaService {
                             route_to_destination(
                                 bus,
                                 &function_arn,
+                                &func_clone.role,
                                 &payload_vec,
                                 &result,
                                 destination_config.as_ref(),

@@ -150,7 +150,7 @@ CRATES=(
   fakecloud-eventbridge    # depends on iam, lambda, logs
 
   # Layer 4: depend on layer 3a/3b crates
-  fakecloud-s3             # depends on kms
+  fakecloud-s3             # depends on kms, iam
   fakecloud-elasticache    # depends on s3
   fakecloud-route53resolver  # depends on ec2, s3 (ImportFirewallDomains)
   fakecloud-acmpca         # depends on s3 (audit-report delivery), acm, kms

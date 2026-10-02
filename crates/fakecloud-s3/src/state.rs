@@ -30,6 +30,10 @@ pub struct S3Object {
     pub tags: BTreeMap<String, String>,
     pub acl_grants: Vec<AclGrant>,
     pub acl_owner_id: Option<String>,
+    /// `x-amz-replication-status`: `COMPLETED` / `FAILED` on a source object
+    /// a replication rule applied to, `REPLICA` on a replica. `None` when no
+    /// replication is involved.
+    pub replication_status: Option<String>,
     /// If created from multipart upload, the number of parts.
     pub parts_count: Option<u32>,
     /// Per-part sizes for multipart objects (part_number, size).

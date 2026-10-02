@@ -1128,6 +1128,7 @@ impl FirehoseService {
             tags: BTreeMap::new(),
             acl_grants: Vec::new(),
             acl_owner_id: None,
+            replication_status: None,
             parts_count: None,
             part_sizes: None,
             sse_algorithm: None,

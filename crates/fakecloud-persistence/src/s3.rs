@@ -181,6 +181,9 @@ pub struct ObjectMeta {
     pub expires: Option<String>,
     #[serde(default)]
     pub website_redirect_location: Option<String>,
+    /// `x-amz-replication-status` (`COMPLETED` / `FAILED` / `REPLICA`).
+    #[serde(default)]
+    pub replication_status: Option<String>,
 }
 
 /// One `PutObjectAnnotation` payload, persisted alongside its object so

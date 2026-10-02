@@ -472,10 +472,17 @@ pub(crate) fn invoke_sns_publish(
     }))
 }
 
-/// Put events onto an EventBridge bus via DeliveryBus.
+/// Put events onto an EventBridge bus via DeliveryBus. The events originate
+/// in the execution's account and region (both read from `execution_arn`);
+/// an `EventBusName` ARN routes to that bus's account, which must allow the
+/// execution role (`role_arn`) through its resource policy. As on AWS, a
+/// response with `FailedEntryCount > 0` fails the task with
+/// `EventBridge.FailedEntry`, the PutEvents response as the cause.
 pub(crate) fn invoke_eventbridge_put_events(
     input: &Value,
     delivery: &Option<Arc<DeliveryBus>>,
+    execution_arn: &str,
+    role_arn: &str,
 ) -> Result<Value, (String, String)> {
     let delivery = delivery.as_ref().ok_or_else(|| {
         (
@@ -494,7 +501,8 @@ pub(crate) fn invoke_eventbridge_put_events(
         })?
         .clone();
 
-    let mut event_ids = Vec::new();
+    let mut result_entries = Vec::new();
+    let mut failed_count = 0;
     for entry in &entries {
         let source = entry["Source"].as_str().unwrap_or("aws.stepfunctions");
         let detail_type = entry["DetailType"].as_str().unwrap_or("StepFunctionsEvent");
@@ -506,15 +514,52 @@ pub(crate) fn invoke_eventbridge_put_events(
                     .expect("serde_json::Value serialization is infallible")
             });
         let bus_name = entry["EventBusName"].as_str().unwrap_or("default");
+        let resources: Vec<String> = entry["Resources"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        delivery.put_event_to_eventbridge(source, detail_type, &detail, bus_name);
-        event_ids.push(uuid::Uuid::new_v4().to_string());
+        let put = delivery.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+            source,
+            detail_type,
+            detail: &detail,
+            event_bus: bus_name,
+            account_id: account_id_from_arn(execution_arn),
+            region: region_from_arn(execution_arn),
+            resources: &resources,
+            principal_arn: (!role_arn.is_empty()).then_some(role_arn),
+        });
+        match put {
+            Ok(id) => result_entries.push(json!({
+                "EventId": id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            })),
+            Err(err) => {
+                use fakecloud_core::delivery::EventBridgeDeliveryError as E;
+                let (code, message) = match err {
+                    E::AccessDenied(message) => ("AccessDeniedException", message),
+                    E::Unavailable(message) => ("InternalException", message),
+                };
+                failed_count += 1;
+                result_entries.push(json!({
+                    "ErrorCode": code,
+                    "ErrorMessage": message,
+                }));
+            }
+        }
     }
 
-    Ok(json!({
-        "Entries": event_ids.iter().map(|id| json!({"EventId": id})).collect::<Vec<_>>(),
-        "FailedEntryCount": 0,
-    }))
+    let response = json!({
+        "Entries": result_entries,
+        "FailedEntryCount": failed_count,
+    });
+    if failed_count > 0 {
+        return Err(("EventBridge.FailedEntry".to_string(), response.to_string()));
+    }
+    Ok(response)
 }
 
 /// Get an item from DynamoDB via direct state access.
@@ -1243,6 +1288,11 @@ pub(crate) fn apply_state_catcher(
     Some((next, new_input))
 }
 
+/// Extract the region from an execution ARN (`arn:aws:states:region:account_id:...`).
+pub(crate) fn region_from_arn(arn: &str) -> &str {
+    arn.split(':').nth(3).unwrap_or("")
+}
+
 /// Extract account ID from an execution ARN (`arn:aws:states:region:account_id:...`).
 pub(crate) fn account_id_from_arn(arn: &str) -> &str {
     arn.split(':').nth(4).unwrap_or("000000000000")
@@ -1470,6 +1520,114 @@ pub(crate) fn deliver_execution_logs(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Records each event and refuses those addressed to a bus ARN in
+    /// another account.
+    /// (account, region, bus, principal) of each recorded event.
+    type GatedCall = (String, String, String, Option<String>);
+
+    #[derive(Default)]
+    struct GatedEb(std::sync::Mutex<Vec<GatedCall>>);
+
+    impl fakecloud_core::delivery::EventBridgeDelivery for GatedEb {
+        fn put_event(
+            &self,
+            e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+        ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+            self.0.lock().unwrap().push((
+                e.account_id.to_string(),
+                e.region.to_string(),
+                e.event_bus.to_string(),
+                e.principal_arn.map(str::to_string),
+            ));
+            if e.event_bus.starts_with("arn:") {
+                return Err(
+                    fakecloud_core::delivery::EventBridgeDeliveryError::AccessDenied(
+                        "denied".to_string(),
+                    ),
+                );
+            }
+            Ok("evt-1".to_string())
+        }
+    }
+
+    const EXEC_ARN: &str = "arn:aws:states:eu-west-2:111111111111:execution:sm:run";
+    const ROLE: &str = "arn:aws:iam::111111111111:role/sfn";
+
+    /// events:putEvents puts as the execution's account/region/role and
+    /// returns the real event id.
+    #[test]
+    fn eventbridge_put_events_uses_execution_scope_and_role() {
+        let eb = Arc::new(GatedEb::default());
+        let delivery = Some(Arc::new(DeliveryBus::new().with_eventbridge(eb.clone())));
+        let out = invoke_eventbridge_put_events(
+            &json!({"Entries": [{"Source": "app", "DetailType": "T", "Detail": "{}"}]}),
+            &delivery,
+            EXEC_ARN,
+            ROLE,
+        )
+        .unwrap();
+        assert_eq!(out["FailedEntryCount"], 0);
+        assert_eq!(out["Entries"][0]["EventId"], "evt-1");
+        let calls = eb.0.lock().unwrap();
+        assert_eq!(calls[0].0, "111111111111");
+        assert_eq!(calls[0].1, "eu-west-2");
+        assert_eq!(calls[0].3.as_deref(), Some(ROLE));
+    }
+
+    /// An event EventBridge could not take (delivery not wired yet) is a
+    /// failed entry, never a success with an empty EventId.
+    #[test]
+    fn eventbridge_put_events_unavailable_is_a_failed_entry() {
+        struct Unwired;
+        impl fakecloud_core::delivery::EventBridgeDelivery for Unwired {
+            fn put_event(
+                &self,
+                _e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+                Err(
+                    fakecloud_core::delivery::EventBridgeDeliveryError::Unavailable(
+                        "not wired".to_string(),
+                    ),
+                )
+            }
+        }
+        let delivery = Some(Arc::new(
+            DeliveryBus::new().with_eventbridge(Arc::new(Unwired)),
+        ));
+        let (error, cause) = invoke_eventbridge_put_events(
+            &json!({"Entries": [{"Source": "app", "DetailType": "T", "Detail": "{}"}]}),
+            &delivery,
+            EXEC_ARN,
+            ROLE,
+        )
+        .unwrap_err();
+        assert_eq!(error, "EventBridge.FailedEntry");
+        let cause: Value = serde_json::from_str(&cause).unwrap();
+        assert_eq!(cause["Entries"][0]["ErrorCode"], "InternalException");
+    }
+
+    /// A refused entry fails the task with EventBridge.FailedEntry, as AWS's
+    /// optimized integration does when FailedEntryCount > 0.
+    #[test]
+    fn eventbridge_put_events_refused_entry_fails_task() {
+        let eb = Arc::new(GatedEb::default());
+        let delivery = Some(Arc::new(DeliveryBus::new().with_eventbridge(eb)));
+        let (error, cause) = invoke_eventbridge_put_events(
+            &json!({"Entries": [{
+                "Source": "app", "DetailType": "T", "Detail": "{}",
+                "EventBusName": "arn:aws:events:eu-west-2:222222222222:event-bus/other"
+            }]}),
+            &delivery,
+            EXEC_ARN,
+            ROLE,
+        )
+        .unwrap_err();
+        assert_eq!(error, "EventBridge.FailedEntry");
+        let cause: Value = serde_json::from_str(&cause).unwrap();
+        assert_eq!(cause["FailedEntryCount"], 1);
+        assert_eq!(cause["Entries"][0]["ErrorCode"], "AccessDeniedException");
+    }
 
     /// The DynamoDB updateItem integration must refuse to write a key
     /// attribute, as DynamoDB does, rather than move the row to another key.

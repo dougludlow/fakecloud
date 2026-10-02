@@ -3040,10 +3040,25 @@ async fn ses_event_fanout_eventbridge_destination() {
     for msg in &msgs {
         let event: serde_json::Value = serde_json::from_str(msg.body().unwrap()).unwrap();
         assert_eq!(event["source"], "aws.ses");
-        assert_eq!(event["detail-type"], "SES Email Sending");
         // detail is already a JSON object in the EventBridge event envelope
         let detail = &event["detail"];
-        assert!(detail["eventType"].is_string());
+        // Per-event detail-types, as SES publishes them to EventBridge.
+        let expected_detail_type = match detail["eventType"].as_str().unwrap() {
+            "Send" => "Email Sent",
+            "Delivery" => "Email Delivered",
+            "Bounce" => "Email Bounced",
+            "Complaint" => "Email Complaint Received",
+            other => panic!("unexpected eventType {other}"),
+        };
+        assert_eq!(event["detail-type"], expected_detail_type);
         assert_eq!(detail["mail"]["source"], "sender@example.com");
+        assert_eq!(detail["mail"]["sendingAccountId"], "123456789012");
+        assert_eq!(
+            detail["mail"]["tags"]["ses:configuration-set"],
+            serde_json::json!(["eb-fanout-test"])
+        );
+        let source_arn = detail["mail"]["sourceArn"].as_str().unwrap();
+        assert!(source_arn.starts_with("arn:aws:ses:us-east-1:123456789012:identity/"));
+        assert_eq!(event["resources"], serde_json::json!([source_arn]));
     }
 }

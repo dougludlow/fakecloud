@@ -2609,6 +2609,7 @@ async fn main() {
     }
     registry.register(Arc::new(
         S3Service::with_store(s3_state.clone(), delivery_for_s3, s3_store.clone())
+            .with_iam_mode(cli.iam_mode())
             .with_kms(kms_state.clone())
             .with_kms_hook(kms_hook_for_services.clone())
             .with_credential_resolver(
@@ -2811,8 +2812,6 @@ async fn main() {
     let ses_delivery_ctx = fakecloud_ses::fanout::SesDeliveryContext {
         ses_state: ses_state.clone(),
         delivery_bus: delivery_for_ses,
-        account_id: cli.account_id.clone(),
-        region: cli.region.clone(),
     };
     let ses_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {

@@ -410,7 +410,15 @@ impl SesV2Service {
 
         // Event fanout: check suppression list, generate events, deliver to destinations
         if let Some(ref ctx) = self.delivery_ctx {
-            crate::fanout::process_send_events(ctx, &mut sent, config_set_name.as_deref());
+            crate::fanout::process_send_events(
+                ctx,
+                crate::fanout::SendScope {
+                    account_id: &req.account_id,
+                    region: &req.region,
+                },
+                &mut sent,
+                config_set_name.as_deref(),
+            );
         }
 
         // Opt-in SMTP relay: when FAKECLOUD_SES_SMTP_RELAY is set, fire a
@@ -592,7 +600,15 @@ impl SesV2Service {
 
             // Event fanout for each bulk entry
             if let Some(ref ctx) = self.delivery_ctx {
-                crate::fanout::process_send_events(ctx, &mut sent, config_set_name.as_deref());
+                crate::fanout::process_send_events(
+                    ctx,
+                    crate::fanout::SendScope {
+                        account_id: &req.account_id,
+                        region: &req.region,
+                    },
+                    &mut sent,
+                    config_set_name.as_deref(),
+                );
             }
 
             self.state

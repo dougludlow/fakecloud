@@ -861,6 +861,7 @@ impl InvocationType {
 fn route_to_destination(
     bus: Arc<fakecloud_core::delivery::DeliveryBus>,
     function_arn: &str,
+    execution_role: &str,
     request_payload: &[u8],
     result: &Result<Vec<u8>, String>,
     destination_config: Option<&serde_json::Value>,
@@ -922,7 +923,32 @@ fn route_to_destination(
         } else {
             "Lambda Function Invocation Result - Failure"
         };
-        bus.put_event_to_eventbridge("lambda", detail_type, &body, "default");
+        // The destination names the bus by ARN (possibly another account's);
+        // the event originates in the function's account and region.
+        let mut arn_parts = function_arn.split(':');
+        let region = arn_parts.nth(3).unwrap_or("");
+        let account_id = arn_parts.next().unwrap_or("");
+        // Lambda puts the record as the function's execution role; a bus in
+        // another account must allow it, else the destination delivery fails.
+        if let Err(err) =
+            bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+                source: "lambda",
+                detail_type,
+                detail: &body,
+                event_bus: dest,
+                account_id,
+                region,
+                resources: &[function_arn.to_string()],
+                principal_arn: (!execution_role.is_empty()).then_some(execution_role),
+            })
+        {
+            tracing::warn!(
+                function_arn,
+                destination = dest,
+                %err,
+                "Lambda destination: EventBridge bus refused the invocation record"
+            );
+        }
     }
 }
 

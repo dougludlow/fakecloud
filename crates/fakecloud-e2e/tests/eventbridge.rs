@@ -1347,7 +1347,8 @@ async fn eb_rule_starts_stepfunctions_execution() {
         .await
         .unwrap();
 
-    // Poll until the EventBridge rule triggers a Step Functions execution
+    // Poll until the EventBridge rule's Step Functions execution has
+    // finished: it is listed as soon as it starts, while still RUNNING.
     let executions = helpers::wait_until(std::time::Duration::from_secs(10), || async {
         let resp = sfn
             .list_executions()
@@ -1355,14 +1356,12 @@ async fn eb_rule_starts_stepfunctions_execution() {
             .send()
             .await
             .ok()?;
-        if resp.executions().len() == 1 {
-            Some(resp)
-        } else {
-            None
-        }
+        let done = resp.executions().len() == 1
+            && resp.executions()[0].status() != &aws_sdk_sfn::types::ExecutionStatus::Running;
+        done.then_some(resp)
     })
     .await
-    .expect("expected 1 execution started by EventBridge rule");
+    .expect("expected 1 finished execution started by EventBridge rule");
     let exec = &executions.executions()[0];
     assert_eq!(
         exec.status(),

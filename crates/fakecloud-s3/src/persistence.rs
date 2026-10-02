@@ -81,6 +81,7 @@ pub fn object_meta_snapshot(o: &S3Object) -> ObjectMeta {
         content_language: o.content_language.clone(),
         expires: o.expires.clone(),
         website_redirect_location: o.website_redirect_location.clone(),
+        replication_status: o.replication_status.clone(),
     }
 }
 
@@ -170,6 +171,7 @@ pub fn s3_object_from_loaded(lo: LoadedObject) -> S3Object {
         cache_control: meta.cache_control,
         content_disposition: meta.content_disposition,
         content_language: meta.content_language,
+        replication_status: meta.replication_status,
         expires: meta.expires,
         website_redirect_location: meta.website_redirect_location,
         restore_ongoing: meta.restore_ongoing,

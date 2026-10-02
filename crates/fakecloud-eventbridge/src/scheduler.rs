@@ -801,7 +801,12 @@ mod tests {
         }
 
         impl EventBridgeDelivery for Recorder {
-            fn put_event(&self, _source: &str, _detail_type: &str, _detail: &str, _bus: &str) {}
+            fn put_event(
+                &self,
+                _event: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+                Ok(String::new())
+            }
         }
 
         impl KinesisDelivery for Recorder {

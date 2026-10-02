@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use fakecloud_aws::arn::Arn;
-use fakecloud_core::delivery::DeliveryBus;
+use fakecloud_core::delivery::{CrossServiceEvent, DeliveryBus};
 
 use crate::state::{S3NotificationEvent, SharedS3State};
 
@@ -154,6 +154,13 @@ pub(crate) struct ReplicationRule {
     pub(crate) status: String,
     pub(crate) prefix: String,
     pub(crate) dest_bucket: String,
+    /// `Destination.Account`: the account expected to own the destination
+    /// bucket (required alongside `AccessControlTranslation`).
+    pub(crate) dest_account: Option<String>,
+    /// `Destination.AccessControlTranslation.Owner == Destination`: replicas
+    /// are owned by the destination bucket owner instead of the source
+    /// object's owner.
+    pub(crate) owner_override: bool,
 }
 
 /// Parse replication configuration XML and extract rules.
@@ -187,26 +194,38 @@ pub(crate) fn parse_replication_rules(xml: &str) -> Vec<ReplicationRule> {
                 .or_else(|| extract_xml_value(rule_body, "Prefix"))
                 .unwrap_or_default();
 
+            let destination = rule_body.find("<Destination>").and_then(|ds| {
+                rule_body
+                    .find("</Destination>")
+                    .map(|de| &rule_body[ds..de + 14])
+            });
+
             // Extract destination bucket ARN and convert to bucket name
-            let dest_bucket = rule_body
-                .find("<Destination>")
-                .and_then(|ds| {
-                    rule_body
-                        .find("</Destination>")
-                        .map(|de| &rule_body[ds..de + 14])
-                })
+            let dest_bucket = destination
                 .and_then(|dest| extract_xml_value(dest, "Bucket"))
                 .map(|arn| {
                     // ARN format: arn:aws:s3:::bucket-name
                     arn.rsplit(":::").next().unwrap_or(&arn).to_string()
                 })
                 .unwrap_or_default();
+            let dest_account = destination
+                .and_then(|dest| extract_xml_value(dest, "Account"))
+                .filter(|a| !a.is_empty());
+            let owner_override = destination
+                .and_then(|dest| {
+                    let start = dest.find("<AccessControlTranslation>")?;
+                    let end = dest.find("</AccessControlTranslation>")?;
+                    extract_xml_value(&dest[start..end], "Owner")
+                })
+                .is_some_and(|owner| owner == "Destination");
 
             if !dest_bucket.is_empty() {
                 rules.push(ReplicationRule {
                     status,
                     prefix,
                     dest_bucket,
+                    dest_account,
+                    owner_override,
                 });
             }
 
@@ -218,81 +237,47 @@ pub(crate) fn parse_replication_rules(xml: &str) -> Vec<ReplicationRule> {
     rules
 }
 
-/// Replicate an object to destination buckets based on replication configuration.
-/// Kept for tests only; production paths use [`replicate_through_store`].
-#[cfg(test)]
-pub(crate) fn replicate_object(state: &mut crate::state::S3State, source_bucket: &str, key: &str) {
-    let replication_config = match state.buckets.get(source_bucket) {
-        Some(b) => match &b.replication_config {
-            Some(config) => config.clone(),
-            None => return,
-        },
-        None => return,
-    };
-
-    let rules = parse_replication_rules(&replication_config);
-    let src_obj = match state
-        .buckets
-        .get(source_bucket)
-        .and_then(|b| b.objects.get(key))
-    {
-        Some(obj) => obj.clone(),
-        None => return,
-    };
-
-    for rule in &rules {
-        if rule.status != "Enabled" {
-            continue;
-        }
-        if !key.starts_with(&rule.prefix) {
-            continue;
-        }
-        if let Some(dest_bucket) = state.buckets.get_mut(&rule.dest_bucket) {
-            let mut replica = src_obj.clone();
-            replica.storage_class = "STANDARD".to_string();
-            // Use a new version ID if destination has versioning enabled
-            if dest_bucket.versioning.as_deref() == Some("Enabled") {
-                let vid = uuid::Uuid::new_v4().to_string();
-                replica.version_id = Some(vid);
-                dest_bucket
-                    .object_versions
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(replica.clone());
-            } else {
-                replica.version_id = None;
-            }
-            dest_bucket.objects.insert(key.to_string(), replica);
-        }
-    }
-}
-
 /// Replicate an object to destination buckets AND persist the replica through
 /// the S3 store so disk-mode restarts see it. Called from PutObject/CopyObject
 /// write paths. Replaces the in-memory BodyRef of each replica with the one
 /// returned by `put_object` (Disk in persistent mode, Memory otherwise).
+///
+/// Bucket names are global, so a destination bucket is looked up first in the
+/// source bucket's account and then across every account: a rule may
+/// replicate into a bucket another account owns. When the rule names a
+/// `Destination.Account` that does not own the destination bucket, AWS fails
+/// the replication, so nothing is written.
+///
+/// Writing into another account's bucket needs that bucket's policy to allow
+/// the replication role (`s3:ReplicateObject`, plus
+/// `s3:ObjectOwnerOverrideToBucketOwner` with ownership translation). Like
+/// every cross-account check, this follows the IAM mode: a refusal is logged
+/// under `soft` and enforced under `strict`.
+///
+/// The source object's `x-amz-replication-status` becomes `COMPLETED` when
+/// every applicable rule replicated it and `FAILED` otherwise; replicas are
+/// marked `REPLICA`.
 pub(crate) fn replicate_through_store(
-    state: &mut crate::state::S3State,
+    accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    source_account: &str,
     store: &std::sync::Arc<dyn fakecloud_persistence::S3Store>,
     source_bucket: &str,
     key: &str,
+    iam_mode: fakecloud_core::auth::IamMode,
 ) -> fakecloud_persistence::StoreResult<()> {
-    let replication_config = match state.buckets.get(source_bucket) {
-        Some(b) => match &b.replication_config {
-            Some(config) => config.clone(),
-            None => return Ok(()),
-        },
-        None => return Ok(()),
+    let Some(state) = accounts.get(source_account) else {
+        return Ok(());
     };
-
+    let Some(src_bucket) = state.buckets.get(source_bucket) else {
+        return Ok(());
+    };
+    let Some(replication_config) = src_bucket.replication_config.clone() else {
+        return Ok(());
+    };
     let rules = parse_replication_rules(&replication_config);
-    let src_obj = match state
-        .buckets
-        .get(source_bucket)
-        .and_then(|b| b.objects.get(key))
-    {
-        Some(obj) => obj.clone(),
-        None => return Ok(()),
+    let replication_role = extract_xml_value(&replication_config, "Role");
+    let Some(src_obj) = src_bucket.objects.get(key).cloned() else {
+        return Ok(());
     };
 
     // For disk-backed sources, hold only the path and stream the source file
@@ -311,6 +296,8 @@ pub(crate) fn replicate_through_store(
         None
     };
 
+    let mut applied = false;
+    let mut failed = false;
     for rule in &rules {
         if rule.status != "Enabled" {
             continue;
@@ -318,15 +305,51 @@ pub(crate) fn replicate_through_store(
         if !key.starts_with(&rule.prefix) {
             continue;
         }
+        applied = true;
         let dest_bucket_name = rule.dest_bucket.clone();
+        let Some(dest_account) = replication_dest_account(accounts, source_account, rule) else {
+            failed = true;
+            continue;
+        };
+        if dest_account != source_account && iam_mode.is_enabled() {
+            let allowed = replication_authorized(
+                accounts,
+                &dest_account,
+                &dest_bucket_name,
+                key,
+                source_account,
+                replication_role.as_deref(),
+                rule.owner_override,
+            );
+            if !allowed {
+                tracing::warn!(
+                    target: "fakecloud::iam::audit",
+                    source_bucket,
+                    destination_bucket = %dest_bucket_name,
+                    role = replication_role.as_deref().unwrap_or(""),
+                    mode = %iam_mode,
+                    "S3 replication: destination bucket policy does not allow the replication role"
+                );
+                if iam_mode.is_strict() {
+                    failed = true;
+                    continue;
+                }
+            }
+        }
+        let Some(dest_state) = accounts.get_mut(&dest_account) else {
+            failed = true;
+            continue;
+        };
         let dest_versioning_enabled;
         let (dest_version_id, dest_meta) = {
-            let Some(dest_bucket) = state.buckets.get_mut(&dest_bucket_name) else {
+            let Some(dest_bucket) = dest_state.buckets.get_mut(&dest_bucket_name) else {
                 continue;
             };
             dest_versioning_enabled = dest_bucket.versioning.as_deref() == Some("Enabled");
             let mut replica = src_obj.clone();
             replica.storage_class = "STANDARD".to_string();
+            replica.replication_status = Some("REPLICA".to_string());
+            translate_replica_owner(&mut replica, dest_bucket, rule.owner_override);
             // Seed the runtime replica body from whatever we have handy; it
             // is overwritten after `put_object` returns the canonical ref.
             let seed_body = match (&src_disk_path, &src_bytes_opt) {
@@ -368,7 +391,7 @@ pub(crate) fn replicate_through_store(
             body_source,
             &dest_meta,
         )?;
-        if let Some(dest_bucket) = state.buckets.get_mut(&dest_bucket_name) {
+        if let Some(dest_bucket) = dest_state.buckets.get_mut(&dest_bucket_name) {
             if let Some(o) = dest_bucket.objects.get_mut(key) {
                 o.body = returned.clone();
             }
@@ -385,7 +408,189 @@ pub(crate) fn replicate_through_store(
             }
         }
     }
+    if applied {
+        let status = if failed { "FAILED" } else { "COMPLETED" };
+        mark_source_replication_status(
+            accounts,
+            source_account,
+            store,
+            source_bucket,
+            key,
+            src_obj.version_id.as_deref(),
+            status,
+        )?;
+    }
     Ok(())
+}
+
+/// Record `status` as the source object's `x-amz-replication-status` (the
+/// current object and its entry in the version history) and persist it.
+fn mark_source_replication_status(
+    accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    source_account: &str,
+    store: &std::sync::Arc<dyn fakecloud_persistence::S3Store>,
+    source_bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    status: &str,
+) -> fakecloud_persistence::StoreResult<()> {
+    let Some(bucket) = accounts
+        .get_mut(source_account)
+        .and_then(|s| s.buckets.get_mut(source_bucket))
+    else {
+        return Ok(());
+    };
+    let mut meta = None;
+    if let Some(obj) = bucket.objects.get_mut(key) {
+        if obj.version_id.as_deref() == version_id {
+            obj.replication_status = Some(status.to_string());
+            meta = Some(crate::persistence::object_meta_snapshot(obj));
+        }
+    }
+    if let Some(versions) = bucket.object_versions.get_mut(key) {
+        if let Some(v) = versions
+            .iter_mut()
+            .rev()
+            .find(|v| v.version_id.as_deref() == version_id)
+        {
+            v.replication_status = Some(status.to_string());
+        }
+    }
+    match meta {
+        Some(meta) => store.put_object_meta(source_bucket, key, version_id, &meta),
+        None => Ok(()),
+    }
+}
+
+/// Whether the destination bucket's policy lets the replication role
+/// (`role`, in `source_account`; the account root when the configuration
+/// names none) replicate `key` into it: `s3:ReplicateObject`, plus
+/// `s3:ObjectOwnerOverrideToBucketOwner` when the rule translates ownership.
+/// A bucket without a policy grants nothing to another account.
+fn replication_authorized(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    dest_account: &str,
+    dest_bucket: &str,
+    key: &str,
+    source_account: &str,
+    role: Option<&str>,
+    owner_override: bool,
+) -> bool {
+    let Some(bucket) = accounts
+        .get(dest_account)
+        .and_then(|s| s.buckets.get(dest_bucket))
+    else {
+        return false;
+    };
+    let Some(policy) = bucket.policy.as_deref() else {
+        return false;
+    };
+    let doc = fakecloud_iam::evaluator::PolicyDocument::parse(policy);
+    let partition = fakecloud_aws::arn::partition_for(&bucket.region);
+    let principal = match role.filter(|r| !r.is_empty()) {
+        Some(role) => fakecloud_core::auth::Principal {
+            arn: role.to_string(),
+            user_id: role.to_string(),
+            account_id: source_account.to_string(),
+            principal_type: fakecloud_core::auth::PrincipalType::AssumedRole,
+            source_identity: None,
+            tags: None,
+        },
+        None => fakecloud_core::auth::Principal {
+            arn: Arn::global("iam", source_account, "root")
+                .with_partition(partition)
+                .to_string(),
+            user_id: source_account.to_string(),
+            account_id: source_account.to_string(),
+            principal_type: fakecloud_core::auth::PrincipalType::Root,
+            source_identity: None,
+            tags: None,
+        },
+    };
+    let resource = Arn::s3_in(&bucket.region, &format!("{dest_bucket}/{key}")).to_string();
+    let mut actions = vec!["s3:ReplicateObject"];
+    if owner_override {
+        actions.push("s3:ObjectOwnerOverrideToBucketOwner");
+    }
+    actions.into_iter().all(|action| {
+        let request = fakecloud_iam::evaluator::EvalRequest {
+            principal: &principal,
+            action: action.to_string(),
+            resource: resource.clone(),
+            context: fakecloud_iam::evaluator::RequestContext {
+                aws_principal_arn: Some(principal.arn.clone()),
+                aws_principal_account: Some(principal.account_id.clone()),
+                ..Default::default()
+            },
+        };
+        matches!(
+            fakecloud_iam::evaluator::evaluate_resource_policy_only(&doc, &request),
+            fakecloud_iam::evaluator::Decision::Allow
+        )
+    })
+}
+
+/// The account owning a replication rule's destination bucket: the source
+/// account when it has the bucket, otherwise whichever account does (bucket
+/// names are global). `None` when no account owns it, or when the rule's
+/// `Destination.Account` names a different owner (AWS fails that
+/// replication).
+fn replication_dest_account(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+    source_account: &str,
+    rule: &ReplicationRule,
+) -> Option<String> {
+    let bucket = rule.dest_bucket.as_str();
+    let owner = if accounts
+        .get(source_account)
+        .is_some_and(|s| s.buckets.contains_key(bucket))
+    {
+        source_account.to_string()
+    } else {
+        accounts
+            .find_account(|s| s.buckets.contains_key(bucket))?
+            .to_string()
+    };
+    if let Some(expected) = rule.dest_account.as_deref() {
+        if expected != owner {
+            tracing::warn!(
+                bucket,
+                expected_account = expected,
+                owner_account = %owner,
+                "S3 replication: destination bucket is not owned by Destination.Account; replication failed"
+            );
+            return None;
+        }
+    }
+    Some(owner)
+}
+
+/// Replicas keep the source object's owner and ACL unless the rule translates
+/// ownership to the destination bucket owner (`AccessControlTranslation`
+/// `Owner=Destination`) or the destination bucket enforces bucket-owner
+/// ownership (ACLs disabled); either way the destination owner then owns the
+/// replica with full control.
+fn translate_replica_owner(
+    replica: &mut crate::state::S3Object,
+    dest_bucket: &crate::state::S3Bucket,
+    owner_override: bool,
+) {
+    let owner_enforced = dest_bucket
+        .ownership_controls
+        .as_deref()
+        .is_some_and(|c| c.contains("BucketOwnerEnforced"));
+    if !owner_override && !owner_enforced {
+        return;
+    }
+    let owner = dest_bucket.acl_owner_id.clone();
+    replica.acl_grants = vec![crate::state::AclGrant {
+        grantee_type: "CanonicalUser".to_string(),
+        grantee_id: Some(owner.clone()),
+        grantee_display_name: Some(owner.clone()),
+        grantee_uri: None,
+        permission: "FULL_CONTROL".to_string(),
+    }];
+    replica.acl_owner_id = Some(owner);
 }
 
 /// Monotonically increasing counter backing the `sequencer` field AWS puts on
@@ -736,6 +941,7 @@ pub(crate) fn event_matches(event_name: &str, filter: &str) -> bool {
 }
 
 /// Everything a reader needs to describe a single S3 object-level event.
+#[derive(Clone, Copy)]
 pub(crate) struct ObjectEvent<'a> {
     pub event_name: &'a str,
     pub bucket_name: &'a str,
@@ -793,25 +999,49 @@ pub(crate) fn deliver_notification_batch(
     let targets = parse_notification_config(notification_config);
 
     // One pass over S3 state for the whole batch: the bucket owner fills the
-    // bucket's `ownerIdentity`, and the EventBridge opt-in is per bucket.
-    let (owner_account, eventbridge_enabled) = s3_state
+    // bucket's `ownerIdentity` and is the account the EventBridge event is
+    // delivered to, the bucket's region is the event's region, and the
+    // EventBridge opt-in is per bucket.
+    let (owner_account, bucket_region, eventbridge_enabled) = s3_state
         .and_then(|st| {
             let mas = st.read();
             let acct = mas.find_account(|s| s.buckets.contains_key(bucket_name))?;
-            let enabled = mas
-                .get(acct)
-                .and_then(|s| s.buckets.get(bucket_name))
-                .map(|b| b.eventbridge_enabled)
-                .unwrap_or(false);
-            Some((acct.to_string(), enabled))
+            let bucket = mas.get(acct).and_then(|s| s.buckets.get(bucket_name))?;
+            Some((
+                acct.to_string(),
+                bucket.region.clone(),
+                bucket.eventbridge_enabled,
+            ))
         })
-        .unwrap_or_else(|| ("000000000000".to_string(), false));
+        // Without S3 state (or once the bucket is gone) the owner cannot be
+        // resolved; the requester and the request's region are the best
+        // available attribution, and no EventBridge event is sent since the
+        // per-bucket opt-in cannot be read.
+        .unwrap_or_else(|| {
+            (
+                first.requester_account.to_string(),
+                first.region.to_string(),
+                false,
+            )
+        });
+    let bucket_region = if bucket_region.is_empty() {
+        first.region.to_string()
+    } else {
+        bucket_region
+    };
+    let bucket_arn = vec![Arn::s3_in(&bucket_region, bucket_name).to_string()];
 
     // Indices of the events that matched at least one target; only those are
     // recorded for introspection.
     let mut delivered: Vec<usize> = Vec::new();
 
     for (idx, event) in events.iter().enumerate() {
+        // Every record reports the bucket's region, not the region of the
+        // endpoint the request happened to reach.
+        let event = &ObjectEvent {
+            region: &bucket_region,
+            ..*event
+        };
         let event_name = event.event_name;
         let key = event.key;
         let s3_event_name = format!("s3:{event_name}");
@@ -842,12 +1072,21 @@ pub(crate) fn deliver_notification_batch(
             } else if event_name == "ObjectRemoved:DeleteMarkerCreated" {
                 detail["deletion-type"] = serde_json::json!("Delete marker created");
             }
-            delivery.put_event_to_eventbridge(
-                "aws.s3",
-                &eventbridge_detail_type(event_name),
-                &detail.to_string(),
-                "default",
-            );
+            let detail = detail.to_string();
+            // The owner's own default bus: never a cross-account put, so it
+            // cannot be refused.
+            if let Err(err) = delivery.put_event_to_eventbridge(&CrossServiceEvent {
+                source: "aws.s3",
+                detail_type: &eventbridge_detail_type(event_name),
+                detail: &detail,
+                event_bus: "default",
+                account_id: &owner_account,
+                region: &bucket_region,
+                resources: &bucket_arn,
+                principal_arn: None,
+            }) {
+                tracing::warn!(bucket = bucket_name, %err, "S3 EventBridge notification refused");
+            }
         }
 
         let mut matched = false;
@@ -1062,6 +1301,76 @@ mod tests {
         assert_eq!(rules[0].dest_bucket, "dest-bucket");
         assert_eq!(rules[1].status, "Disabled");
         assert_eq!(rules[1].dest_bucket, "archive-dest");
+    }
+
+    #[test]
+    fn parse_replication_rules_reads_account_and_owner_translation() {
+        let xml = r#"<ReplicationConfiguration><Rule><Status>Enabled</Status>
+            <Destination><Bucket>arn:aws:s3:::dest</Bucket><Account>222222222222</Account>
+            <AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>
+            </Destination></Rule>
+            <Rule><Status>Enabled</Status>
+            <Destination><Bucket>arn:aws:s3:::plain</Bucket></Destination></Rule>
+            </ReplicationConfiguration>"#;
+        let rules = parse_replication_rules(xml);
+        assert_eq!(rules[0].dest_account.as_deref(), Some("222222222222"));
+        assert!(rules[0].owner_override);
+        assert_eq!(rules[1].dest_account, None);
+        assert!(!rules[1].owner_override);
+    }
+
+    /// (bus, account, region, resources) of each recorded event.
+    type EbCall = (String, String, String, Vec<String>);
+
+    #[derive(Default)]
+    struct EbRecorder(std::sync::Mutex<Vec<EbCall>>);
+
+    impl fakecloud_core::delivery::EventBridgeDelivery for EbRecorder {
+        fn put_event(
+            &self,
+            e: &CrossServiceEvent<'_>,
+        ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+            self.0.lock().unwrap().push((
+                e.event_bus.to_string(),
+                e.account_id.to_string(),
+                e.region.to_string(),
+                e.resources.to_vec(),
+            ));
+            Ok("id".to_string())
+        }
+    }
+
+    /// S3's EventBridge event goes to the bucket owner's default bus and
+    /// carries the bucket's region, whatever account made the request and
+    /// whatever the server's startup account/region are.
+    #[test]
+    fn eventbridge_event_is_scoped_to_bucket_owner_and_region() {
+        let state: SharedS3State = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("000000000000", "us-east-1", ""),
+        ));
+        {
+            let mut mas = state.write();
+            let mut bucket = crate::state::S3Bucket::new("my-bucket", "eu-west-2", "111111111111");
+            bucket.eventbridge_enabled = true;
+            mas.get_or_create("111111111111")
+                .buckets
+                .insert("my-bucket".to_string(), bucket);
+        }
+        let recorder = Arc::new(EbRecorder::default());
+        let bus = Arc::new(DeliveryBus::new().with_eventbridge(recorder.clone()));
+        // The request reached the us-east-1 endpoint from another account.
+        deliver_notifications(
+            &bus,
+            "<NotificationConfiguration><EventBridgeConfiguration/></NotificationConfiguration>",
+            &ev("ObjectCreated:Put", "k", None),
+            Some(&state),
+        );
+        let calls = recorder.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "default");
+        assert_eq!(calls[0].1, "111111111111");
+        assert_eq!(calls[0].2, "eu-west-2");
+        assert_eq!(calls[0].3, vec!["arn:aws:s3:::my-bucket".to_string()]);
     }
 
     #[test]

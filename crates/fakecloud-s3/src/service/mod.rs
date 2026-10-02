@@ -31,8 +31,6 @@ mod objects;
 mod tags;
 
 // Re-export notification helpers for use in sub-modules
-#[cfg(test)]
-use notifications::replicate_object;
 pub(super) use notifications::{
     deliver_notifications, normalize_notification_ids, normalize_replication_xml,
     replicate_through_store,
@@ -141,6 +139,11 @@ pub struct S3Service {
     /// `test*` root-bypass access key, matching [`fakecloud_core::auth::is_root_bypass`]'s
     /// "always skip crypto" convention used everywhere else in the codebase.
     pub(crate) credential_resolver: Option<Arc<dyn fakecloud_core::auth::CredentialResolver>>,
+    /// IAM enforcement mode, for authorization S3 performs itself rather
+    /// than at dispatch: replication into another account's bucket needs
+    /// that bucket's policy to allow the replication role (logged under
+    /// `soft`, refused under `strict`).
+    pub(crate) iam_mode: fakecloud_core::auth::IamMode,
 }
 
 /// Serialize a persistence snapshot, turning a failure into a 500 rather than an
@@ -403,7 +406,13 @@ impl S3Service {
             kms_hook: None,
             store,
             credential_resolver: None,
+            iam_mode: fakecloud_core::auth::IamMode::Off,
         }
+    }
+
+    pub fn with_iam_mode(mut self, mode: fakecloud_core::auth::IamMode) -> Self {
+        self.iam_mode = mode;
+        self
     }
 
     pub fn with_kms(mut self, kms_state: SharedKmsState) -> Self {

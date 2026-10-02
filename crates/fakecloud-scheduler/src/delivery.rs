@@ -65,7 +65,6 @@ pub fn deliver_target(bus: &Arc<DeliveryBus>, schedule: &Schedule) -> Result<(),
 
     if arn.contains(":events:") {
         let bus_name = event_bus_name_from_arn(arn);
-        let target_account = account_id_from_arn(arn);
         // EventBridgeParameters.{Source, DetailType} are REQUIRED by AWS for an
         // EventBridge bus target and populate the emitted event's source /
         // detail-type; falling back to the scheduler defaults only when absent.
@@ -80,16 +79,39 @@ pub fn deliver_target(bus: &Arc<DeliveryBus>, schedule: &Schedule) -> Result<(),
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("Scheduled Event");
-        match target_account {
-            Some(account) => bus.put_event_to_eventbridge_for_account(
-                source,
-                detail_type,
-                body,
-                &bus_name,
-                &account,
-            ),
-            None => bus.put_event_to_eventbridge(source, detail_type, body, &bus_name),
-        }
+        // The event originates in the schedule's account and region; the bus
+        // is addressed by a canonical event-bus ARN so a target bus in
+        // another account is routed to that account (the `bus/` alias is
+        // normalized here).
+        let (origin_account, origin_region) = arn_account_region(&schedule.arn);
+        let bus_ref = match account_id_from_arn(arn) {
+            Some(_) => {
+                let prefix: Vec<&str> = arn.splitn(6, ':').take(5).collect();
+                format!("{}:event-bus/{bus_name}", prefix.join(":"))
+            }
+            None => bus_name,
+        };
+        bus.put_event_to_eventbridge(&fakecloud_core::delivery::CrossServiceEvent {
+            source,
+            detail_type,
+            detail: body,
+            event_bus: &bus_ref,
+            account_id: origin_account,
+            region: origin_region,
+            resources: std::slice::from_ref(&schedule.arn),
+            // The schedule puts the event as its execution role; a target
+            // bus in another account must allow that role, or the fire
+            // fails (and is retried / dead-lettered).
+            principal_arn: Some(&schedule.target.role_arn),
+        })
+        .map_err(|err| match err {
+            fakecloud_core::delivery::EventBridgeDeliveryError::AccessDenied(message) => {
+                SqsDeliveryError::AccessDenied(message)
+            }
+            fakecloud_core::delivery::EventBridgeDeliveryError::Unavailable(message) => {
+                SqsDeliveryError::TargetUnavailable(message)
+            }
+        })?;
         return Ok(());
     }
 
@@ -450,6 +472,14 @@ fn fifo_dedup_id(queue_arn: &str, _schedule_arn: &str) -> Option<String> {
     Some(uuid::Uuid::new_v4().to_string())
 }
 
+/// The `(account, region)` segments of an ARN (empty when absent).
+fn arn_account_region(arn: &str) -> (&str, &str) {
+    let mut parts = arn.split(':');
+    let region = parts.nth(3).unwrap_or("");
+    let account = parts.next().unwrap_or("");
+    (account, region)
+}
+
 /// Extract the account-id segment from any AWS ARN. Returns `None` when
 /// the ARN is malformed or omits the account (some service ARNs do).
 fn account_id_from_arn(arn: &str) -> Option<String> {
@@ -610,15 +640,23 @@ mod tests {
 
     #[test]
     fn deliver_target_eventbridge_uses_source_and_detail_type_params() {
-        struct EbRec(Mutex<Vec<(String, String, String, String)>>);
+        type EbCall = (String, String, String, String, String, String, Vec<String>);
+        struct EbRec(Mutex<Vec<EbCall>>);
         impl fakecloud_core::delivery::EventBridgeDelivery for EbRec {
-            fn put_event(&self, source: &str, detail_type: &str, detail: &str, bus_name: &str) {
+            fn put_event(
+                &self,
+                e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
                 self.0.lock().unwrap().push((
-                    source.to_string(),
-                    detail_type.to_string(),
-                    detail.to_string(),
-                    bus_name.to_string(),
+                    e.source.to_string(),
+                    e.detail_type.to_string(),
+                    e.detail.to_string(),
+                    e.event_bus.to_string(),
+                    e.account_id.to_string(),
+                    e.region.to_string(),
+                    e.resources.to_vec(),
                 ));
+                Ok("id".to_string())
             }
         }
         let eb = Arc::new(EbRec(Mutex::new(Vec::new())));
@@ -630,6 +668,10 @@ mod tests {
         );
         sched.target.eventbridge_parameters =
             Some(serde_json::json!({"Source": "my.app", "DetailType": "OrderPlaced"}));
+        // The schedule lives in a different account/region than the bus; the
+        // event must carry the schedule's (originating) account and region.
+        let (sched_account, sched_region) = ("222233334444", "eu-west-1");
+        sched.arn = "arn:aws:scheduler:eu-west-1:222233334444:schedule/default/t".to_string();
         let result = deliver_target(&bus, &sched);
         assert!(result.is_ok());
         let calls = eb.0.lock().unwrap();
@@ -639,7 +681,42 @@ mod tests {
             calls[0].1, "OrderPlaced",
             "DetailType must come from params"
         );
-        assert_eq!(calls[0].3, "app-bus");
+        assert_eq!(
+            calls[0].3, "arn:aws:events:us-east-1:1:event-bus/app-bus",
+            "the target bus is addressed by its ARN so it routes to its account"
+        );
+        assert_eq!(calls[0].4, sched_account);
+        assert_eq!(calls[0].5, sched_region);
+        assert_eq!(calls[0].6, vec![sched.arn.clone()]);
+    }
+
+    /// A target bus that refuses the schedule's role fails the fire, so the
+    /// ticker retries it and routes it to the DLQ.
+    #[test]
+    fn deliver_target_eventbridge_refusal_is_a_delivery_failure() {
+        struct Refusing;
+        impl fakecloud_core::delivery::EventBridgeDelivery for Refusing {
+            fn put_event(
+                &self,
+                _e: &fakecloud_core::delivery::CrossServiceEvent<'_>,
+            ) -> Result<String, fakecloud_core::delivery::EventBridgeDeliveryError> {
+                Err(
+                    fakecloud_core::delivery::EventBridgeDeliveryError::AccessDenied(
+                        "not allowed".to_string(),
+                    ),
+                )
+            }
+        }
+        let bus = Arc::new(DeliveryBus::new().with_eventbridge(Arc::new(Refusing)));
+        let sched = make_schedule(
+            "arn:aws:events:us-east-1:999988887777:event-bus/other",
+            None,
+            Some("{}"),
+        );
+        assert!(matches!(
+            deliver_target(&bus, &sched),
+            Err(SqsDeliveryError::AccessDenied(_))
+        ));
     }
 
     #[test]
