@@ -66,12 +66,13 @@ fn check_optional_int_range(
 
 const LAMBDA_PUBLISH_TO_VALUES: &[&str] = &["LATEST_PUBLISHED"];
 
-// Trimmed to runtimes the SDK still mints; the full Smithy enum has 46
-// entries but only these are emitted by `aws-sdk-lambda` since the
-// older ones are deprecation-only and never surfaced via CreateFunction
-// in practice. Conformance probes use the model enum exhaustively, so
-// keep this list in sync with the Smithy model.
-const LAMBDA_RUNTIMES: &[&str] = &[
+/// Every member of the Smithy `com.amazonaws.lambda#Runtime` enum in
+/// `aws-models/lambda.json`, deprecated runtimes included (AWS still returns
+/// them on existing functions and accepts them as layer filters). The single
+/// allowlist for `Runtime` / `CompatibleRuntime` across the crate;
+/// `lambda_runtimes_match_the_model` fails when the model gains a value this
+/// list lacks.
+pub(crate) const LAMBDA_RUNTIMES: &[&str] = &[
     "nodejs",
     "nodejs4.3",
     "nodejs4.3-edge",
@@ -85,10 +86,14 @@ const LAMBDA_RUNTIMES: &[&str] = &[
     "nodejs20.x",
     "nodejs22.x",
     "nodejs24.x",
+    "nodejs26.x",
     "java8",
     "java8.al2",
+    "java8.al2023",
     "java11",
+    "java11.al2023",
     "java17",
+    "java17.al2023",
     "java21",
     "java25",
     "python2.7",
@@ -101,6 +106,7 @@ const LAMBDA_RUNTIMES: &[&str] = &[
     "python3.12",
     "python3.13",
     "python3.14",
+    "python3.15",
     "dotnetcore1.0",
     "dotnetcore2.0",
     "dotnetcore2.1",
@@ -114,6 +120,7 @@ const LAMBDA_RUNTIMES: &[&str] = &[
     "ruby3.2",
     "ruby3.3",
     "ruby3.4",
+    "ruby4.0",
     "provided",
     "provided.al2",
     "provided.al2023",

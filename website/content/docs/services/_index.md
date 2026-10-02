@@ -17,7 +17,7 @@ fakecloud implements 105 AWS services with 7,517 total operations. 248,557/248,5
 | EventBridge            |  57 | Pattern matching, schedules, archives, replay, API destinations        |
 | EventBridge Scheduler  |  12 | at/rate/cron, SQS targets, DLQ routing, one-shot self-delete           |
 | EventBridge Pipes      |  10 | Source -> filter -> Lambda enrichment -> target, InputTemplate transform, real background runner |
-| Lambda                 |  73 | Real Docker, 23 runtimes, ESM with FilterCriteria + partial-batch failure |
+| Lambda                 |  73 | Real Docker, 31 runtimes, ESM with FilterCriteria + partial-batch failure |
 | DynamoDB               |  58 | Transactions, PartiQL, backups, global tables, streams, **KMS audit-trail on SSE-KMS tables** |
 | IAM                    | 180 | Users, roles, policies, groups, OIDC/SAML, **PassRole trust enforcement** |
 | STS                    |  11 | AssumeRole, session tokens, federation                                 |

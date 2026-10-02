@@ -184,57 +184,6 @@ pub fn parse_layer_version_arn(arn: &str) -> Option<(String, String, i64)> {
     Some((account, name, version))
 }
 
-/// Enum members of `com.amazonaws.lambda#Runtime`. Used by layer-listing
-/// ops to validate the `CompatibleRuntime` query filter without
-/// teaching every handler the full enum.
-const LAMBDA_RUNTIMES: &[&str] = &[
-    "nodejs",
-    "nodejs4.3",
-    "nodejs6.10",
-    "nodejs8.10",
-    "nodejs10.x",
-    "nodejs12.x",
-    "nodejs14.x",
-    "nodejs16.x",
-    "nodejs18.x",
-    "nodejs20.x",
-    "nodejs22.x",
-    "nodejs24.x",
-    "nodejs4.3-edge",
-    "java8",
-    "java8.al2",
-    "java11",
-    "java17",
-    "java21",
-    "java25",
-    "python2.7",
-    "python3.6",
-    "python3.7",
-    "python3.8",
-    "python3.9",
-    "python3.10",
-    "python3.11",
-    "python3.12",
-    "python3.13",
-    "python3.14",
-    "dotnetcore1.0",
-    "dotnetcore2.0",
-    "dotnetcore2.1",
-    "dotnetcore3.1",
-    "dotnet6",
-    "dotnet8",
-    "dotnet10",
-    "go1.x",
-    "ruby2.5",
-    "ruby2.7",
-    "ruby3.2",
-    "ruby3.3",
-    "ruby3.4",
-    "provided",
-    "provided.al2",
-    "provided.al2023",
-];
-
 /// Validate the `CompatibleArchitecture` and `CompatibleRuntime` query
 /// filters shared by `ListLayers` and `ListLayerVersions`.
 fn validate_layer_filters(req: &AwsRequest) -> Result<(), AwsServiceError> {
@@ -251,7 +200,7 @@ fn validate_layer_filters(req: &AwsRequest) -> Result<(), AwsServiceError> {
         }
     }
     if let Some(rt) = req.query_params.get("CompatibleRuntime") {
-        if !LAMBDA_RUNTIMES.contains(&rt.as_str()) {
+        if !crate::service::LAMBDA_RUNTIMES.contains(&rt.as_str()) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidParameterValueException",

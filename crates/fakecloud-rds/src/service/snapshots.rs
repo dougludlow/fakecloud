@@ -133,15 +133,10 @@ fn snapshot_matches_filters(
 }
 
 /// The container engine an Aurora family maps onto. Aurora clusters run
-/// their data on a normal engine (that is why fakecloud attaches an
-/// `engine=postgres` writer to an `aurora-postgresql` cluster), and the
-/// runtime only knows the concrete engines.
+/// their data on a normal engine, and the runtime only knows the concrete
+/// engines.
 fn container_engine_for(engine: &str) -> &str {
-    match engine {
-        "aurora-mysql" | "aurora" => "mysql",
-        "aurora-postgresql" => "postgres",
-        other => other,
-    }
+    crate::runtime::container_engine(engine)
 }
 
 /// Build the source-snapshot record a restore needs from a stored DB

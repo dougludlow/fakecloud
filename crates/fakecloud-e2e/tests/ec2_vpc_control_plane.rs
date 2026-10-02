@@ -455,3 +455,137 @@ async fn associate_address_rejects_unknown_allocation_id() {
         "expected InvalidAllocationID.NotFound, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn describe_regions_and_zone_ids_follow_aws_naming() {
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+
+    let regions = c.describe_regions().send().await.unwrap();
+    let find = |name: &str| {
+        regions
+            .regions()
+            .iter()
+            .find(|r| r.region_name() == Some(name))
+            .cloned()
+    };
+    for name in [
+        "ap-southeast-6",
+        "ap-southeast-7",
+        "mx-central-1",
+        "ap-east-2",
+    ] {
+        let r = find(name).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(r.opt_in_status(), Some("opted-in"), "{name}");
+    }
+    assert_eq!(
+        find("us-east-1").unwrap().opt_in_status(),
+        Some("opt-in-not-required")
+    );
+
+    // Zone ids use AWS's prefixes: ap-southeast-2 is `apse2`, and ap-south-1
+    // (`aps1`) does not collide with ap-southeast-1 (`apse1`).
+    // Each region lists its real number of zones (us-east-1 has six).
+    for (region, prefix, count) in [
+        ("ap-southeast-2", "apse2", 3),
+        ("ap-south-1", "aps1", 3),
+        ("ap-southeast-1", "apse1", 3),
+        ("us-west-2", "usw2", 4),
+        ("us-east-1", "use1", 6),
+        // The union of the letters different accounts see.
+        ("us-west-1", "usw1", 3),
+        ("ap-northeast-1", "apne1", 4),
+    ] {
+        let rc = aws_sdk_ec2::Client::new(&server.aws_config_in(region).await);
+        let zones = rc.describe_availability_zones().send().await.unwrap();
+        let ids: Vec<&str> = zones
+            .availability_zones()
+            .iter()
+            .filter_map(|z| z.zone_id())
+            .collect();
+        let expected: Vec<String> = (1..=count).map(|n| format!("{prefix}-az{n}")).collect();
+        assert_eq!(ids, expected, "{region}");
+    }
+
+    // us-east-1d..f are real zones: a subnet can be placed there.
+    let east = aws_sdk_ec2::Client::new(&server.aws_config_in("us-east-1").await);
+    let east_vpc = east
+        .create_vpc()
+        .cidr_block("10.41.0.0/16")
+        .send()
+        .await
+        .unwrap();
+    let east_subnet = east
+        .create_subnet()
+        .vpc_id(east_vpc.vpc().unwrap().vpc_id().unwrap())
+        .cidr_block("10.41.1.0/24")
+        .availability_zone("us-east-1f")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        east_subnet.subnet().unwrap().availability_zone_id(),
+        Some("use1-az6")
+    );
+
+    // A subnet's zone id agrees with DescribeAvailabilityZones, and a subnet
+    // can be placed by zone id.
+    let rc = aws_sdk_ec2::Client::new(&server.aws_config_in("ap-southeast-2").await);
+    let vpc = rc
+        .create_vpc()
+        .cidr_block("10.40.0.0/16")
+        .send()
+        .await
+        .unwrap();
+    let vpc_id = vpc.vpc().unwrap().vpc_id().unwrap();
+    let by_name = rc
+        .create_subnet()
+        .vpc_id(vpc_id)
+        .cidr_block("10.40.1.0/24")
+        .availability_zone("ap-southeast-2b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        by_name.subnet().unwrap().availability_zone_id(),
+        Some("apse2-az2")
+    );
+    let by_id = rc
+        .create_subnet()
+        .vpc_id(vpc_id)
+        .cidr_block("10.40.2.0/24")
+        .availability_zone_id("apse2-az3")
+        .send()
+        .await
+        .unwrap();
+    let s = by_id.subnet().unwrap();
+    assert_eq!(s.availability_zone(), Some("ap-southeast-2c"));
+    assert_eq!(s.availability_zone_id(), Some("apse2-az3"));
+
+    // A zone or zone id outside the region is InvalidParameterValue, not a
+    // subnet silently placed in another zone (and a non-ASCII name must not
+    // crash the handler).
+    for (az, az_id) in [
+        (Some("us-east-1a"), None),
+        (Some("ap-southeast-2d"), None),
+        (Some("us-\u{e9}-1a"), None),
+        (None, Some("use1-az1")),
+        (None, Some("apse2-az99")),
+        (None, Some("garbage")),
+    ] {
+        let err = rc
+            .create_subnet()
+            .vpc_id(vpc_id)
+            .cidr_block("10.40.9.0/24")
+            .set_availability_zone(az.map(str::to_string))
+            .set_availability_zone_id(az_id.map(str::to_string))
+            .send()
+            .await
+            .expect_err("foreign zone must be rejected");
+        assert_eq!(
+            err.into_service_error().meta().code(),
+            Some("InvalidParameterValue"),
+            "{az:?} {az_id:?}"
+        );
+    }
+}

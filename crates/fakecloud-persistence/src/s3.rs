@@ -73,6 +73,10 @@ pub struct BucketMeta {
     pub eventbridge_enabled: bool,
     #[serde(default)]
     pub lifecycle_transition_default_min_size: Option<String>,
+    /// Created with the legacy `EU` location constraint (an eu-west-1 bucket
+    /// whose GetBucketLocation still reports `EU`).
+    #[serde(default)]
+    pub legacy_eu_location: bool,
 }
 
 fn default_time() -> DateTime<Utc> {

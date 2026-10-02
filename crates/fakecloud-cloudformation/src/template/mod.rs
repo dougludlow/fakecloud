@@ -901,7 +901,7 @@ Resources:
         let v: Value = serde_json::from_str(r#"{"Fn::GetAZs": ""}"#).unwrap();
         assert_eq!(
             resolve_refs(&v, &p, &r, &ids, &attrs),
-            serde_json::json!(["us-west-2a", "us-west-2b", "us-west-2c"])
+            serde_json::json!(["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"])
         );
         // The ubiquitous Select-over-GetAZs pattern now resolves.
         let sel: Value =
@@ -919,6 +919,12 @@ Resources:
         assert_eq!(
             resolve_refs(&v, &p, &r, &ids, &attrs),
             serde_json::json!(["eu-west-1a", "eu-west-1b", "eu-west-1c"])
+        );
+        // A region's zone set follows EC2's (ca-central-1 has no `c`).
+        let v: Value = serde_json::from_str(r#"{"Fn::GetAZs": "ca-central-1"}"#).unwrap();
+        assert_eq!(
+            resolve_refs(&v, &p, &r, &ids, &attrs),
+            serde_json::json!(["ca-central-1a", "ca-central-1b", "ca-central-1d"])
         );
     }
 

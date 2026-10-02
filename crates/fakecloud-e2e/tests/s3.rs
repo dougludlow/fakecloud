@@ -6531,3 +6531,61 @@ async fn s3_object_tagging_round_trips_ampersand_value_unchanged() {
     assert_eq!(resp.tag_set()[0].key(), "dept");
     assert_eq!(resp.tag_set()[0].value(), value);
 }
+
+#[tokio::test]
+async fn s3_create_bucket_in_new_regions_and_legacy_eu() {
+    // The location-constraint allowlist lagged the S3 model: newer regions
+    // and the legacy `EU` alias were rejected with InvalidLocationConstraint.
+    use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+    let server = TestServer::start().await;
+    let client = server.s3_client().await;
+
+    for (bucket, constraint) in [
+        (
+            "loc-apse6",
+            BucketLocationConstraint::from("ap-southeast-6"),
+        ),
+        ("loc-mxc1", BucketLocationConstraint::from("mx-central-1")),
+        ("loc-ape2", BucketLocationConstraint::from("ap-east-2")),
+        ("loc-eu-legacy", BucketLocationConstraint::Eu),
+    ] {
+        client
+            .create_bucket()
+            .bucket(bucket)
+            .create_bucket_configuration(
+                CreateBucketConfiguration::builder()
+                    .location_constraint(constraint.clone())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{constraint:?} rejected: {e:?}"));
+        let loc = client
+            .get_bucket_location()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+        // `EU` is reported back as `EU`, like AWS does for such buckets.
+        assert_eq!(loc.location_constraint(), Some(&constraint), "{bucket}");
+    }
+
+    // The legacy EU bucket lives in eu-west-1.
+    let head = client
+        .head_bucket()
+        .bucket("loc-eu-legacy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.bucket_region(), Some("eu-west-1"));
+    let listed = client
+        .list_buckets()
+        .bucket_region("eu-west-1")
+        .send()
+        .await
+        .unwrap();
+    assert!(listed
+        .buckets()
+        .iter()
+        .any(|b| b.name() == Some("loc-eu-legacy")));
+}

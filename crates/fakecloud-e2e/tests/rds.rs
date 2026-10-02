@@ -2262,3 +2262,80 @@ async fn rds_start_db_instance_returns_starting_immediately() {
     // It eventually converges to available in the background.
     helpers::wait_for_db_available(&client, "orders-start-db", 180).await;
 }
+
+#[tokio::test]
+async fn rds_engine_versions_use_aws_version_grammars() {
+    // DescribeDBEngineVersions advertises AWS's real version strings for the
+    // suffixed engines, while DefaultOnly keeps the established default.
+    let server = TestServer::start().await;
+    let client = server.rds_client().await;
+
+    for (engine, version, family) in [
+        ("mysql", "5.7.44-rds.20250103", "mysql5.7"),
+        ("mariadb", "11.8.3", "mariadb11.8"),
+        (
+            "oracle-ee",
+            "19.0.0.0.ru-2025-07.rur-2025-07.r1",
+            "oracle-ee-19",
+        ),
+        ("sqlserver-ex", "16.00.4195.2.v1", "sqlserver-ex-16"),
+        ("db2-se", "11.5.9.0.sb00000000.r1", "db2-se-11.5"),
+    ] {
+        let resp = client
+            .describe_db_engine_versions()
+            .engine(engine)
+            .engine_version(version)
+            .send()
+            .await
+            .unwrap();
+        let versions = resp.db_engine_versions();
+        assert_eq!(versions.len(), 1, "{engine} {version}");
+        assert_eq!(versions[0].db_parameter_group_family(), Some(family));
+    }
+
+    for (engine, default) in [("mysql", "8.0.35"), ("mariadb", "11.4.5")] {
+        let resp = client
+            .describe_db_engine_versions()
+            .engine(engine)
+            .default_only(true)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.db_engine_versions()[0].engine_version(),
+            Some(default),
+            "{engine}"
+        );
+    }
+
+    // The default parameter groups an instance of those versions gets exist.
+    for group in [
+        "default.mariadb11.8",
+        "default.mysql8.4",
+        "default.oracle-ee-cdb-19",
+        "default.aurora-postgresql16",
+        "default.aurora-mysql8.0",
+    ] {
+        client
+            .describe_db_parameter_groups()
+            .db_parameter_group_name(group)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{group} missing: {e:?}"));
+    }
+
+    // A version-less aurora-mysql cluster reports an Aurora MySQL version.
+    let cluster = client
+        .create_db_cluster()
+        .db_cluster_identifier("versionless-aurora-mysql")
+        .engine("aurora-mysql")
+        .master_username("admin")
+        .master_user_password("secret123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster.db_cluster().unwrap().engine_version(),
+        Some("8.0.mysql_aurora.3.04.0")
+    );
+}

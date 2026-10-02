@@ -12,8 +12,9 @@ use crate::state::S3Bucket;
 
 use super::{
     canned_acl_grants, create_bucket_configuration_tags, extract_xml_value, has_grant_headers,
-    is_valid_bucket_name, is_valid_region, no_such_bucket, resolved_grant_headers, s3_xml,
-    validate_tags, xml_escape, S3Service, BUCKET_CANNED_ACLS, OBJECT_OWNERSHIP_VALUES,
+    is_valid_bucket_name, is_valid_region, location_constraint_region, no_such_bucket,
+    resolved_grant_headers, s3_xml, validate_tags, xml_escape, S3Service, BUCKET_CANNED_ACLS,
+    OBJECT_OWNERSHIP_VALUES,
 };
 
 impl S3Service {
@@ -204,7 +205,8 @@ impl S3Service {
                         format!("The specified location-constraint is not valid: {constraint}"),
                     ));
                 }
-                if constraint != &req.region && req.region != "us-east-1" {
+                if location_constraint_region(constraint) != req.region && req.region != "us-east-1"
+                {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "IllegalLocationConstraintException",
@@ -230,9 +232,13 @@ impl S3Service {
         }
 
         let requested_region = match &explicit_constraint {
-            Some(c) if !c.is_empty() => c.clone(),
+            Some(c) if !c.is_empty() => location_constraint_region(c).to_string(),
             _ => req.region.clone(),
         };
+        // `EU` is the legacy alias of eu-west-1: the bucket lives in eu-west-1
+        // (ARN, `x-amz-bucket-region`, ListBuckets `BucketRegion`) but
+        // GetBucketLocation keeps reporting the constraint it was created with.
+        let legacy_eu_location = explicit_constraint.as_deref() == Some("EU");
 
         // CreateBucketConfiguration carries an optional <Tags> tag set (added to
         // the S3 API in 2025). The AWS Terraform provider tags a bucket this way
@@ -409,6 +415,7 @@ impl S3Service {
             .unwrap_or(false);
 
         let mut b = S3Bucket::new(bucket, &requested_region, &req.account_id);
+        b.legacy_eu_location = legacy_eu_location;
         b.acl_grants = if grant_headers_present {
             header_grants
         } else {
@@ -657,7 +664,9 @@ impl S3Service {
             .buckets
             .get(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
-        let loc = if b.region == "us-east-1" {
+        let loc = if b.legacy_eu_location {
+            "EU".to_string()
+        } else if b.region == "us-east-1" {
             String::new()
         } else {
             b.region.clone()

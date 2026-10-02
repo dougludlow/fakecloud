@@ -1623,3 +1623,45 @@ async fn lambda_handler_exception_is_handled_function_error() {
         "error envelope in payload, got: {body}"
     );
 }
+
+#[tokio::test]
+async fn lambda_accepts_every_newly_modeled_runtime() {
+    // The runtime allowlist lagged the Smithy `Runtime` enum, so functions
+    // and layer filters naming these runtimes were rejected.
+    let server = TestServer::start().await;
+    let client = server.lambda_client().await;
+    for (i, rt) in [
+        "nodejs26.x",
+        "python3.15",
+        "ruby4.0",
+        "java8.al2023",
+        "java11.al2023",
+        "java17.al2023",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = client
+            .create_function()
+            .function_name(format!("new-runtime-{i}"))
+            .runtime(aws_sdk_lambda::types::Runtime::from(rt))
+            .role("arn:aws:iam::123456789012:role/test-role")
+            .handler("index.handler")
+            .code(
+                aws_sdk_lambda::types::FunctionCode::builder()
+                    .zip_file(Blob::new(make_python_zip()))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("runtime {rt} rejected: {e:?}"));
+        assert_eq!(out.runtime().map(|r| r.as_str()), Some(rt));
+
+        client
+            .list_layers()
+            .compatible_runtime(aws_sdk_lambda::types::Runtime::from(rt))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("CompatibleRuntime {rt} rejected: {e:?}"));
+    }
+}

@@ -548,9 +548,42 @@ fn docker_env_args(env: Vec<(String, String)>) -> (Vec<String>, Vec<(String, Str
     (args, child_env)
 }
 
-/// Map AWS runtime identifier to a Docker image tag.
+/// Deprecated runtimes AWS still models (existing functions keep reporting
+/// them) that fakecloud does not execute. Most predate container-image
+/// support and never had a `public.ecr.aws/lambda/*` base image; the rest are
+/// past AWS's block-function-create date. Every other runtime in
+/// `crate::service::LAMBDA_RUNTIMES` must map to an image in
+/// [`runtime_to_image`]; `every_runtime_has_an_image_or_is_a_documented_exception`
+/// enforces it, so a newly modeled runtime cannot silently lack one.
+#[cfg(test)]
+pub(crate) const RUNTIMES_WITHOUT_IMAGE: &[&str] = &[
+    "nodejs",
+    "nodejs4.3",
+    "nodejs4.3-edge",
+    "nodejs6.10",
+    "nodejs8.10",
+    "nodejs10.x",
+    "nodejs12.x",
+    "nodejs14.x",
+    "java8",
+    "python2.7",
+    "python3.6",
+    "python3.7",
+    "dotnetcore1.0",
+    "dotnetcore2.0",
+    "dotnetcore2.1",
+    "dotnetcore3.1",
+    "dotnet6",
+    "ruby2.5",
+    "ruby2.7",
+    "provided",
+];
+
+/// Map AWS runtime identifier to its AWS-published base image.
 pub fn runtime_to_image(runtime: &str) -> Option<String> {
     let (base, tag) = match runtime {
+        // Only a `-preview` tag is published for these so far.
+        "python3.15" => ("python", "3.15-preview"),
         "python3.14" => ("python", "3.14"),
         "python3.13" => ("python", "3.13"),
         "python3.12" => ("python", "3.12"),
@@ -558,17 +591,24 @@ pub fn runtime_to_image(runtime: &str) -> Option<String> {
         "python3.10" => ("python", "3.10"),
         "python3.9" => ("python", "3.9"),
         "python3.8" => ("python", "3.8"),
+        "nodejs26.x" => ("nodejs", "26-preview"),
         "nodejs24.x" => ("nodejs", "24"),
         "nodejs22.x" => ("nodejs", "22"),
         "nodejs20.x" => ("nodejs", "20"),
         "nodejs18.x" => ("nodejs", "18"),
         "nodejs16.x" => ("nodejs", "16"),
+        "ruby4.0" => ("ruby", "4.0"),
         "ruby3.4" => ("ruby", "3.4"),
         "ruby3.3" => ("ruby", "3.3"),
+        "ruby3.2" => ("ruby", "3.2"),
         "java25" => ("java", "25"),
         "java21" => ("java", "21"),
         "java17" => ("java", "17"),
+        "java17.al2023" => ("java", "17.al2023"),
         "java11" => ("java", "11"),
+        "java11.al2023" => ("java", "11.al2023"),
+        "java8.al2023" => ("java", "8.al2023"),
+        "java8.al2" => ("java", "8.al2"),
         "dotnet10" => ("dotnet", "10"),
         "dotnet8" => ("dotnet", "8"),
         "go1.x" => ("go", "1"),
@@ -659,6 +699,45 @@ mod tests {
     use std::io::{Read, Write};
 
     use super::*;
+
+    #[test]
+    fn every_runtime_has_an_image_or_is_a_documented_exception() {
+        for rt in crate::service::LAMBDA_RUNTIMES {
+            let mapped = runtime_to_image(rt).is_some();
+            let exempt = RUNTIMES_WITHOUT_IMAGE.contains(rt);
+            assert!(
+                mapped != exempt,
+                "runtime {rt}: mapped={mapped} exempt={exempt}; map it to its \
+                 public.ecr.aws/lambda image or document why none exists"
+            );
+        }
+        for rt in RUNTIMES_WITHOUT_IMAGE {
+            assert!(
+                crate::service::LAMBDA_RUNTIMES.contains(rt),
+                "{rt} is exempt but not an allowlisted runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn new_runtimes_map_to_their_base_images() {
+        for (rt, image) in [
+            ("ruby4.0", "ruby:4.0"),
+            ("ruby3.2", "ruby:3.2"),
+            ("java8.al2", "java:8.al2"),
+            ("java8.al2023", "java:8.al2023"),
+            ("java11.al2023", "java:11.al2023"),
+            ("java17.al2023", "java:17.al2023"),
+            ("nodejs26.x", "nodejs:26-preview"),
+            ("python3.15", "python:3.15-preview"),
+        ] {
+            assert_eq!(
+                runtime_to_image(rt),
+                Some(format!("public.ecr.aws/lambda/{image}")),
+                "{rt}"
+            );
+        }
+    }
 
     #[test]
     fn test_runtime_to_image() {

@@ -3488,49 +3488,71 @@ fn is_ipv4_format(name: &str) -> bool {
         })
 }
 
+/// Every value of the Smithy `BucketLocationConstraint` enum in
+/// `aws-models/s3.json` (kept in step by
+/// `bucket_location_constraints_cover_the_model`), plus the partitions the
+/// model omits but S3 serves (us-gov-east-2 and the isolated regions).
+/// `us-east-1` is absent: it is the default and is rejected as an explicit
+/// constraint before this check runs.
+const BUCKET_LOCATION_CONSTRAINTS: &[&str] = &[
+    "af-south-1",
+    "ap-east-1",
+    "ap-east-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-6",
+    "ap-southeast-7",
+    "ca-central-1",
+    "ca-west-1",
+    "cn-north-1",
+    "cn-northwest-1",
+    "EU",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "il-central-1",
+    "me-central-1",
+    "me-south-1",
+    "mx-central-1",
+    "sa-east-1",
+    "us-east-2",
+    "us-gov-east-1",
+    "us-gov-west-1",
+    "us-west-1",
+    "us-west-2",
+    // Not in the model's enum, but real S3 partitions.
+    "us-gov-east-2",
+    "us-iso-east-1",
+    "us-iso-west-1",
+    "us-isob-east-1",
+    "us-isof-south-1",
+];
+
 pub(crate) fn is_valid_region(region: &str) -> bool {
-    // Basic validation: region should match pattern like us-east-1, eu-west-2, etc.
-    let valid_regions = [
-        "us-east-1",
-        "us-east-2",
-        "us-west-1",
-        "us-west-2",
-        "af-south-1",
-        "ap-east-1",
-        "ap-south-1",
-        "ap-south-2",
-        "ap-southeast-1",
-        "ap-southeast-2",
-        "ap-southeast-3",
-        "ap-southeast-4",
-        "ap-northeast-1",
-        "ap-northeast-2",
-        "ap-northeast-3",
-        "ca-central-1",
-        "ca-west-1",
-        "eu-central-1",
-        "eu-central-2",
-        "eu-west-1",
-        "eu-west-2",
-        "eu-west-3",
-        "eu-south-1",
-        "eu-south-2",
-        "eu-north-1",
-        "il-central-1",
-        "me-south-1",
-        "me-central-1",
-        "sa-east-1",
-        "cn-north-1",
-        "cn-northwest-1",
-        "us-gov-east-1",
-        "us-gov-east-2",
-        "us-gov-west-1",
-        "us-iso-east-1",
-        "us-iso-west-1",
-        "us-isob-east-1",
-        "us-isof-south-1",
-    ];
-    valid_regions.contains(&region)
+    region == "us-east-1" || BUCKET_LOCATION_CONSTRAINTS.contains(&region)
+}
+
+/// The region a location constraint places a bucket in. `EU` is the legacy
+/// alias S3 still accepts for eu-west-1.
+pub(crate) fn location_constraint_region(constraint: &str) -> &str {
+    if constraint == "EU" {
+        "eu-west-1"
+    } else {
+        constraint
+    }
 }
 
 pub(crate) fn resolve_object<'a>(

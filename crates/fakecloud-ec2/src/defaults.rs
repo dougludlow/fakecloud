@@ -27,11 +27,6 @@ use crate::state::{
 /// CIDR of the default VPC, matching AWS.
 const DEFAULT_VPC_CIDR: &str = "172.31.0.0/16";
 
-/// The Availability Zone suffixes that receive a default subnet. AWS creates a
-/// default subnet in every AZ; three covers the cardinality every realistic
-/// test exercises (and keeps the deterministic CIDR layout simple).
-const DEFAULT_AZ_SUFFIXES: [&str; 3] = ["a", "b", "c"];
-
 /// Deterministic EC2 resource id: `<prefix>-<17 hex>` derived from the account
 /// and a per-resource `role`. Deliberately **region-independent**: a
 /// `MultiAccountState` partitions by account and pins a single region per
@@ -63,20 +58,88 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// AWS-style AZ-id prefix for a region: `us-east-1 -> use1`. Falls back to the
-/// region with dashes stripped for non-`a-b-N` shapes.
-fn az_id_prefix(region: &str) -> String {
+/// AWS's zone-id prefix for a region: the geography code followed by the
+/// abbreviated direction and the number (`us-east-1 -> use1`,
+/// `ap-southeast-2 -> apse2`, `ap-south-1 -> aps1`, `us-gov-west-1 ->
+/// usgw1`). Compound directions keep both letters, which is what keeps
+/// ap-south-1 (`aps1`) and ap-southeast-1 (`apse1`) apart.
+pub(crate) fn az_id_prefix(region: &str) -> String {
     let parts: Vec<&str> = region.split('-').collect();
-    if parts.len() == 3 && !parts[1].is_empty() {
-        format!(
-            "{}{}{}",
-            parts[0],
-            parts[1].chars().next().unwrap_or('x'),
-            parts[2]
-        )
-    } else {
-        region.replace('-', "")
+    if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
+        return region.replace('-', "");
     }
+    let mut out = String::from(parts[0]);
+    for part in &parts[1..parts.len() - 1] {
+        let abbrev = match *part {
+            "east" => "e",
+            "west" => "w",
+            "north" => "n",
+            "south" => "s",
+            "central" => "c",
+            "northeast" => "ne",
+            "northwest" => "nw",
+            "southeast" => "se",
+            "southwest" => "sw",
+            "gov" => "g",
+            other => {
+                // First character, not first byte: the input can be any
+                // caller-supplied zone name.
+                out.extend(other.chars().next());
+                continue;
+            }
+        };
+        out.push_str(abbrev);
+    }
+    out.push_str(parts[parts.len() - 1]);
+    out
+}
+
+/// The availability zones of `region`, as `(zone name, zone id)`: exactly
+/// what DescribeAvailabilityZones reports, and so exactly what a subnet can
+/// be placed in by name or by id. Zone ids number the zones in order
+/// (`us-east-1a -> use1-az1` ... `us-east-1f -> use1-az6`), a fixed stand-in
+/// for AWS's per-account letter-to-id mapping.
+pub(crate) fn region_zones(region: &str) -> Vec<(String, String)> {
+    let prefix = az_id_prefix(region);
+    fakecloud_aws::regions::availability_zone_letters(region)
+        .chars()
+        .enumerate()
+        .map(|(i, letter)| (format!("{region}{letter}"), format!("{prefix}-az{}", i + 1)))
+        .collect()
+}
+
+/// The zone id of an availability zone name, as DescribeAvailabilityZones
+/// reports it. A name outside the region's zone set (a subnet persisted by
+/// an older build) gets the next id after the listed zones' ids, keyed by
+/// its letter, so it still has a stable, region-shaped id.
+pub(crate) fn zone_id_for(zone: &str) -> String {
+    let Some(letter) = zone.chars().last().filter(char::is_ascii_lowercase) else {
+        return format!("{}-az1", az_id_prefix(zone));
+    };
+    let region = &zone[..zone.len() - 1];
+    if let Some((_, id)) = region_zones(region)
+        .into_iter()
+        .find(|(name, _)| name == zone)
+    {
+        return id;
+    }
+    let n = u32::from(letter) - u32::from('a') + 1;
+    format!("{}-az{n}", az_id_prefix(region))
+}
+
+/// Whether `zone` is one of `region`'s availability zones.
+pub(crate) fn zone_in_region(region: &str, zone: &str) -> bool {
+    region_zones(region).iter().any(|(name, _)| name == zone)
+}
+
+/// The availability-zone name a zone id denotes in `region`
+/// (`use1-az2 -> us-east-1b`), or `None` when the id is not one of the
+/// region's zones.
+pub(crate) fn zone_name_for_id(region: &str, zone_id: &str) -> Option<String> {
+    region_zones(region)
+        .into_iter()
+        .find(|(_, id)| id == zone_id)
+        .map(|(name, _)| name)
 }
 
 /// The default VPC id for an account (also exposed so request handlers can
@@ -296,11 +359,14 @@ pub(crate) fn bootstrap_default_network(state: &mut Ec2State) {
     );
 
     // --- default subnets, one per AZ ---
-    let az_prefix = az_id_prefix(&region);
+    // Placed in the region's first (up to) three listed zones, so every
+    // default subnet sits in a zone DescribeAvailabilityZones reports. AWS
+    // creates one per AZ; three covers the cardinality realistic tests
+    // exercise and keeps the deterministic CIDR layout simple.
     let mut subnet_ids = Vec::new();
-    for (idx, suffix) in DEFAULT_AZ_SUFFIXES.iter().enumerate() {
+    for (idx, (az, zone_id)) in region_zones(&region).into_iter().take(3).enumerate() {
+        let suffix = az.chars().last().unwrap_or('a');
         let subnet_id = deterministic_id("subnet", &account, &format!("default-subnet-{suffix}"));
-        let az = format!("{region}{suffix}");
         state.subnets.insert(
             subnet_id.clone(),
             Subnet {
@@ -309,7 +375,7 @@ pub(crate) fn bootstrap_default_network(state: &mut Ec2State) {
                 // /20 blocks carved from 172.31.0.0/16: .0, .16, .32 …
                 cidr_block: format!("172.31.{}.0/20", idx * 16),
                 availability_zone: az,
-                availability_zone_id: format!("{az_prefix}-az{}", idx + 1),
+                availability_zone_id: zone_id,
                 state: "available".to_string(),
                 available_ip_address_count: 4091,
                 default_for_az: true,
@@ -623,9 +689,98 @@ mod tests {
 
     #[test]
     fn az_id_prefix_matches_aws_shape() {
-        assert_eq!(az_id_prefix("us-east-1"), "use1");
-        assert_eq!(az_id_prefix("eu-west-2"), "euw2");
-        assert_eq!(az_id_prefix("ap-southeast-1"), "aps1");
+        for (region, prefix) in [
+            ("us-east-1", "use1"),
+            ("us-east-2", "use2"),
+            ("us-west-1", "usw1"),
+            ("us-west-2", "usw2"),
+            ("eu-west-2", "euw2"),
+            ("eu-central-1", "euc1"),
+            ("eu-north-1", "eun1"),
+            ("eu-south-2", "eus2"),
+            ("ap-south-1", "aps1"),
+            ("ap-south-2", "aps2"),
+            ("ap-southeast-1", "apse1"),
+            ("ap-southeast-2", "apse2"),
+            ("ap-southeast-7", "apse7"),
+            ("ap-northeast-1", "apne1"),
+            ("ap-northeast-3", "apne3"),
+            ("ap-east-1", "ape1"),
+            ("af-south-1", "afs1"),
+            ("ca-central-1", "cac1"),
+            ("ca-west-1", "caw1"),
+            ("sa-east-1", "sae1"),
+            ("me-south-1", "mes1"),
+            ("me-central-1", "mec1"),
+            ("il-central-1", "ilc1"),
+            ("mx-central-1", "mxc1"),
+            ("cn-north-1", "cnn1"),
+            ("cn-northwest-1", "cnnw1"),
+            ("us-gov-west-1", "usgw1"),
+            ("us-gov-east-1", "usge1"),
+        ] {
+            assert_eq!(az_id_prefix(region), prefix, "{region}");
+        }
+    }
+
+    #[test]
+    fn zone_ids_round_trip_through_zone_names() {
+        assert_eq!(zone_id_for("us-east-1a"), "use1-az1");
+        assert_eq!(zone_id_for("us-east-1f"), "use1-az6");
+        assert_eq!(zone_id_for("us-gov-west-1b"), "usgw1-az2");
+        // Zones number in order of their letters.
+        assert_eq!(zone_id_for("ap-northeast-1d"), "apne1-az4");
+        assert_eq!(zone_id_for("ca-central-1d"), "cac1-az3");
+        assert_eq!(zone_id_for("ap-southeast-2c"), "apse2-az3");
+        assert_eq!(zone_id_for("ap-south-1b"), "aps1-az2");
+        assert_eq!(
+            zone_name_for_id("ap-southeast-2", "apse2-az3").as_deref(),
+            Some("ap-southeast-2c")
+        );
+        // An id from another region is not a zone of this one.
+        assert_eq!(zone_name_for_id("ap-southeast-1", "aps1-az1"), None);
+        assert_eq!(zone_name_for_id("us-east-1", "use1-az0"), None);
+        assert_eq!(zone_name_for_id("us-east-1", "use1-az7"), None);
+        assert_eq!(
+            zone_name_for_id("us-east-1", "use1-az6").as_deref(),
+            Some("us-east-1f")
+        );
+        // Every listed zone round-trips by id.
+        for (name, id) in region_zones("ap-south-1") {
+            assert_eq!(zone_name_for_id("ap-south-1", &id), Some(name));
+        }
+        assert_eq!(zone_name_for_id("us-east-1", "garbage"), None);
+    }
+
+    #[test]
+    fn non_ascii_zone_names_do_not_panic() {
+        // Caller-supplied names reach these helpers; a multi-byte character
+        // must not be sliced mid-codepoint.
+        assert_eq!(az_id_prefix("us-\u{e9}-1"), "us\u{e9}1");
+        let _ = zone_id_for("us-\u{e9}-1a");
+        let _ = zone_id_for("\u{e9}");
+        assert!(!zone_in_region("us-east-1", "us-east-1\u{e9}"));
+    }
+
+    #[test]
+    fn zone_membership_follows_the_region() {
+        assert!(zone_in_region("us-east-1", "us-east-1a"));
+        assert!(zone_in_region("us-east-1", "us-east-1c"));
+        assert!(zone_in_region("us-east-1", "us-east-1f"));
+        assert!(zone_in_region("us-west-2", "us-west-2d"));
+        // Only the zones DescribeAvailabilityZones lists.
+        assert!(!zone_in_region("us-east-1", "us-east-1g"));
+        assert!(!zone_in_region("us-west-2", "us-west-2e"));
+        // Names some real accounts have are accepted.
+        assert!(zone_in_region("ap-northeast-1", "ap-northeast-1b"));
+        assert!(zone_in_region("us-west-1", "us-west-1b"));
+        assert!(zone_in_region("us-west-1", "us-west-1c"));
+        assert!(!zone_in_region("us-west-1", "us-west-1d"));
+        assert!(!zone_in_region("us-east-1", "us-west-2a"));
+        assert!(!zone_in_region("us-east-1", "us-east-1"));
+        assert!(!zone_in_region("us-east-1", "us-east-1ab"));
+        assert!(!zone_in_region("us-east-1", "us-east-12a"));
+        assert!(!zone_in_region("us-east-1", "string"));
     }
 
     #[test]
@@ -637,7 +792,7 @@ mod tests {
         assert!(vpc.is_default);
         assert_eq!(vpc.cidr_block, "172.31.0.0/16");
         // one subnet per AZ suffix, all default_for_az + public
-        assert_eq!(state.subnets.len(), DEFAULT_AZ_SUFFIXES.len());
+        assert_eq!(state.subnets.len(), 3);
         assert!(state.subnets.values().all(|s| s.default_for_az));
         assert!(state.subnets.values().all(|s| s.map_public_ip_on_launch));
         // IGW attached to the default VPC
