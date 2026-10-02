@@ -145,7 +145,8 @@ async fn stack_set_instances_provision_stacks_across_accounts_and_regions() {
         );
     }
 
-    // The default account's stacks are ordinary stacks it can describe.
+    // The default account's stacks are ordinary stacks it can describe, in
+    // the instance's region.
     let default_instance = cfn
         .describe_stack_instance()
         .stack_set_name("regional")
@@ -159,7 +160,8 @@ async fn stack_set_instances_provision_stacks_across_accounts_and_regions() {
         .and_then(|i| i.stack_id())
         .expect("stack id")
         .to_string();
-    let stacks = cfn
+    let eu_cfn = aws_sdk_cloudformation::Client::new(&server.aws_config_in("eu-west-1").await);
+    let stacks = eu_cfn
         .describe_stacks()
         .stack_name(&stack_id)
         .send()
@@ -169,6 +171,14 @@ async fn stack_set_instances_provision_stacks_across_accounts_and_regions() {
         stacks.stacks()[0].stack_status().map(|s| s.as_str()),
         Some("CREATE_COMPLETE")
     );
+    // Stacks are regional: the stack set's own region does not see it.
+    let err = cfn
+        .describe_stacks()
+        .stack_name(&stack_id)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some("ValidationError"));
 
     // Override a parameter for the member account's us-east-1 instance.
     let update = cfn

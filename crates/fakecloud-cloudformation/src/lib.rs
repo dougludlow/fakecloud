@@ -11,5 +11,6 @@ pub mod xml_responses;
 pub use service::{CloudControlOutcome, CloudFormationDeps, CloudFormationService};
 pub use stack_sets::restore_stack_sets;
 pub use state::{
-    CloudFormationSnapshot, SharedCloudFormationState, CLOUDFORMATION_SNAPSHOT_SCHEMA_VERSION,
+    parse_cloudformation_snapshot, CloudFormationAccountState, CloudFormationSnapshot,
+    RegionalAccounts, SharedCloudFormationState, CLOUDFORMATION_SNAPSHOT_SCHEMA_VERSION,
 };

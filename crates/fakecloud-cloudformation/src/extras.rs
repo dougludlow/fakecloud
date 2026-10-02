@@ -20,7 +20,7 @@ use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::CloudFormationService;
-use crate::state::{Stack, StackResource};
+use crate::state::{RegionalAccounts, Stack, StackResource};
 use crate::template;
 
 const NS: &str = "http://cloudformation.amazonaws.com/doc/2010-05-15/";
@@ -235,18 +235,6 @@ fn retire_sibling_change_sets(
     change_sets.retain(|id, v| id == executed || v["StackId"].as_str() != Some(stack_id));
 }
 
-/// The stack name a `StackName` parameter refers to: the name itself, or the
-/// name segment of a stack ARN (`arn:...:stack/<name>/<uuid>`).
-fn stack_name_from_ref(stack: &str) -> &str {
-    if !stack.starts_with("arn:") {
-        return stack;
-    }
-    stack
-        .split_once(":stack/")
-        .and_then(|(_, rest)| rest.split('/').next())
-        .unwrap_or(stack)
-}
-
 fn missing(name: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -441,6 +429,7 @@ impl CloudFormationService {
     fn template_for_introspection(
         &self,
         account_id: &str,
+        region: &str,
         params: &BTreeMap<String, String>,
         allow_stack_sources: bool,
     ) -> Result<String, AwsServiceError> {
@@ -490,7 +479,7 @@ impl CloudFormationService {
             // code here -- and it would cost a deletion timestamp on every
             // stack record to express. Deliberate divergence, not an
             // oversight.
-            if let Some(body) = accounts.get(account_id).and_then(|st| {
+            if let Some(body) = accounts.regional(account_id, region).and_then(|st| {
                 st.stacks
                     .values()
                     .find(|s| {
@@ -513,7 +502,7 @@ impl CloudFormationService {
                 .stack_set_admin_account_of(account_id, params)
                 .ok()
                 .and_then(|admin| {
-                    self.state.read().get(&admin).and_then(|st| {
+                    self.state.read().regional(&admin, region).and_then(|st| {
                         crate::stack_sets::find_active(
                             st,
                             name,
@@ -690,10 +679,16 @@ impl CloudFormationService {
     /// hang against an existing stack: the CLI deletes its change set and polls
     /// `DescribeChangeSet` until it 404s (`waitForGone`), so a stubbed success
     /// never terminates. Callers now map `None` to `change_set_not_found`.
-    fn find_change_set(&self, account_id: &str, cs: &str, stack: Option<&str>) -> Option<Value> {
+    fn find_change_set(
+        &self,
+        account_id: &str,
+        region: &str,
+        cs: &str,
+        stack: Option<&str>,
+    ) -> Option<Value> {
         let accounts = self.state.read();
         accounts
-            .get(account_id)
+            .regional(account_id, region)
             .and_then(|s| s.extras.get("change_sets"))
             .and_then(|m| {
                 m.values()
@@ -709,6 +704,7 @@ impl CloudFormationService {
         let action = req.action.clone();
         let params = Self::get_all_params(req);
         let aid = req.account_id.clone();
+        let region = req.region.clone();
         let rid = req.request_id.clone();
 
         match action.as_str() {
@@ -732,16 +728,20 @@ impl CloudFormationService {
                 // `UsePreviousTemplate` / `UsePreviousValue`.
                 let previous: Option<(String, BTreeMap<String, String>)> = {
                     let accounts = self.state.read();
-                    accounts.get(&aid).and_then(|s| {
-                        s.stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
+                    accounts.regional(&aid, &region).and_then(|s| {
+                        s.live_stack(&stack_name)
                             .map(|st| (st.template.clone(), st.parameters.clone()))
                     })
                 };
+                // A stack id names an existing stack; with none behind it there
+                // is nothing to change, and no new stack is made out of it.
+                if previous.is_none() {
+                    if let crate::service::StackRef::Id(id) =
+                        crate::service::resolve_stack_ref(&stack_name, &aid, &region)?
+                    {
+                        return Err(crate::service::stack_does_not_exist(id));
+                    }
+                }
                 let template_body = {
                     let inline = params.get("TemplateBody").cloned().unwrap_or_default();
                     if !inline.trim().is_empty() {
@@ -815,13 +815,8 @@ impl CloudFormationService {
                 // and every resource is reported as Add.
                 let stack_lookup: Option<(String, Vec<crate::state::StackResource>)> = {
                     let accounts = self.state.read();
-                    accounts.get(&aid).and_then(|s| {
-                        s.stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
+                    accounts.regional(&aid, &region).and_then(|s| {
+                        s.live_stack(&stack_name)
                             .map(|st| (st.stack_id.clone(), st.resources.clone()))
                     })
                 };
@@ -958,7 +953,7 @@ impl CloudFormationService {
                 let activated_hooks: Vec<Value> = {
                     let accounts = self.state.read();
                     accounts
-                        .get(&aid)
+                        .regional(&aid, &region)
                         .and_then(|s| s.extras.get("hooks"))
                         .map(|m| m.values().cloned().collect())
                         .unwrap_or_default()
@@ -977,7 +972,7 @@ impl CloudFormationService {
                     "Hooks": activated_hooks,
                 });
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
+                let state = accounts.regional_mut(&aid, &region);
                 // Re-resolve the target stack under the write lock: a
                 // concurrent CREATE change set may have put the
                 // `REVIEW_IN_PROGRESS` placeholder in place since the read
@@ -985,26 +980,25 @@ impl CloudFormationService {
                 // the one minted speculatively. Store the stack's real name
                 // too, so a later name-or-ARN filter matches either way.
                 let live = state
-                    .stacks
-                    .values()
-                    .find(|s| {
-                        (s.name == stack_name || s.stack_id == stack_name)
-                            && s.status != "DELETE_COMPLETE"
-                    })
+                    .live_stack(&stack_name)
                     .map(|s| (s.stack_id.clone(), s.name.clone(), s.status.clone()));
                 let (stack_id_str, stack_name) = match &live {
                     Some((sid, name, _)) => (sid.clone(), name.clone()),
                     None => {
-                        let name = stack_name_from_ref(&stack_name).to_string();
-                        // No live stack. A stack ARN names its own id.
-                        // For a plain name, change sets already aimed at the
-                        // same missing stack share one id, so the
-                        // name-uniqueness check below and every by-stack
-                        // filter treat them as one stack; the first gets a
-                        // fresh id.
-                        let sid = if name != stack_name {
-                            stack_name.clone()
-                        } else {
+                        // No live stack. A stack id addresses an existing
+                        // stack only: it is never cut down to its name to
+                        // create one.
+                        if let crate::service::StackRef::Id(id) =
+                            crate::service::resolve_stack_ref(&stack_name, &aid, &region)?
+                        {
+                            return Err(crate::service::stack_does_not_exist(id));
+                        }
+                        let name = stack_name.clone();
+                        // Change sets already aimed at the same missing stack
+                        // share one id, so the name-uniqueness check below and
+                        // every by-stack filter treat them as one stack; the
+                        // first gets a fresh id.
+                        let sid = {
                             state
                                 .extras
                                 .get("change_sets")
@@ -1127,7 +1121,7 @@ impl CloudFormationService {
                     .clone();
                 let stack_filter = params.get("StackName").cloned();
                 let entry = self
-                    .find_change_set(&aid, &cs, stack_filter.as_deref())
+                    .find_change_set(&aid, &region, &cs, stack_filter.as_deref())
                     .ok_or_else(|| change_set_not_found(&cs))?;
                 let changes_xml = entry["Changes"]
                     .as_array()
@@ -1194,7 +1188,7 @@ impl CloudFormationService {
                 // CreateChangeSet time instead of always returning empty
                 // (bug-audit 2026-06-13, 1.8).
                 let entry = self
-                    .find_change_set(&aid, &cs, stack_filter.as_deref())
+                    .find_change_set(&aid, &region, &cs, stack_filter.as_deref())
                     .ok_or_else(|| change_set_not_found(&cs))?;
                 let (cs_id, cs_name, stack_id, stack_name, hooks) = (
                     entry["Id"].as_str().unwrap_or("").to_string(),
@@ -1246,8 +1240,10 @@ impl CloudFormationService {
                 // ExecuteChangeSet would then fail with ChangeSetNotFound.
                 let stack_filter = params.get("StackName").cloned();
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                if let Some(m) = state.extras.get_mut("change_sets") {
+                if let Some(m) = accounts
+                    .regional_get_mut(&aid, &region)
+                    .and_then(|state| state.extras.get_mut("change_sets"))
+                {
                     m.retain(|_, v| !change_set_matches(v, &cs, stack_filter.as_deref()));
                 }
                 Ok(xml_response("DeleteChangeSet", String::new(), &rid))
@@ -1260,7 +1256,7 @@ impl CloudFormationService {
                 let stack_filter = params.get("StackName").cloned();
 
                 let entry = self
-                    .find_change_set(&aid, &cs, stack_filter.as_deref())
+                    .find_change_set(&aid, &region, &cs, stack_filter.as_deref())
                     .ok_or_else(|| change_set_not_found(&cs))?;
 
                 if entry["ExecutionStatus"].as_str() != Some("AVAILABLE") {
@@ -1306,15 +1302,9 @@ impl CloudFormationService {
 
                 let found: Option<String> = {
                     let accounts = self.state.read();
-                    accounts.get(&aid).and_then(|s| {
-                        s.stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
-                            .map(|st| st.stack_id.clone())
-                    })
+                    accounts
+                        .regional(&aid, &region)
+                        .and_then(|s| s.live_stack(&stack_name).map(|st| st.stack_id.clone()))
                 };
 
                 // Empty change set: nothing to provision. Finalize a
@@ -1325,7 +1315,12 @@ impl CloudFormationService {
                 // stack.
                 if template_body.trim().is_empty() {
                     let mut accounts = self.state.write();
-                    let state = accounts.get_or_create(&aid);
+                    // The change set was found in this region, so the region
+                    // holds state; it is only gone if a concurrent delete
+                    // took the change set with it.
+                    let Some(state) = accounts.regional_get_mut(&aid, &region) else {
+                        return Err(change_set_not_found(&cs));
+                    };
                     if let Some(sid) = &found {
                         if let Some(stack) = state.stacks.values_mut().find(|s| &s.stack_id == sid)
                         {
@@ -1418,11 +1413,24 @@ impl CloudFormationService {
 
                 // Cross-stack exports for `Fn::ImportValue` in resource
                 // properties (1.5); collected before the write lock.
-                let cs_imports =
-                    CloudFormationService::collect_account_imports(&self.state, &aid, None);
+                let cs_imports = CloudFormationService::collect_account_imports(
+                    &self.state,
+                    &aid,
+                    &region,
+                    None,
+                );
 
+                let stack_missing = || {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationError",
+                        format!("Stack [{stack_name}] does not exist"),
+                    )
+                };
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
+                let Some(state) = accounts.regional_get_mut(&aid, &region) else {
+                    return Err(stack_missing());
+                };
 
                 // A stack still in `REVIEW_IN_PROGRESS` was minted by a
                 // `CREATE` change set and has no resources yet — executing the
@@ -1435,13 +1443,7 @@ impl CloudFormationService {
                         .stacks
                         .values_mut()
                         .find(|st| st.stack_id == found_stack_id && st.status != "DELETE_COMPLETE")
-                        .ok_or_else(|| {
-                            AwsServiceError::aws_error(
-                                StatusCode::BAD_REQUEST,
-                                "ValidationError",
-                                format!("Stack [{stack_name}] does not exist"),
-                            )
-                        })?;
+                        .ok_or_else(stack_missing)?;
                     let was_review = stack.status == "REVIEW_IN_PROGRESS";
                     stack.status = if was_review {
                         "CREATE_IN_PROGRESS"
@@ -1604,10 +1606,11 @@ impl CloudFormationService {
                     &cs_params,
                     &resources_snapshot,
                     &self.state,
+                    &aid,
+                    &region,
                 );
-                {
-                    let mut accounts = self.state.write();
-                    let state = accounts.get_or_create(&aid);
+                let mut accounts = self.state.write();
+                if let Some(state) = accounts.regional_get_mut(&aid, &region) {
                     if let Some(stack) = state
                         .stacks
                         .values_mut()
@@ -1625,6 +1628,7 @@ impl CloudFormationService {
                         &[],
                     );
                 }
+                drop(accounts);
 
                 Ok(xml_response("ExecuteChangeSet", String::new(), &rid))
             }
@@ -1633,7 +1637,7 @@ impl CloudFormationService {
                 let stack = params.get("StackName").cloned().unwrap_or_default();
                 let accounts = self.state.read();
                 let items: Vec<Value> = accounts
-                    .get(&aid)
+                    .regional(&aid, &region)
                     .and_then(|s| s.extras.get("change_sets"))
                     .map(|m| {
                         m.values()
@@ -1662,7 +1666,7 @@ impl CloudFormationService {
                 let id = rand_id();
                 let entry = json!({"StackRefactorId": id.clone(), "Status": "CREATE_COMPLETE"});
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
+                let state = accounts.regional_mut(&aid, &region);
                 store(&mut state.extras, "refactors").insert(id.clone(), entry);
                 Ok(xml_response(
                     "CreateStackRefactor",
@@ -1721,7 +1725,7 @@ impl CloudFormationService {
                 ) {
                     if let Some(name) = type_name {
                         let mut accounts = self.state.write();
-                        let state = accounts.get_or_create(&aid);
+                        let state = accounts.regional_mut(&aid, &region);
                         register_hook(&mut state.extras, name, None, None);
                     }
                 }
@@ -1763,7 +1767,7 @@ impl CloudFormationService {
                 ) {
                     if let Some(name) = params.get("TypeName") {
                         let mut accounts = self.state.write();
-                        let state = accounts.get_or_create(&aid);
+                        let state = accounts.regional_mut(&aid, &region);
                         register_hook(&mut state.extras, name, None, None);
                     }
                 }
@@ -1827,7 +1831,7 @@ impl CloudFormationService {
                             })
                             .map(str::to_string);
                         let mut accounts = self.state.write();
-                        let state = accounts.get_or_create(&aid);
+                        let state = accounts.regional_mut(&aid, &region);
                         register_hook(
                             &mut state.extras,
                             name,
@@ -1918,7 +1922,7 @@ impl CloudFormationService {
                 .to_string();
                 let entry = json!({"GeneratedTemplateId": id.clone(), "Name": name.clone(), "Status": "COMPLETE"});
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
+                let state = accounts.regional_mut(&aid, &region);
                 store(&mut state.extras, "generated_templates").insert(name.clone(), entry);
                 Ok(xml_response(
                     "CreateGeneratedTemplate",
@@ -1984,8 +1988,10 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("GeneratedTemplateName"))?
                     .clone();
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                if let Some(m) = state.extras.get_mut("generated_templates") {
+                if let Some(m) = accounts
+                    .regional_get_mut(&aid, &region)
+                    .and_then(|state| state.extras.get_mut("generated_templates"))
+                {
                     m.remove(&name);
                 }
                 Ok(xml_response("DeleteGeneratedTemplate", String::new(), &rid))
@@ -2054,12 +2060,9 @@ impl CloudFormationService {
 
                 let resources: Vec<StackResource> = {
                     let accounts = self.state.read();
-                    let stack = accounts.get(&aid).and_then(|s| {
-                        s.stacks.values().find(|st| {
-                            (st.name == stack_name || st.stack_id == stack_name)
-                                && st.status != "DELETE_COMPLETE"
-                        })
-                    });
+                    let stack = accounts
+                        .regional(&aid, &region)
+                        .and_then(|s| s.live_stack(&stack_name));
                     stack.map(|s| s.resources.clone()).unwrap_or_default()
                 };
 
@@ -2094,7 +2097,7 @@ impl CloudFormationService {
 
                 {
                     let mut accounts = self.state.write();
-                    let state = accounts.get_or_create(&aid);
+                    let state = accounts.regional_mut(&aid, &region);
                     store(&mut state.extras, "drift_detection").insert(id.clone(), record);
                 }
 
@@ -2118,13 +2121,8 @@ impl CloudFormationService {
                     .clone();
                 let accounts = self.state.read();
                 let resource_drift = accounts
-                    .get(&aid)
-                    .and_then(|s| {
-                        s.stacks.values().find(|st| {
-                            (st.name == stack_name || st.stack_id == stack_name)
-                                && st.status != "DELETE_COMPLETE"
-                        })
-                    })
+                    .regional(&aid, &region)
+                    .and_then(|s| s.live_stack(&stack_name))
                     .and_then(|stack| stack.resources.iter().find(|r| r.logical_id == logical))
                     .map(|resource| {
                         let exists = self.resource_exists(&aid, resource).unwrap_or(true);
@@ -2150,7 +2148,7 @@ impl CloudFormationService {
                     .clone();
                 let accounts = self.state.read();
                 let record = accounts
-                    .get(&aid)
+                    .regional(&aid, &region)
                     .and_then(|s| s.extras.get("drift_detection"))
                     .and_then(|m| m.get(&id))
                     .cloned()
@@ -2204,16 +2202,9 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("StackName"))?;
                 let accounts = self.state.read();
                 let drifted: Vec<Value> = accounts
-                    .get(&aid)
+                    .regional(&aid, &region)
                     .and_then(|s| {
-                        let found = s
-                            .stacks
-                            .values()
-                            .find(|st| {
-                                (st.name == stack_name || st.stack_id == stack_name)
-                                    && st.status != "DELETE_COMPLETE"
-                            })
-                            .is_some();
+                        let found = s.live_stack(&stack_name).is_some();
                         if !found {
                             return None;
                         }
@@ -2255,9 +2246,16 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("LogicalResourceId"))?
                     .clone();
                 let accounts = self.state.read();
-                let detail = accounts
-                    .get(&aid)
-                    .and_then(|s| s.stacks.get(&stack_name))
+                let stack = accounts
+                    .regional(&aid, &region)
+                    .and_then(|s| s.live_stack(&stack_name));
+                // The stack's own name and `StackId` whenever the stack is
+                // real, however the caller addressed it.
+                let shown_name = stack.map_or(stack_name.as_str(), |s| s.name.as_str());
+                let stack_id_el = stack
+                    .map(|s| format!("\n      <StackId>{}</StackId>", xml_escape(&s.stack_id)))
+                    .unwrap_or_default();
+                let detail = stack
                     .and_then(|s| s.resources.iter().find(|r| r.logical_id == logical))
                     .map(|r| {
                         (
@@ -2274,8 +2272,9 @@ impl CloudFormationService {
                         )
                     });
                 let inner = format!(
-                    "    <StackResourceDetail>\n      <StackName>{}</StackName>\n      <LogicalResourceId>{}</LogicalResourceId>\n      <PhysicalResourceId>{}</PhysicalResourceId>\n      <ResourceType>{}</ResourceType>\n      <ResourceStatus>{}</ResourceStatus>\n      <LastUpdatedTimestamp>{}</LastUpdatedTimestamp>\n    </StackResourceDetail>",
-                    xml_escape(&stack_name),
+                    "    <StackResourceDetail>\n      <StackName>{}</StackName>{}\n      <LogicalResourceId>{}</LogicalResourceId>\n      <PhysicalResourceId>{}</PhysicalResourceId>\n      <ResourceType>{}</ResourceType>\n      <ResourceStatus>{}</ResourceStatus>\n      <LastUpdatedTimestamp>{}</LastUpdatedTimestamp>\n    </StackResourceDetail>",
+                    xml_escape(shown_name),
+                    stack_id_el,
                     xml_escape(&logical),
                     xml_escape(&detail.0),
                     xml_escape(&detail.1),
@@ -2291,7 +2290,7 @@ impl CloudFormationService {
                 let stack_filter = params.get("StackName").cloned();
                 let accounts = self.state.read();
                 let events: Vec<Value> = accounts
-                    .get(&aid)
+                    .regional(&aid, &region)
                     .map(|s| {
                         let mut all: Vec<Value> = Vec::new();
                         for (sid, evs) in &s.events {
@@ -2364,7 +2363,7 @@ impl CloudFormationService {
                 let record = {
                     let accounts = self.state.read();
                     accounts
-                        .get(&aid)
+                        .regional(&aid, &region)
                         .and_then(|s| s.extras.get("hook_results"))
                         .and_then(|m| m.get(&result_id))
                         .cloned()
@@ -2405,7 +2404,7 @@ impl CloudFormationService {
                 let records: Vec<Value> = {
                     let accounts = self.state.read();
                     accounts
-                        .get(&aid)
+                        .regional(&aid, &region)
                         .and_then(|s| s.extras.get("hook_results"))
                         .map(|m| {
                             m.values()
@@ -2469,7 +2468,7 @@ impl CloudFormationService {
             "ListExports" => {
                 let accounts = self.state.read();
                 let mut entries = String::new();
-                if let Some(state) = accounts.get(&aid) {
+                if let Some(state) = accounts.regional(&aid, &region) {
                     for (name, export) in &state.exports {
                         entries.push_str(&format!(
                             "      <member>\n        <ExportingStackId>{}</ExportingStackId>\n        <Name>{}</Name>\n        <Value>{}</Value>\n      </member>\n",
@@ -2493,7 +2492,7 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("ExportName"))?;
                 let accounts = self.state.read();
                 let mut entries = String::new();
-                if let Some(state) = accounts.get(&aid) {
+                if let Some(state) = accounts.regional(&aid, &region) {
                     if let Some(consumers) = state.imports.get(&export_name) {
                         for stack_name in consumers {
                             entries.push_str(&format!(
@@ -2518,8 +2517,13 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("StackName"))?
                     .clone();
                 let accounts = self.state.read();
-                let body = accounts.get(&aid)
-                    .and_then(|s| s.stack_policies.get(&stack))
+                let body = accounts.regional(&aid, &region)
+                    .and_then(|s| {
+                        // Policies are kept under the stack's name; a stack id
+                        // finds the same stack's policy.
+                        let name = s.live_stack(&stack).map_or(stack.as_str(), |st| st.name.as_str());
+                        s.stack_policies.get(name)
+                    })
                     .cloned()
                     .unwrap_or_else(|| r#"{"Statement":[{"Effect":"Allow","Action":"Update:*","Principal":"*","Resource":"*"}]}"#.to_string());
                 let inner = format!(
@@ -2534,9 +2538,20 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("StackName"))?
                     .clone();
                 let body = params.get("StackPolicyBody").cloned().unwrap_or_default();
+                // A policy attaches to a live stack of this region. AWS answers
+                // `ValidationError` for an unknown one, but SetStackPolicy
+                // declares no errors and the conformance probe's success
+                // variants name a placeholder stack, so an unknown stack stays
+                // a no-op success, as GetTemplateSummary and
+                // UpdateTerminationProtection treat it. Nothing is recorded for
+                // it, so a later GetStackPolicy does not report a policy on a
+                // stack that never existed.
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                state.stack_policies.insert(stack, body);
+                if let Some(state) = accounts.regional_get_mut(&aid, &region) {
+                    if let Some(name) = state.live_stack(&stack).map(|s| s.name.clone()) {
+                        state.stack_policies.insert(name, body);
+                    }
+                }
                 Ok(xml_response_no_result("SetStackPolicy", &rid))
             }
 
@@ -2552,13 +2567,12 @@ impl CloudFormationService {
                 let enabled = enabled_raw.eq_ignore_ascii_case("true");
                 let stack_id = {
                     let mut accounts = self.state.write();
-                    let state = accounts.get_or_create(&aid);
                     // Toggle the flag on the stack itself (the single source of
                     // truth). Look up by name or stack id, skipping deleted
                     // stacks, so DeleteStack/DescribeStacks observe it.
-                    let target = state.stacks.values_mut().find(|s| {
-                        (s.name == stack || s.stack_id == stack) && s.status != "DELETE_COMPLETE"
-                    });
+                    let target = accounts
+                        .regional_get_mut(&aid, &region)
+                        .and_then(|state| state.live_stack_mut(&stack));
                     match target {
                         Some(s) => {
                             s.enable_termination_protection = enabled;
@@ -2597,9 +2611,9 @@ impl CloudFormationService {
                 ))
             }
             "DeactivateOrganizationsAccess" => {
-                let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                state.orgs_access_enabled = false;
+                if let Some(state) = self.state.write().get_mut(&aid) {
+                    state.orgs_access_enabled = false;
+                }
                 Ok(xml_response(
                     "DeactivateOrganizationsAccess",
                     String::new(),
@@ -2624,7 +2638,7 @@ impl CloudFormationService {
                 ))
             }
             "ValidateTemplate" => {
-                let body = self.template_for_introspection(&aid, &params, false)?;
+                let body = self.template_for_introspection(&aid, &region, &params, false)?;
                 Self::reject_unparseable_template(&body)?;
                 let summary = crate::template_summary::summarize(&body);
                 Ok(xml_response(
@@ -2639,7 +2653,7 @@ impl CloudFormationService {
                 &rid,
             )),
             "GetTemplateSummary" => {
-                let body = self.template_for_introspection(&aid, &params, true)?;
+                let body = self.template_for_introspection(&aid, &region, &params, true)?;
                 Self::reject_unparseable_template(&body)?;
                 let summary = crate::template_summary::summarize(&body);
                 Ok(xml_response(
@@ -2668,8 +2682,8 @@ impl CloudFormationService {
                 let stack_id = {
                     let accounts = self.state.read();
                     accounts
-                        .get(&aid)
-                        .and_then(|s| s.stacks.get(&stack))
+                        .regional(&aid, &region)
+                        .and_then(|s| s.live_stack(&stack))
                         .map(|s| s.stack_id.clone())
                         .unwrap_or_else(|| stack.clone())
                 };
@@ -2699,7 +2713,7 @@ impl CloudFormationService {
 pub(crate) mod tests {
     use super::{looks_like_url, parse_s3_url};
     use crate::service::{CloudFormationDeps, CloudFormationService};
-    use crate::state::{CloudFormationState, SharedCloudFormationState};
+    use crate::state::{CloudFormationAccountState, RegionalAccounts, SharedCloudFormationState};
     use fakecloud_core::delivery::DeliveryBus;
     use fakecloud_core::multi_account::MultiAccountState;
     use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
@@ -3097,12 +3111,13 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn svc() -> CloudFormationService {
-        let state: SharedCloudFormationState =
-            Arc::new(RwLock::new(MultiAccountState::<CloudFormationState>::new(
-                "000000000000",
-                "us-east-1",
-                "",
-            )));
+        let state: SharedCloudFormationState = Arc::new(RwLock::new(MultiAccountState::<
+            CloudFormationAccountState,
+        >::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        )));
         CloudFormationService::new(state, deps())
     }
 
@@ -3196,7 +3211,7 @@ pub(crate) mod tests {
         let svc = svc();
         svc.state
             .write()
-            .get_or_create("000000000000")
+            .regional_mut("000000000000", "us-east-1")
             .stacks
             .insert(
                 "decoy".to_string(),
@@ -3371,7 +3386,7 @@ pub(crate) mod tests {
         let svc = svc();
         svc.state
             .write()
-            .get_or_create("000000000000")
+            .regional_mut("000000000000", "us-east-1")
             .stacks
             .insert(
                 "gone".to_string(),
@@ -3434,7 +3449,7 @@ pub(crate) mod tests {
             // Seeded in the record shape older builds persisted, so the
             // migration into the typed store is exercised too.
             let mut accounts = svc.state.write();
-            let st = accounts.get_or_create("000000000000");
+            let st = accounts.regional_mut("000000000000", "us-east-1");
             let sets = st.extras.entry("stack_sets".to_string()).or_default();
             sets.insert(
                 "myset".to_string(),
@@ -3505,8 +3520,22 @@ pub(crate) mod tests {
     /// call depends on state an earlier one created. `ok` builds a fresh
     /// service per call, so anything that must EXIST by the time it is used
     /// belongs here instead.
+    /// Run `action` the way the service dispatcher does: the stack reference
+    /// is checked against the request's account and region first.
+    fn dispatch(
+        svc: &CloudFormationService,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let request = req(action, params);
+        if let Some(stack_ref) = params.iter().find(|(k, _)| *k == "StackName") {
+            crate::service::resolve_stack_ref(stack_ref.1, &request.account_id, &request.region)?;
+        }
+        call(svc, &request)
+    }
+
     fn ok_on(svc: &CloudFormationService, action: &str, params: &[(&str, &str)]) {
-        match call(svc, &req(action, params)) {
+        match dispatch(svc, action, params) {
             Ok(resp) => assert!(resp.status.is_success(), "{action} status: {}", resp.status),
             Err(e) => panic!("{action} failed: {e:?}"),
         }
@@ -3658,38 +3687,30 @@ pub(crate) mod tests {
         xml[start..end].to_string()
     }
 
-    /// A stack ARN for a stack that does not exist yet is used as the stack
-    /// id as given, not nested inside a freshly minted one.
+    /// A stack ARN addresses an existing stack only. One with no stack behind
+    /// it is refused, never cut down to its name to make a new stack.
     #[test]
-    fn change_set_on_missing_stack_arn_keeps_that_arn() {
+    fn change_set_on_missing_stack_arn_is_refused() {
         let svc = svc();
         let arn = "arn:aws:cloudformation:us-east-1:000000000000:stack/ghost/abc-123";
-        let created = body_str(
-            &svc.handle_extra_action(&req(
-                "CreateChangeSet",
-                &[("StackName", arn), ("ChangeSetName", "cs")],
-            ))
-            .expect("CreateChangeSet"),
-        );
-        assert_eq!(xml_field(&created, "StackId"), arn);
-        let described = body_str(
-            &svc.handle_extra_action(&req(
-                "DescribeChangeSet",
-                &[("StackName", arn), ("ChangeSetName", "cs")],
-            ))
-            .expect("DescribeChangeSet by the original ARN"),
-        );
-        assert_eq!(xml_field(&described, "StackName"), "ghost");
-        for filter in [arn, "ghost"] {
-            let xml = body_str(
-                &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", filter)]))
-                    .expect("ListChangeSets"),
-            );
-            assert!(
-                xml.contains("<ChangeSetName>cs</ChangeSetName>"),
-                "{filter}: {xml}"
-            );
+        for change_set_type in ["UPDATE", "CREATE"] {
+            let err = svc
+                .handle_extra_action(&req(
+                    "CreateChangeSet",
+                    &[
+                        ("StackName", arn),
+                        ("ChangeSetName", "cs"),
+                        ("ChangeSetType", change_set_type),
+                    ],
+                ))
+                .err()
+                .expect("CreateChangeSet on a missing stack id");
+            assert_eq!(err.code(), "ValidationError");
+            assert_eq!(err.message(), format!("Stack with id {arn} does not exist"));
         }
+        let accounts = svc.state.read();
+        let state = accounts.regional("000000000000", "us-east-1");
+        assert!(state.is_none_or(|s| s.stacks.is_empty() && s.extras.is_empty()));
     }
 
     /// UPDATE-type change sets aimed at the same missing stack share its id,
@@ -3747,7 +3768,7 @@ pub(crate) mod tests {
 
         for filter in ["s", stack_arn.as_str()] {
             let xml = body_str(
-                &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", filter)]))
+                &dispatch(&svc, "ListChangeSets", &[("StackName", filter)])
                     .expect("ListChangeSets"),
             );
             assert!(
@@ -3772,21 +3793,9 @@ pub(crate) mod tests {
             &[("StackName", &stack_arn), ("ChangeSetName", "by-name")],
         );
         let xml = body_str(
-            &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", "s")]))
-                .expect("ListChangeSets"),
+            &dispatch(&svc, "ListChangeSets", &[("StackName", "s")]).expect("ListChangeSets"),
         );
         assert!(!xml.contains("<ChangeSetName>"), "{xml}");
-    }
-
-    #[test]
-    fn stack_name_from_ref_takes_the_arn_name_segment() {
-        assert_eq!(super::stack_name_from_ref("plain"), "plain");
-        assert_eq!(
-            super::stack_name_from_ref(
-                "arn:aws:cloudformation:us-east-1:123456789012:stack/my-stack/abc-123"
-            ),
-            "my-stack"
-        );
     }
 
     /// Concurrent CREATE change sets for one new stack all attach to the
@@ -3821,7 +3830,9 @@ pub(crate) mod tests {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let accounts = svc.state.read();
-        let state = accounts.get("000000000000").expect("account");
+        let state = accounts
+            .regional("000000000000", "us-east-1")
+            .expect("account");
         let live: Vec<&str> = state
             .stacks
             .values()
@@ -4058,7 +4069,7 @@ pub(crate) mod tests {
         // The event log must carry exactly the REVIEW_IN_PROGRESS stack event.
         {
             let accounts = svc.state.read();
-            let acct = accounts.get("000000000000").unwrap();
+            let acct = accounts.regional("000000000000", "us-east-1").unwrap();
             let total: usize = acct.events.values().map(|v| v.len()).sum();
             assert_eq!(total, 1, "expected one event after CreateChangeSet");
             let ev = acct.events.values().next().unwrap().last().unwrap();
@@ -4102,7 +4113,7 @@ pub(crate) mod tests {
         .expect("execute change set");
 
         let accounts = svc.state.read();
-        let acct = accounts.get("000000000000").unwrap();
+        let acct = accounts.regional("000000000000", "us-east-1").unwrap();
         let stack_id = acct.stacks.get("cs-fast").unwrap().stack_id.clone();
         let events = acct.events.get(&stack_id).expect("stack has events");
 
@@ -4157,7 +4168,7 @@ pub(crate) mod tests {
 
         let accounts = svc.state.read();
         let stack = accounts
-            .get("000000000000")
+            .regional("000000000000", "us-east-1")
             .unwrap()
             .stacks
             .get("cs-stack")
@@ -4181,12 +4192,13 @@ pub(crate) mod tests {
     fn changeset_provisions_lambda_before_referencing_state_machine() {
         let d = deps();
         let sfn = d.stepfunctions.clone();
-        let state: SharedCloudFormationState =
-            Arc::new(RwLock::new(MultiAccountState::<CloudFormationState>::new(
-                "000000000000",
-                "us-east-1",
-                "",
-            )));
+        let state: SharedCloudFormationState = Arc::new(RwLock::new(MultiAccountState::<
+            CloudFormationAccountState,
+        >::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        )));
         let svc = CloudFormationService::new(state, d);
 
         // "Machine" sorts before "Worker", so without dependency ordering the

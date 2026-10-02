@@ -1574,9 +1574,10 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_cloudformation::CloudFormationSnapshot>(
-                        &bytes,
-                    ) {
+                    // Older schemas are migrated on parse: v2 kept one
+                    // account-wide stack map, which is split into regions by
+                    // each stack's ARN.
+                    match fakecloud_cloudformation::parse_cloudformation_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_cloudformation::CLOUDFORMATION_SNAPSHOT_SCHEMA_VERSION
@@ -1596,7 +1597,7 @@ async fn main() {
                                     "loaded cloudformation persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let stack_count = single_state.stacks.len();
+                                let stack_count = single_state.all_stacks().count();
                                 let account_id = single_state.account_id.clone();
                                 let mut mas = cloudformation_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
@@ -3692,7 +3693,7 @@ async fn main() {
                         let mut owned = fakecloud_route53::StackOwnedResources::new();
                         let cfn = cloudformation_state.read();
                         for (_, account) in cfn.iter() {
-                            for stack in account.stacks.values() {
+                            for stack in account.all_stacks() {
                                 for resource in &stack.resources {
                                     owned.record(
                                         &stack.stack_id,
