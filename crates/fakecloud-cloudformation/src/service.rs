@@ -344,6 +344,16 @@ fn service_key_for_type(resource_type: &str) -> Option<&'static str> {
 /// state through to disk afterwards, so a CFN-provisioned (or CFN-deleted)
 /// resource survives a restart. Services with no registered hook (memory mode,
 /// or non-snapshot-backed services) are skipped.
+/// Snapshot-hook keys of services a resource type's provisioner mutates in
+/// addition to its owning service: an `AWS::EKS::Cluster` also creates and
+/// deletes its EKS-managed cluster security group in EC2.
+fn secondary_service_keys_for_type(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        "AWS::EKS::Cluster" => &["ec2"],
+        _ => &[],
+    }
+}
+
 async fn persist_touched_services<I>(
     hooks: &BTreeMap<&'static str, SnapshotHook>,
     resource_types: I,
@@ -358,6 +368,7 @@ async fn persist_touched_services<I>(
         if let Some(key) = service_key_for_type(&ty) {
             keys.insert(key);
         }
+        keys.extend(secondary_service_keys_for_type(&ty));
     }
     for key in keys {
         if let Some(hook) = hooks.get(key) {
@@ -6367,6 +6378,26 @@ mod tests {
         assert_eq!(service_key_for_type("Custom::Thing::Resource"), None);
         assert_eq!(service_key_for_type("AWS"), None);
         assert_eq!(service_key_for_type(""), None);
+    }
+
+    #[tokio::test]
+    async fn persist_touched_services_eks_cluster_also_persists_ec2() {
+        // An EKS cluster's provisioner also writes its cluster security group
+        // into EC2 state, so both snapshot hooks must fire.
+        let eks = Arc::new(AtomicUsize::new(0));
+        let ec2 = Arc::new(AtomicUsize::new(0));
+        let mut hooks: BTreeMap<&'static str, fakecloud_persistence::SnapshotHook> =
+            BTreeMap::new();
+        hooks.insert("eks", counting_hook(eks.clone()));
+        hooks.insert("ec2", counting_hook(ec2.clone()));
+        persist_touched_services(&hooks, vec!["AWS::EKS::Cluster".to_string()]).await;
+        assert_eq!(eks.load(Ordering::SeqCst), 1);
+        assert_eq!(ec2.load(Ordering::SeqCst), 1);
+
+        // Other EKS resources only touch EKS state.
+        persist_touched_services(&hooks, vec!["AWS::EKS::Nodegroup".to_string()]).await;
+        assert_eq!(eks.load(Ordering::SeqCst), 2);
+        assert_eq!(ec2.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

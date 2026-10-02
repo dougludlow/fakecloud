@@ -18,7 +18,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
-use fakecloud_persistence::SnapshotStore;
+use fakecloud_persistence::{SnapshotHook, SnapshotStore};
 
 use crate::eks_helpers::*;
 
@@ -116,6 +116,11 @@ pub struct EksService {
     state: SharedEksState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// EC2 state, where each cluster's EKS-managed security group lives.
+    /// `None` (unit tests) keeps the cluster security group id synthetic.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// Persists EC2 after a cluster security group is created or deleted.
+    ec2_snapshot_hook: Option<SnapshotHook>,
 }
 
 enum PathArgs {
@@ -148,7 +153,19 @@ impl EksService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            ec2_state: None,
+            ec2_snapshot_hook: None,
         }
+    }
+
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    pub fn with_ec2_snapshot_hook(mut self, hook: Option<SnapshotHook>) -> Self {
+        self.ec2_snapshot_hook = hook;
+        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -581,6 +598,20 @@ impl EksService {
 
         let tags = parse_tag_map(body.get("tags"));
 
+        let mut resources_vpc_config = build_vpc_config_response(vpc_req, &id);
+        if let Some(ec2) = &self.ec2_state {
+            let network = crate::cluster_sg::create_cluster_security_group(
+                ec2,
+                &account_id,
+                &name,
+                &string_list(vpc_req.get("subnetIds")),
+                resources_vpc_config["vpcId"].as_str().unwrap_or_default(),
+            );
+            resources_vpc_config["vpcId"] = Value::String(network.vpc_id);
+            resources_vpc_config["clusterSecurityGroupId"] =
+                Value::String(network.cluster_security_group_id);
+        }
+
         let cluster = Cluster {
             name: name.clone(),
             arn: arn.clone(),
@@ -594,7 +625,7 @@ impl EksService {
             ),
             platform_version: "eks.1".to_string(),
             certificate_authority_data: default_ca_data(),
-            resources_vpc_config: build_vpc_config_response(vpc_req, &id),
+            resources_vpc_config,
             kubernetes_network_config: build_k8s_network_config(
                 body.get("kubernetesNetworkConfig"),
             ),
@@ -725,6 +756,12 @@ impl EksService {
             .remove(name)
             .expect("existence checked above");
         cluster.status = "DELETING".to_string();
+        if let (Some(ec2), Some(sg)) = (
+            &self.ec2_state,
+            cluster.resources_vpc_config["clusterSecurityGroupId"].as_str(),
+        ) {
+            crate::cluster_sg::delete_cluster_security_group(ec2, &req.account_id, name, sg);
+        }
         let id = arn_cluster_id(&cluster.endpoint);
         Ok(AwsResponse::json(
             StatusCode::OK,
@@ -767,8 +804,7 @@ impl EksService {
             params.push(("ClusterLogging".to_string(), logging.to_string()));
         }
         if let Some(vpc) = body.get("resourcesVpcConfig") {
-            let id = arn_cluster_id(&cluster.endpoint);
-            cluster.resources_vpc_config = build_vpc_config_response(vpc, &id);
+            merge_vpc_config_update(&mut cluster.resources_vpc_config, vpc);
             mark!("VpcConfigUpdate");
             params.push(("ResourcesVpcConfig".to_string(), vpc.to_string()));
         }
@@ -3795,6 +3831,13 @@ impl AwsService for EksService {
 
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
+            // CreateCluster / DeleteCluster also create / delete the cluster
+            // security group in EC2.
+            if matches!(action, "CreateCluster" | "DeleteCluster") {
+                if let Some(hook) = &self.ec2_snapshot_hook {
+                    hook().await;
+                }
+            }
         }
         result
     }

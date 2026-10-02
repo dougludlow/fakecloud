@@ -16,6 +16,7 @@ use fakecloud_eks::{
     nodegroup_arn, pod_identity_association_arn, AccessEntry, Addon, Cluster, FargateProfile,
     IdentityProviderConfig, Nodegroup, PodIdentityAssociation, TagMap, DEFAULT_K8S_VERSION,
 };
+use fakecloud_eks::{create_cluster_security_group, delete_cluster_security_group};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
 
@@ -89,7 +90,7 @@ impl ResourceProvisioner {
         );
         // Build the VpcConfigResponse-shaped object echoed on describe, mapping
         // the CFN PascalCase members to the API's camelCase ones.
-        let resources_vpc_config = json!({
+        let mut resources_vpc_config = json!({
             "subnetIds": vpc_req.get("SubnetIds").cloned().unwrap_or_else(|| json!([])),
             "securityGroupIds": vpc_req.get("SecurityGroupIds").cloned().unwrap_or_else(|| json!([])),
             "clusterSecurityGroupId": format!("sg-{sid}"),
@@ -162,6 +163,26 @@ impl ResourceProvisioner {
         if state.clusters.contains_key(&name) {
             return Err(format!("Cluster already exists with name: {name}"));
         }
+        // EKS creates the cluster security group in the cluster's VPC, exactly
+        // as the direct CreateCluster path does.
+        let subnet_ids: Vec<String> = vpc_req
+            .get("SubnetIds")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let network = create_cluster_security_group(
+            &self.ec2_state,
+            &self.account_id,
+            &name,
+            &subnet_ids,
+            &format!("vpc-{sid}"),
+        );
+        resources_vpc_config["vpcId"] = json!(network.vpc_id);
+        resources_vpc_config["clusterSecurityGroupId"] = json!(network.cluster_security_group_id);
         let cluster = Cluster {
             name: name.clone(),
             arn: arn.clone(),
@@ -229,7 +250,11 @@ impl ResourceProvisioner {
     pub(super) fn delete_eks_cluster(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.eks_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        state.clusters.remove(physical_id);
+        if let Some(cluster) = state.clusters.remove(physical_id) {
+            if let Some(sg) = cluster.resources_vpc_config["clusterSecurityGroupId"].as_str() {
+                delete_cluster_security_group(&self.ec2_state, &self.account_id, physical_id, sg);
+            }
+        }
         Ok(())
     }
 
