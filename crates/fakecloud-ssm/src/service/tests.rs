@@ -5858,17 +5858,18 @@ fn far_future_policy_windows_never_fire_and_never_panic() {
             {"Type": "NoChangeNotification", "Version": "1.0",
              "Attributes": {"After": "100000000", "Unit": "Days"}},
             {"Type": "Expiration", "Version": "1.0",
-             "Attributes": {"Timestamp": "0001-01-02T00:00:00.000Z"}},
-            {"Type": "ExpirationNotification", "Version": "1.0",
-             "Attributes": {"Before": "100000000", "Unit": "Days"}}
+             "Attributes": {"Timestamp": "9999-01-01T00:00:00.000Z"}}
         ]),
     )
     .unwrap();
-    // Ticks the evaluator; must not panic.
+    // Ticks the evaluator on a live parameter (a future Expiration keeps the
+    // purge from deleting it first); must not panic.
     let events = svc.parameter_policy_events("123456789012");
     assert!(!events
         .iter()
         .any(|e| e.event_type == "NoChangeNotification"));
+    let req = make_request("GetParameter", json!({"Name": "/far-window"}));
+    assert!(svc.get_parameter(&req).is_ok());
 
     let svc = make_service();
     put_with_policies(
@@ -5924,4 +5925,37 @@ fn persisted_unrepresentable_window_does_not_poison_reads() {
         .any(|e| e.event_type == "NoChangeNotification"));
     let req = make_request("GetParameter", json!({"Name": "/persisted"}));
     assert!(svc.get_parameter(&req).is_ok());
+}
+
+// A legacy unrepresentable window must not hide a valid Expiration in the same
+// policy array: the expired parameter still gets purged on read.
+#[test]
+fn persisted_unrepresentable_window_keeps_expiration_working() {
+    let svc = make_service();
+    put_with_policies(
+        &svc,
+        "/legacy-expired",
+        json!([{"Type": "NoChangeNotification", "Version": "1.0",
+                "Attributes": {"After": "1", "Unit": "Days"}}]),
+    )
+    .unwrap();
+    {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("123456789012");
+        let param = state.parameters.get_mut("/legacy-expired").unwrap();
+        param.policies = Some(
+            json!([
+                {"Type": "NoChangeNotification", "Version": "1.0",
+                 "Attributes": {"After": "9223372036854775807", "Unit": "Days"}},
+                {"Type": "Expiration", "Version": "1.0",
+                 "Attributes": {"Timestamp": "2000-01-01T00:00:00.000Z"}}
+            ])
+            .to_string(),
+        );
+    }
+    let req = make_request("GetParameter", json!({"Name": "/legacy-expired"}));
+    match svc.get_parameter(&req) {
+        Ok(_) => panic!("the expired parameter must be purged"),
+        Err(err) => assert_eq!(err.code(), "ParameterNotFound"),
+    }
 }
