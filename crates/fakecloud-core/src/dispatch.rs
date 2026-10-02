@@ -386,10 +386,9 @@ pub async fn dispatch(
         let resolved_for_verify = match resolved.as_ref() {
             Some(r) => r,
             None => {
-                return build_error_response(
-                    StatusCode::FORBIDDEN,
-                    "InvalidClientTokenId",
-                    "The security token included in the request is invalid",
+                return unresolved_credential_response(
+                    &config,
+                    caller_akid,
                     &request_id,
                     ErrorEnvelope::for_request(&detected, &parts.headers),
                 );
@@ -690,8 +689,15 @@ pub async fn dispatch(
                                 service.iam_condition_keys_for(&aws_request, iam_action);
 
                             // ABAC: populate tag-based condition keys.
-                            // aws:ResourceTag/*
-                            match service.resource_tags_for(&iam_action.resource) {
+                            // aws:ResourceTag/*. An `iam:PassRole` resource is
+                            // an IAM role, not one of this service's resources,
+                            // so the service has no tags (or resource policy)
+                            // for it.
+                            let service_resource = !iam_action.is_pass_role();
+                            match service_resource
+                                .then(|| service.resource_tags_for(&iam_action.resource))
+                                .flatten()
+                            {
                                 Some(tags) => condition_context.resource_tags = Some(tags),
                                 None => tracing::debug!(
                                     target: "fakecloud::iam::audit",
@@ -721,8 +727,11 @@ pub async fn dispatch(
                             // multi-account alignment); S3 ARNs have an
                             // empty account field, so we fall back to the
                             // server's configured account ID in that case.
-                            let resource_policy_json =
-                                config.resource_policy_provider.as_ref().and_then(|p| {
+                            let resource_policy_json = config
+                                .resource_policy_provider
+                                .as_ref()
+                                .filter(|_| service_resource)
+                                .and_then(|p| {
                                     p.resource_policy(&detected.service, &iam_action.resource)
                                 });
                             // Derive the resource-owning account. Prefer a provider
@@ -737,6 +746,7 @@ pub async fn dispatch(
                             let resource_account_id = config
                                 .resource_policy_provider
                                 .as_ref()
+                                .filter(|_| service_resource)
                                 .and_then(|p| {
                                     p.resource_owner_account(
                                         &detected.service,
@@ -866,6 +876,37 @@ pub async fn dispatch(
                         // handler.
                     }
                 }
+            } else if let Some(akid) = aws_request
+                .access_key_id
+                .as_deref()
+                .filter(|_| aws_request.principal.is_none())
+            {
+                // The request presented an access key that resolves to no
+                // identity: unknown, deactivated (Inactive), or an expired /
+                // revoked STS session. AWS rejects such a request before
+                // authorization (`InvalidClientTokenId` / `ExpiredToken`), so
+                // under strict enforcement it must not run unchecked -- nor
+                // reach STS, which would otherwise read the missing principal
+                // as the account root and mint real credentials. The
+                // explicit exemptions stay: the reserved `test*` root
+                // identity (excluded above) and truly anonymous requests
+                // (next branch). Soft mode logs and lets it through.
+                tracing::warn!(
+                    target: "fakecloud::iam::audit",
+                    service = %detected.service,
+                    action = %aws_request.action,
+                    mode = %config.iam_mode,
+                    request_id = %request_id,
+                    "request credential does not resolve to an identity; denying under strict, allowing under soft"
+                );
+                if config.iam_mode.is_strict() {
+                    return unresolved_credential_response(
+                        &config,
+                        akid,
+                        &request_id,
+                        ErrorEnvelope::for_request(&detected, &aws_request.headers),
+                    );
+                }
             } else if aws_request.access_key_id.is_none() {
                 // Truly anonymous (unsigned) caller — no Authorization header at
                 // all. No identity policies exist, so authorization rests
@@ -876,12 +917,8 @@ pub async fn dispatch(
                 // iam_enforceable service in enforcement mode would bypass
                 // authorization entirely.
                 //
-                // A request that carried an Authorization header but whose
-                // credential did not resolve (principal `None` with
-                // `access_key_id` `Some`) is intentionally left alone here: with
-                // SigV4 verification off, fakecloud does not reject unverified
-                // signed requests, and turning them into anonymous denials would
-                // change long-standing behavior.
+                // A request whose credential did not resolve (principal `None`
+                // with `access_key_id` `Some`) is handled by the branch above.
                 let iam_actions = service.iam_actions_for(&aws_request);
                 if !iam_actions.is_empty() {
                     for iam_action in &iam_actions {
@@ -1600,6 +1637,39 @@ fn sha256_hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// The AWS error for a request whose access key resolves to no identity:
+/// `ExpiredToken` for a temporary credential that has expired, otherwise
+/// `InvalidClientTokenId` (unknown or deactivated key, revoked session).
+fn unresolved_credential_response(
+    config: &DispatchConfig,
+    access_key_id: &str,
+    request_id: &str,
+    envelope: ErrorEnvelope,
+) -> Response<Body> {
+    let expired = config
+        .credential_resolver
+        .as_ref()
+        .is_some_and(|r| r.is_expired(access_key_id));
+    let (code, message) = if expired {
+        (
+            "ExpiredToken",
+            "The security token included in the request is expired",
+        )
+    } else {
+        (
+            "InvalidClientTokenId",
+            "The security token included in the request is invalid",
+        )
+    };
+    build_error_response(
+        StatusCode::FORBIDDEN,
+        code,
+        message,
+        request_id,
+        envelope,
+    )
+}
+
 fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<String> {
     let provider = config.resource_policy_provider.as_ref()?;
     let segment = uri.path().split('/').find(|s| !s.is_empty())?.to_string();
@@ -1675,7 +1745,9 @@ fn authorize_internal_caller(
         );
         return denied();
     }
-    for iam_action in &iam_actions {
+    // A service acting on AWS's behalf is not subject to `iam:PassRole`:
+    // that check binds the customer principal handing a role to a service.
+    for iam_action in iam_actions.iter().filter(|a| !a.is_pass_role()) {
         let now = chrono::Utc::now();
         let mut context = ConditionContext {
             aws_principal_arn: Some(principal.arn.clone()),
@@ -2032,6 +2104,41 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(sha256_hex_lower(b"abc").len(), 64);
+    }
+
+    #[test]
+    fn unresolved_credential_distinguishes_expired_from_invalid() {
+        struct Expired;
+        impl CredentialResolver for Expired {
+            fn resolve(&self, _: &str) -> Option<crate::auth::ResolvedCredential> {
+                None
+            }
+            fn is_expired(&self, akid: &str) -> bool {
+                akid == "ASIAEXPIRED"
+            }
+        }
+        let mut cfg = DispatchConfig::new("us-east-1", "123456789012");
+        cfg.credential_resolver = Some(Arc::new(Expired));
+        let detected = protocol::DetectedRequest {
+            service: "sts".into(),
+            action: "GetCallerIdentity".into(),
+            protocol: AwsProtocol::Query,
+        };
+        let code = |akid: &str| {
+            let resp = unresolved_credential_response(
+                &cfg,
+                akid,
+                "r",
+                ErrorEnvelope::for_request(&detected, &http::HeaderMap::new()),
+            );
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            resp.headers()["x-amz-error-code"]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(code("ASIAEXPIRED"), "ExpiredToken");
+        assert_eq!(code("AKIAUNKNOWN"), "InvalidClientTokenId");
     }
 
     #[test]

@@ -4963,6 +4963,25 @@ fn create_bucket_tags_decode_xml_entities() {
 }
 
 #[test]
+fn put_bucket_replication_requires_pass_role_on_the_replication_role() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let body = br#"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/repl</Role><Rule><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule></ReplicationConfiguration>"#;
+    let req = make_request(Method::PUT, "/src", &[("replication", "")], body);
+    let actions = svc.iam_actions_for(&req);
+    assert_eq!(actions.len(), 2, "{actions:?}");
+    assert_eq!(actions[0].action, "PutBucketReplication");
+    assert!(actions[1].is_pass_role());
+    assert_eq!(actions[1].resource, "arn:aws:iam::123456789012:role/repl");
+    let keys = svc.iam_condition_keys_for(&req, &actions[1]);
+    assert_eq!(
+        keys["iam:passedtoservice"],
+        vec!["s3.amazonaws.com".to_string()]
+    );
+}
+
+#[test]
 fn create_bucket_requires_a_permission_per_setting_it_configures() {
     use fakecloud_core::service::AwsService as _;
 

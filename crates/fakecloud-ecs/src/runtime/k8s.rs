@@ -407,7 +407,7 @@ fn with_credentials_env(
         .map(|(plan, env)| {
             let mut env = env.clone();
             if plan.has_task_role {
-                env.push(task_creds::credentials_env(task_id, link_local, base));
+                env.extend(task_creds::credentials_env(task_id, link_local, base));
             }
             (plan.clone(), env)
         })
@@ -1442,6 +1442,10 @@ mod tests {
                 c.name
             );
             assert_eq!(env_of(c, "AWS_CONTAINER_CREDENTIALS_FULL_URI"), None);
+            assert_eq!(
+                env_of(c, "AWS_CONTAINER_AUTHORIZATION_TOKEN"),
+                Some(crate::runtime::task_credentials_token("task-1").as_str())
+            );
         }
     }
 

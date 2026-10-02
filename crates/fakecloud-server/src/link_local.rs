@@ -111,8 +111,9 @@ fn ecs_creds_router(ctx: Arc<ImdsContext>, tasks: Arc<EcsTaskCredentials>) -> Ro
             ECS_TASK_CREDS_PATH,
             get(
                 |State(tasks): State<Arc<EcsTaskCredentials>>,
-                 axum::extract::Path(task_id): axum::extract::Path<String>| async move {
-                    tasks.respond(&task_id)
+                 axum::extract::Path(task_id): axum::extract::Path<String>,
+                 headers: axum::http::HeaderMap| async move {
+                    tasks.respond(&task_id, crate::ecs_creds::authorization_header(&headers))
                 },
             ),
         )

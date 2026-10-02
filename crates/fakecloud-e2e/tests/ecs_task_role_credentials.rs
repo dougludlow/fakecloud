@@ -64,16 +64,55 @@ async fn wait_status(ecs: &aws_sdk_ecs::Client, cluster: &str, arn: &str, want: 
 }
 
 async fn fetch_creds(server: &TestServer, task_id: &str) -> (u16, serde_json::Value) {
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/_fakecloud/ecs/creds/{task_id}",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap();
+    fetch_creds_with(server, task_id, None).await
+}
+
+async fn fetch_creds_with(
+    server: &TestServer,
+    task_id: &str,
+    authorization: Option<&str>,
+) -> (u16, serde_json::Value) {
+    let mut req = reqwest::Client::new().get(format!(
+        "{}/_fakecloud/ecs/creds/{task_id}",
+        server.endpoint()
+    ));
+    if let Some(token) = authorization {
+        req = req.header("Authorization", token);
+    }
+    let resp = req.send().await.unwrap();
     let status = resp.status().as_u16();
     (status, resp.json().await.unwrap())
+}
+
+/// The `AWS_CONTAINER_AUTHORIZATION_TOKEN` fakecloud injected into the task's
+/// container, read from the container's real environment.
+fn injected_authorization_token(task_id: &str) -> String {
+    let cli = helpers::container_cli();
+    let ps = std::process::Command::new(&cli)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=^{task_id}"),
+            "--format",
+            "{{.ID}}",
+        ])
+        .output()
+        .unwrap();
+    let id = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .next()
+        .expect("task container")
+        .to_string();
+    let inspect = std::process::Command::new(&cli)
+        .args(["inspect", "--format", "{{json .Config.Env}}", &id])
+        .output()
+        .unwrap();
+    let env: Vec<String> = serde_json::from_slice(&inspect.stdout).unwrap();
+    env.iter()
+        .find_map(|e| e.strip_prefix("AWS_CONTAINER_AUTHORIZATION_TOKEN="))
+        .expect("task container carries AWS_CONTAINER_AUTHORIZATION_TOKEN")
+        .to_string()
 }
 
 fn sdk_config(server: &TestServer, creds: &serde_json::Value) -> aws_config::SdkConfig {
@@ -177,7 +216,7 @@ async fn running_task_gets_its_role_session_until_it_stops() {
                 .command(
                     "nc -l -p 80 -e true & sleep 1; \
                      echo PORT80=$(netstat -ltn | grep -q ':80 ' && echo up || echo down); \
-                     wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" | grep -o '\"RoleArn\":\"[^\"]*\"'; \
+                     wget -qO- --header \"Authorization: $AWS_CONTAINER_AUTHORIZATION_TOKEN\" \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" | grep -o '\"RoleArn\":\"[^\"]*\"'; \
                      sleep 300",
                 )
                 .build(),
@@ -197,14 +236,20 @@ async fn running_task_gets_its_role_session_until_it_stops() {
     let task_id = task_arn.rsplit('/').next().unwrap().to_string();
     wait_status(&ecs, "creds-cluster", &task_arn, "RUNNING").await;
 
-    let (status, creds) = fetch_creds(&server, &task_id).await;
+    // Under --iam strict, knowing the task ID is not enough: the request must
+    // carry the task's injected AWS_CONTAINER_AUTHORIZATION_TOKEN.
+    let (status, body) = fetch_creds(&server, &task_id).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["code"], "AccessDenied");
+    let token = injected_authorization_token(&task_id);
+    let (status, creds) = fetch_creds_with(&server, &task_id, Some(&token)).await;
     assert_eq!(status, 200, "{creds}");
     assert_eq!(creds["RoleArn"].as_str(), Some(role_arn.as_str()));
     for field in ["AccessKeyId", "SecretAccessKey", "Token", "Expiration"] {
         assert!(creds[field].is_string(), "missing {field}: {creds}");
     }
     // Refetching within the validity window hands back the same session.
-    let (_, again) = fetch_creds(&server, &task_id).await;
+    let (_, again) = fetch_creds_with(&server, &task_id, Some(&token)).await;
     assert_eq!(again["AccessKeyId"], creds["AccessKeyId"]);
 
     // The container reached the endpoint at 169.254.170.2 + the injected
@@ -304,7 +349,7 @@ async fn running_task_gets_its_role_session_until_it_stops() {
 
     // The endpoint refuses the stopped task, and the session it handed out
     // no longer authenticates.
-    let (status, body) = fetch_creds(&server, &task_id).await;
+    let (status, body) = fetch_creds_with(&server, &task_id, Some(&token)).await;
     assert_not_found(status, &body);
     let mut revoked = false;
     for _ in 0..20 {
@@ -765,8 +810,9 @@ async fn task_without_role_and_unknown_id_get_the_agent_error() {
 #[tokio::test]
 async fn register_task_definition_refuses_roles_ecs_cannot_assume() {
     let server = TestServer::start_with_env(&[("FAKECLOUD_IAM", "strict")]).await;
-    let iam = server.iam_client().await;
-    let ecs = server.ecs_client().await;
+    let root = root_config(&server).await;
+    let iam = aws_sdk_iam::Client::new(&root);
+    let ecs = aws_sdk_ecs::Client::new(&root);
 
     let untrusted = iam
         .create_role()

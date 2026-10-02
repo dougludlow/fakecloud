@@ -45,20 +45,36 @@ pub enum CredentialsError {
     NoId,
     /// No running task with that ID has a task role.
     NotFound,
+    /// Under `--iam strict`, the request did not present the task's
+    /// `AWS_CONTAINER_AUTHORIZATION_TOKEN` in its `Authorization` header.
+    Unauthorized,
 }
 
 impl IntoResponse for CredentialsError {
     fn into_response(self) -> Response {
-        let (code, message) = match self {
-            Self::NoId => ("NoIdInRequest", "No Credential ID in the request"),
-            Self::NotFound => ("InvalidIdInRequest", "Credentials not found"),
+        let (status, code, message) = match self {
+            Self::NoId => (
+                StatusCode::BAD_REQUEST,
+                "NoIdInRequest",
+                "No Credential ID in the request",
+            ),
+            Self::NotFound => (
+                StatusCode::BAD_REQUEST,
+                "InvalidIdInRequest",
+                "Credentials not found",
+            ),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "AccessDenied",
+                "Authorization token missing or invalid for this task",
+            ),
         };
         (
-            StatusCode::BAD_REQUEST,
+            status,
             axum::Json(serde_json::json!({
                 "code": code,
                 "message": format!("{ERR_PREFIX}{message}"),
-                "HTTPErrorCode": StatusCode::BAD_REQUEST.as_u16(),
+                "HTTPErrorCode": status.as_u16(),
             })),
         )
             .into_response()
@@ -72,6 +88,8 @@ pub struct EcsTaskCredentials {
     iam: SharedIamState,
     default_account_id: String,
     cache: WorkloadCredentialCache,
+    /// Require the task's authorization token (`--iam strict`).
+    require_authorization_token: bool,
 }
 
 /// The full ARN of a task's role. ECS accepts a bare role name for
@@ -93,16 +111,34 @@ fn cache_key(account_id: &str, task_id: &str) -> String {
 }
 
 impl EcsTaskCredentials {
+    /// An endpoint that requires no authorization token (`--iam` off/soft).
+    #[cfg(test)]
     pub fn new(
         ecs: SharedEcsState,
         iam: SharedIamState,
         default_account_id: impl Into<String>,
+    ) -> Arc<Self> {
+        Self::with_authorization(ecs, iam, default_account_id, false)
+    }
+
+    /// Like [`EcsTaskCredentials::new`]; with `require_authorization_token`
+    /// (set under `--iam strict`) a request must present the task's
+    /// `AWS_CONTAINER_AUTHORIZATION_TOKEN` (injected into its containers) as
+    /// its `Authorization` header. Otherwise anyone able to reach fakecloud
+    /// and name a running task ID would walk away with its role's
+    /// credentials; on ECS only the task's own network reaches the agent.
+    pub fn with_authorization(
+        ecs: SharedEcsState,
+        iam: SharedIamState,
+        default_account_id: impl Into<String>,
+        require_authorization_token: bool,
     ) -> Arc<Self> {
         let this = Arc::new(Self {
             ecs,
             iam,
             default_account_id: default_account_id.into(),
             cache: WorkloadCredentialCache::new(),
+            require_authorization_token,
         });
         this.revoke_persisted_sessions();
         this
@@ -186,8 +222,23 @@ impl EcsTaskCredentials {
         drop(accounts);
     }
 
-    /// The endpoint response for `task_id`.
-    pub fn respond(&self, task_id: &str) -> Response {
+    /// Whether `authorization` (the request's `Authorization` header) may
+    /// fetch `task_id`'s credentials.
+    fn authorized(&self, task_id: &str, authorization: Option<&str>) -> bool {
+        if !self.require_authorization_token {
+            return true;
+        }
+        let expected = fakecloud_ecs::runtime::task_credentials_token(task_id);
+        authorization
+            .is_some_and(|got| constant_time_eq(got.trim().as_bytes(), expected.as_bytes()))
+    }
+
+    /// The endpoint response for `task_id`, given the request's
+    /// `Authorization` header.
+    pub fn respond(&self, task_id: &str, authorization: Option<&str>) -> Response {
+        if !task_id.is_empty() && !self.authorized(task_id, authorization) {
+            return CredentialsError::Unauthorized.into_response();
+        }
         match self.credentials(task_id) {
             Ok(creds) => (StatusCode::OK, axum::Json(creds.to_container_json())).into_response(),
             Err(e) => e.into_response(),
@@ -225,6 +276,7 @@ fn respond_link_local(
     creds: &EcsTaskCredentials,
     method: &axum::http::Method,
     path: &str,
+    authorization: Option<&str>,
 ) -> Response {
     let Some(rest) = path.strip_prefix(V2_CREDENTIALS_PATH) else {
         return (StatusCode::NOT_FOUND, "404 page not found\n").into_response();
@@ -239,13 +291,25 @@ fn respond_link_local(
     };
     if method == axum::http::Method::HEAD {
         // Same status and headers as GET, no body.
-        let (parts, _) = creds.respond(task_id).into_parts();
+        let (parts, _) = creds.respond(task_id, authorization).into_parts();
         return Response::from_parts(parts, axum::body::Body::empty());
     }
     if method != axum::http::Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    creds.respond(task_id)
+    creds.respond(task_id, authorization)
+}
+
+/// The `Authorization` header of a credentials request, where the AWS SDKs
+/// put `AWS_CONTAINER_AUTHORIZATION_TOKEN`.
+pub fn authorization_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Serve the ECS agent's link-local credentials surface on the main listener.
@@ -260,7 +324,12 @@ pub async fn link_local_host_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     if is_link_local_host(req.headers()) {
-        return respond_link_local(&creds, req.method(), req.uri().path());
+        return respond_link_local(
+            &creds,
+            req.method(),
+            req.uri().path(),
+            authorization_header(req.headers()),
+        );
     }
     next.run(req).await
 }
@@ -430,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn error_body_matches_the_agent() {
         let (_ecs, _iam, endpoint) = setup();
-        let resp = endpoint.respond("missing");
+        let resp = endpoint.respond("missing", None);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -506,6 +575,57 @@ mod tests {
         assert!(!resolves(&iam, &creds));
     }
 
+    #[tokio::test]
+    async fn strict_mode_requires_the_tasks_authorization_token() {
+        let (ecs, iam, _) = setup();
+        let endpoint = EcsTaskCredentials::with_authorization(ecs.clone(), iam, ACCOUNT, true);
+        add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+        add_task(&ecs, ACCOUNT, "other", Some(ROLE));
+        let token = fakecloud_ecs::runtime::task_credentials_token("t");
+
+        // No token, or another task's token: refused before any mint.
+        for auth in [
+            None,
+            Some("wrong".to_string()),
+            Some(fakecloud_ecs::runtime::task_credentials_token("other")),
+        ] {
+            let resp = endpoint.respond("t", auth.as_deref());
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["code"], "AccessDenied");
+            assert_eq!(v["HTTPErrorCode"], 401);
+        }
+        // The task's own token: served.
+        assert_eq!(endpoint.respond("t", Some(&token)).status(), StatusCode::OK);
+
+        // The link-local surface enforces it too.
+        let app = app(endpoint);
+        use tower::ServiceExt;
+        let req = |auth: Option<&str>| {
+            let mut b = axum::http::Request::builder()
+                .uri("/v2/credentials/t")
+                .header(axum::http::header::HOST, LINK_LOCAL_HOST);
+            if let Some(a) = auth {
+                b = b.header(axum::http::header::AUTHORIZATION, a);
+            }
+            b.body(axum::body::Body::empty()).unwrap()
+        };
+        let resp = app.clone().oneshot(req(None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app.clone().oneshot(req(Some(&token))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn token_not_required_by_default() {
+        let (ecs, _iam, endpoint) = setup();
+        add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+        assert_eq!(endpoint.respond("t", None).status(), StatusCode::OK);
+    }
+
     /// A router whose own routes answer `fallthrough`, behind the link-local
     /// middleware, so tests see which requests the middleware claims.
     fn app(endpoint: Arc<EcsTaskCredentials>) -> axum::Router {
@@ -575,7 +695,7 @@ mod tests {
             add_task(&ecs, ACCOUNT, "t", Some(ROLE));
             endpoint
         };
-        let head = respond_link_local(&creds, &axum::http::Method::HEAD, "/v2/credentials/t");
+        let head = respond_link_local(&creds, &axum::http::Method::HEAD, "/v2/credentials/t", None);
         assert!(head
             .headers()
             .get(axum::http::header::CONTENT_LENGTH)

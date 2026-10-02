@@ -349,8 +349,9 @@ pub struct IamState {
     pub credential_identities: BTreeMap<String, CredentialIdentity>,
     /// Temporary credentials issued by STS, keyed by access key ID. Includes
     /// the secret access key and session token — required for SigV4
-    /// verification and IAM enforcement. Expired entries are purged lazily on
-    /// lookup.
+    /// verification and IAM enforcement. Expired entries stay (they no
+    /// longer authenticate) so a request using one is answered
+    /// `ExpiredToken`, as on AWS.
     pub sts_temp_credentials: BTreeMap<String, StsTempCredential>,
     pub credential_report_generated: bool,
     pub ssh_public_keys: BTreeMap<String, Vec<SshPublicKey>>, // user_name -> keys
@@ -546,14 +547,14 @@ impl IamState {
     /// for a given access key ID.
     ///
     /// Searches IAM user access keys first, then STS temporary credentials.
-    /// Expired STS temporary credentials are purged in-place and skipped.
+    /// Expired STS temporary credentials are skipped (and kept, so they can
+    /// be reported as expired).
     ///
     /// Returns `None` if the AKID is unknown or its STS credential has
     /// expired.
     ///
     /// Required for SigV4 signature verification (batch 3) and principal
-    /// resolution (batch 4). Callers must hold a write lock on
-    /// [`IamState`] to allow the lazy purge; read-only callers should use
+    /// resolution (batch 4). Read-only callers can use
     /// [`IamState::credential_secret_readonly`].
     pub fn credential_secret(&mut self, access_key_id: &str) -> Option<SecretLookup> {
         // IAM user access keys: look up by scanning (same pattern the
@@ -601,14 +602,23 @@ impl IamState {
                     federated_provider: temp.federated_provider.clone(),
                 });
             }
-            self.sts_temp_credentials.remove(access_key_id);
+            // Keep the expired entry: a later request with it must be told
+            // `ExpiredToken` (see [`IamState::sts_credential_expired`]), not
+            // `InvalidClientTokenId` as for a key that never existed.
         }
         None
     }
 
-    /// Read-only variant of [`IamState::credential_secret`] that does not
-    /// purge expired entries. Prefer the mutable variant wherever possible
-    /// to keep the temp-credential table small.
+    /// True when `access_key_id` names an STS temporary credential that has
+    /// expired, so the caller gets AWS's `ExpiredToken` rather than
+    /// `InvalidClientTokenId`.
+    pub fn sts_credential_expired(&self, access_key_id: &str) -> bool {
+        self.sts_temp_credentials
+            .get(access_key_id)
+            .is_some_and(|t| t.expiration <= Utc::now())
+    }
+
+    /// Read-only variant of [`IamState::credential_secret`].
     pub fn credential_secret_readonly(&self, access_key_id: &str) -> Option<SecretLookup> {
         for keys in self.access_keys.values() {
             for key in keys {
@@ -800,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_secret_purges_expired_sts_credentials() {
+    fn credential_secret_skips_but_remembers_expired_sts_credentials() {
         let mut state = IamState::new("123456789012");
         state.sts_temp_credentials.insert(
             "FSIAOLD".to_string(),
@@ -819,7 +829,8 @@ mod tests {
             },
         );
         assert!(state.credential_secret("FSIAOLD").is_none());
-        assert!(!state.sts_temp_credentials.contains_key("FSIAOLD"));
+        assert!(state.sts_credential_expired("FSIAOLD"));
+        assert!(!state.sts_credential_expired("FSIANEVER"));
     }
 
     #[test]

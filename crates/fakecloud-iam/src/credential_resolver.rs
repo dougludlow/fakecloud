@@ -13,8 +13,9 @@ use fakecloud_core::auth::{CredentialResolver, Principal, PrincipalType, Resolve
 use crate::state::SharedIamState;
 
 /// [`CredentialResolver`] backed by an [`IamState`] shared via
-/// [`SharedIamState`]. Acquires a write lock on lookup so expired STS
-/// temporary credentials are purged in place.
+/// [`SharedIamState`]. Expired STS temporary credentials never resolve;
+/// [`CredentialResolver::is_expired`] reports them so dispatch can answer
+/// `ExpiredToken`.
 #[derive(Clone)]
 pub struct IamCredentialResolver {
     state: SharedIamState,
@@ -57,6 +58,13 @@ impl CredentialResolver for IamCredentialResolver {
             }
         }
         None
+    }
+
+    fn is_expired(&self, access_key_id: &str) -> bool {
+        self.state
+            .read()
+            .iter()
+            .any(|(_, s)| s.sts_credential_expired(access_key_id))
     }
 }
 

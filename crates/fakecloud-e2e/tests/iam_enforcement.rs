@@ -94,14 +94,12 @@ async fn sts_get_caller_identity_denied_without_policy() {
 }
 
 /// bug-hunt 2026-06-13, finding 5.1: enabling `--verify-sigv4` alongside
-/// `--iam` is what actually binds a request to a real identity — an
-/// unknown access key id is then rejected with InvalidClientTokenId before
-/// any handler runs. (Without `--verify-sigv4`, an unresolved key falls
-/// through unenforced — the same path the local-dev bootstrap relies on —
-/// which is why the server logs a loud startup warning recommending
-/// `--verify-sigv4`; that gap is inherent to not verifying signatures and
-/// can't be closed without breaking the bootstrap, so it's surfaced, not
-/// silently "fixed".)
+/// `--iam` binds a request to a real identity -- an unknown access key id is
+/// rejected with InvalidClientTokenId before any handler runs. (Without
+/// `--verify-sigv4`, strict mode still rejects a key that resolves to no
+/// identity; see `unresolved_access_key_rejected_under_strict_without_sigv4`.
+/// What only signature verification adds is proof the caller holds the
+/// secret.)
 #[tokio::test]
 async fn unknown_access_key_rejected_when_sigv4_verification_enabled() {
     // strict IAM *with* SigV4 verification — the secure configuration.
@@ -123,6 +121,115 @@ async fn unknown_access_key_rejected_when_sigv4_verification_enabled() {
         msg.contains("InvalidClientTokenId"),
         "expected InvalidClientTokenId for an unknown access key, got {msg}"
     );
+}
+
+/// Bug audit 2026-10-01: under `--iam strict` without `--verify-sigv4`, a key
+/// that resolves to no identity (unknown, or a deactivated user key) used to
+/// skip every check -- and AssumeRole then read the missing principal as the
+/// account root and minted real credentials. Strict now rejects it the way
+/// AWS does, while the reserved `test*` root identity stays exempt.
+#[tokio::test]
+async fn unresolved_access_key_rejected_under_strict_without_sigv4() {
+    let server = TestServer::start_with_env(&[("FAKECLOUD_IAM", "strict")]).await;
+    let boot = sdk_config_with(&server, "test", "test").await;
+    let iam_boot = IamClient::new(&boot);
+    iam_boot
+        .create_role()
+        .role_name("open-role")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // Unknown key: rejected on an enforced service, and AssumeRole mints
+    // nothing.
+    let bogus = sdk_config_with(&server, "AKIABOGUS000000000000", "bogus-secret").await;
+    let err = IamClient::new(&bogus)
+        .list_users()
+        .send()
+        .await
+        .expect_err("unknown key must be rejected under strict");
+    assert!(
+        format!("{err:?}").contains("InvalidClientTokenId"),
+        "{err:?}"
+    );
+    let err = StsClient::new(&bogus)
+        .assume_role()
+        .role_arn("arn:aws:iam::123456789012:role/open-role")
+        .role_session_name("s")
+        .send()
+        .await
+        .expect_err("an unresolved caller must not be treated as root");
+    assert!(
+        format!("{err:?}").contains("InvalidClientTokenId"),
+        "{err:?}"
+    );
+
+    // A deactivated user key is rejected the same way.
+    let (akid, secret) = bootstrap_user(&server, "inactive-user").await;
+    attach_inline_policy(
+        &server,
+        "inactive-user",
+        "all",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+    )
+    .await;
+    let user_cfg = sdk_config_with(&server, &akid, &secret).await;
+    IamClient::new(&user_cfg)
+        .list_users()
+        .send()
+        .await
+        .expect("active key with an allow-all policy works");
+    iam_boot
+        .update_access_key()
+        .user_name("inactive-user")
+        .access_key_id(&akid)
+        .status(aws_sdk_iam::types::StatusType::Inactive)
+        .send()
+        .await
+        .unwrap();
+    let err = IamClient::new(&user_cfg)
+        .list_users()
+        .send()
+        .await
+        .expect_err("an Inactive key must not authenticate");
+    assert!(
+        format!("{err:?}").contains("InvalidClientTokenId"),
+        "{err:?}"
+    );
+
+    // The reserved root identity is still exempt.
+    iam_boot.list_users().send().await.unwrap();
+}
+
+/// A `Deny` guarded by a negated operator applies when the request carries no
+/// value for the key at all (AWS: `StringNotEquals` on an absent key is
+/// true). Before the fix the missing key made the condition false and the
+/// Deny was skipped.
+#[tokio::test]
+async fn deny_with_negated_condition_applies_when_key_absent() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "vpce-user").await;
+    attach_inline_policy(
+        &server,
+        "vpce-user",
+        "allow-but-only-via-vpce",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"},
+            {"Effect":"Deny","Action":"*","Resource":"*",
+             "Condition":{"StringNotEquals":{"aws:SourceVpce":"vpce-0123456789abcdef0"}}}
+        ]}"#,
+    )
+    .await;
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let err = IamClient::new(&cfg)
+        .list_users()
+        .send()
+        .await
+        .expect_err("no aws:SourceVpce in the request: the Deny must apply");
+    assert!(format!("{err:?}").contains("AccessDenied"), "{err:?}");
 }
 
 #[tokio::test]
@@ -1650,6 +1757,93 @@ async fn topic_policy_condition_block_gates_access() {
 // and we match on AccessDeniedException / ServiceException shapes that
 // the runtime emits when enforcement says yes.
 // ======================================================================
+
+/// Bug audit 2026-10-01: `iam:PassRole` was never evaluated for the caller.
+/// A principal holding only `lambda:CreateFunction` could attach any role --
+/// an admin role included -- to code it controls. CreateFunction now also
+/// needs `iam:PassRole` on the role, with `iam:PassedToService` set to
+/// `lambda.amazonaws.com`.
+#[tokio::test]
+async fn lambda_create_function_requires_pass_role_on_the_role() {
+    let server = start_strict().await;
+    let boot = sdk_config_with(&server, "test", "test").await;
+    let iam_boot = IamClient::new(&boot);
+    let admin_role = iam_boot
+        .create_role()
+        .role_name("admin-role")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap()
+        .role()
+        .unwrap()
+        .arn()
+        .to_string();
+    let (akid, secret) = bootstrap_user(&server, "deployer").await;
+    attach_inline_policy(
+        &server,
+        "deployer",
+        "create-only",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"lambda:CreateFunction","Resource":"*"}]}"#,
+    )
+    .await;
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let lambda = aws_sdk_lambda::Client::new(&cfg);
+    let create = |name: &'static str| {
+        lambda
+            .create_function()
+            .function_name(name)
+            .runtime(aws_sdk_lambda::types::Runtime::Python312)
+            .role(&admin_role)
+            .handler("index.handler")
+            .code(
+                aws_sdk_lambda::types::FunctionCode::builder()
+                    .zip_file(aws_sdk_lambda::primitives::Blob::new(
+                        make_empty_python_zip(),
+                    ))
+                    .build(),
+            )
+            .send()
+    };
+    let err = create("escalate")
+        .await
+        .expect_err("CreateFunction without iam:PassRole must be denied");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessDenied") && msg.contains("iam:PassRole"),
+        "{msg}"
+    );
+
+    // PassRole scoped to a different service does not help.
+    attach_inline_policy(
+        &server,
+        "deployer",
+        "pass-to-ec2",
+        &format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"iam:PassRole","Resource":"{admin_role}","Condition":{{"StringEquals":{{"iam:PassedToService":"ec2.amazonaws.com"}}}}}}]}}"#
+        ),
+    )
+    .await;
+    create("still-denied")
+        .await
+        .expect_err("PassRole for ec2 must not cover Lambda");
+
+    // PassRole to Lambda for this role: allowed.
+    attach_inline_policy(
+        &server,
+        "deployer",
+        "pass-to-lambda",
+        &format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"iam:PassRole","Resource":"{admin_role}","Condition":{{"StringEquals":{{"iam:PassedToService":"lambda.amazonaws.com"}}}}}}]}}"#
+        ),
+    )
+    .await;
+    create("allowed")
+        .await
+        .expect("CreateFunction with iam:PassRole to lambda is allowed");
+}
 
 fn make_empty_python_zip() -> Vec<u8> {
     use std::io::Write;
