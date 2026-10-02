@@ -5185,10 +5185,13 @@ async fn main() {
                     .is_some_and(|state| state.stages.values().any(|s| s.contains_key(stage)))
             }))
             .with_v2_domain_lookup(Arc::new(move |account_id: &str, host: &str| {
-                v2_domain_state
-                    .read()
-                    .get(account_id)
-                    .is_some_and(|state| state.domain_names.contains_key(host))
+                v2_domain_state.read().get(account_id).is_some_and(|state| {
+                    fakecloud_apigatewayv2::domain_for_host(
+                        state,
+                        &fakecloud_core::protocol::normalize_host(host),
+                    )
+                    .is_some()
+                })
             })),
     ));
     let bedrock_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =

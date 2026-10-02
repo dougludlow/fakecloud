@@ -396,6 +396,33 @@ pub fn is_s3_control_host(headers: &HeaderMap) -> bool {
     control_label && parse_routing_host(host).is_none_or(|h| h.bucket.is_none())
 }
 
+/// Normalize a `Host` header value for comparing against configured domain
+/// names: drop the port (`api.example.com:4566`), any trailing root dot, and
+/// lowercase it (DNS names are case-insensitive). A bracketed IPv6 literal
+/// keeps its brackets.
+pub fn normalize_host(host: &str) -> String {
+    let host = host.trim();
+    let without_port = if let Some(rest) = host.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &host[..end + 2],
+            None => host,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    without_port.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The normalized `Host` header (see [`normalize_host`]), if present.
+pub fn normalized_host_from_headers(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get("host")?.to_str().ok()?;
+    let host = normalize_host(host);
+    (!host.is_empty()).then_some(host)
+}
+
 /// Pull the `Host` header and parse it with [`parse_routing_host`].
 pub fn parse_routing_host_from_headers(headers: &HeaderMap) -> Option<RoutingHost> {
     let host = headers.get("host")?.to_str().ok()?;
@@ -1569,6 +1596,15 @@ mod tests {
         let detected = detect_service(&headers, &query, &body).unwrap();
         assert_eq!(detected.service, "bedrock");
         assert_eq!(detected.protocol, AwsProtocol::RestJson);
+    }
+
+    #[test]
+    fn normalize_host_strips_port_and_case() {
+        assert_eq!(normalize_host("Rest.Example.com:4566"), "rest.example.com");
+        assert_eq!(normalize_host("rest.example.com."), "rest.example.com");
+        assert_eq!(normalize_host("rest.example.com"), "rest.example.com");
+        assert_eq!(normalize_host("[::1]:4566"), "[::1]");
+        assert_eq!(normalize_host("localhost"), "localhost");
     }
 
     #[test]

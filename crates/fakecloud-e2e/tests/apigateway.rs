@@ -1365,3 +1365,37 @@ async fn path_style_urls_pick_the_named_api_when_stages_collide() {
         }
     }
 }
+
+#[tokio::test]
+async fn custom_domain_base_path_mapping_resolves_with_host_port() {
+    // Clients reach fakecloud on a port, so the Host carries it
+    // (`rest.example.com:4566`); the domain name is still matched, case
+    // insensitively, and its base path mapping picks the API and stage.
+    let server = TestServer::start().await;
+    let client = server.apigateway_client().await;
+    let api_id = provision_mock_items_api(&client, "mapped").await;
+    client
+        .create_domain_name()
+        .domain_name("rest.example.com")
+        .send()
+        .await
+        .expect("create_domain_name");
+    client
+        .create_base_path_mapping()
+        .domain_name("rest.example.com")
+        .base_path("v1")
+        .rest_api_id(&api_id)
+        .stage("prod")
+        .send()
+        .await
+        .expect("create_base_path_mapping");
+
+    let http = reqwest::Client::new();
+    let (status, body) = get_body(
+        http.get(format!("{}/v1/items", server.endpoint()))
+            .header("host", "Rest.Example.com:4566"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"api":"mapped"}"#);
+}

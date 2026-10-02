@@ -670,14 +670,7 @@ fn resolve_custom_domain(
     service: &ApiGatewayService,
     req: &AwsRequest,
 ) -> Option<(Option<String>, Vec<String>, Option<String>)> {
-    let host = req
-        .headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if host.is_empty() {
-        return None;
-    }
+    let host = fakecloud_core::protocol::normalized_host_from_headers(&req.headers)?;
 
     let accounts = service.state_handle().read();
     let state = accounts.get(&req.account_id)?;
@@ -687,13 +680,10 @@ fn resolve_custom_domain(
     // (`api.example.com`) as Host; the regionalDomainName is the internal
     // CloudFront/regional alias. Matching only the latter missed every
     // request that used the actual domain name.
-    let domain_entry = state.domain_names.iter().find(|(name, value)| {
-        name.eq_ignore_ascii_case(host)
-            || value
-                .get("regionalDomainName")
-                .and_then(Value::as_str)
-                .is_some_and(|rdn| rdn.eq_ignore_ascii_case(host))
-    });
+    let domain_entry = state
+        .domain_names
+        .iter()
+        .find(|(name, value)| domain_matches_host(name, value, &host));
     let (domain_name, _domain_value) = domain_entry?;
 
     let mappings = state.base_path_mappings.get(domain_name)?;
@@ -730,6 +720,18 @@ fn resolve_custom_domain(
     }
 
     None
+}
+
+/// Whether a v1 `DomainName` (its name key or its `regionalDomainName`) is the
+/// already-normalized request host (port stripped, lowercase; see
+/// [`fakecloud_core::protocol::normalize_host`]).
+pub(crate) fn domain_matches_host(name: &str, value: &Value, host: &str) -> bool {
+    let matches = |candidate: &str| fakecloud_core::protocol::normalize_host(candidate) == host;
+    matches(name)
+        || value
+            .get("regionalDomainName")
+            .and_then(Value::as_str)
+            .is_some_and(matches)
 }
 
 /// Drop the leading stage segment of an execute-api request path, keeping the

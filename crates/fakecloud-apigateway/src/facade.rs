@@ -106,46 +106,29 @@ impl ApiGatewayFacade {
         self
     }
 
-    /// The request's `Host`, with and without its port.
-    fn host_candidates(req: &AwsRequest) -> Vec<String> {
-        let Some(host) = req.headers.get("host").and_then(|v| v.to_str().ok()) else {
-            return Vec::new();
-        };
-        let mut out = vec![host.to_string()];
-        if let Some((bare, _port)) = host.rsplit_once(':') {
-            if !bare.is_empty() && !bare.contains(']') {
-                out.push(bare.to_string());
-            }
-        }
-        out
-    }
-
     /// Whether the `Host` names a v1 custom domain (its name or its regional
     /// domain name), which the v1 data plane resolves via base path mappings.
     fn host_is_v1_custom_domain(&self, req: &AwsRequest) -> bool {
-        let hosts = Self::host_candidates(req);
-        if hosts.is_empty() {
+        let Some(host) = fakecloud_core::protocol::normalized_host_from_headers(&req.headers)
+        else {
             return false;
-        }
+        };
         let accounts = self.v1.state_handle().read();
         let Some(state) = accounts.get(&req.account_id) else {
             return false;
         };
-        state.domain_names.iter().any(|(name, value)| {
-            let regional = value.get("regionalDomainName").and_then(|v| v.as_str());
-            hosts.iter().any(|h| {
-                name.eq_ignore_ascii_case(h) || regional.is_some_and(|r| r.eq_ignore_ascii_case(h))
-            })
-        })
+        state
+            .domain_names
+            .iter()
+            .any(|(name, value)| crate::data_plane::domain_matches_host(name, value, &host))
     }
 
     fn host_is_v2_custom_domain(&self, req: &AwsRequest) -> bool {
         let Some(lookup) = self.v2_has_domain.as_ref() else {
             return false;
         };
-        Self::host_candidates(req)
-            .iter()
-            .any(|h| lookup(&req.account_id, h))
+        fakecloud_core::protocol::normalized_host_from_headers(&req.headers)
+            .is_some_and(|h| lookup(&req.account_id, &h))
     }
 
     /// Rewrite a path-style invocation URL to the canonical execute-api form:
