@@ -1575,4 +1575,95 @@ mod tests {
         // Repeating against the same endpoint still returns the first one.
         assert_eq!(make(&first), a);
     }
+
+    async fn tags_of_arn(s: &AcmService, arn: &str) -> Value {
+        json_of(
+            s.handle(req("ListTagsForResource", json!({ "ResourceArn": arn })))
+                .await
+                .unwrap(),
+        )["Tags"]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn acme_resources_are_taggable_through_the_generic_tag_api() {
+        let s = svc();
+        let body = json!({
+            "AuthorizationBehavior": "PRE_APPROVED",
+            "CertificateAuthority": ca(),
+            "Tags": [{ "Key": "env", "Value": "prod" }],
+        });
+        let endpoint = json_of(
+            s.create_acme_endpoint(&req("CreateAcmeEndpoint", body))
+                .unwrap(),
+        )["AcmeEndpointArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Creation-time tags are visible.
+        assert_eq!(
+            tags_of_arn(&s, &endpoint).await,
+            json!([{ "Key": "env", "Value": "prod" }])
+        );
+
+        let binding = make_binding(&s, &endpoint);
+        let validation = json_of(
+            s.create_acme_domain_validation(&req(
+                "CreateAcmeDomainValidation",
+                json!({
+                    "AcmeEndpointArn": endpoint,
+                    "DomainName": "example.com",
+                    "PrevalidationOptions": { "DnsPrevalidation": {} },
+                    "Tags": [{ "Key": "a", "Value": "1" }],
+                }),
+            ))
+            .unwrap(),
+        )["AcmeDomainValidationArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for arn in [&endpoint, &binding, &validation] {
+            s.handle(req(
+                "TagResource",
+                json!({ "ResourceArn": arn, "Tags": [{ "Key": "team", "Value": "pki" }] }),
+            ))
+            .await
+            .unwrap();
+            let tags = tags_of_arn(&s, arn).await;
+            assert!(
+                tags.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["Key"] == "team" && t["Value"] == "pki"),
+                "{arn}: {tags}"
+            );
+            s.handle(req(
+                "UntagResource",
+                json!({ "ResourceArn": arn, "TagKeys": ["team"] }),
+            ))
+            .await
+            .unwrap();
+            let tags = tags_of_arn(&s, arn).await;
+            assert!(
+                !tags.as_array().unwrap().iter().any(|t| t["Key"] == "team"),
+                "{arn}: {tags}"
+            );
+        }
+        assert_eq!(
+            tags_of_arn(&s, &validation).await,
+            json!([{ "Key": "a", "Value": "1" }])
+        );
+
+        // An unknown ARN is still ResourceNotFoundException.
+        let err = s
+            .handle(req(
+                "ListTagsForResource",
+                json!({ "ResourceArn": format!("{endpoint}-missing") }),
+            ))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "ResourceNotFoundException");
+    }
 }

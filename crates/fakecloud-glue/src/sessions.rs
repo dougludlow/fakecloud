@@ -42,6 +42,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.sessions, &id, session.clone(), "Session")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "session", &id),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "Session": session })))
     }
 
@@ -57,14 +61,26 @@ impl GlueService {
     }
 
     pub(crate) fn list_sessions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let (ids, sessions): (Vec<String>, Vec<Value>) = accounts
             .get(&req.account_id)
             .map(|st| {
-                (
-                    st.sessions.keys().cloned().collect(),
-                    st.sessions.values().cloned().collect(),
-                )
+                st.sessions
+                    .iter()
+                    .filter(|(k, _)| {
+                        st.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "session",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .unzip()
             })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({
@@ -80,6 +96,12 @@ impl GlueService {
         let st = accounts.get_or_create(&req.account_id, &req.region);
         // DeleteSession does not declare EntityNotFoundException; idempotent.
         st.sessions.remove(&id);
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "session",
+            &id,
+        ));
         Ok(AwsResponse::ok_json(json!({ "Id": id })))
     }
 

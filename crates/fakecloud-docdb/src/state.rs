@@ -51,6 +51,14 @@ pub struct ClusterMember {
     pub promotion_tier: i32,
 }
 
+/// Serverless v2 capacity range of a cluster
+/// (`ServerlessV2ScalingConfiguration`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ServerlessV2Scaling {
+    pub min_capacity: Option<f64>,
+    pub max_capacity: Option<f64>,
+}
+
 /// A DocumentDB DB cluster (control-plane record).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbCluster {
@@ -77,6 +85,8 @@ pub struct DbCluster {
     pub preferred_backup_window: String,
     pub preferred_maintenance_window: String,
     pub storage_type: String,
+    #[serde(default)]
+    pub serverless_v2_scaling: Option<ServerlessV2Scaling>,
     pub availability_zones: Vec<String>,
     pub vpc_security_group_ids: Vec<String>,
     pub enabled_cloudwatch_logs_exports: Vec<String>,

@@ -204,12 +204,51 @@ impl AthenaService {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let configuration = body.get("EngineConfiguration").cloned();
+        let monitoring_configuration = body.get("MonitoringConfiguration").cloned();
+        let idle_minutes = body
+            .get("SessionIdleTimeoutInMinutes")
+            .and_then(Value::as_i64)
+            .unwrap_or(20);
+        let request_tags = parse_tags(body.get("Tags"))?;
+        let copy_wg_tags = body
+            .get("CopyWorkGroupTags")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let mut state = self.state.write();
         let account = account_mut(&mut state, &req.account_id);
-        if !account.work_groups.contains_key(&work_group) {
+        let Some(wg) = account.work_groups.get(&work_group) else {
             return Err(invalid_request(format!("Workgroup {work_group} not found")));
-        }
+        };
+        let execution_role = body
+            .get("ExecutionRole")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                wg.configuration
+                    .as_ref()
+                    .and_then(|c| c.get("ExecutionRole"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
         let id = synth_uuid();
+        // Session tags: the workgroup's (when CopyWorkGroupTags) overlaid by
+        // the request's own Tags.
+        let mut session_tags = if copy_wg_tags {
+            let wg_arn = athena_arn(
+                &req.region,
+                &req.account_id,
+                &format!("workgroup/{work_group}"),
+            );
+            account.tags.get(&wg_arn).cloned().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        session_tags.extend(request_tags);
+        if !session_tags.is_empty() {
+            account
+                .tags
+                .insert(session_arn(&req.region, &req.account_id, &id), session_tags);
+        }
         account.sessions.insert(
             id.clone(),
             Session {
@@ -224,6 +263,9 @@ impl AthenaService {
                 idle_since_date_time: Some(Utc::now()),
                 configuration,
                 notebook_version: Some("Athena notebook version 1".to_string()),
+                execution_role,
+                monitoring_configuration,
+                session_idle_timeout_minutes: Some(idle_minutes),
             },
         );
         Ok(AwsResponse::ok_json(json!({

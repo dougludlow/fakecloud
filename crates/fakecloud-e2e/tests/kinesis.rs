@@ -941,3 +941,86 @@ async fn kinesis_get_records_caps_response_at_ten_mib() {
         "resuming the iterator returns the remaining records"
     );
 }
+
+#[tokio::test]
+async fn kinesis_create_stream_settings_and_consumer_tags() {
+    use aws_sdk_kinesis::types::{StreamMode, StreamModeDetails};
+    let server = TestServer::start().await;
+    let client = server.kinesis_client().await;
+
+    client
+        .create_stream()
+        .stream_name("configured")
+        .stream_mode_details(
+            StreamModeDetails::builder()
+                .stream_mode(StreamMode::OnDemand)
+                .build()
+                .unwrap(),
+        )
+        .warm_throughput_mibps(32)
+        .max_record_size_in_kib(2048)
+        .send()
+        .await
+        .expect("create");
+    let summary = client
+        .describe_stream_summary()
+        .stream_name("configured")
+        .send()
+        .await
+        .unwrap();
+    let s = summary.stream_description_summary().unwrap();
+    assert_eq!(s.warm_throughput().unwrap().target_mibps(), Some(32));
+    assert_eq!(s.max_record_size_in_kib(), Some(2048));
+    let stream_arn = s.stream_arn().to_string();
+
+    // 1.5 MiB is over the 1 MiB default but under the configured ceiling.
+    client
+        .put_record()
+        .stream_name("configured")
+        .partition_key("k")
+        .data(Blob::new(vec![b'x'; 1536 * 1024]))
+        .send()
+        .await
+        .expect("put large record");
+
+    let consumer = client
+        .register_stream_consumer()
+        .stream_arn(&stream_arn)
+        .consumer_name("tagged")
+        .tags("env", "dev")
+        .send()
+        .await
+        .expect("register consumer");
+    let consumer_arn = consumer.consumer().unwrap().consumer_arn().to_string();
+    client
+        .tag_resource()
+        .resource_arn(&consumer_arn)
+        .tags("team", "core")
+        .send()
+        .await
+        .expect("tag consumer");
+    let tags = client
+        .list_tags_for_resource()
+        .resource_arn(&consumer_arn)
+        .send()
+        .await
+        .expect("list consumer tags");
+    let mut pairs: Vec<(String, String)> = tags
+        .tags()
+        .iter()
+        .map(|t| {
+            (
+                t.key().to_string(),
+                t.value().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("env".to_string(), "dev".to_string()),
+            ("team".to_string(), "core".to_string())
+        ]
+    );
+}

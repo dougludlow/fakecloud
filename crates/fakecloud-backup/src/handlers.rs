@@ -456,6 +456,7 @@ impl BackupService {
             .plans
             .remove(id)
             .ok_or_else(|| not_found(format!("Backup plan not found: {id}")))?;
+        st.tags.remove(&plan.arn);
         Ok(ok(json!({
             "BackupPlanId": plan.id,
             "BackupPlanArn": plan.arn,
@@ -818,6 +819,10 @@ impl BackupService {
                 recovery_points: Default::default(),
             },
         );
+        let t = parse_tags(body.get("BackupVaultTags"));
+        if !t.is_empty() {
+            st.tags.insert(arn.clone(), t);
+        }
         Ok(ok(json!({
             "RestoreAccessBackupVaultArn": arn,
             "VaultState": "CREATING",
@@ -860,7 +865,9 @@ impl BackupService {
                 "Backup vault cannot be deleted while it contains recovery points",
             ));
         }
-        st.vaults.remove(name);
+        if let Some(v) = st.vaults.remove(name) {
+            st.tags.remove(&v.arn);
+        }
         Ok(empty(200))
     }
 
@@ -1975,9 +1982,13 @@ impl BackupService {
         check_ident_name(name, "FrameworkName")?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        st.frameworks
+        let fw = st
+            .frameworks
             .remove(name)
             .ok_or_else(|| not_found(format!("Framework not found: {name}")))?;
+        if let Some(arn) = fw.get("FrameworkArn").and_then(Value::as_str) {
+            st.tags.remove(arn);
+        }
         Ok(empty(200))
     }
 
@@ -2105,9 +2116,13 @@ impl BackupService {
         check_ident_name(name, "ReportPlanName")?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        st.report_plans
+        let rp = st
+            .report_plans
             .remove(name)
             .ok_or_else(|| not_found(format!("Report plan not found: {name}")))?;
+        if let Some(arn) = rp.get("ReportPlanArn").and_then(Value::as_str) {
+            st.tags.remove(arn);
+        }
         Ok(empty(200))
     }
 
@@ -2362,7 +2377,9 @@ impl BackupService {
         }
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        st.restore_testing_plans.remove(name);
+        if let Some(p) = st.restore_testing_plans.remove(name) {
+            st.tags.remove(&p.arn);
+        }
         Ok(empty(204))
     }
 
@@ -2603,9 +2620,13 @@ impl BackupService {
     fn delete_tiering(&self, req: &AwsRequest, name: &str) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        st.tiering_configs
+        let cfg = st
+            .tiering_configs
             .remove(name)
             .ok_or_else(|| not_found(format!("Tiering configuration not found: {name}")))?;
+        if let Some(arn) = cfg.get("TieringConfigurationArn").and_then(Value::as_str) {
+            st.tags.remove(arn);
+        }
         Ok(ok(json!({})))
     }
 
@@ -2991,11 +3012,7 @@ impl BackupService {
                     .get(&recovery_point_arn)
                     .map(|p| (vname.clone(), p.clone()))
             })
-            .ok_or_else(|| {
-                not_found(format!(
-                    "Recovery point not found: {recovery_point_arn}"
-                ))
-            })?;
+            .ok_or_else(|| not_found(format!("Recovery point not found: {recovery_point_arn}")))?;
 
         let arn = access_point_arn(&region, &account_id, &name);
         if st.access_points.contains_key(&arn) {
@@ -3027,10 +3044,15 @@ impl BackupService {
             status_message: None,
             metadata: parse_string_map(body.get("AccessPointMetadata")),
             policy: str_field(&body, "AccessPointPolicy"),
-            tags: parse_string_map(body.get("Tags")),
         };
         let status = record.status.clone();
         st.access_points.insert(arn.clone(), record);
+        // Tags live in the account's ARN-keyed store so ListTags / TagResource
+        // / UntagResource see them like any other Backup resource.
+        let t = parse_tags(body.get("Tags"));
+        if !t.is_empty() {
+            st.tags.insert(arn.clone(), t);
+        }
 
         let mut resp = ok(json!({ "AccessPointArn": arn, "Status": status }));
         resp.status = StatusCode::CREATED;
@@ -3060,6 +3082,7 @@ impl BackupService {
         st.access_points
             .remove(arn)
             .ok_or_else(|| not_found(format!("Backup access point not found: {arn}")))?;
+        st.tags.remove(arn);
         Ok(empty(204))
     }
 

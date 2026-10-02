@@ -18,8 +18,8 @@ use fakecloud_persistence::SnapshotStore;
 use crate::state::{
     global_cluster_arn, rds_arn, ClusterMember, DbCluster, DbClusterParameterGroup,
     DbClusterSnapshot, DbInstance, DbSubnetGroup, DocDbSnapshot, DocDbState, EventSubscription,
-    GlobalCluster, GlobalClusterMember, ParameterValue, SharedDocDbState, Subnet, Tag,
-    DOCDB_SNAPSHOT_SCHEMA_VERSION,
+    GlobalCluster, GlobalClusterMember, ParameterValue, ServerlessV2Scaling, SharedDocDbState,
+    Subnet, Tag, DOCDB_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::xml;
 
@@ -385,6 +385,33 @@ fn collect_list(req: &AwsRequest, base: &str, members: &[&str]) -> Vec<String> {
     out
 }
 
+/// Parse `ServerlessV2ScalingConfiguration.{MinCapacity,MaxCapacity}`,
+/// merging any given bound onto `base` (the cluster's current range on
+/// ModifyDBCluster). `None` when the request names neither bound.
+/// An unparseable capacity is ignored: the operations declare no
+/// `InvalidParameterValue`-equivalent to reject it with.
+fn parse_serverless_v2(
+    req: &AwsRequest,
+    base: Option<&ServerlessV2Scaling>,
+) -> Option<ServerlessV2Scaling> {
+    let bound = |name: &str| {
+        optional_query_param(req, &format!("ServerlessV2ScalingConfiguration.{name}"))
+            .and_then(|v| v.parse::<f64>().ok())
+    };
+    let (min, max) = (bound("MinCapacity"), bound("MaxCapacity"));
+    if min.is_none() && max.is_none() {
+        return None;
+    }
+    let mut out = base.cloned().unwrap_or_default();
+    if min.is_some() {
+        out.min_capacity = min;
+    }
+    if max.is_some() {
+        out.max_capacity = max;
+    }
+    Some(out)
+}
+
 /// Parse `Tags.Tag.N.{Key,Value}` (and the generic `.member.N` form).
 fn parse_tags(req: &AwsRequest) -> Vec<Tag> {
     let mut out = Vec::new();
@@ -595,6 +622,7 @@ impl DocDbService {
                 .unwrap_or_else(|| "sun:08:00-sun:08:30".to_string()),
             storage_type: optional_query_param(req, "StorageType")
                 .unwrap_or_else(|| "standard".to_string()),
+            serverless_v2_scaling: parse_serverless_v2(req, None),
             availability_zones: {
                 let azs = collect_list(req, "AvailabilityZones", &["AvailabilityZone", "member"]);
                 if azs.is_empty() {
@@ -709,6 +737,12 @@ impl DocDbService {
         }
         if let Some(v) = optional_query_param(req, "CopyTagsToSnapshot") {
             cluster.copy_tags_to_snapshot = v == "true";
+        }
+        if let Some(v) = optional_query_param(req, "StorageType") {
+            cluster.storage_type = v;
+        }
+        if let Some(scaling) = parse_serverless_v2(req, cluster.serverless_v2_scaling.as_ref()) {
+            cluster.serverless_v2_scaling = Some(scaling);
         }
         if let Some(v) = optional_query_param(req, "Port").and_then(|v| v.parse().ok()) {
             cluster.port = v;
@@ -1343,7 +1377,9 @@ impl DocDbService {
             backup_retention_period: 1,
             preferred_backup_window: "07:00-07:30".to_string(),
             preferred_maintenance_window: "sun:08:00-sun:08:30".to_string(),
-            storage_type: "standard".to_string(),
+            storage_type: optional_query_param(req, "StorageType")
+                .unwrap_or_else(|| "standard".to_string()),
+            serverless_v2_scaling: parse_serverless_v2(req, None),
             availability_zones: snap.availability_zones.clone(),
             vpc_security_group_ids: collect_list(
                 req,
@@ -1403,6 +1439,12 @@ impl DocDbService {
         cluster.status = "available".to_string();
         cluster.cluster_create_time = Utc::now();
         cluster.tags = parse_tags(req);
+        if let Some(v) = optional_query_param(req, "StorageType") {
+            cluster.storage_type = v;
+        }
+        if let Some(scaling) = parse_serverless_v2(req, None) {
+            cluster.serverless_v2_scaling = Some(scaling);
+        }
         cluster.copy_tags_to_snapshot = optional_query_param(req, "CopyTagsToSnapshot")
             .map(|v| v == "true")
             .unwrap_or(false);

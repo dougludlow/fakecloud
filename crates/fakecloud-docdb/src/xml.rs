@@ -9,7 +9,7 @@ use fakecloud_aws::xml::xml_escape;
 
 use crate::state::{
     DbCluster, DbClusterParameterGroup, DbClusterSnapshot, DbInstance, DbSubnetGroup,
-    EventSubscription, GlobalCluster, ParameterValue, Tag,
+    EventSubscription, GlobalCluster, ParameterValue, ServerlessV2Scaling, Tag,
 };
 
 /// ISO-8601 timestamp in the form AWS emits for RDS/DocDB `TStamp` fields.
@@ -38,6 +38,21 @@ fn string_list(name: &str, member: &str, items: &[String]) -> String {
         .map(|v| format!("<{member}>{}</{member}>", xml_escape(v)))
         .collect();
     format!("<{name}>{inner}</{name}>")
+}
+
+/// `<ServerlessV2ScalingConfiguration>` with whichever bounds are set;
+/// omitted entirely for a cluster that was never given a range.
+fn serverless_v2_scaling(scaling: Option<&ServerlessV2Scaling>) -> String {
+    let Some(scaling) = scaling else {
+        return String::new();
+    };
+    let bound =
+        |tag: &str, v: Option<f64>| v.map(|v| format!("<{tag}>{v}</{tag}>")).unwrap_or_default();
+    format!(
+        "<ServerlessV2ScalingConfiguration>{}{}</ServerlessV2ScalingConfiguration>",
+        bound("MinCapacity", scaling.min_capacity),
+        bound("MaxCapacity", scaling.max_capacity),
+    )
 }
 
 pub(crate) fn db_cluster(c: &DbCluster) -> String {
@@ -101,6 +116,7 @@ pub(crate) fn db_cluster(c: &DbCluster) -> String {
          <PreferredBackupWindow>{pbw}</PreferredBackupWindow>\
          <PreferredMaintenanceWindow>{pmw}</PreferredMaintenanceWindow>\
          <StorageType>{st}</StorageType>\
+         {serverless}\
          <ClusterCreateTime>{cct}</ClusterCreateTime>\
          {azs}\
          <VpcSecurityGroups>{vpc_sgs}</VpcSecurityGroups>\
@@ -128,6 +144,7 @@ pub(crate) fn db_cluster(c: &DbCluster) -> String {
         pbw = xml_escape(&c.preferred_backup_window),
         pmw = xml_escape(&c.preferred_maintenance_window),
         st = xml_escape(&c.storage_type),
+        serverless = serverless_v2_scaling(c.serverless_v2_scaling.as_ref()),
         cct = ts(&c.cluster_create_time),
     )
 }

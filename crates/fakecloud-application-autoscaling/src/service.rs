@@ -1,5 +1,6 @@
 //! Application Auto Scaling JSON 1.1 service.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -257,6 +258,18 @@ impl ApplicationAutoScalingService {
                 predicted_capacity: None,
             };
             account.scalable_targets.insert(key, target);
+            // Create-time Tags seed the tag store (AWS applies them only when
+            // the target is first registered; later re-registrations leave
+            // tags to TagResource/UntagResource).
+            if let Some(tags) = body.get("Tags").and_then(Value::as_object) {
+                let tags: BTreeMap<String, String> = tags
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                if !tags.is_empty() {
+                    account.tags.insert(arn.clone(), tags);
+                }
+            }
             (arn, None, None, false)
         };
 
@@ -375,12 +388,13 @@ impl ApplicationAutoScalingService {
 
         let mut state = self.state.write();
         let account = account_mut(&mut state, &req.account_id);
-        if account.scalable_targets.remove(&key).is_none() {
+        let Some(removed) = account.scalable_targets.remove(&key) else {
             return Err(object_not_found(format!(
                 "No scalable target registered for ServiceNamespace={} ResourceId={} ScalableDimension={}",
                 key.0, key.1, key.2
             )));
-        }
+        };
+        account.tags.remove(&removed.arn);
         // Cascade: real AWS keeps the policies/scheduled actions on the
         // target; cleaning up here keeps state coherent for tests.
         account
@@ -1761,5 +1775,43 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code(), "InvalidNextTokenException");
+    }
+
+    #[tokio::test]
+    async fn register_tags_are_listed_and_deregister_clears_them() {
+        let svc = ApplicationAutoScalingService::new(Arc::new(RwLock::new(
+            ApplicationAutoScalingAccounts::new(),
+        )));
+        let target = json!({
+            "ServiceNamespace": "ecs",
+            "ResourceId": "service/c/s",
+            "ScalableDimension": "ecs:service:DesiredCount",
+        });
+        let mut reg = target.clone();
+        reg["MinCapacity"] = json!(1);
+        reg["MaxCapacity"] = json!(3);
+        reg["Tags"] = json!({"env": "dev", "team": "core"});
+        let resp = svc
+            .handle(make_req("RegisterScalableTarget", reg))
+            .await
+            .unwrap();
+        let arn = serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()
+            ["ScalableTargetARN"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = svc
+            .handle(make_req("ListTagsForResource", json!({"ResourceARN": arn})))
+            .await
+            .unwrap();
+        let tags = serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap();
+        assert_eq!(tags["Tags"], json!({"env": "dev", "team": "core"}));
+
+        svc.handle(make_req("DeregisterScalableTarget", target))
+            .await
+            .unwrap();
+        assert!(!svc.state.read().accounts["123456789012"]
+            .tags
+            .contains_key(&arn));
     }
 }

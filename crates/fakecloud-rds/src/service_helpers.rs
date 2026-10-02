@@ -1810,7 +1810,9 @@ pub(crate) fn db_instance_xml(
          <DbiResourceId>{dbi_resource_id}</DbiResourceId>\
          <DeletionProtection>{deletion_protection}</DeletionProtection>\
          {pending_modified_values_xml}\
+         <TagList>{tag_list}</TagList>\
          <DBInstanceArn>{arn}</DBInstanceArn>",
+        tag_list = instance.tags.iter().map(tag_xml).collect::<String>(),
         identifier = xml_escape(&instance.db_instance_identifier),
         class = xml_escape(&instance.db_instance_class),
         engine = xml_escape(&instance.engine),
@@ -1927,6 +1929,7 @@ pub(crate) fn db_snapshot_xml(snapshot: &DbSnapshot) -> String {
          {storage_throughput_xml}\
          {source_snapshot_xml}\
          <ProcessorFeatures/>\
+         <TagList>{tag_list}</TagList>\
          <DBSnapshotArn>{}</DBSnapshotArn>",
         xml_escape(&snapshot.db_snapshot_identifier),
         xml_escape(&snapshot.db_instance_identifier),
@@ -1945,6 +1948,7 @@ pub(crate) fn db_snapshot_xml(snapshot: &DbSnapshot) -> String {
             .as_ref()
             .map(|name| format!("<DBName>{}</DBName>", xml_escape(name)))
             .unwrap_or_default(),
+        tag_list = snapshot.tags.iter().map(tag_xml).collect::<String>(),
         encrypted = if snapshot.encrypted { "true" } else { "false" },
         iam_auth = if snapshot.iam_database_authentication_enabled {
             "true"
@@ -2150,6 +2154,57 @@ impl TagTargetRef<'_> {
     }
 }
 
+/// Tags in the `[{Key, Value}]` shape a JSON-backed row stores under its
+/// `Tags` key: what `TagTargetMut::merge` writes and
+/// `ListTagsForResource` reads back.
+pub(crate) fn tags_to_json(tags: &[RdsTag]) -> serde_json::Value {
+    serde_json::Value::Array(
+        tags.iter()
+            .map(|t| serde_json::json!({"Key": t.key, "Value": t.value}))
+            .collect(),
+    )
+}
+
+/// The tags a resource created by a snapshot copy carries. Tags named on
+/// the request win; without any, the source's tags carry over only when
+/// the caller asked for that (`CopyTags`, or the source's
+/// `CopyTagsToSnapshot`), and otherwise the copy starts untagged.
+pub(crate) fn inherited_tags(
+    request_tags: Vec<RdsTag>,
+    copy_source: bool,
+    source_tags: &[RdsTag],
+) -> Vec<RdsTag> {
+    if !request_tags.is_empty() {
+        request_tags
+    } else if copy_source {
+        source_tags.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The tags a JSON-backed row stores under `Tags`, as typed tags.
+pub(crate) fn json_tags(entry: &serde_json::Value) -> Vec<RdsTag> {
+    entry
+        .get("Tags")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    Some(RdsTag {
+                        key: v.get("Key")?.as_str()?.to_string(),
+                        value: v
+                            .get("Value")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn extras_bucket_for_resource_type(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "cluster" => "clusters",
@@ -2159,6 +2214,7 @@ fn extras_bucket_for_resource_type(kind: &str) -> Option<&'static str> {
         "secgrp" => "security_groups",
         "es" => "event_subscriptions",
         "db-proxy" => "proxies",
+        "db-proxy-endpoint" => "proxy_endpoints",
         _ => return None,
     })
 }
@@ -2215,6 +2271,10 @@ fn resource_not_found_for_kind(kind: &str, name: &str) -> AwsServiceError {
             format!("DBSecurityGroup {name} not found."),
         ),
         "db-proxy" => ("DBProxyNotFoundFault", format!("DBProxy {name} not found.")),
+        "db-proxy-endpoint" => (
+            "DBProxyEndpointNotFoundFault",
+            format!("DBProxyEndpoint {name} not found."),
+        ),
         "es" => (
             "SubscriptionNotFound",
             format!("EventSubscription {name} not found."),

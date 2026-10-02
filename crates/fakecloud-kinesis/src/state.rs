@@ -243,6 +243,10 @@ pub struct KinesisConsumer {
     pub consumer_status: String,
     pub consumer_creation_timestamp: DateTime<Utc>,
     pub stream_arn: String,
+    /// Consumer ARNs are Tags v2 resources (`TagResource` /
+    /// `ListTagsForResource`), seeded by `RegisterStreamConsumer`'s `Tags`.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 impl KinesisState {

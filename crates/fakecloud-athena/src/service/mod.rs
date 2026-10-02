@@ -840,8 +840,20 @@ fn query_execution_json(q: &QueryExecution) -> Value {
             "EngineExecutionTimeInMillis": q.engine_execution_time_ms,
             "QueryPlanningTimeInMillis": q.query_planning_time_ms,
             "TotalExecutionTimeInMillis": q.total_execution_time_ms,
+            // Every query runs fresh; no prior result is ever served from cache.
+            "ResultReuseInformation": { "ReusedPreviousResult": false },
         },
     });
+    if let Some(c) = &q.result_reuse_configuration {
+        obj.as_object_mut()
+            .unwrap()
+            .insert("ResultReuseConfiguration".to_string(), c.clone());
+    }
+    if let Some(p) = &q.execution_parameters {
+        obj.as_object_mut()
+            .unwrap()
+            .insert("ExecutionParameters".to_string(), p.clone());
+    }
     if let Some(c) = &q.query_execution_context {
         obj.as_object_mut()
             .unwrap()
@@ -905,7 +917,31 @@ fn session_detail_json(s: &Session) -> Value {
             .unwrap()
             .insert("EngineConfiguration".to_string(), c.clone());
     }
+    if let Some(m) = &s.monitoring_configuration {
+        obj.as_object_mut()
+            .unwrap()
+            .insert("MonitoringConfiguration".to_string(), m.clone());
+    }
+    let mut session_cfg = serde_json::Map::new();
+    if let Some(role) = &s.execution_role {
+        session_cfg.insert("ExecutionRole".to_string(), json!(role));
+    }
+    if let Some(mins) = s.session_idle_timeout_minutes {
+        session_cfg.insert("SessionIdleTimeoutInMinutes".to_string(), json!(mins));
+        session_cfg.insert("IdleTimeoutSeconds".to_string(), json!(mins * 60));
+    }
+    if !session_cfg.is_empty() {
+        obj.as_object_mut().unwrap().insert(
+            "SessionConfiguration".to_string(),
+            Value::Object(session_cfg),
+        );
+    }
     obj
+}
+
+/// ARN of an Athena Spark session (the target of StartSession `Tags`).
+pub(crate) fn session_arn(region: &str, account_id: &str, session_id: &str) -> String {
+    athena_arn(region, account_id, &format!("session/{session_id}"))
 }
 
 fn session_status_json(s: &Session) -> Value {
@@ -1244,6 +1280,8 @@ mod tests {
                     total_execution_time_ms: 2,
                     result_rows: (0..5).map(|n| vec![n.to_string()]).collect(),
                     result_columns: vec![("n".to_string(), "integer".to_string())],
+                    result_reuse_configuration: None,
+                    execution_parameters: None,
                 },
             );
         }
@@ -2021,6 +2059,124 @@ mod tests {
         list.region = "cn-north-1".to_string();
         let tags = parse_json(&svc.list_tags_for_resource(&list).unwrap());
         assert_eq!(tags["Tags"], json!([{ "Key": "team", "Value": "data" }]));
+    }
+
+    #[test]
+    fn query_execution_keeps_result_reuse_configuration() {
+        let svc = AthenaService::new(SharedAthenaState::default());
+        let reuse =
+            json!({ "ResultReuseByAgeConfiguration": { "Enabled": true, "MaxAgeInMinutes": 30 } });
+        let started = parse_json(
+            &svc.start_query_execution(&req(
+                "StartQueryExecution",
+                json!({ "QueryString": "SELECT 1", "ResultReuseConfiguration": reuse }),
+            ))
+            .unwrap(),
+        );
+        let id = started["QueryExecutionId"].as_str().unwrap().to_string();
+        let got = parse_json(
+            &svc.get_query_execution(&req("GetQueryExecution", json!({ "QueryExecutionId": id })))
+                .unwrap(),
+        );
+        assert_eq!(got["QueryExecution"]["ResultReuseConfiguration"], reuse);
+        assert_eq!(
+            got["QueryExecution"]["Statistics"]["ResultReuseInformation"]["ReusedPreviousResult"],
+            json!(false)
+        );
+        let batch = parse_json(
+            &svc.batch_get_query_execution(&req(
+                "BatchGetQueryExecution",
+                json!({ "QueryExecutionIds": [id] }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            batch["QueryExecutions"][0]["ResultReuseConfiguration"],
+            reuse
+        );
+    }
+
+    #[test]
+    fn start_session_round_trips_config_and_tags() {
+        let svc = AthenaService::new(SharedAthenaState::default());
+        svc.create_work_group(&req(
+            "CreateWorkGroup",
+            json!({
+                "Name": "spark",
+                "Configuration": { "ExecutionRole": "arn:aws:iam::123456789012:role/wg-role" },
+                "Tags": [{ "Key": "team", "Value": "data" }, { "Key": "env", "Value": "dev" }],
+            }),
+        ))
+        .unwrap();
+        let monitoring = json!({ "CloudWatchLoggingConfiguration": { "Enabled": true } });
+        let started = parse_json(
+            &svc.start_session(&req(
+                "StartSession",
+                json!({
+                    "WorkGroup": "spark",
+                    "EngineConfiguration": { "MaxConcurrentDpus": 4 },
+                    "MonitoringConfiguration": monitoring,
+                    "SessionIdleTimeoutInMinutes": 45,
+                    "CopyWorkGroupTags": true,
+                    "Tags": [{ "Key": "env", "Value": "prod" }],
+                }),
+            ))
+            .unwrap(),
+        );
+        let id = started["SessionId"].as_str().unwrap().to_string();
+        let got = parse_json(
+            &svc.get_session(&req("GetSession", json!({ "SessionId": id })))
+                .unwrap(),
+        );
+        assert_eq!(got["MonitoringConfiguration"], monitoring);
+        assert_eq!(
+            got["SessionConfiguration"]["SessionIdleTimeoutInMinutes"],
+            45
+        );
+        assert_eq!(got["SessionConfiguration"]["IdleTimeoutSeconds"], 2700);
+        assert_eq!(
+            got["SessionConfiguration"]["ExecutionRole"],
+            "arn:aws:iam::123456789012:role/wg-role"
+        );
+        let tags = parse_json(
+            &svc.list_tags_for_resource(&req(
+                "ListTagsForResource",
+                json!({ "ResourceARN": super::session_arn("us-east-1", "123456789012", &id) }),
+            ))
+            .unwrap(),
+        );
+        // Workgroup tags copied; the request's own Tags win on a key clash.
+        assert_eq!(
+            tags["Tags"],
+            json!([{ "Key": "env", "Value": "prod" }, { "Key": "team", "Value": "data" }])
+        );
+
+        // Without CopyWorkGroupTags only the request's tags apply, and the
+        // idle timeout defaults to 20 minutes.
+        let started = parse_json(
+            &svc.start_session(&req(
+                "StartSession",
+                json!({ "WorkGroup": "spark", "EngineConfiguration": {} }),
+            ))
+            .unwrap(),
+        );
+        let id = started["SessionId"].as_str().unwrap().to_string();
+        let got = parse_json(
+            &svc.get_session(&req("GetSession", json!({ "SessionId": id })))
+                .unwrap(),
+        );
+        assert_eq!(
+            got["SessionConfiguration"]["SessionIdleTimeoutInMinutes"],
+            20
+        );
+        let tags = parse_json(
+            &svc.list_tags_for_resource(&req(
+                "ListTagsForResource",
+                json!({ "ResourceARN": super::session_arn("us-east-1", "123456789012", &id) }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(tags["Tags"], json!([]));
     }
 }
 

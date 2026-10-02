@@ -1109,6 +1109,7 @@ impl GlueService {
         if dbs.contains_key(&name) {
             return Err(already_exists(format!("Database {name} already exists")));
         }
+        let db_name = name.clone();
         dbs.insert(
             name.clone(),
             Database {
@@ -1128,6 +1129,10 @@ impl GlueService {
                     .cloned(),
                 tables: BTreeMap::new(),
             },
+        );
+        state.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "database", &db_name),
+            &body,
         );
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -1206,6 +1211,12 @@ impl GlueService {
         if state.dbs_in_mut(&req.region).remove(name).is_none() {
             return Err(entity_not_found(format!("Database {name} not found")));
         }
+        state.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "database",
+            name,
+        ));
         Ok(AwsResponse::ok_json(json!({})))
     }
 

@@ -1396,3 +1396,116 @@ async fn snapshot_hook_fires_with_store() {
         .expect("hook present when a store is set");
     hook().await;
 }
+
+#[tokio::test]
+async fn create_guardrail_persists_tags_kms_and_cross_region() {
+    let svc = BedrockService::new(make_state());
+    let body = serde_json::json!({
+        "name": "g",
+        "blockedInputMessaging": "no",
+        "blockedOutputsMessaging": "no",
+        "kmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+        "crossRegionConfig": {"guardrailProfileIdentifier": "us.guardrail.v1:0"},
+        "automatedReasoningPolicyConfig": {
+            "policies": ["arn:aws:bedrock:us-east-1:123456789012:automated-reasoning-policy/p1"],
+            "confidenceThreshold": 0.5
+        },
+        "tags": [{"key": "env", "value": "prod"}],
+    });
+    let resp = svc
+        .handle(make_request(Method::POST, "/guardrails", &body.to_string()))
+        .await
+        .unwrap();
+    let b = body_json(&resp);
+    let id = b["guardrailId"].as_str().unwrap().to_string();
+    let arn = b["guardrailArn"].as_str().unwrap().to_string();
+
+    let resp = svc
+        .handle(make_request(Method::GET, &format!("/guardrails/{id}"), ""))
+        .await
+        .unwrap();
+    let g = body_json(&resp);
+    assert_eq!(
+        g["kmsKeyArn"],
+        "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+    );
+    assert_eq!(
+        g["crossRegionDetails"]["guardrailProfileId"],
+        "us.guardrail.v1:0"
+    );
+    assert_eq!(
+        g["crossRegionDetails"]["guardrailProfileArn"],
+        "arn:aws:bedrock:us-east-1:123456789012:guardrail-profile/us.guardrail.v1:0"
+    );
+    assert_eq!(g["automatedReasoningPolicy"]["confidenceThreshold"], 0.5);
+
+    let body = serde_json::json!({"resourceARN": arn});
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/listTagsForResource",
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    let tags = body_json(&resp)["tags"].clone();
+    assert_eq!(tags, serde_json::json!([{"key": "env", "value": "prod"}]));
+
+    // A published version carries the same members.
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            &format!("/guardrails/{id}"),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    let ver = body_json(&resp)["version"].as_str().unwrap().to_string();
+    let mut q = HashMap::new();
+    q.insert("guardrailVersion".to_string(), ver);
+    let resp = svc
+        .handle(make_request_with_query(
+            Method::GET,
+            &format!("/guardrails/{id}"),
+            "",
+            q,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(&resp);
+    assert_eq!(g["kmsKeyArn"], v["kmsKeyArn"]);
+    assert_eq!(g["crossRegionDetails"], v["crossRegionDetails"]);
+}
+
+#[tokio::test]
+async fn create_custom_model_stores_model_tags() {
+    let svc = BedrockService::new(make_state());
+    let body = serde_json::json!({
+        "modelName": "m",
+        "modelSourceConfig": {"s3DataSource": {"s3Uri": "s3://b/k"}},
+        "modelKmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/k1",
+        "modelTags": [{"key": "team", "value": "ml"}],
+    });
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/custom-models/create-custom-model",
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    let arn = body_json(&resp)["modelArn"].as_str().unwrap().to_string();
+    let body = serde_json::json!({"resourceARN": arn});
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/listTagsForResource",
+            &body.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&resp)["tags"],
+        serde_json::json!([{"key": "team", "value": "ml"}])
+    );
+}

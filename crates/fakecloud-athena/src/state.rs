@@ -179,6 +179,12 @@ pub struct QueryExecution {
     pub total_execution_time_ms: i64,
     pub result_rows: Vec<Vec<String>>,
     pub result_columns: Vec<(String, String)>,
+    /// `ResultReuseConfiguration` as submitted to StartQueryExecution.
+    #[serde(default)]
+    pub result_reuse_configuration: Option<Value>,
+    /// `ExecutionParameters` as submitted to StartQueryExecution.
+    #[serde(default)]
+    pub execution_parameters: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +214,15 @@ pub struct Session {
     pub idle_since_date_time: Option<DateTime<Utc>>,
     pub configuration: Option<Value>,
     pub notebook_version: Option<String>,
+    /// Execution role from StartSession, else the workgroup's.
+    #[serde(default)]
+    pub execution_role: Option<String>,
+    /// `MonitoringConfiguration` as submitted to StartSession.
+    #[serde(default)]
+    pub monitoring_configuration: Option<Value>,
+    /// `SessionIdleTimeoutInMinutes` (StartSession, default 20).
+    #[serde(default)]
+    pub session_idle_timeout_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2405,3 +2405,89 @@ async fn bedrock_list_inference_profiles_paginates_without_skip_or_dup() {
     exp_sorted.sort();
     assert_eq!(got, exp_sorted, "pagination skipped or added entries");
 }
+
+#[tokio::test]
+async fn bedrock_create_guardrail_persists_kms_cross_region_and_tags() {
+    use aws_sdk_bedrock::types::GuardrailCrossRegionConfig;
+    let server = TestServer::start().await;
+    let client = server.bedrock_client().await;
+
+    let resp = client
+        .create_guardrail()
+        .name("kms-guardrail")
+        .blocked_input_messaging("blocked")
+        .blocked_outputs_messaging("blocked")
+        .kms_key_id("1234abcd-12ab-34cd-56ef-1234567890ab")
+        .cross_region_config(
+            GuardrailCrossRegionConfig::builder()
+                .guardrail_profile_identifier("us.guardrail.v1:0")
+                .build()
+                .unwrap(),
+        )
+        .tags(Tag::builder().key("env").value("prod").build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let guardrail_id = resp.guardrail_id().to_string();
+    let guardrail_arn = resp.guardrail_arn().to_string();
+
+    let got = client
+        .get_guardrail()
+        .guardrail_identifier(&guardrail_id)
+        .send()
+        .await
+        .unwrap();
+    let kms = got.kms_key_arn().expect("kmsKeyArn");
+    assert!(
+        kms.ends_with(":key/1234abcd-12ab-34cd-56ef-1234567890ab"),
+        "{kms}"
+    );
+    let details = got.cross_region_details().expect("crossRegionDetails");
+    assert_eq!(details.guardrail_profile_id(), Some("us.guardrail.v1:0"));
+    assert!(details
+        .guardrail_profile_arn()
+        .unwrap()
+        .ends_with(":guardrail-profile/us.guardrail.v1:0"));
+
+    let tags = client
+        .list_tags_for_resource()
+        .resource_arn(&guardrail_arn)
+        .send()
+        .await
+        .unwrap();
+    assert!(tags
+        .tags()
+        .iter()
+        .any(|t| t.key() == "env" && t.value() == "prod"));
+}
+
+#[tokio::test]
+async fn bedrock_create_custom_model_stores_model_tags() {
+    use aws_sdk_bedrock::types::{ModelDataSource, S3DataSource};
+    let server = TestServer::start().await;
+    let client = server.bedrock_client().await;
+
+    let resp = client
+        .create_custom_model()
+        .model_name("tagged-model")
+        .model_source_config(ModelDataSource::S3DataSource(
+            S3DataSource::builder()
+                .s3_uri("s3://bucket/model/")
+                .build()
+                .unwrap(),
+        ))
+        .model_tags(Tag::builder().key("team").value("ml").build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let tags = client
+        .list_tags_for_resource()
+        .resource_arn(resp.model_arn())
+        .send()
+        .await
+        .unwrap();
+    assert!(tags
+        .tags()
+        .iter()
+        .any(|t| t.key() == "team" && t.value() == "ml"));
+}

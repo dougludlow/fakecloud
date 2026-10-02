@@ -145,3 +145,31 @@ async fn iotdata_shadow_and_retained_lifecycle() {
         .await;
     assert!(after.is_err(), "deleted shadow must be gone");
 }
+
+#[tokio::test]
+async fn iotdata_retained_message_keeps_user_properties() {
+    let server = TestServer::start().await;
+    let client = iot_client(&server).await;
+    let props = r#"[{"deviceName":"alpha"},{"deviceCnt":"45"}]"#;
+    client
+        .publish()
+        .topic("sensors/props")
+        .retain(true)
+        .qos(1)
+        .user_properties(props)
+        .payload(Blob::new(b"v".to_vec()))
+        .send()
+        .await
+        .expect("publish");
+    let got = client
+        .get_retained_message()
+        .topic("sensors/props")
+        .send()
+        .await
+        .expect("get_retained_message");
+    let blob = got.user_properties().expect("userProperties present");
+    let echoed: Value = serde_json::from_slice(blob.as_ref()).expect("user properties JSON");
+    let sent: Value = serde_json::from_str(props).unwrap();
+    assert_eq!(echoed, sent);
+    assert_eq!(got.qos(), 1);
+}

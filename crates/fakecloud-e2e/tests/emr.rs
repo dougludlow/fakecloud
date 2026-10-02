@@ -168,3 +168,100 @@ async fn job_flow_lifecycle_run_describe_steps_tags_terminate() {
         .await;
     assert!(err.is_err(), "unknown cluster should error");
 }
+
+#[tokio::test]
+async fn add_and_remove_tags_are_reflected_by_describe_studio_and_cluster() {
+    use aws_sdk_emr::types::AuthMode;
+    let server = TestServer::start().await;
+    let emr = emr_client(&server).await;
+
+    let studio = emr
+        .create_studio()
+        .name("st")
+        .auth_mode(AuthMode::Iam)
+        .vpc_id("vpc-1")
+        .subnet_ids("subnet-1")
+        .service_role("arn:aws:iam::123456789012:role/svc")
+        .workspace_security_group_id("sg-1")
+        .engine_security_group_id("sg-2")
+        .default_s3_location("s3://bucket/prefix")
+        .tags(Tag::builder().key("created").value("1").build())
+        .send()
+        .await
+        .expect("create studio");
+    let studio_id = studio.studio_id().unwrap().to_string();
+
+    emr.add_tags()
+        .resource_id(&studio_id)
+        .tags(Tag::builder().key("added").value("2").build())
+        .send()
+        .await
+        .expect("add tags");
+    let described = emr
+        .describe_studio()
+        .studio_id(&studio_id)
+        .send()
+        .await
+        .expect("describe studio");
+    let mut keys: Vec<&str> = described
+        .studio()
+        .unwrap()
+        .tags()
+        .iter()
+        .filter_map(|t| t.key())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["added", "created"]);
+
+    emr.remove_tags()
+        .resource_id(&studio_id)
+        .tag_keys("created")
+        .send()
+        .await
+        .expect("remove tags");
+    let described = emr
+        .describe_studio()
+        .studio_id(&studio_id)
+        .send()
+        .await
+        .expect("describe studio");
+    let keys: Vec<&str> = described
+        .studio()
+        .unwrap()
+        .tags()
+        .iter()
+        .filter_map(|t| t.key())
+        .collect();
+    assert_eq!(keys, vec!["added"]);
+
+    // The same store backs DescribeCluster.
+    let cluster_id = emr
+        .run_job_flow()
+        .name("c")
+        .release_label("emr-7.0.0")
+        .instances(JobFlowInstancesConfig::builder().instance_count(1).build())
+        .send()
+        .await
+        .expect("run job flow")
+        .job_flow_id()
+        .unwrap()
+        .to_string();
+    emr.add_tags()
+        .resource_id(&cluster_id)
+        .tags(Tag::builder().key("env").value("e2e").build())
+        .send()
+        .await
+        .expect("add cluster tags");
+    let cluster = emr
+        .describe_cluster()
+        .cluster_id(&cluster_id)
+        .send()
+        .await
+        .expect("describe cluster");
+    assert!(cluster
+        .cluster()
+        .unwrap()
+        .tags()
+        .iter()
+        .any(|t| t.key() == Some("env") && t.value() == Some("e2e")));
+}

@@ -596,3 +596,119 @@ async fn select_failing_against_unknown_table_marks_query_failed() {
         "expected `not found` in reason, got `{reason}`"
     );
 }
+
+#[tokio::test]
+async fn athena_query_execution_echoes_result_reuse_configuration() {
+    use aws_sdk_athena::types::{ResultReuseByAgeConfiguration, ResultReuseConfiguration};
+    let server = TestServer::start().await;
+    let athena = server.athena_client().await;
+    let reuse = ResultReuseConfiguration::builder()
+        .result_reuse_by_age_configuration(
+            ResultReuseByAgeConfiguration::builder()
+                .enabled(true)
+                .max_age_in_minutes(30)
+                .build(),
+        )
+        .build();
+    let id = athena
+        .start_query_execution()
+        .query_string("SELECT 1")
+        .result_reuse_configuration(reuse)
+        .send()
+        .await
+        .expect("start query")
+        .query_execution_id()
+        .expect("id")
+        .to_string();
+    let got = athena
+        .get_query_execution()
+        .query_execution_id(&id)
+        .send()
+        .await
+        .expect("get query");
+    let by_age = got
+        .query_execution()
+        .and_then(|q| q.result_reuse_configuration())
+        .and_then(|r| r.result_reuse_by_age_configuration())
+        .expect("reuse config echoed");
+    assert!(by_age.enabled());
+    assert_eq!(by_age.max_age_in_minutes(), Some(30));
+    let batch = athena
+        .batch_get_query_execution()
+        .query_execution_ids(&id)
+        .send()
+        .await
+        .expect("batch get");
+    assert!(batch.query_executions()[0]
+        .result_reuse_configuration()
+        .is_some());
+}
+
+#[tokio::test]
+async fn athena_start_session_round_trips_monitoring_timeout_and_tags() {
+    use aws_sdk_athena::types::{
+        CloudWatchLoggingConfiguration, EngineConfiguration, MonitoringConfiguration,
+    };
+    let server = TestServer::start().await;
+    let athena = server.athena_client().await;
+    athena
+        .create_work_group()
+        .name("spark-wg")
+        .tags(Tag::builder().key("team").value("data").build())
+        .send()
+        .await
+        .expect("create wg");
+    let session_id = athena
+        .start_session()
+        .work_group("spark-wg")
+        .engine_configuration(
+            EngineConfiguration::builder()
+                .max_concurrent_dpus(4)
+                .build(),
+        )
+        .monitoring_configuration(
+            MonitoringConfiguration::builder()
+                .cloud_watch_logging_configuration(
+                    CloudWatchLoggingConfiguration::builder()
+                        .enabled(true)
+                        .build()
+                        .expect("cw logging"),
+                )
+                .build(),
+        )
+        .session_idle_timeout_in_minutes(45)
+        .copy_work_group_tags(true)
+        .tags(Tag::builder().key("env").value("prod").build())
+        .send()
+        .await
+        .expect("start session")
+        .session_id()
+        .expect("session id")
+        .to_string();
+    let got = athena
+        .get_session()
+        .session_id(&session_id)
+        .send()
+        .await
+        .expect("get session");
+    assert_eq!(
+        got.monitoring_configuration()
+            .and_then(|m| m.cloud_watch_logging_configuration())
+            .map(|c| c.enabled()),
+        Some(true)
+    );
+    let cfg = got.session_configuration().expect("session configuration");
+    assert_eq!(cfg.session_idle_timeout_in_minutes(), Some(45));
+    assert_eq!(cfg.idle_timeout_seconds(), Some(2700));
+
+    let session_arn = format!("arn:aws:athena:us-east-1:123456789012:session/{session_id}");
+    let tags = athena
+        .list_tags_for_resource()
+        .resource_arn(session_arn)
+        .send()
+        .await
+        .expect("list session tags");
+    let mut keys: Vec<&str> = tags.tags().iter().filter_map(|t| t.key()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["env", "team"]);
+}

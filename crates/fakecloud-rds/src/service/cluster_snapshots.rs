@@ -40,6 +40,7 @@ impl RdsService {
         use serde_json::json;
         let snapshot_id = required_query_param(request, "DBClusterSnapshotIdentifier")?;
         let cluster_id = required_query_param(request, "DBClusterIdentifier")?;
+        let request_tags = parse_tags(request)?;
         let arn = rds_arn(
             &request.region,
             &request.account_id,
@@ -187,6 +188,14 @@ impl RdsService {
                     format!("DBClusterSnapshot {snapshot_id} already exists."),
                 ));
             }
+            // The entry is a clone of the cluster row, tags included: the
+            // snapshot gets the request's tags, or the cluster's only when
+            // the cluster has CopyTagsToSnapshot set.
+            let snapshot_tags = tags_to_json(&inherited_tags(
+                request_tags,
+                entry["CopyTagsToSnapshot"].as_bool() == Some(true),
+                &json_tags(&entry),
+            ));
             if let Some(obj) = entry.as_object_mut() {
                 obj.insert(
                     "DBClusterSnapshotIdentifier".to_string(),
@@ -201,6 +210,7 @@ impl RdsService {
                     json!(Utc::now().to_rfc3339()),
                 );
                 obj.insert("PercentProgress".to_string(), json!(100));
+                obj.insert("Tags".to_string(), snapshot_tags);
                 if let Some((engine, username, password, db_name, engine_version)) =
                     writer_source.as_ref()
                 {
@@ -294,6 +304,7 @@ impl RdsService {
             })?;
         let arn = rds_arn(&request.region, &request.account_id, "cluster", &target);
         let restore_key = self.restore_kms_key(request);
+        let request_tags = parse_tags(request)?;
 
         let mut accounts = self.state.write();
         // Resolved before the mutable borrow the cluster insert needs.
@@ -435,6 +446,9 @@ impl RdsService {
                 obj.insert("PendingRestoreDumpB64".to_string(), json!(b64));
             }
             apply_restore_kms_key(obj, restore_key);
+            // The restored cluster is tagged with the request's tags, not
+            // the snapshot's (the instance restores behave the same way).
+            obj.insert("Tags".to_string(), tags_to_json(&request_tags));
         }
         state
             .extras
@@ -539,6 +553,7 @@ impl RdsService {
         // the instance-restore path's `spawn_finalize_restored_instance`.
         let restore_type = optional_query_param(request, "RestoreType");
         let restore_key = self.restore_kms_key(request);
+        let request_tags = parse_tags(request)?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         // Restoring onto an existing cluster would replace a live
@@ -663,6 +678,9 @@ impl RdsService {
                 obj.insert("UseLatestRestorableTime".to_string(), json!(latest));
             }
             apply_restore_kms_key(obj, restore_key);
+            // The new cluster is tagged with the request's tags, not the
+            // source cluster's.
+            obj.insert("Tags".to_string(), tags_to_json(&request_tags));
         }
         let target_incarnation = entry_resource_id(&entry);
         state

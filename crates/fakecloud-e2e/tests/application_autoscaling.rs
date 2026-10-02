@@ -963,3 +963,34 @@ async fn step_scaling_applies_when_alarm_action_fires() {
         "capacity must not regress while alarm fires"
     );
 }
+
+#[tokio::test]
+async fn register_scalable_target_tags_are_listed() {
+    let server = TestServer::start().await;
+    let aas = server.application_autoscaling_client().await;
+
+    let arn = aas
+        .register_scalable_target()
+        .service_namespace(ServiceNamespace::Ecs)
+        .resource_id("service/cluster/tagged")
+        .scalable_dimension(ScalableDimension::EcsServiceDesiredCount)
+        .min_capacity(1)
+        .max_capacity(4)
+        .tags("env", "dev")
+        .send()
+        .await
+        .expect("register")
+        .scalable_target_arn()
+        .map(str::to_owned)
+        .expect("arn");
+    let tags = aas
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .expect("list tags");
+    assert_eq!(
+        tags.tags().unwrap().get("env").map(String::as_str),
+        Some("dev")
+    );
+}

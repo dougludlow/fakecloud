@@ -44,6 +44,22 @@ pub struct BatchState {
     /// Per-job-definition-name highest revision allocated.
     #[serde(default)]
     pub job_def_revisions: BTreeMap<String, i64>,
+    /// Consumable resources keyed by name.
+    #[serde(default)]
+    pub consumable_resources: JsonStore,
+    /// `UpdateConsumableResource` idempotency records keyed by clientToken:
+    /// `{ "request": <body>, "response": <body>, "at": <millis> }`.
+    #[serde(default)]
+    pub consumable_update_tokens: JsonStore,
+    /// Service environments keyed by name.
+    #[serde(default)]
+    pub service_environments: JsonStore,
+    /// Quota shares keyed by ARN (names are only unique within a job queue).
+    #[serde(default)]
+    pub quota_shares: JsonStore,
+    /// Service jobs (SageMaker Training jobs queued through Batch) keyed by jobId.
+    #[serde(default)]
+    pub service_jobs: JsonStore,
 }
 
 impl BatchAccounts {

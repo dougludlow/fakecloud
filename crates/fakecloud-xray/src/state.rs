@@ -27,6 +27,9 @@ pub const XRAY_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// The name of the built-in sampling rule X-Ray always provides.
 pub const DEFAULT_SAMPLING_RULE: &str = "Default";
 
+/// The name of the single built-in Transaction Search indexing rule.
+pub const DEFAULT_INDEXING_RULE: &str = "Default";
+
 /// Per-account AWS X-Ray state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XrayData {
@@ -58,6 +61,12 @@ pub struct XrayData {
     /// Tags keyed by resource ARN (groups + sampling rules).
     #[serde(default)]
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// Transaction Search indexing rules keyed by rule `Name`, stored as their
+    /// `IndexingRule` wire object. X-Ray provides exactly one, `Default`,
+    /// seeded by [`XrayData::ensure_default_rule`]; `UpdateIndexingRule`
+    /// rewrites it in place.
+    #[serde(default)]
+    pub indexing_rules: BTreeMap<String, Value>,
 }
 
 fn default_destination() -> String {
@@ -75,6 +84,7 @@ impl Default for XrayData {
             traces: BTreeMap::new(),
             retrievals: BTreeMap::new(),
             tags: BTreeMap::new(),
+            indexing_rules: BTreeMap::new(),
         }
     }
 }
@@ -90,6 +100,18 @@ impl XrayData {
     /// The built-in rule exists in every region, so re-point it instead of
     /// freezing whichever region happened to create the account.
     pub(crate) fn ensure_default_rule(&mut self, region: &str, account: &str) {
+        self.indexing_rules
+            .entry(DEFAULT_INDEXING_RULE.to_string())
+            .or_insert_with(|| {
+                json!({
+                    "Name": DEFAULT_INDEXING_RULE,
+                    "ModifiedAt": now_epoch(),
+                    "Rule": { "Probabilistic": {
+                        "DesiredSamplingPercentage": 1.0,
+                        "ActualSamplingPercentage": 1.0,
+                    } },
+                })
+            });
         let partition = fakecloud_aws::arn::partition_for(region);
         let want = format!(
             "arn:{partition}:xray:{region}:{account}:sampling-rule/{DEFAULT_SAMPLING_RULE}"

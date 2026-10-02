@@ -374,7 +374,13 @@ impl RdsService {
                 // actually narrow the result.
                 snapshot_type: "manual".to_string(),
                 master_user_password: instance.master_user_password.clone(),
-                tags: Vec::new(),
+                // DeleteDBInstance takes no tags: the final snapshot carries
+                // the instance's only under CopyTagsToSnapshot.
+                tags: inherited_tags(
+                    Vec::new(),
+                    instance.copy_tags_to_snapshot == Some(true),
+                    &instance.tags,
+                ),
                 dump_data: Vec::new(),
                 availability_zone: instance.availability_zone.clone(),
                 vpc_id: None,
@@ -435,6 +441,8 @@ impl RdsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let db_snapshot_identifier = required_query_param(request, "DBSnapshotIdentifier")?;
         let db_instance_identifier = required_query_param(request, "DBInstanceIdentifier")?;
+
+        let request_tags = parse_tags(request)?;
 
         let (instance, db_name) = {
             let accounts = self.state.read();
@@ -514,7 +522,13 @@ impl RdsService {
                 source_data_volume: None,
                 snapshot_type: "manual".to_string(),
                 master_user_password: instance.master_user_password.clone(),
-                tags: Vec::new(),
+                // The request's tags, or the instance's only under
+                // CopyTagsToSnapshot.
+                tags: inherited_tags(
+                    request_tags,
+                    instance.copy_tags_to_snapshot == Some(true),
+                    &instance.tags,
+                ),
                 dump_data: Vec::new(),
                 availability_zone: instance.availability_zone.clone(),
                 vpc_id: None,

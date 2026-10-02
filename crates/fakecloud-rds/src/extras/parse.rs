@@ -21,7 +21,7 @@ pub(super) fn parse_member_list(req: &AwsRequest, prefix: &str) -> Vec<String> {
     out
 }
 
-/// Read repeated `Auth.member.<N>.{AuthScheme,SecretArn,IAMAuth,Description,ClientPasswordAuthType}`
+/// Read repeated `Auth.member.<N>.{AuthScheme,SecretArn,IAMAuth,Description,ClientPasswordAuthType,UserName}`
 /// proxy auth descriptors into a JSON array.
 pub(super) fn parse_proxy_auth(req: &AwsRequest) -> Vec<Value> {
     let mut out = Vec::new();
@@ -31,10 +31,20 @@ pub(super) fn parse_proxy_auth(req: &AwsRequest) -> Vec<Value> {
         let iam = get_param(req, &format!("Auth.member.{i}.IAMAuth"));
         let desc = get_param(req, &format!("Auth.member.{i}.Description"));
         let pw = get_param(req, &format!("Auth.member.{i}.ClientPasswordAuthType"));
-        if scheme.is_none() && secret.is_none() && iam.is_none() && desc.is_none() && pw.is_none() {
+        let user = get_param(req, &format!("Auth.member.{i}.UserName"));
+        if scheme.is_none()
+            && secret.is_none()
+            && iam.is_none()
+            && desc.is_none()
+            && pw.is_none()
+            && user.is_none()
+        {
             break;
         }
         let mut entry = serde_json::Map::new();
+        if let Some(v) = user {
+            entry.insert("UserName".to_string(), json!(v));
+        }
         if let Some(v) = scheme {
             entry.insert("AuthScheme".to_string(), json!(v));
         }

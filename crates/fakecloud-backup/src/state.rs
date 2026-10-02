@@ -106,8 +106,6 @@ pub struct AccessPointRecord {
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
     pub policy: Option<String>,
-    #[serde(default)]
-    pub tags: BTreeMap<String, String>,
 }
 
 /// A restore-testing plan with its selections.

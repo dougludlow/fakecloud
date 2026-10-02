@@ -307,6 +307,7 @@ impl ElastiCacheService {
         let snapshot_name = required_query_param(request, "SnapshotName")?;
         let replication_group_id = optional_query_param(request, "ReplicationGroupId");
         let cache_cluster_id = optional_query_param(request, "CacheClusterId");
+        let tags = parse_tags(request)?;
 
         if replication_group_id.is_none() && cache_cluster_id.is_none() {
             return Err(AwsServiceError::aws_error(
@@ -420,7 +421,9 @@ impl ElastiCacheService {
                     format!("Snapshot {snapshot_name} already exists."),
                 ));
             }
-            state.tags.insert(arn, Vec::new());
+            let mut tag_list = Vec::new();
+            merge_tags(&mut tag_list, &tags);
+            state.tags.insert(arn, tag_list);
             state.snapshots.insert(snapshot_name.clone(), snapshot);
         }
 
@@ -554,6 +557,7 @@ impl ElastiCacheService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let source = required_query_param(request, "SourceSnapshotName")?;
         let target = required_query_param(request, "TargetSnapshotName")?;
+        let tags = parse_tags(request)?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         let mut snap = state.snapshots.get(&source).cloned().ok_or_else(|| {
@@ -602,6 +606,11 @@ impl ElastiCacheService {
         snap.snapshot_status = "available".to_string();
         snap.snapshot_source = "manual".to_string();
         let xml = snapshot_xml(&snap);
+        // The copy is tagged only with the request's Tags; the source's tags
+        // are not inherited.
+        let mut tag_list = Vec::new();
+        merge_tags(&mut tag_list, &tags);
+        state.tags.insert(snap.arn.clone(), tag_list);
         state.snapshots.insert(target, snap);
         Ok(AwsResponse::xml(
             StatusCode::OK,
@@ -620,6 +629,7 @@ impl ElastiCacheService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let source = required_query_param(request, "SourceServerlessCacheSnapshotName")?;
         let target = required_query_param(request, "TargetServerlessCacheSnapshotName")?;
+        let tags = parse_tags(request)?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         if state.serverless_cache_snapshots.contains_key(&target) {
@@ -651,6 +661,9 @@ impl ElastiCacheService {
         // immediately; it was previously stuck `creating` with no finalizer.
         snap.status = "available".to_string();
         let xml = serverless_cache_snapshot_xml(&snap);
+        let mut tag_list = Vec::new();
+        merge_tags(&mut tag_list, &tags);
+        state.tags.insert(snap.arn.clone(), tag_list);
         state.serverless_cache_snapshots.insert(target, snap);
         Ok(AwsResponse::xml(
             StatusCode::OK,

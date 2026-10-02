@@ -96,6 +96,9 @@ impl ResourceProvisioner {
 
         let mut guard = self.emr_state.write();
         let st = guard.get_or_create(account);
+        if let Some(tags) = props.get("Tags").and_then(Value::as_array) {
+            st.tags.insert(id.clone(), tags.clone());
+        }
         st.clusters.insert(id.clone(), Value::Object(cluster));
         st.cluster_order.push(id.clone());
 
@@ -165,6 +168,10 @@ impl ResourceProvisioner {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // EMR renders a cluster's tags from its tag store.
+        if let Some(tags) = props.get("Tags").and_then(Value::as_array) {
+            st.tags.insert(id.clone(), tags.clone());
+        }
         Ok(ProvisionResult::new(id).with("MasterPublicDNS", master_dns))
     }
 
@@ -173,6 +180,7 @@ impl ResourceProvisioner {
         let st = guard.get_or_create(&self.account_id);
         st.clusters.remove(physical_id);
         st.cluster_order.retain(|n| n != physical_id);
+        st.tags.remove(physical_id);
         Ok(())
     }
 

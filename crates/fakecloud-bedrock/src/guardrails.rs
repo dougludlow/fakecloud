@@ -17,6 +17,48 @@ fn guardrail_key(identifier: &str) -> &str {
         .unwrap_or(identifier)
 }
 
+/// Resolve a `GuardrailCrossRegionConfig` into the `GuardrailCrossRegionDetails`
+/// read shape. The `guardrailProfileIdentifier` is either a profile id (for
+/// example `us.guardrail.v1:0`) or a full guardrail-profile ARN.
+fn cross_region_details(req: &AwsRequest, config: &Value) -> Option<Value> {
+    let ident = config.get("guardrailProfileIdentifier")?.as_str()?;
+    let (id, arn) = match ident.rsplit_once("guardrail-profile/") {
+        Some((_, id)) if ident.starts_with("arn:") => (id.to_string(), ident.to_string()),
+        _ => (
+            ident.to_string(),
+            crate::arns::guardrail_profile_arn(&req.region, &req.account_id, ident),
+        ),
+    };
+    Some(json!({ "guardrailProfileId": id, "guardrailProfileArn": arn }))
+}
+
+/// Store the create-time `tags` of a resource under its ARN in the shared
+/// Bedrock tag store (read by ListTagsForResource).
+pub(crate) fn store_tags(
+    s: &mut crate::state::BedrockState,
+    resource_arn: &str,
+    tags: Option<&Value>,
+) {
+    let Some(tags) = tags.and_then(Value::as_array) else {
+        return;
+    };
+    let map: std::collections::BTreeMap<String, String> = tags
+        .iter()
+        .filter_map(|t| {
+            Some((
+                t["key"].as_str()?.to_string(),
+                t["value"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    if !map.is_empty() {
+        s.tags
+            .entry(resource_arn.to_string())
+            .or_default()
+            .extend(map);
+    }
+}
+
 pub(crate) fn create_guardrail(
     state: &SharedBedrockState,
     req: &AwsRequest,
@@ -58,6 +100,13 @@ pub(crate) fn create_guardrail(
         sensitive_information_policy: body.get("sensitiveInformationPolicyConfig").cloned(),
         topic_policy: body.get("topicPolicyConfig").cloned(),
         contextual_grounding_policy: body.get("contextualGroundingPolicyConfig").cloned(),
+        automated_reasoning_policy: body.get("automatedReasoningPolicyConfig").cloned(),
+        cross_region_details: body
+            .get("crossRegionConfig")
+            .and_then(|c| cross_region_details(req, c)),
+        kms_key_arn: body["kmsKeyId"]
+            .as_str()
+            .map(|k| crate::arns::kms_key_arn(&req.region, &req.account_id, k)),
         created_at: now,
         updated_at: now,
     };
@@ -65,6 +114,7 @@ pub(crate) fn create_guardrail(
     let mut accts = state.write();
     let s = accts.get_or_create(&req.account_id);
     s.guardrails.insert(guardrail_id.clone(), guardrail);
+    store_tags(s, &guardrail_arn, body.get("tags"));
 
     Ok(AwsResponse::json_value(
         StatusCode::CREATED,
@@ -216,6 +266,15 @@ pub(crate) fn update_guardrail(
     if let Some(policy) = body.get("contextualGroundingPolicyConfig") {
         guardrail.contextual_grounding_policy = Some(policy.clone());
     }
+    if let Some(policy) = body.get("automatedReasoningPolicyConfig") {
+        guardrail.automated_reasoning_policy = Some(policy.clone());
+    }
+    if let Some(config) = body.get("crossRegionConfig") {
+        guardrail.cross_region_details = cross_region_details(req, config);
+    }
+    if let Some(key) = body["kmsKeyId"].as_str() {
+        guardrail.kms_key_arn = Some(crate::arns::kms_key_arn(&req.region, &req.account_id, key));
+    }
 
     guardrail.updated_at = Utc::now();
 
@@ -237,13 +296,14 @@ pub(crate) fn delete_guardrail(
     let guardrail_id = guardrail_key(guardrail_id);
     let mut accts = state.write();
     let s = accts.get_or_create(&req.account_id);
-    s.guardrails.remove(guardrail_id).ok_or_else(|| {
+    let removed = s.guardrails.remove(guardrail_id).ok_or_else(|| {
         AwsServiceError::aws_error(
             StatusCode::NOT_FOUND,
             "ResourceNotFoundException",
             format!("Guardrail {guardrail_id} not found"),
         )
     })?;
+    s.tags.remove(&removed.guardrail_arn);
 
     // Remove all versions
     s.guardrail_versions.retain(|(id, _), _| id != guardrail_id);
@@ -292,6 +352,9 @@ pub(crate) fn create_guardrail_version(
         sensitive_information_policy: guardrail.sensitive_information_policy.clone(),
         topic_policy: guardrail.topic_policy.clone(),
         contextual_grounding_policy: guardrail.contextual_grounding_policy.clone(),
+        automated_reasoning_policy: guardrail.automated_reasoning_policy.clone(),
+        cross_region_details: guardrail.cross_region_details.clone(),
+        kms_key_arn: guardrail.kms_key_arn.clone(),
         created_at: now,
     };
 
@@ -651,8 +714,34 @@ fn guardrail_to_json(g: &Guardrail) -> Value {
     if let Some(ref policy) = g.contextual_grounding_policy {
         obj["contextualGroundingPolicy"] = policy_read_shape(policy);
     }
+    insert_extras(
+        &mut obj,
+        g.automated_reasoning_policy.as_ref(),
+        g.cross_region_details.as_ref(),
+        g.kms_key_arn.as_deref(),
+    );
 
     obj
+}
+
+/// Render the members a guardrail (or version) carries beyond its policies.
+fn insert_extras(
+    obj: &mut Value,
+    automated_reasoning_policy: Option<&Value>,
+    cross_region_details: Option<&Value>,
+    kms_key_arn: Option<&str>,
+) {
+    if let Some(policy) = automated_reasoning_policy {
+        // Config and read shapes share member names (`policies`,
+        // `confidenceThreshold`).
+        obj["automatedReasoningPolicy"] = policy.clone();
+    }
+    if let Some(details) = cross_region_details {
+        obj["crossRegionDetails"] = details.clone();
+    }
+    if let Some(arn) = kms_key_arn {
+        obj["kmsKeyArn"] = json!(arn);
+    }
 }
 
 fn guardrail_version_to_json(gv: &GuardrailVersion) -> Value {
@@ -683,6 +772,12 @@ fn guardrail_version_to_json(gv: &GuardrailVersion) -> Value {
     if let Some(ref policy) = gv.contextual_grounding_policy {
         obj["contextualGroundingPolicy"] = policy_read_shape(policy);
     }
+    insert_extras(
+        &mut obj,
+        gv.automated_reasoning_policy.as_ref(),
+        gv.cross_region_details.as_ref(),
+        gv.kms_key_arn.as_deref(),
+    );
 
     obj
 }
@@ -728,6 +823,9 @@ mod tests {
             sensitive_information_policy: None,
             topic_policy: None,
             contextual_grounding_policy: None,
+            automated_reasoning_policy: None,
+            cross_region_details: None,
+            kms_key_arn: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

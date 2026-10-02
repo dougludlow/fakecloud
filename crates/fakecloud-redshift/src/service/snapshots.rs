@@ -219,6 +219,14 @@ impl RedshiftService {
             .cloned()
             .ok_or_else(|| snapshot_not_found(&src))?;
         snap.snapshot_identifier = target.clone();
+        // The copy is its own resource: its ARN names the copy, not the
+        // source, so CreateTags/DescribeTags on it reach the copy.
+        snap.snapshot_arn = crate::state::redshift_arn(
+            &req.region,
+            &req.account_id,
+            "snapshot",
+            &format!("{}/{target}", snap.cluster_identifier),
+        );
         snap.snapshot_create_time = Utc::now();
         snap.manual_snapshot_retention_period =
             int_param(req, "ManualSnapshotRetentionPeriod").unwrap_or(-1);

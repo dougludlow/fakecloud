@@ -148,8 +148,12 @@ impl ShieldService {
         let id = sf(&body, "ProtectionId").unwrap_or("").to_string();
         let removed = self.with_account_mut(req, |acct| {
             let removed = acct.protections.remove(&id);
-            if removed.is_some() {
+            if let Some(p) = &removed {
                 acct.protection_order.retain(|x| x != &id);
+                // Tags belong to the protection; they do not outlive it.
+                if let Some(arn) = p.get("ProtectionArn").and_then(Value::as_str) {
+                    acct.tags.remove(arn);
+                }
             }
             removed
         });
@@ -249,10 +253,13 @@ impl ShieldService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let id = sf(&body, "ProtectionGroupId").unwrap_or("").to_string();
+        let arn = protection_group_arn(&req.region, &req.account_id, &id);
         let removed = self.with_account_mut(req, |acct| {
             let removed = acct.protection_groups.remove(&id).is_some();
             if removed {
                 acct.protection_group_order.retain(|x| x != &id);
+                // Tags belong to the group; a same-name recreate starts clean.
+                acct.tags.remove(&arn);
             }
             removed
         });
@@ -296,7 +303,8 @@ impl ShieldService {
                 .iter()
                 .filter_map(|id| acct.protection_groups.get(id).cloned())
                 .filter(|g| {
-                    let field = |k: &str| g.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    let field =
+                        |k: &str| g.get(k).and_then(Value::as_str).unwrap_or("").to_string();
                     (want_ids.is_empty() || want_ids.contains(&field("ProtectionGroupId")))
                         && (want_patterns.is_empty() || want_patterns.contains(&field("Pattern")))
                         && (want_aggs.is_empty() || want_aggs.contains(&field("Aggregation")))
@@ -521,8 +529,9 @@ impl ShieldService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let (role, buckets) =
-            self.with_account(req, |acct| (acct.drt_role_arn.clone(), acct.drt_log_buckets.clone()));
+        let (role, buckets) = self.with_account(req, |acct| {
+            (acct.drt_role_arn.clone(), acct.drt_log_buckets.clone())
+        });
         let mut out = serde_json::Map::new();
         if let Some(role) = role {
             out.insert("RoleArn".into(), json!(role));
@@ -756,7 +765,11 @@ impl ShieldService {
         let keys: Vec<String> = body
             .get("TagKeys")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         self.with_account_mut(req, |acct| {
             if let Some(list) = acct.tags.get_mut(&arn) {
@@ -790,7 +803,11 @@ fn filter_strings(filters: Option<&Value>, key: &str) -> Vec<String> {
     filters
         .and_then(|f| f.get(key))
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -822,7 +839,10 @@ fn build_protection_group(body: &Value, id: &str, region: &str, account: &str) -
     g.insert("ProtectionGroupId".into(), json!(id));
     g.insert(
         "Aggregation".into(),
-        json!(body.get("Aggregation").and_then(Value::as_str).unwrap_or("SUM")),
+        json!(body
+            .get("Aggregation")
+            .and_then(Value::as_str)
+            .unwrap_or("SUM")),
     );
     g.insert(
         "Pattern".into(),
@@ -901,15 +921,19 @@ mod handler_tests {
     fn subscription_lifecycle() {
         let s = svc();
         assert_eq!(
-            body_of(&s.get_subscription_state(&req("GetSubscriptionState", json!({}))).unwrap())
-                ["SubscriptionState"],
+            body_of(
+                &s.get_subscription_state(&req("GetSubscriptionState", json!({})))
+                    .unwrap()
+            )["SubscriptionState"],
             json!("INACTIVE")
         );
         s.create_subscription(&req("CreateSubscription", json!({})))
             .unwrap();
         assert_eq!(
-            body_of(&s.get_subscription_state(&req("GetSubscriptionState", json!({}))).unwrap())
-                ["SubscriptionState"],
+            body_of(
+                &s.get_subscription_state(&req("GetSubscriptionState", json!({})))
+                    .unwrap()
+            )["SubscriptionState"],
             json!("ACTIVE")
         );
         // Second create -> already exists.
@@ -953,7 +977,10 @@ mod handler_tests {
         s.delete_protection(&req("DeleteProtection", json!({ "ProtectionId": id })))
             .unwrap();
         assert!(s
-            .describe_protection(&req("DescribeProtection", json!({ "ProtectionId": "missing" })))
+            .describe_protection(&req(
+                "DescribeProtection",
+                json!({ "ProtectionId": "missing" })
+            ))
             .is_err());
     }
 
@@ -971,10 +998,7 @@ mod handler_tests {
                 json!({ "ProtectionGroupId": "grp" }),
             ))
             .unwrap();
-        assert_eq!(
-            body_of(&d)["ProtectionGroup"]["Aggregation"],
-            json!("SUM")
-        );
+        assert_eq!(body_of(&d)["ProtectionGroup"]["Aggregation"], json!("SUM"));
         let l = s
             .list_resources_in_protection_group(&req(
                 "ListResourcesInProtectionGroup",
@@ -982,6 +1006,69 @@ mod handler_tests {
             ))
             .unwrap();
         assert!(body_of(&l)["ResourceArns"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_removes_tags_so_recreate_starts_clean() {
+        let s = svc();
+        let tags = json!([{ "Key": "env", "Value": "prod" }]);
+        s.create_protection_group(&req(
+            "CreateProtectionGroup",
+            json!({ "ProtectionGroupId": "grp", "Aggregation": "SUM", "Pattern": "ALL", "Tags": tags }),
+        ))
+        .unwrap();
+        let d = s
+            .describe_protection_group(&req(
+                "DescribeProtectionGroup",
+                json!({ "ProtectionGroupId": "grp" }),
+            ))
+            .unwrap();
+        let group_arn = body_of(&d)["ProtectionGroup"]["ProtectionGroupArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let list = |arn: &str| {
+            body_of(
+                &s.list_tags_for_resource(&req(
+                    "ListTagsForResource",
+                    json!({ "ResourceARN": arn }),
+                ))
+                .unwrap(),
+            )["Tags"]
+                .clone()
+        };
+        assert_eq!(list(&group_arn), tags);
+        s.delete_protection_group(&req(
+            "DeleteProtectionGroup",
+            json!({ "ProtectionGroupId": "grp" }),
+        ))
+        .unwrap();
+        s.create_protection_group(&req(
+            "CreateProtectionGroup",
+            json!({ "ProtectionGroupId": "grp", "Aggregation": "SUM", "Pattern": "ALL" }),
+        ))
+        .unwrap();
+        assert_eq!(list(&group_arn), json!([]));
+
+        let created = s
+            .create_protection(&req(
+                "CreateProtection",
+                json!({
+                    "Name": "web",
+                    "ResourceArn": "arn:aws:cloudfront::000000000000:distribution/E1",
+                    "Tags": tags,
+                }),
+            ))
+            .unwrap();
+        let id = body_of(&created)["ProtectionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let prot_arn = protection_arn("us-east-1", "000000000000", &id);
+        assert_eq!(list(&prot_arn), tags);
+        s.delete_protection(&req("DeleteProtection", json!({ "ProtectionId": id })))
+            .unwrap();
+        assert!(s.with_account(&req("X", json!({})), |a| a.tags.is_empty()));
     }
 
     #[test]
@@ -999,7 +1086,10 @@ mod handler_tests {
                 json!({ "Name": "cn", "ResourceArn": resource }),
             ))
             .unwrap();
-        let id = body_of(&created)["ProtectionId"].as_str().unwrap().to_string();
+        let id = body_of(&created)["ProtectionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let d = s
             .describe_protection(&in_cn("DescribeProtection", json!({ "ProtectionId": id })))
             .unwrap();
@@ -1007,7 +1097,10 @@ mod handler_tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(arn, format!("arn:aws-cn:shield::000000000000:protection/{id}"));
+        assert_eq!(
+            arn,
+            format!("arn:aws-cn:shield::000000000000:protection/{id}")
+        );
 
         s.create_protection_group(&in_cn(
             "CreateProtectionGroup",

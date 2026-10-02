@@ -450,7 +450,10 @@ impl TimestreamService {
                     "The database '{name}' cannot be deleted because it still has tables."
                 )));
             }
-            data.databases.remove(&name);
+            if let Some(db) = data.databases.remove(&name) {
+                // Tags belong to the database; a same-name recreate starts clean.
+                data.tags.remove(&db.arn);
+            }
             empty_ok()
         })
     }
@@ -612,11 +615,12 @@ impl TimestreamService {
         let table = required_str(body, "TableName")?;
         let key = table_key(&database, &table);
         self.with_account_mut(req, |data| {
-            if data.tables.remove(&key).is_none() {
+            let Some(removed) = data.tables.remove(&key) else {
                 return Err(resource_not_found(format!(
                     "Table '{table}' does not exist in database '{database}'."
                 )));
-            }
+            };
+            data.tags.remove(&removed.arn);
             data.records.remove(&key);
             if let Some(db) = data.databases.get_mut(&database) {
                 db.table_count = (db.table_count - 1).max(0);
@@ -1773,6 +1777,48 @@ mod tests {
         .unwrap();
         let t = call(&s, "ListTagsForResource", json!({ "ResourceARN": arn })).unwrap();
         assert_eq!(t["Tags"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_removes_tags_so_recreate_starts_clean() {
+        let s = svc();
+        let tags = json!([{ "Key": "env", "Value": "prod" }]);
+        let db = call(
+            &s,
+            "CreateDatabase",
+            json!({ "DatabaseName": "m", "Tags": tags }),
+        )
+        .unwrap();
+        let db_arn = db["Database"]["Arn"].as_str().unwrap().to_string();
+        let tb = call(
+            &s,
+            "CreateTable",
+            json!({ "DatabaseName": "m", "TableName": "t", "Tags": tags }),
+        )
+        .unwrap();
+        let tb_arn = tb["Table"]["Arn"].as_str().unwrap().to_string();
+        let list = |arn: &str| {
+            call(&s, "ListTagsForResource", json!({ "ResourceARN": arn })).unwrap()["Tags"].clone()
+        };
+        assert_eq!(list(&db_arn), tags);
+        assert_eq!(list(&tb_arn), tags);
+
+        call(
+            &s,
+            "DeleteTable",
+            json!({ "DatabaseName": "m", "TableName": "t" }),
+        )
+        .unwrap();
+        call(&s, "DeleteDatabase", json!({ "DatabaseName": "m" })).unwrap();
+        call(&s, "CreateDatabase", json!({ "DatabaseName": "m" })).unwrap();
+        call(
+            &s,
+            "CreateTable",
+            json!({ "DatabaseName": "m", "TableName": "t" }),
+        )
+        .unwrap();
+        assert_eq!(list(&db_arn), json!([]));
+        assert_eq!(list(&tb_arn), json!([]));
     }
 
     #[test]

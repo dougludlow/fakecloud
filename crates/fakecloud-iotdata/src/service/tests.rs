@@ -228,6 +228,7 @@ fn publish_retained_then_get_and_list() {
             "sensors/temp",
             &q(&[("qos", "1"), ("retain", "true")]),
             None,
+            None,
             b"hello",
         )
         .unwrap();
@@ -252,10 +253,51 @@ fn publish_retained_then_get_and_list() {
 }
 
 #[test]
+fn retained_message_keeps_user_properties() {
+    let svc = service();
+    let ctx = ctx();
+    let props = r#"[{"deviceName":"alpha"},{"deviceCnt":"45"}]"#;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(props);
+    svc.publish(
+        &ctx,
+        "t/props",
+        &q(&[("retain", "true")]),
+        None,
+        Some(&encoded),
+        b"v",
+    )
+    .unwrap();
+    let got = body_of(&svc.get_retained_message(&ctx, "t/props").unwrap());
+    assert_eq!(got["userProperties"], json!(encoded));
+    // The list summary shape has no userProperties member.
+    let list = body_of(&svc.list_retained_messages(&ctx, &[]).unwrap());
+    assert!(list["retainedTopics"][0].get("userProperties").is_none());
+
+    // A raw (unencoded) JSON header is normalized to the same blob.
+    svc.publish(
+        &ctx,
+        "t/raw",
+        &q(&[("retain", "true")]),
+        None,
+        Some(props),
+        b"v",
+    )
+    .unwrap();
+    let got = body_of(&svc.get_retained_message(&ctx, "t/raw").unwrap());
+    assert_eq!(got["userProperties"], json!(encoded));
+
+    // Without user properties the member is omitted.
+    svc.publish(&ctx, "t/none", &q(&[("retain", "true")]), None, None, b"v")
+        .unwrap();
+    let got = body_of(&svc.get_retained_message(&ctx, "t/none").unwrap());
+    assert!(got.get("userProperties").is_none());
+}
+
+#[test]
 fn non_retained_publish_is_noop() {
     let svc = service();
     let ctx = ctx();
-    svc.publish(&ctx, "t/x", &q(&[("qos", "0")]), None, b"data")
+    svc.publish(&ctx, "t/x", &q(&[("qos", "0")]), None, None, b"data")
         .unwrap();
     let err = expect_err(svc.get_retained_message(&ctx, "t/x"));
     assert!(is_code(&err, "ResourceNotFoundException"));
@@ -265,11 +307,11 @@ fn non_retained_publish_is_noop() {
 fn empty_retained_payload_clears_topic() {
     let svc = service();
     let ctx = ctx();
-    svc.publish(&ctx, "t/x", &q(&[("retain", "true")]), None, b"v")
+    svc.publish(&ctx, "t/x", &q(&[("retain", "true")]), None, None, b"v")
         .unwrap();
     assert!(svc.get_retained_message(&ctx, "t/x").is_ok());
     // Retained publish with empty body clears the topic.
-    svc.publish(&ctx, "t/x", &q(&[("retain", "true")]), None, b"")
+    svc.publish(&ctx, "t/x", &q(&[("retain", "true")]), None, None, b"")
         .unwrap();
     assert!(svc.get_retained_message(&ctx, "t/x").is_err());
 }
@@ -277,7 +319,7 @@ fn empty_retained_payload_clears_topic() {
 #[test]
 fn publish_rejects_out_of_range_qos() {
     let svc = service();
-    let err = expect_err(svc.publish(&ctx(), "t", &q(&[("qos", "5")]), None, b"x"));
+    let err = expect_err(svc.publish(&ctx(), "t", &q(&[("qos", "5")]), None, None, b"x"));
     assert!(is_code(&err, "InvalidRequestException"));
 }
 
@@ -292,11 +334,11 @@ fn rejects_over_long_thing_name() {
 #[test]
 fn publish_rejects_invalid_payload_format_indicator() {
     let svc = service();
-    let err = expect_err(svc.publish(&ctx(), "t", &[], Some("BOGUS"), b"x"));
+    let err = expect_err(svc.publish(&ctx(), "t", &[], Some("BOGUS"), None, b"x"));
     assert!(is_code(&err, "InvalidRequestException"));
     // A valid enum value is accepted.
     assert!(svc
-        .publish(&ctx(), "t", &[], Some("UTF8_DATA"), b"x")
+        .publish(&ctx(), "t", &[], Some("UTF8_DATA"), None, b"x")
         .is_ok());
 }
 

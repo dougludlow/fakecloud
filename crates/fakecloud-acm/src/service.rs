@@ -1299,22 +1299,23 @@ impl AcmService {
         }
         let mut state = self.state.write();
         let account = account_mut(&mut state, &req.account_id);
-        let cert = account
-            .certificates
-            .get_mut(&arn)
+        let resource_tags = account
+            .resource_tags_mut(&arn)
             .ok_or_else(|| no_such_resource(&arn))?;
-        for (k, v) in tags {
-            cert.tags.insert(k, v);
-        }
         // ACM caps a resource at 50 tags; adding past that is a quota error,
-        // not a validation one.
-        if cert.tags.len() > 50 {
+        // not a validation one, and nothing is applied.
+        let new_keys = tags
+            .keys()
+            .filter(|k| !resource_tags.contains_key(*k))
+            .count();
+        if resource_tags.len() + new_keys > 50 {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ServiceQuotaExceededException",
                 format!("Resource {arn} cannot carry more than 50 tags"),
             ));
         }
+        resource_tags.extend(tags);
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -1336,13 +1337,12 @@ impl AcmService {
         }
         let mut state = self.state.write();
         let account = account_mut(&mut state, &req.account_id);
-        let cert = account
-            .certificates
-            .get_mut(&arn)
+        let resource_tags = account
+            .resource_tags_mut(&arn)
             .ok_or_else(|| no_such_resource(&arn))?;
         // AWS removes the keys that are present and ignores the rest.
         for key in keys {
-            cert.tags.remove(&key);
+            resource_tags.remove(&key);
         }
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -1350,13 +1350,12 @@ impl AcmService {
     fn list_tags_for_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let arn = Self::require_resource_arn(req)?;
         let state = self.state.read();
-        let cert = state
+        let resource_tags = state
             .accounts
             .get(&req.account_id)
-            .and_then(|a| a.certificates.get(&arn))
+            .and_then(|a| a.resource_tags(&arn))
             .ok_or_else(|| no_such_resource(&arn))?;
-        let tag_list: Vec<Value> = cert
-            .tags
+        let tag_list: Vec<Value> = resource_tags
             .iter()
             .map(|(k, v)| json!({ "Key": k, "Value": v }))
             .collect();

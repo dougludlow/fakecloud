@@ -2561,6 +2561,84 @@ async fn copy_snapshot_is_available_not_stuck_creating() {
     );
 }
 
+fn tags_xml_for(service: &ElastiCacheService, arn: &str) -> String {
+    let resp = service
+        .list_tags_for_resource(&request("ListTagsForResource", &[("ResourceName", arn)]))
+        .unwrap();
+    String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn create_and_copy_snapshot_honor_tags() {
+    let service = service_with_replication_group("tag-rg", 1);
+    service
+        .create_snapshot(&request(
+            "CreateSnapshot",
+            &[
+                ("SnapshotName", "tag-src"),
+                ("ReplicationGroupId", "tag-rg"),
+                ("Tags.Tag.1.Key", "env"),
+                ("Tags.Tag.1.Value", "dev"),
+            ],
+        ))
+        .await
+        .unwrap();
+    let src_arn = "arn:aws:elasticache:us-east-1:123456789012:snapshot:tag-src";
+    let xml = tags_xml_for(&service, src_arn);
+    assert!(
+        xml.contains("<Key>env</Key>") && xml.contains("<Value>dev</Value>"),
+        "{xml}"
+    );
+
+    service
+        .copy_snapshot(&request(
+            "CopySnapshot",
+            &[
+                ("SourceSnapshotName", "tag-src"),
+                ("TargetSnapshotName", "tag-dst"),
+                ("Tags.Tag.1.Key", "team"),
+                ("Tags.Tag.1.Value", "cache"),
+            ],
+        ))
+        .unwrap();
+    let dst_arn = "arn:aws:elasticache:us-east-1:123456789012:snapshot:tag-dst";
+    let xml = tags_xml_for(&service, dst_arn);
+    assert!(
+        xml.contains("<Key>team</Key>") && xml.contains("<Value>cache</Value>"),
+        "{xml}"
+    );
+    // The copy carries only the request's tags, not the source's.
+    assert!(!xml.contains("<Key>env</Key>"), "{xml}");
+}
+
+#[tokio::test]
+async fn copy_serverless_cache_snapshot_honors_tags() {
+    let service = service_with_serverless_cache("slt-cache");
+    service
+        .create_serverless_cache_snapshot(&request(
+            "CreateServerlessCacheSnapshot",
+            &[
+                ("ServerlessCacheSnapshotName", "slt-src"),
+                ("ServerlessCacheName", "slt-cache"),
+            ],
+        ))
+        .unwrap();
+    service
+        .copy_serverless_cache_snapshot(&request(
+            "CopyServerlessCacheSnapshot",
+            &[
+                ("SourceServerlessCacheSnapshotName", "slt-src"),
+                ("TargetServerlessCacheSnapshotName", "slt-dst"),
+                ("Tags.Tag.1.Key", "team"),
+                ("Tags.Tag.1.Value", "cache"),
+            ],
+        ))
+        .unwrap();
+    let arn = "arn:aws:elasticache:us-east-1:123456789012:serverlesssnapshot:slt-dst";
+    let xml = tags_xml_for(&service, arn);
+    assert!(xml.contains("<Key>team</Key>"), "{xml}");
+}
+
 #[tokio::test]
 async fn copy_serverless_cache_snapshot_is_available_not_stuck_creating() {
     let service = service_with_serverless_cache("sl-cache");

@@ -212,3 +212,65 @@ async fn shield_advanced_control_plane_lifecycle() {
         .await;
     assert!(after.is_err(), "deleted protection should not be found");
 }
+
+#[tokio::test]
+async fn shield_delete_protection_group_drops_its_tags() {
+    let server = TestServer::start().await;
+    let shield = shield_client(&server).await;
+    shield
+        .create_subscription()
+        .send()
+        .await
+        .expect("subscribe");
+
+    let tag = Tag::builder().key("env").value("prod").build();
+    shield
+        .create_protection_group()
+        .protection_group_id("grp")
+        .aggregation(aws_sdk_shield::types::ProtectionGroupAggregation::Sum)
+        .pattern(aws_sdk_shield::types::ProtectionGroupPattern::All)
+        .tags(tag)
+        .send()
+        .await
+        .expect("create group");
+    let arn = shield
+        .describe_protection_group()
+        .protection_group_id("grp")
+        .send()
+        .await
+        .expect("describe group")
+        .protection_group()
+        .expect("group")
+        .protection_group_arn()
+        .expect("arn")
+        .to_string();
+    let tags = shield
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .expect("list tags");
+    assert_eq!(tags.tags().len(), 1);
+
+    shield
+        .delete_protection_group()
+        .protection_group_id("grp")
+        .send()
+        .await
+        .expect("delete group");
+    shield
+        .create_protection_group()
+        .protection_group_id("grp")
+        .aggregation(aws_sdk_shield::types::ProtectionGroupAggregation::Sum)
+        .pattern(aws_sdk_shield::types::ProtectionGroupPattern::All)
+        .send()
+        .await
+        .expect("recreate group");
+    let tags = shield
+        .list_tags_for_resource()
+        .resource_arn(&arn)
+        .send()
+        .await
+        .expect("list tags after recreate");
+    assert!(tags.tags().is_empty(), "tags leaked: {:?}", tags.tags());
+}

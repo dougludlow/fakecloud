@@ -265,3 +265,52 @@ async fn neptune_engine_versions_and_parameter_groups() {
         .expect("describe db parameters");
     assert!(!params.parameters().is_empty());
 }
+
+/// CreateDBCluster's `CopyTagsToSnapshot` and
+/// `ServerlessV2ScalingConfiguration`, and ModifyDBCluster's `StorageType`,
+/// read back through DescribeDBClusters via the real SDK.
+#[tokio::test]
+async fn neptune_cluster_serverless_copy_tags_and_storage_type_round_trip() {
+    use aws_sdk_neptune::types::ServerlessV2ScalingConfiguration;
+
+    let server = TestServer::start().await;
+    let client = server.neptune_client().await;
+
+    client
+        .create_db_cluster()
+        .db_cluster_identifier("neptune-sv2")
+        .engine("neptune")
+        .copy_tags_to_snapshot(true)
+        .serverless_v2_scaling_configuration(
+            ServerlessV2ScalingConfiguration::builder()
+                .min_capacity(2.5)
+                .max_capacity(64.0)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create cluster");
+    client
+        .modify_db_cluster()
+        .db_cluster_identifier("neptune-sv2")
+        .storage_type("iopt1")
+        .send()
+        .await
+        .expect("modify cluster");
+
+    let cluster = client
+        .describe_db_clusters()
+        .db_cluster_identifier("neptune-sv2")
+        .send()
+        .await
+        .expect("describe cluster")
+        .db_clusters()[0]
+        .clone();
+    assert_eq!(cluster.copy_tags_to_snapshot(), Some(true));
+    assert_eq!(cluster.storage_type(), Some("iopt1"));
+    let scaling = cluster
+        .serverless_v2_scaling_configuration()
+        .expect("scaling configuration");
+    assert_eq!(scaling.min_capacity(), Some(2.5));
+    assert_eq!(scaling.max_capacity(), Some(64.0));
+}

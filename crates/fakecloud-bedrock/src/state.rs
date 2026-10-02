@@ -252,6 +252,17 @@ pub struct Guardrail {
     pub topic_policy: Option<serde_json::Value>,
     #[serde(default)]
     pub contextual_grounding_policy: Option<serde_json::Value>,
+    /// `GuardrailAutomatedReasoningPolicy` read shape (`policies`,
+    /// `confidenceThreshold`).
+    #[serde(default)]
+    pub automated_reasoning_policy: Option<serde_json::Value>,
+    /// `GuardrailCrossRegionDetails` (`guardrailProfileId`,
+    /// `guardrailProfileArn`) resolved from `crossRegionConfig`.
+    #[serde(default)]
+    pub cross_region_details: Option<serde_json::Value>,
+    /// The KMS key ARN resolved from the create/update `kmsKeyId`.
+    #[serde(default)]
+    pub kms_key_arn: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -272,6 +283,17 @@ pub struct GuardrailVersion {
     pub topic_policy: Option<serde_json::Value>,
     #[serde(default)]
     pub contextual_grounding_policy: Option<serde_json::Value>,
+    /// `GuardrailAutomatedReasoningPolicy` read shape (`policies`,
+    /// `confidenceThreshold`).
+    #[serde(default)]
+    pub automated_reasoning_policy: Option<serde_json::Value>,
+    /// `GuardrailCrossRegionDetails` (`guardrailProfileId`,
+    /// `guardrailProfileArn`) resolved from `crossRegionConfig`.
+    #[serde(default)]
+    pub cross_region_details: Option<serde_json::Value>,
+    /// The KMS key ARN resolved from the create/update `kmsKeyId`.
+    #[serde(default)]
+    pub kms_key_arn: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

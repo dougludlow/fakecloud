@@ -1442,10 +1442,14 @@ impl MemoryDbService {
             status: "available".to_string(),
             source: "manual".to_string(),
             kms_key_id: opt_str(&b, "KmsKeyId").or(src.kms_key_id),
-            arn: snap_arn,
+            arn: snap_arn.clone(),
             data_tiering: src.data_tiering,
             cluster_configuration: src.cluster_configuration,
         };
+        let tags = parse_tags(&b);
+        if !tags.is_empty() {
+            st.tags.insert(snap_arn, tags);
+        }
         st.snapshots.insert(target, snap.clone());
         ok(json!({ "Snapshot": snapshot_json(&snap) }))
     }
@@ -1898,6 +1902,36 @@ mod tests {
     fn call(s: &MemoryDbService, action: &str, body: Value) -> Result<Value, AwsServiceError> {
         let resp = dispatch(s, &req(action, body))?;
         Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+    }
+
+    #[test]
+    fn copy_snapshot_honors_tags() {
+        let s = service();
+        call(
+            &s,
+            "CreateCluster",
+            json!({"ClusterName": "src", "NodeType": "db.r6g.large", "ACLName": "open-access"}),
+        )
+        .unwrap();
+        call(
+            &s,
+            "CreateSnapshot",
+            json!({"ClusterName": "src", "SnapshotName": "snap-a"}),
+        )
+        .unwrap();
+        let out = call(
+            &s,
+            "CopySnapshot",
+            json!({
+                "SourceSnapshotName": "snap-a",
+                "TargetSnapshotName": "snap-b",
+                "Tags": [{"Key": "env", "Value": "dev"}]
+            }),
+        )
+        .unwrap();
+        let arn = out["Snapshot"]["ARN"].as_str().unwrap().to_string();
+        let tags = call(&s, "ListTags", json!({"ResourceArn": arn})).unwrap();
+        assert_eq!(tags["TagList"], json!([{"Key": "env", "Value": "dev"}]));
     }
 
     #[test]

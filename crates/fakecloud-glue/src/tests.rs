@@ -2447,3 +2447,238 @@ fn federated_tables_and_view_definitions_round_trip() {
         Ok(_) => panic!("unknown ResourceShareType accepted"),
     }
 }
+
+fn tags_of(svc: &GlueService, arn: &str) -> Value {
+    body_of(
+        svc.get_tags(&req("GetTags", json!({"ResourceArn": arn})))
+            .unwrap(),
+    )["Tags"]
+        .clone()
+}
+
+const ARN_PREFIX: &str = "arn:aws:glue:us-east-1:123456789012";
+
+#[test]
+fn create_time_tags_reach_get_tags_and_delete_clears_them() {
+    let svc = GlueService::default();
+    let tags = json!({"env": "dev", "team": "data"});
+    svc.create_job(&req(
+        "CreateJob",
+        json!({"Name": "j", "Role": "r", "Command": {"Name": "glueetl"}, "Tags": tags}),
+    ))
+    .unwrap();
+    svc.create_crawler(&req(
+        "CreateCrawler",
+        json!({"Name": "c", "Role": "r", "Targets": {}, "Tags": tags}),
+    ))
+    .unwrap();
+    svc.create_catalog(&req(
+        "CreateCatalog",
+        json!({"Name": "cat", "CatalogInput": {}, "Tags": tags}),
+    ))
+    .unwrap();
+    svc.create_custom_entity_type(&req(
+        "CreateCustomEntityType",
+        json!({"Name": "cet", "RegexString": "[0-9]+", "Tags": tags}),
+    ))
+    .unwrap();
+    svc.create_trigger(&req(
+        "CreateTrigger",
+        json!({"Name": "t", "Type": "ON_DEMAND", "Actions": [{"JobName": "j"}], "Tags": tags}),
+    ))
+    .unwrap();
+    svc.create_workflow(&req("CreateWorkflow", json!({"Name": "w", "Tags": tags})))
+        .unwrap();
+    svc.create_database(&req(
+        "CreateDatabase",
+        json!({"DatabaseInput": {"Name": "db"}, "Tags": tags}),
+    ))
+    .unwrap();
+    for kind in [
+        "job/j",
+        "crawler/c",
+        "catalog/cat",
+        "customEntityType/cet",
+        "trigger/t",
+        "workflow/w",
+        "database/db",
+    ] {
+        assert_eq!(
+            tags_of(&svc, &format!("{ARN_PREFIX}:{kind}")),
+            tags,
+            "{kind}"
+        );
+    }
+
+    svc.delete_job(&req("DeleteJob", json!({"JobName": "j"})))
+        .unwrap();
+    svc.delete_crawler(&req("DeleteCrawler", json!({"Name": "c"})))
+        .unwrap();
+    svc.delete_catalog(&req("DeleteCatalog", json!({"CatalogId": "cat"})))
+        .unwrap();
+    svc.delete_custom_entity_type(&req("DeleteCustomEntityType", json!({"Name": "cet"})))
+        .unwrap();
+    svc.delete_trigger(&req("DeleteTrigger", json!({"Name": "t"})))
+        .unwrap();
+    svc.delete_workflow(&req("DeleteWorkflow", json!({"Name": "w"})))
+        .unwrap();
+    svc.delete_database(&req("DeleteDatabase", json!({"Name": "db"})))
+        .unwrap();
+    for kind in [
+        "job/j",
+        "crawler/c",
+        "catalog/cat",
+        "customEntityType/cet",
+        "trigger/t",
+        "workflow/w",
+        "database/db",
+    ] {
+        assert_eq!(
+            tags_of(&svc, &format!("{ARN_PREFIX}:{kind}")),
+            json!({}),
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn list_ops_honor_tag_filter() {
+    let svc = GlueService::default();
+    for (name, env) in [("a", "prod"), ("b", "dev")] {
+        svc.create_job(&req(
+            "CreateJob",
+            json!({"Name": name, "Role": "r", "Command": {"Name": "glueetl"}, "Tags": {"env": env}}),
+        ))
+        .unwrap();
+        svc.create_crawler(&req(
+            "CreateCrawler",
+            json!({"Name": name, "Role": "r", "Targets": {}, "Tags": {"env": env}}),
+        ))
+        .unwrap();
+    }
+    let jobs = body_of(
+        svc.list_jobs(&req("ListJobs", json!({"Tags": {"env": "prod"}})))
+            .unwrap(),
+    );
+    assert_eq!(jobs["JobNames"], json!(["a"]));
+    let all = body_of(svc.list_jobs(&req("ListJobs", json!({}))).unwrap());
+    assert_eq!(all["JobNames"], json!(["a", "b"]));
+    let crawlers = body_of(
+        svc.list_crawlers(&req("ListCrawlers", json!({"Tags": {"env": "dev"}})))
+            .unwrap(),
+    );
+    assert_eq!(crawlers["CrawlerNames"], json!(["b"]));
+}
+
+#[test]
+fn job_mode_and_queuing_round_trip() {
+    let svc = GlueService::default();
+    svc.create_job(&req(
+        "CreateJob",
+        json!({"Name": "j", "Role": "r", "Command": {"Name": "glueetl"},
+               "JobMode": "VISUAL", "JobRunQueuingEnabled": true}),
+    ))
+    .unwrap();
+    let got = body_of(
+        svc.get_job(&req("GetJob", json!({"JobName": "j"})))
+            .unwrap(),
+    );
+    assert_eq!(got["Job"]["JobMode"], "VISUAL");
+    assert_eq!(got["Job"]["JobRunQueuingEnabled"], true);
+    let batch = body_of(
+        svc.batch_get_jobs(&req("BatchGetJobs", json!({"JobNames": ["j"]})))
+            .unwrap(),
+    );
+    assert_eq!(batch["Jobs"][0]["JobMode"], "VISUAL");
+
+    svc.update_job(&req(
+        "UpdateJob",
+        json!({"JobName": "j", "JobUpdate": {"Role": "r", "Command": {"Name": "glueetl"},
+               "JobMode": "NOTEBOOK", "JobRunQueuingEnabled": false}}),
+    ))
+    .unwrap();
+    let got = body_of(svc.get_jobs(&req("GetJobs", json!({}))).unwrap());
+    assert_eq!(got["Jobs"][0]["JobMode"], "NOTEBOOK");
+    assert_eq!(got["Jobs"][0]["JobRunQueuingEnabled"], false);
+}
+
+#[test]
+fn create_catalog_persists_full_catalog_input() {
+    let svc = GlueService::default();
+    let props = json!({
+        "DataLakeAccessProperties": {"DataLakeAccess": true, "CatalogType": "aws:redshift"},
+        "CustomProperties": {"k": "v"}
+    });
+    let perms = json!([{"Principal": {"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"},
+                        "Permissions": ["ALL"]}]);
+    svc.create_catalog(&req(
+        "CreateCatalog",
+        json!({"Name": "cat", "CatalogInput": {
+            "Description": "d",
+            "FederatedCatalog": {"Identifier": "fid", "ConnectionName": "conn", "ConnectionType": "aws:redshift"},
+            "TargetRedshiftCatalog": {"CatalogArn": "arn:aws:glue:us-east-1:123456789012:catalog/x"},
+            "CatalogProperties": props,
+            "CreateTableDefaultPermissions": perms,
+            "CreateDatabaseDefaultPermissions": perms,
+            "AllowFullTableExternalDataAccess": "True",
+            "OverwriteChildResourcePermissionsWithDefault": "Accept"
+        }}),
+    ))
+    .unwrap();
+    let got = body_of(
+        svc.get_catalog(&req("GetCatalog", json!({"CatalogId": "cat"})))
+            .unwrap(),
+    );
+    let c = &got["Catalog"];
+    assert_eq!(c["Description"], "d");
+    assert_eq!(c["ResourceArn"], format!("{ARN_PREFIX}:catalog/cat"));
+    assert_eq!(c["FederatedCatalog"]["Identifier"], "fid");
+    assert_eq!(
+        c["TargetRedshiftCatalog"]["CatalogArn"],
+        "arn:aws:glue:us-east-1:123456789012:catalog/x"
+    );
+    assert_eq!(c["CatalogProperties"], props);
+    assert_eq!(c["CreateTableDefaultPermissions"], perms);
+    assert_eq!(c["CreateDatabaseDefaultPermissions"], perms);
+    assert_eq!(c["AllowFullTableExternalDataAccess"], "True");
+    assert!(c
+        .get("OverwriteChildResourcePermissionsWithDefault")
+        .is_none());
+
+    svc.update_catalog(&req(
+        "UpdateCatalog",
+        json!({"CatalogId": "cat", "CatalogInput": {"AllowFullTableExternalDataAccess": "False"}}),
+    ))
+    .unwrap();
+    let list = body_of(svc.get_catalogs(&req("GetCatalogs", json!({}))).unwrap());
+    let c = &list["CatalogList"][0];
+    assert_eq!(c["AllowFullTableExternalDataAccess"], "False");
+    assert_eq!(c["FederatedCatalog"]["Identifier"], "fid");
+}
+
+#[test]
+fn crawler_schedule_round_trips_through_start_stop() {
+    let svc = GlueService::default();
+    svc.create_crawler(&req(
+        "CreateCrawler",
+        json!({"Name": "c", "Role": "r", "Targets": {}, "Schedule": "cron(0 1 * * ? *)"}),
+    ))
+    .unwrap();
+    let get = |svc: &GlueService| {
+        body_of(
+            svc.get_crawler(&req("GetCrawler", json!({"Name": "c"})))
+                .unwrap(),
+        )["Crawler"]["Schedule"]
+            .clone()
+    };
+    assert_eq!(
+        get(&svc),
+        json!({"ScheduleExpression": "cron(0 1 * * ? *)", "State": "SCHEDULED"})
+    );
+    svc.stop_crawler_schedule(&req("StopCrawlerSchedule", json!({"CrawlerName": "c"})))
+        .unwrap();
+    assert_eq!(
+        get(&svc),
+        json!({"ScheduleExpression": "cron(0 1 * * ? *)", "State": "NOT_SCHEDULED"})
+    );
+}

@@ -541,6 +541,13 @@ impl RdsService {
                 if let Some(obj) = entry.as_object_mut() {
                     apply_create_cluster_params(obj, req);
                     self.resolve_cluster_storage_key(obj, &aid, region);
+                    // Stored where AddTagsToResource merges and
+                    // ListTagsForResource / the TagList read.
+                    let tags = crate::service::service_helpers::parse_tags(req)?;
+                    obj.insert(
+                        "Tags".to_string(),
+                        crate::service::service_helpers::tags_to_json(&tags),
+                    );
                 }
                 {
                     let mut accounts = write_state!();
@@ -788,6 +795,15 @@ impl RdsService {
                         &source_id,
                     ));
                 }
+                // Tags named on the request; otherwise the source's,
+                // only with CopyTags=true (AWS copies none by default).
+                let copy_tags = crate::service::service_helpers::tags_to_json(
+                    &crate::service::service_helpers::inherited_tags(
+                        crate::service::service_helpers::parse_tags(req)?,
+                        optional_flag(get_param(req, "CopyTags").as_deref()) == Some(true),
+                        &crate::service::service_helpers::json_tags(&entry),
+                    ),
+                );
                 let state = accounts.get_or_create(&aid);
                 let cluster = entry
                     .get("DBClusterIdentifier")
@@ -826,6 +842,7 @@ impl RdsService {
                     // source's `restore` list would publish a snapshot
                     // nobody shared.
                     obj.remove("SnapshotAttributes");
+                    obj.insert("Tags".to_string(), copy_tags);
                 }
                 store(&mut state.extras, "cluster_snapshots").insert(id.clone(), entry.clone());
                 Ok(xml_response(
@@ -1510,13 +1527,65 @@ impl RdsService {
                 let name = get_param(req, "DBClusterParameterGroupName").or_else(|| get_param(req, "TargetDBClusterParameterGroupIdentifier"))
                     .ok_or_else(|| missing("DBClusterParameterGroupName"))?;
                 let arn = rds_arn(region, &aid, "cluster-pg", &name);
-                let family = get_param(req, "DBParameterGroupFamily").unwrap_or_else(|| "aurora-postgresql15".to_string());
-                let description = get_param(req, "Description").unwrap_or_default();
-                let entry = json!({"DBClusterParameterGroupName": name, "DBClusterParameterGroupArn": arn, "DBParameterGroupFamily": family, "Description": description});
+                let tags = crate::service::service_helpers::tags_to_json(
+                    &crate::service::service_helpers::parse_tags(req)?,
+                );
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
-                store(&mut state.extras, "cluster_param_groups").insert(name.clone(), entry);
-                Ok(xml_response(action.as_str(), cluster_pg_xml(&name, &arn, &family, &description), &rid))
+                let entry = if action == "CopyDBClusterParameterGroup" {
+                    // A copy takes the source's family and parameter
+                    // values; only the name, description and tags are the
+                    // request's own.
+                    let source = get_param(req, "SourceDBClusterParameterGroupIdentifier")
+                        .ok_or_else(|| missing("SourceDBClusterParameterGroupIdentifier"))?;
+                    let source_not_found = || {
+                        AwsServiceError::aws_error(
+                            StatusCode::NOT_FOUND,
+                            "DBParameterGroupNotFound",
+                            format!("DBClusterParameterGroup {source} not found."),
+                        )
+                    };
+                    if !addresses_own_account(&source, &aid)
+                        || !identifier_matches_type(&source, "cluster-pg")
+                    {
+                        return Err(source_not_found());
+                    }
+                    let source_key = normalized_identifier(Some(source.clone()), "cluster-pg")
+                        .unwrap_or_else(|| source.clone());
+                    let groups = store(&mut state.extras, "cluster_param_groups");
+                    if groups.contains_key(&name) {
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "DBParameterGroupAlreadyExists",
+                            format!("DBClusterParameterGroup {name} already exists."),
+                        ));
+                    }
+                    let mut entry = groups.get(&source_key).cloned().ok_or_else(source_not_found)?;
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("DBClusterParameterGroupName".to_string(), json!(name));
+                        obj.insert("DBClusterParameterGroupArn".to_string(), json!(arn));
+                        if let Some(description) = get_param(req, "TargetDBClusterParameterGroupDescription") {
+                            obj.insert("Description".to_string(), json!(description));
+                        }
+                        obj.insert("Tags".to_string(), tags);
+                    }
+                    entry
+                } else {
+                    let family = get_param(req, "DBParameterGroupFamily").unwrap_or_else(|| "aurora-postgresql15".to_string());
+                    let description = get_param(req, "Description").unwrap_or_default();
+                    json!({"DBClusterParameterGroupName": name, "DBClusterParameterGroupArn": arn, "DBParameterGroupFamily": family, "Description": description, "Tags": tags})
+                };
+                store(&mut state.extras, "cluster_param_groups").insert(name.clone(), entry.clone());
+                Ok(xml_response(
+                    action.as_str(),
+                    cluster_pg_xml(
+                        &name,
+                        &arn,
+                        entry_str(&entry, "DBParameterGroupFamily").unwrap_or_default(),
+                        entry_str(&entry, "Description").unwrap_or_default(),
+                    ),
+                    &rid,
+                ))
             }
             "ModifyDBClusterParameterGroup" => {
                 let name = get_param(req, "DBClusterParameterGroupName").ok_or_else(|| missing("DBClusterParameterGroupName"))?;
@@ -1948,11 +2017,38 @@ impl RdsService {
             "CreateDBProxy" => {
                 let name = get_param(req, "DBProxyName").ok_or_else(|| missing("DBProxyName"))?;
                 let arn = rds_arn(region, &aid, "db-proxy", &name);
-                let entry = json!({"DBProxyName": name, "DBProxyArn": arn, "Status": "available", "EngineFamily": get_param(req, "EngineFamily").unwrap_or_else(|| "POSTGRESQL".to_string())});
+                let now = chrono::Utc::now().to_rfc3339();
+                let mut entry = json!({
+                    "DBProxyName": name, "DBProxyArn": arn, "Status": "available",
+                    "EngineFamily": get_param(req, "EngineFamily").unwrap_or_else(|| "POSTGRESQL".to_string()),
+                    "Endpoint": format!("{name}.proxy-xxx.{region}.rds.amazonaws.com"),
+                    "Auth": parse_proxy_auth(req),
+                    "VpcSubnetIds": parse_member_list(req, "VpcSubnetIds"),
+                    "VpcSecurityGroupIds": parse_member_list(req, "VpcSecurityGroupIds"),
+                    "RequireTLS": optional_flag(get_param(req, "RequireTLS").as_deref()).unwrap_or(false),
+                    // AWS's default idle timeout is 30 minutes.
+                    "IdleClientTimeout": get_param(req, "IdleClientTimeout")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(1800),
+                    "DebugLogging": optional_flag(get_param(req, "DebugLogging").as_deref()).unwrap_or(false),
+                    "EndpointNetworkType": get_param(req, "EndpointNetworkType").unwrap_or_else(|| "IPV4".to_string()),
+                    "TargetConnectionNetworkType": get_param(req, "TargetConnectionNetworkType").unwrap_or_else(|| "IPV4".to_string()),
+                    "CreatedDate": now, "UpdatedDate": now,
+                    "Tags": crate::service::service_helpers::tags_to_json(
+                        &crate::service::service_helpers::parse_tags(req)?,
+                    ),
+                });
+                if let Some(obj) = entry.as_object_mut() {
+                    for key in ["RoleArn", "DefaultAuthScheme"] {
+                        if let Some(v) = get_param(req, key) {
+                            obj.insert(key.to_string(), json!(v));
+                        }
+                    }
+                }
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
                 store(&mut state.extras, "proxies").insert(name.clone(), entry.clone());
-                Ok(xml_response("CreateDBProxy", proxy_xml(&entry), &rid))
+                Ok(xml_response("CreateDBProxy", format!("    <DBProxy>\n{}\n    </DBProxy>", proxy_xml(&entry)), &rid))
             }
             "ModifyDBProxy" => {
                 let name = get_param(req, "DBProxyName").ok_or_else(|| missing("DBProxyName"))?;
@@ -1987,6 +2083,16 @@ impl RdsService {
                     if let Some(v) = new_name.as_ref() {
                         obj.insert("DBProxyName".to_string(), json!(v));
                     }
+                    for key in ["RoleArn", "DefaultAuthScheme"] {
+                        if let Some(v) = get_param(req, key) {
+                            obj.insert(key.to_string(), json!(v));
+                        }
+                    }
+                    let security_groups = parse_member_list(req, "SecurityGroups");
+                    if !security_groups.is_empty() {
+                        obj.insert("VpcSecurityGroupIds".to_string(), json!(security_groups));
+                    }
+                    obj.insert("UpdatedDate".to_string(), json!(chrono::Utc::now().to_rfc3339()));
                 }
                 let updated = entry.clone();
                 // Rekey the map so subsequent Describe/Delete/Modify
@@ -2036,11 +2142,26 @@ impl RdsService {
             "DescribeDBProxies" => list_extras_xml(self, &aid, "proxies", "DBProxies", "member", "DescribeDBProxies", proxy_xml, &rid),
             "CreateDBProxyEndpoint" => {
                 let name = get_param(req, "DBProxyEndpointName").ok_or_else(|| missing("DBProxyEndpointName"))?;
-                let entry = json!({"DBProxyEndpointName": name, "Status": "available"});
+                let entry = json!({
+                    "DBProxyEndpointName": name,
+                    "DBProxyEndpointArn": rds_arn(region, &aid, "db-proxy-endpoint", &name),
+                    "DBProxyName": get_param(req, "DBProxyName"),
+                    "Status": "available",
+                    "Endpoint": format!("{name}.endpoint.proxy-xxx.{region}.rds.amazonaws.com"),
+                    "VpcSubnetIds": parse_member_list(req, "VpcSubnetIds"),
+                    "VpcSecurityGroupIds": parse_member_list(req, "VpcSecurityGroupIds"),
+                    "TargetRole": get_param(req, "TargetRole").unwrap_or_else(|| "READ_WRITE".to_string()),
+                    "EndpointNetworkType": get_param(req, "EndpointNetworkType").unwrap_or_else(|| "IPV4".to_string()),
+                    "CreatedDate": chrono::Utc::now().to_rfc3339(),
+                    "IsDefault": false,
+                    "Tags": crate::service::service_helpers::tags_to_json(
+                        &crate::service::service_helpers::parse_tags(req)?,
+                    ),
+                });
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
-                store(&mut state.extras, "proxy_endpoints").insert(name.clone(), entry);
-                Ok(xml_response("CreateDBProxyEndpoint", format!("    <DBProxyEndpoint>\n      <DBProxyEndpointName>{}</DBProxyEndpointName>\n    </DBProxyEndpoint>", xml_escape(&name)), &rid))
+                store(&mut state.extras, "proxy_endpoints").insert(name.clone(), entry.clone());
+                Ok(xml_response("CreateDBProxyEndpoint", format!("    <DBProxyEndpoint>\n{}\n    </DBProxyEndpoint>", proxy_endpoint_xml(&entry)), &rid))
             }
             "ModifyDBProxyEndpoint" => {
                 let name = get_param(req, "DBProxyEndpointName").ok_or_else(|| missing("DBProxyEndpointName"))?;
@@ -2067,7 +2188,7 @@ impl RdsService {
                         obj.insert("DBProxyEndpointName".to_string(), json!(v));
                     }
                 }
-                let final_name = new_name.clone().unwrap_or_else(|| name.clone());
+                let updated = entry.clone();
                 // Rekey so the rename is visible to subsequent lookups,
                 // not just to the payload field.
                 if let Some(new) = new_name {
@@ -2079,7 +2200,7 @@ impl RdsService {
                         }
                     }
                 }
-                Ok(xml_response("ModifyDBProxyEndpoint", format!("    <DBProxyEndpoint>\n      <DBProxyEndpointName>{}</DBProxyEndpointName>\n    </DBProxyEndpoint>", xml_escape(&final_name)), &rid))
+                Ok(xml_response("ModifyDBProxyEndpoint", format!("    <DBProxyEndpoint>\n{}\n    </DBProxyEndpoint>", proxy_endpoint_xml(&updated)), &rid))
             }
             "DeleteDBProxyEndpoint" => {
                 let name = get_param(req, "DBProxyEndpointName").ok_or_else(|| missing("DBProxyEndpointName"))?;
@@ -2095,17 +2216,11 @@ impl RdsService {
                 if let Some(state) = state_opt {
                     if let Some(m) = state.extras.get("proxy_endpoints") {
                         for v in m.values() {
-                            // Render with the same field shape as
-                            // CreateDBProxyEndpoint above so consumers
-                            // see the persisted endpoint name and any
-                            // VpcSecurityGroupIds we recorded.
-                            let n = v
-                                .get("DBProxyEndpointName")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default();
+                            // Same rendering as CreateDBProxyEndpoint, so
+                            // every stored field reads back.
                             members.push_str(&format!(
-                                "      <member>\n        <DBProxyEndpointName>{}</DBProxyEndpointName>\n      </member>\n",
-                                xml_escape(n)
+                                "      <member>\n{}\n      </member>\n",
+                                proxy_endpoint_xml(v)
                             ));
                         }
                     }
@@ -3413,6 +3528,9 @@ impl RdsService {
                     .unwrap_or_else(|| source_id.clone());
                 let source_owner = identifier_account(&source_id);
                 let option_group_name = get_param(req, "OptionGroupName");
+                let request_tags = crate::service::service_helpers::parse_tags(req)?;
+                let copy_source_tags =
+                    optional_flag(get_param(req, "CopyTags").as_deref()) == Some(true);
                 // Reported as the key's ARN: resolved through KMS before the
                 // RDS lock, or formatted as one when KMS doesn't know it.
                 // Only for a copy that can succeed (the target is free and the
@@ -3512,6 +3630,13 @@ impl RdsService {
                     // A copy is a fresh sharing surface; it does not inherit
                     // the source snapshot's restore attributes.
                     snapshot.snapshot_attributes = BTreeMap::new();
+                    // Tags named on the request; otherwise the source's,
+                    // only with CopyTags=true (AWS copies none by default).
+                    snapshot.tags = crate::service::service_helpers::inherited_tags(
+                        request_tags,
+                        copy_source_tags,
+                        &snapshot.tags,
+                    );
                     state.snapshots.insert(target_id.clone(), snapshot.clone());
                     (snapshot, arn)
                 };
@@ -3553,6 +3678,7 @@ impl RdsService {
                 let source_key = normalized_identifier(Some(source.clone()), "pg")
                     .unwrap_or_else(|| source.clone());
                 let description = get_param(req, "TargetDBParameterGroupDescription");
+                let request_tags = crate::service::service_helpers::parse_tags(req)?;
                 let group = {
                     let mut accounts = write_state!();
                     let state = accounts.get_or_create(&aid);
@@ -3579,7 +3705,8 @@ impl RdsService {
                     if let Some(desc) = description {
                         group.description = desc;
                     }
-                    group.tags = Vec::new();
+                    // The copy carries only the tags named on the request.
+                    group.tags = request_tags;
                     state.parameter_groups.insert(target.clone(), group.clone());
                     group
                 };
@@ -4291,6 +4418,7 @@ pub(crate) fn cluster_snapshot_detail_xml(entry: Option<&Value>) -> String {
     if let Some(key) = entry_str(entry, "KmsKeyId") {
         out.push_str(&format!("\n      <KmsKeyId>{}</KmsKeyId>", xml_escape(key)));
     }
+    out.push_str(&format!("\n      {}", json_tag_list_xml(entry)));
     out
 }
 

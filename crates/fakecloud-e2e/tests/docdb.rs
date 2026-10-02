@@ -205,3 +205,51 @@ async fn docdb_engine_versions_and_certificates() {
         .expect("certificates");
     assert!(!certs.certificates().is_empty());
 }
+
+/// ModifyDBCluster's `StorageType` and `ServerlessV2ScalingConfiguration`
+/// read back through DescribeDBClusters via the real SDK.
+#[tokio::test]
+async fn docdb_modify_cluster_storage_type_and_serverless_round_trip() {
+    use aws_sdk_docdb::types::ServerlessV2ScalingConfiguration;
+
+    let server = TestServer::start().await;
+    let client = server.docdb_client().await;
+
+    client
+        .create_db_cluster()
+        .db_cluster_identifier("docdb-st")
+        .engine("docdb")
+        .master_username("admin")
+        .master_user_password("Passw0rd123")
+        .send()
+        .await
+        .expect("create cluster");
+    client
+        .modify_db_cluster()
+        .db_cluster_identifier("docdb-st")
+        .storage_type("iopt1")
+        .serverless_v2_scaling_configuration(
+            ServerlessV2ScalingConfiguration::builder()
+                .min_capacity(0.5)
+                .max_capacity(16.0)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("modify cluster");
+
+    let cluster = client
+        .describe_db_clusters()
+        .db_cluster_identifier("docdb-st")
+        .send()
+        .await
+        .expect("describe cluster")
+        .db_clusters()[0]
+        .clone();
+    assert_eq!(cluster.storage_type(), Some("iopt1"));
+    let scaling = cluster
+        .serverless_v2_scaling_configuration()
+        .expect("scaling configuration");
+    assert_eq!(scaling.min_capacity(), Some(0.5));
+    assert_eq!(scaling.max_capacity(), Some(16.0));
+}

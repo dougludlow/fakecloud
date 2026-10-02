@@ -778,6 +778,106 @@ mod scheduler_reconcile {
         );
         assert_eq!(v["settings"], json!([]));
     }
+
+    fn tags_of(svc: &EcsService, arn: &str) -> Value {
+        let resp = svc
+            .list_tags_for_resource(&ecs_request(
+                "ListTagsForResource",
+                json!({"resourceArn": arn}),
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        v["tags"].clone()
+    }
+
+    #[tokio::test]
+    async fn daemons_daemon_task_definitions_and_express_gateway_services_are_taggable() {
+        let svc = EcsService::new(empty_state());
+        svc.create_cluster(&ecs_request("CreateCluster", json!({"clusterName": "c1"})))
+            .unwrap();
+        let resp = svc
+            .register_daemon_task_definition(&ecs_request(
+                "RegisterDaemonTaskDefinition",
+                json!({
+                    "family": "agent",
+                    "containerDefinitions": [{"name": "a", "image": "busybox"}],
+                    "tags": [{"key": "env", "value": "prod"}]
+                }),
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let td_arn = v["daemonTaskDefinitionArn"].as_str().unwrap().to_string();
+
+        let resp = svc
+            .create_daemon(&ecs_request(
+                "CreateDaemon",
+                json!({
+                    "daemonName": "d1",
+                    "clusterArn": "c1",
+                    "daemonTaskDefinitionArn": td_arn,
+                    "capacityProviderArns": [],
+                    "tags": [{"key": "env", "value": "prod"}]
+                }),
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let daemon_arn = v["daemonArn"].as_str().unwrap().to_string();
+
+        let resp = svc
+            .create_express_gateway_service(&ecs_request(
+                "CreateExpressGatewayService",
+                json!({
+                    "cluster": "c1",
+                    "serviceName": "eg1",
+                    "executionRoleArn": "arn:aws:iam::123456789012:role/exec",
+                    "infrastructureRoleArn": "arn:aws:iam::123456789012:role/infra",
+                    "primaryContainer": {"image": "nginx"},
+                    "tags": [{"key": "env", "value": "prod"}]
+                }),
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let eg_arn = v["service"]["serviceArn"].as_str().unwrap().to_string();
+
+        for arn in [&td_arn, &daemon_arn, &eg_arn] {
+            // Creation-time tags are visible through the generic API.
+            assert_eq!(
+                tags_of(&svc, arn),
+                json!([{"key": "env", "value": "prod"}]),
+                "{arn}"
+            );
+            svc.tag_resource(&ecs_request(
+                "TagResource",
+                json!({"resourceArn": arn, "tags": [{"key": "team", "value": "infra"}]}),
+            ))
+            .unwrap();
+            assert_eq!(
+                tags_of(&svc, arn),
+                json!([{"key": "env", "value": "prod"}, {"key": "team", "value": "infra"}]),
+                "{arn}"
+            );
+            svc.untag_resource(&ecs_request(
+                "UntagResource",
+                json!({"resourceArn": arn, "tagKeys": ["env"]}),
+            ))
+            .unwrap();
+            assert_eq!(
+                tags_of(&svc, arn),
+                json!([{"key": "team", "value": "infra"}]),
+                "{arn}"
+            );
+        }
+
+        let err = svc
+            .list_tags_for_resource(&ecs_request(
+                "ListTagsForResource",
+                json!({"resourceArn": format!("{daemon_arn}-missing")}),
+            ))
+            .err()
+            .unwrap();
+        // ECS reports an unknown tag target as a ClientException.
+        assert_eq!(err.code(), "ClientException");
+    }
 }
 
 /// Trusts exactly one role, like a role whose trust policy names
