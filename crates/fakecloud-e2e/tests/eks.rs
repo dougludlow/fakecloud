@@ -40,7 +40,8 @@ async fn eks_describe_addon_versions_resolves_pod_identity_agent_default() {
         .expect("a default version for 1.32");
     assert_eq!(default, "v1.3.4-eksbuild.1");
 
-    // The other AWS-owned add-ons the module commonly installs resolve too.
+    // The other add-ons the module commonly installs resolve to a 1.32
+    // default too.
     for name in [
         "metrics-server",
         "snapshot-controller",
@@ -54,7 +55,16 @@ async fn eks_describe_addon_versions_resolves_pod_identity_agent_default() {
             .await
             .unwrap();
         assert_eq!(out.addons().len(), 1, "{name}");
-        assert!(!out.addons()[0].addon_versions().is_empty(), "{name}");
+        let defaults = out.addons()[0]
+            .addon_versions()
+            .iter()
+            .filter(|v| {
+                v.compatibilities()
+                    .iter()
+                    .any(|c| c.cluster_version() == Some("1.32") && c.default_version())
+            })
+            .count();
+        assert_eq!(defaults, 1, "{name} needs exactly one 1.32 default");
     }
 }
 
