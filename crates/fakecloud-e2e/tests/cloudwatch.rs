@@ -1031,3 +1031,51 @@ async fn json_protocol_errors_use_json_1_0_and_query_error_header() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["__type"], "ResourceNotFound");
 }
+
+#[tokio::test]
+async fn large_put_metric_data_is_gzip_compressed_and_accepted() {
+    // PutMetricData is `@requestCompression`: aws-sdk-cloudwatch gzips bodies
+    // above 10 KiB (Content-Encoding: gzip). A few hundred datums cross that.
+    let server = TestServer::start().await;
+    let cw = server.cloudwatch_client().await;
+    let now = chrono::Utc::now();
+    let mut req = cw.put_metric_data().namespace("Gzip");
+    for i in 0..400 {
+        req = req.metric_data(
+            MetricDatum::builder()
+                .metric_name("Requests")
+                .dimensions(
+                    Dimension::builder()
+                        .name("Shard")
+                        .value(format!("shard-{i:04}"))
+                        .build(),
+                )
+                .value(1.0)
+                .unit(StandardUnit::Count)
+                .timestamp(AwsDateTime::from_secs(now.timestamp()))
+                .build(),
+        );
+    }
+    req.send().await.expect("gzip-compressed put_metric_data");
+
+    let listed = cw
+        .list_metrics()
+        .namespace("Gzip")
+        .send()
+        .await
+        .expect("list metrics");
+    let mut total = listed.metrics().len();
+    let mut token = listed.next_token().map(str::to_string);
+    while let Some(t) = token {
+        let page = cw
+            .list_metrics()
+            .namespace("Gzip")
+            .next_token(t)
+            .send()
+            .await
+            .expect("list metrics page");
+        total += page.metrics().len();
+        token = page.next_token().map(str::to_string);
+    }
+    assert_eq!(total, 400);
+}

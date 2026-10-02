@@ -65,6 +65,63 @@ pub async fn dispatch_to_service(
     .await
 }
 
+/// Services whose Smithy model marks operations `@requestCompression`, so a
+/// client may send a gzip `Content-Encoding` body that the service decodes.
+/// Elsewhere `Content-Encoding` is left alone: S3 stores it as object metadata
+/// and API Gateway forwards it to the backend.
+const REQUEST_COMPRESSION_SERVICES: &[&str] = &["monitoring"];
+
+/// Decompressed bodies are capped like buffered ones, so a small gzip bomb
+/// can't expand past the request size limit.
+fn decode_request_compression(
+    headers: &http::HeaderMap,
+    rpc_v2_cbor: Option<&protocol::DetectedRequest>,
+    body: Bytes,
+) -> Result<Bytes, (String, AwsProtocol)> {
+    let gzipped = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|enc| enc.trim().eq_ignore_ascii_case("gzip"));
+    if !gzipped || body.is_empty() {
+        return Ok(body);
+    }
+    let target = headers
+        .get("x-amz-target")
+        .and_then(|v| v.to_str().ok())
+        .and_then(protocol::parse_amz_target);
+    let (service, protocol) = if let Some(d) = rpc_v2_cbor {
+        (Some(d.service.clone()), AwsProtocol::RpcV2Cbor)
+    } else if let Some(d) = target {
+        (Some(d.service), AwsProtocol::Json)
+    } else {
+        (
+            protocol::extract_service_from_auth(headers),
+            AwsProtocol::Query,
+        )
+    };
+    if !service.is_some_and(|s| REQUEST_COMPRESSION_SERVICES.contains(&s.as_str())) {
+        return Ok(body);
+    }
+    use std::io::Read;
+    let limit = max_request_body_bytes() as u64;
+    let mut out = Vec::new();
+    let read = flate2::read::MultiGzDecoder::new(body.as_ref())
+        .take(limit + 1)
+        .read_to_end(&mut out);
+    match read {
+        Ok(_) if out.len() as u64 > limit => {
+            Err(("Decompressed request body too large".to_string(), protocol))
+        }
+        Ok(_) => Ok(Bytes::from(out)),
+        Err(e) => Err((
+            format!("Unable to decompress gzip request body: {e}"),
+            protocol,
+        )),
+    }
+}
+
 /// awsJson content type of protocol version 1.0.
 const AWS_JSON_1_0: &str = "application/x-amz-json-1.0";
 /// awsJson content type of protocol version 1.1, the services' default.
@@ -185,6 +242,28 @@ async fn dispatch_inner(
                 );
             }
         }
+    };
+
+    // `@requestCompression`: a client may gzip the body of an operation whose
+    // model allows it. Decode it before anything parses the body (Query
+    // detection reads the form body), but keep the wire bytes for SigV4,
+    // which signed the compressed payload.
+    let wire_body = body_bytes.clone();
+    let body_bytes = if pinned.is_none() && stream_dispatch.is_none() {
+        match decode_request_compression(&parts.headers, rpc_v2_cbor.as_ref(), body_bytes) {
+            Ok(b) => b,
+            Err((message, protocol)) => {
+                return build_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "SerializationException",
+                    &message,
+                    &request_id,
+                    protocol,
+                );
+            }
+        }
+    } else {
+        body_bytes
     };
 
     // Detect service and action
@@ -466,7 +545,7 @@ async fn dispatch_inner(
             path: parts.uri.path(),
             query: &raw_query_for_verify,
             headers: &headers_vec,
-            body: &body_bytes,
+            body: &wire_body,
         };
         match fakecloud_aws::sigv4::verify(
             &parsed,
@@ -497,7 +576,7 @@ async fn dispatch_inner(
                         .and_then(|v| v.to_str().ok())
                         .filter(|h| is_hex_sha256(h))
                     {
-                        if sha256_hex_lower(&body_bytes) != signed_hash {
+                        if sha256_hex_lower(&wire_body) != signed_hash {
                             return build_error_response(
                                 StatusCode::FORBIDDEN,
                                 "SignatureDoesNotMatch",
@@ -2015,6 +2094,104 @@ fn bedrock_agent_service_for(method: &http::Method, path: &str) -> Option<&'stat
 
 #[cfg(test)]
 mod tests {
+
+    fn gzip(data: &[u8]) -> Bytes {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        Bytes::from(enc.finish().unwrap())
+    }
+
+    fn gzip_headers(extra: &[(&'static str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert("content-encoding", "gzip".parse().unwrap());
+        for (k, v) in extra {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn request_compression_decodes_gzip_for_cloudwatch() {
+        let body = br#"{"Namespace":"App"}"#;
+        // awsJson (X-Amz-Target).
+        let h = gzip_headers(&[(
+            "x-amz-target",
+            "GraniteServiceVersion20100801.PutMetricData",
+        )]);
+        assert_eq!(
+            decode_request_compression(&h, None, gzip(body)).unwrap(),
+            Bytes::from_static(body)
+        );
+        // awsQuery (SigV4 scope only).
+        let h = gzip_headers(&[(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/monitoring/aws4_request, SignedHeaders=host, Signature=0",
+        )]);
+        let form = b"Action=PutMetricData&Namespace=App";
+        assert_eq!(
+            decode_request_compression(&h, None, gzip(form)).unwrap(),
+            Bytes::from_static(form)
+        );
+        // rpcv2Cbor.
+        let detected = protocol::DetectedRequest {
+            service: "monitoring".to_string(),
+            action: "PutMetricData".to_string(),
+            protocol: AwsProtocol::RpcV2Cbor,
+        };
+        let h = gzip_headers(&[]);
+        assert_eq!(
+            decode_request_compression(&h, Some(&detected), gzip(&[0xa0])).unwrap(),
+            Bytes::from_static(&[0xa0])
+        );
+        // Corrupt gzip is a serialization error in the caller's protocol.
+        let err = decode_request_compression(&h, Some(&detected), Bytes::from_static(b"nope"))
+            .unwrap_err();
+        assert_eq!(err.1, AwsProtocol::RpcV2Cbor);
+    }
+
+    #[test]
+    fn request_compression_leaves_other_services_alone() {
+        // S3 keeps Content-Encoding as object metadata: the body is stored as sent.
+        let h = gzip_headers(&[(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0",
+        )]);
+        let body = gzip(b"object bytes");
+        assert_eq!(
+            decode_request_compression(&h, None, body.clone()).unwrap(),
+            body
+        );
+        // No Content-Encoding: untouched.
+        let h = http::HeaderMap::new();
+        assert_eq!(
+            decode_request_compression(&h, None, Bytes::from_static(b"x")).unwrap(),
+            Bytes::from_static(b"x")
+        );
+    }
+
+    #[test]
+    fn request_compression_services_match_the_models() {
+        // Every vendored model with an `@requestCompression` operation must be
+        // listed (by registry name) in REQUEST_COMPRESSION_SERVICES.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aws-models");
+        let mut with_trait: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                std::fs::read_to_string(e.path())
+                    .is_ok_and(|s| s.contains("\"smithy.api#requestCompression\""))
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        with_trait.sort();
+        assert_eq!(
+            with_trait,
+            vec!["cloudwatch.json".to_string()],
+            "update REQUEST_COMPRESSION_SERVICES for new @requestCompression models"
+        );
+        assert_eq!(REQUEST_COMPRESSION_SERVICES, &["monitoring"]);
+    }
     #[test]
     fn bedrock_agent_paths_split_between_runtime_and_control_plane() {
         use http::Method;

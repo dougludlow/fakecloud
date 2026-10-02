@@ -36,6 +36,11 @@ const USER_REQUEST_MARKER: &str = "_user_request_";
 /// stage only a REST API defines.
 pub type V2StageLookup = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+/// Looks up whether `host` is an API Gateway v2 custom domain name in
+/// `account`. Custom-domain traffic is routed by its mappings, never by
+/// guessing from the first path segment.
+pub type V2DomainLookup = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 const V1_CONTROL_PREFIXES: &[&str] = &[
     "restapis",
     "apikeys",
@@ -54,6 +59,7 @@ pub struct ApiGatewayFacade {
     v1: Arc<ApiGatewayService>,
     v2: Arc<dyn AwsService>,
     v2_has_stage: Option<V2StageLookup>,
+    v2_has_domain: Option<V2DomainLookup>,
     actions: Vec<&'static str>,
 }
 
@@ -80,6 +86,7 @@ impl ApiGatewayFacade {
             v1,
             v2,
             v2_has_stage: None,
+            v2_has_domain: None,
             actions: leaked,
         }
     }
@@ -90,6 +97,55 @@ impl ApiGatewayFacade {
     pub fn with_v2_stage_lookup(mut self, lookup: V2StageLookup) -> Self {
         self.v2_has_stage = Some(lookup);
         self
+    }
+
+    /// Give the facade a view of v2 custom domain names, so traffic for an
+    /// HTTP API custom domain is never captured by a REST API stage name.
+    pub fn with_v2_domain_lookup(mut self, lookup: V2DomainLookup) -> Self {
+        self.v2_has_domain = Some(lookup);
+        self
+    }
+
+    /// The request's `Host`, with and without its port.
+    fn host_candidates(req: &AwsRequest) -> Vec<String> {
+        let Some(host) = req.headers.get("host").and_then(|v| v.to_str().ok()) else {
+            return Vec::new();
+        };
+        let mut out = vec![host.to_string()];
+        if let Some((bare, _port)) = host.rsplit_once(':') {
+            if !bare.is_empty() && !bare.contains(']') {
+                out.push(bare.to_string());
+            }
+        }
+        out
+    }
+
+    /// Whether the `Host` names a v1 custom domain (its name or its regional
+    /// domain name), which the v1 data plane resolves via base path mappings.
+    fn host_is_v1_custom_domain(&self, req: &AwsRequest) -> bool {
+        let hosts = Self::host_candidates(req);
+        if hosts.is_empty() {
+            return false;
+        }
+        let accounts = self.v1.state_handle().read();
+        let Some(state) = accounts.get(&req.account_id) else {
+            return false;
+        };
+        state.domain_names.iter().any(|(name, value)| {
+            let regional = value.get("regionalDomainName").and_then(|v| v.as_str());
+            hosts.iter().any(|h| {
+                name.eq_ignore_ascii_case(h) || regional.is_some_and(|r| r.eq_ignore_ascii_case(h))
+            })
+        })
+    }
+
+    fn host_is_v2_custom_domain(&self, req: &AwsRequest) -> bool {
+        let Some(lookup) = self.v2_has_domain.as_ref() else {
+            return false;
+        };
+        Self::host_candidates(req)
+            .iter()
+            .any(|h| lookup(&req.account_id, h))
     }
 
     /// Rewrite a path-style invocation URL to the canonical execute-api form:
@@ -148,7 +204,12 @@ impl ApiGatewayFacade {
     /// host to name the API) belongs to v1 when a REST API defines that stage
     /// and no v2 API does. When both do, v2 keeps the request, as before.
     fn plain_host_stage_owned_by_v1(&self, req: &AwsRequest) -> bool {
-        if host_is_execute_api(req) {
+        // An execute-api host names the API itself, and a custom domain is
+        // routed by its own mappings: neither is a stage-name guess.
+        if host_is_execute_api(req)
+            || self.host_is_v1_custom_domain(req)
+            || self.host_is_v2_custom_domain(req)
+        {
             return false;
         }
         let Some(stage) = req.path_segments.first() else {
@@ -247,6 +308,11 @@ impl AwsService for ApiGatewayFacade {
         }
         if self.data_plane_owned_by_v1(&req) {
             return self.v1.handle(req).await;
+        }
+        // A REST API custom domain is served by v1's base path mappings
+        // (unless an HTTP API claims the same domain name).
+        if self.host_is_v1_custom_domain(&req) && !self.host_is_v2_custom_domain(&req) {
+            return self.v1.handle_data_plane(req).await;
         }
         if self.plain_host_stage_owned_by_v1(&req) {
             return self.v1.handle_data_plane(req).await;
@@ -412,11 +478,41 @@ mod tests {
         let f = facade().with_v2_stage_lookup(Arc::new(|_, _| false));
         assert!(f.plain_host_stage_owned_by_v1(&req));
         // An execute-api host names the API itself; no stage guessing.
+        // A v2 custom domain routes by its API mappings, not by stage name.
+        let f = facade()
+            .with_v2_stage_lookup(Arc::new(|_, _| false))
+            .with_v2_domain_lookup(Arc::new(|_, host| host == "api.example.com"));
+        let mut custom = request(Method::GET, "/prod/items");
+        custom
+            .headers
+            .insert("host", "api.example.com:4566".parse().unwrap());
+        assert!(!f.plain_host_stage_owned_by_v1(&custom));
+        assert!(f.host_is_v2_custom_domain(&custom));
+        assert!(f.plain_host_stage_owned_by_v1(&req));
         let mut pinned = request(Method::GET, "/prod/items");
         pinned.headers.insert(
             "host",
             "zzz.execute-api.us-east-1.amazonaws.com".parse().unwrap(),
         );
         assert!(!f.plain_host_stage_owned_by_v1(&pinned));
+    }
+
+    #[test]
+    fn v1_custom_domain_is_recognized_and_not_stage_guessed() {
+        let f = facade();
+        f.v1.state_handle()
+            .write()
+            .get_or_create(ACCOUNT)
+            .domain_names
+            .insert(
+                "rest.example.com".to_string(),
+                serde_json::json!({"regionalDomainName": "d-abc.execute-api.us-east-1.amazonaws.com"}),
+            );
+        let mut req = request(Method::GET, "/prod/items");
+        req.headers
+            .insert("host", "rest.example.com:4566".parse().unwrap());
+        assert!(f.host_is_v1_custom_domain(&req));
+        assert!(!f.plain_host_stage_owned_by_v1(&req));
+        assert!(!f.host_is_v1_custom_domain(&request(Method::GET, "/prod/items")));
     }
 }

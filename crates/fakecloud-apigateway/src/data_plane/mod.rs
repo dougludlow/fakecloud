@@ -103,6 +103,15 @@ pub async fn handle(
         }
     };
     let stage_name = stage_name.unwrap_or_else(|| req.path_segments[0].clone());
+    // The proxy / REQUEST-authorizer event `path`: on the execute-api
+    // endpoint AWS drops the stage segment (`/prod/items` -> `/items`,
+    // while `requestContext.path` keeps it); on a custom domain it is the
+    // path as requested, base path included.
+    let request_path = if via_custom_domain {
+        req.raw_path.clone()
+    } else {
+        stage_relative_path(&req.raw_path)
+    };
 
     // Find the API/stage pair that owns this request.
     let DataPlaneMatch {
@@ -301,6 +310,7 @@ pub async fn handle(
         &api_id,
         &stage_name,
         &resource_path,
+        &request_path,
         &authorization_type,
         authorizer.as_ref(),
     )
@@ -411,6 +421,7 @@ pub async fn handle(
                 &api_id,
                 &stage_name,
                 &resource_path,
+                &request_path,
                 path_params,
                 stage_vars,
                 &binary_media_types,
@@ -719,6 +730,16 @@ fn resolve_custom_domain(
     }
 
     None
+}
+
+/// Drop the leading stage segment of an execute-api request path, keeping the
+/// rest verbatim (`/prod/items/` -> `/items/`, `/prod` -> `/`).
+fn stage_relative_path(raw_path: &str) -> String {
+    let trimmed = raw_path.trim_start_matches('/');
+    match trimmed.find('/') {
+        Some(idx) => trimmed[idx..].to_string(),
+        None => "/".to_string(),
+    }
 }
 
 /// Extract the API id from the execute-api `Host` header
@@ -2913,6 +2934,38 @@ mod tests {
         // sorts first and also has a `prod`/`/items`.
         assert_eq!(lambda.invocation_count(SECOND_ARN), 1);
         assert_eq!(lambda.invocation_count(BACKEND_ARN), 0);
+    }
+
+    #[test]
+    fn stage_relative_path_drops_only_the_stage() {
+        assert_eq!(stage_relative_path("/prod/items"), "/items");
+        assert_eq!(stage_relative_path("/prod/items/a%2Fb/"), "/items/a%2Fb/");
+        assert_eq!(stage_relative_path("/prod"), "/");
+        assert_eq!(stage_relative_path("/prod/"), "/");
+    }
+
+    #[tokio::test]
+    async fn proxy_event_path_omits_the_stage() {
+        // AWS: `path` is stage-relative on the execute-api endpoint, while
+        // `requestContext.path` keeps the stage.
+        let state = build_state("NONE", None);
+        let lambda = Arc::new(StubLambda::new());
+        lambda.set(BACKEND_ARN, json!({"statusCode": 200, "body": "ok"}));
+        let service = build_service(state, lambda.clone(), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            format!("{TEST_API_ID}.execute-api.us-east-1.amazonaws.com")
+                .parse()
+                .unwrap(),
+        );
+        let resp = handle(&service, &make_request(headers)).await.unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let event: Value =
+            serde_json::from_str(&lambda.last_payload(BACKEND_ARN).unwrap()).unwrap();
+        assert_eq!(event["path"], "/items");
+        assert_eq!(event["requestContext"]["path"], "/prod/items");
+        assert_eq!(event["resource"], "/items");
     }
 
     // ── H4: static resource beats {proxy+} catch-all ──

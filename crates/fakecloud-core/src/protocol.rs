@@ -628,7 +628,7 @@ pub fn detect_rpc_v2_cbor(headers: &HeaderMap, path: &str) -> Option<DetectedReq
 
 /// Parse `X-Amz-Target: AWSEvents.PutEvents` -> service=events, action=PutEvents
 /// Parse `X-Amz-Target: AmazonSSM.GetParameter` -> service=ssm, action=GetParameter
-fn parse_amz_target(target: &str) -> Option<DetectedRequest> {
+pub(crate) fn parse_amz_target(target: &str) -> Option<DetectedRequest> {
     let (prefix, action) = target.rsplit_once('.')?;
 
     let service = match prefix {
@@ -842,7 +842,7 @@ fn infer_service_from_action(action: &str) -> Option<String> {
 }
 
 /// Extract service name from the SigV4 Authorization header credential scope.
-fn extract_service_from_auth(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_service_from_auth(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     let info = fakecloud_aws::sigv4::parse_sigv4(auth)?;
     Some(normalize_service_name(&info.service).to_string())
