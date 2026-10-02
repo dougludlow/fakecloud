@@ -3044,6 +3044,7 @@ impl BackupService {
             status_message: None,
             metadata: parse_string_map(body.get("AccessPointMetadata")),
             policy: str_field(&body, "AccessPointPolicy"),
+            legacy_tags: BTreeMap::new(),
         };
         let status = record.status.clone();
         st.access_points.insert(arn.clone(), record);

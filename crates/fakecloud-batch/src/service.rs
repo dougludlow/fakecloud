@@ -721,15 +721,34 @@ impl BatchService {
         let name = arn_or_name(&body, "jobQueue")?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        if body.get("serviceEnvironmentOrder").is_some() {
-            let kind = crate::extended::validate_service_environment_order(Some(st), &body)?;
-            let current = st
-                .job_queues
-                .get(&name)
-                .and_then(|q| q.get("jobQueueType"))
-                .and_then(Value::as_str);
-            if let (Some(k), Some(c)) = (kind.as_deref(), current) {
-                if k != c {
+        let stored = st
+            .job_queues
+            .get(&name)
+            .ok_or_else(|| client_error("ClientException", format!("Object not found: {name}")))?;
+        let current_type = stored
+            .get("jobQueueType")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Validate the queue as it will be after the update, not just the
+        // request: a compute queue can't gain a serviceEnvironmentOrder (and
+        // vice versa) by sending only one of the two lists.
+        let mut new_type = None;
+        if body.get("serviceEnvironmentOrder").is_some()
+            || body.get("computeEnvironmentOrder").is_some()
+        {
+            let pick = |key: &str| {
+                body.get(key)
+                    .or_else(|| stored.get(key))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let effective = json!({
+                "computeEnvironmentOrder": pick("computeEnvironmentOrder"),
+                "serviceEnvironmentOrder": pick("serviceEnvironmentOrder"),
+            });
+            let kind = crate::extended::validate_service_environment_order(Some(st), &effective)?;
+            match (kind.as_deref(), current_type.as_deref()) {
+                (Some(k), Some(c)) if k != c => {
                     return Err(client_error(
                         "ClientException",
                         format!(
@@ -737,12 +756,17 @@ impl BatchService {
                         ),
                     ));
                 }
+                (Some(k), None) => new_type = Some(k.to_string()),
+                _ => {}
             }
         }
         let q = st
             .job_queues
             .get_mut(&name)
             .ok_or_else(|| client_error("ClientException", format!("Object not found: {name}")))?;
+        if let (Some(t), Some(o)) = (new_type, q.as_object_mut()) {
+            o.insert("jobQueueType".into(), json!(t));
+        }
         let arn = merge_updates(
             q,
             &body,
@@ -1473,6 +1497,35 @@ async fn launch(
     .await;
 }
 
+/// Admit a retrying job's consumable resources, waiting at RUNNABLE until
+/// they fit. Returns false when the job left RUNNABLE meanwhile (cancelled,
+/// terminated) or is gone, so the retry must not relaunch.
+pub(crate) async fn wait_for_retry_admission(
+    batch_state: &SharedBatchState,
+    account_id: &str,
+    job_id: &str,
+) -> bool {
+    loop {
+        {
+            let mut accounts = batch_state.write();
+            let st = accounts.get_or_create(account_id);
+            let runnable = st
+                .jobs
+                .get(job_id)
+                .and_then(|j| j.get("status"))
+                .and_then(Value::as_str)
+                == Some("RUNNABLE");
+            if !runnable {
+                return false;
+            }
+            if let crate::extended::Admission::Admitted = crate::extended::admit_job(st, job_id) {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 /// Wait (at RUNNABLE) until a job's consumable resources fit, then launch it.
 /// Exits as soon as the job leaves RUNNABLE (cancelled/terminated) or is gone.
 #[allow(clippy::too_many_arguments)]
@@ -1876,6 +1929,13 @@ fn spawn_status_sync(
                     }
                 }
                 save_snapshot_now(&batch_state, &snapshot_store, &snapshot_lock).await;
+                // The retry re-enters dispatch: its consumable resources were
+                // released when the attempt failed, so it must be admitted
+                // again (atomically with the other waiters) before relaunch,
+                // and waits at RUNNABLE while capacity is held by others.
+                if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await {
+                    break;
+                }
                 match launch_ecs_task(
                     &ecs_state,
                     &ecs_runtime,

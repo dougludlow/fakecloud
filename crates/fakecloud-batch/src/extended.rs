@@ -2370,6 +2370,118 @@ mod tests {
         assert!(matches!(admit_job(&mut st, "d"), Admission::Wait));
     }
 
+    #[tokio::test]
+    async fn retry_relaunch_waits_for_consumable_capacity() {
+        let shared: crate::state::SharedBatchState = Arc::new(RwLock::new(BatchAccounts::new()));
+        let acct = "123456789012";
+        {
+            let mut accounts = shared.write();
+            let st = accounts.get_or_create(acct);
+            st.consumable_resources.insert(
+                "lic".into(),
+                json!({"consumableResourceName": "lic",
+                       "consumableResourceArn": "arn:aws:batch:us-east-1:1:consumable-resource/lic",
+                       "totalQuantity": 1, "resourceType": "REPLENISHABLE"}),
+            );
+            let job = |id: &str, status: &str| {
+                json!({"jobId": id, "status": status,
+                       "consumableResourceProperties": {"consumableResourceList": [
+                           {"consumableResource": "lic", "quantity": 1}]}})
+            };
+            // "retry" just failed an attempt and is back at RUNNABLE; "other"
+            // was admitted in the gap and now holds the only unit.
+            st.jobs.insert("retry".into(), job("retry", "RUNNABLE"));
+            st.jobs.insert("other".into(), job("other", "RUNNING"));
+        }
+        let waiter = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                crate::service::wait_for_retry_admission(&shared, "123456789012", "retry").await
+            }
+        });
+        // Spans two of the waiter's 1s admission polls.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            !waiter.is_finished(),
+            "retry must wait while capacity is held"
+        );
+        {
+            let accounts = shared.read();
+            let st = accounts.get(acct).unwrap();
+            assert_eq!(st.jobs["retry"]["status"], "RUNNABLE");
+            assert_eq!(consumable_in_use(st, "lic", None), 1);
+        }
+        shared
+            .write()
+            .get_or_create(acct)
+            .jobs
+            .get_mut("other")
+            .unwrap()["status"] = json!("SUCCEEDED");
+        assert!(waiter.await.unwrap());
+        let accounts = shared.read();
+        let st = accounts.get(acct).unwrap();
+        assert_eq!(st.jobs["retry"]["status"], "STARTING");
+        assert_eq!(consumable_in_use(st, "lic", None), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_admission_stops_when_job_terminated() {
+        let shared: crate::state::SharedBatchState = Arc::new(RwLock::new(BatchAccounts::new()));
+        shared
+            .write()
+            .get_or_create("123456789012")
+            .jobs
+            .insert("j".into(), json!({"jobId": "j", "status": "FAILED"}));
+        assert!(!crate::service::wait_for_retry_admission(&shared, "123456789012", "j").await);
+    }
+
+    #[tokio::test]
+    async fn update_job_queue_cannot_mix_environment_orders() {
+        let s = svc();
+        sagemaker_queue(&s).await;
+        ok(
+            &s,
+            "createcomputeenvironment",
+            json!({"computeEnvironmentName": "ce", "type": "UNMANAGED"}),
+        )
+        .await;
+        ok(
+            &s,
+            "createjobqueue",
+            json!({"jobQueueName": "cq", "priority": 1,
+                   "computeEnvironmentOrder": [{"order": 1, "computeEnvironment": "ce"}]}),
+        )
+        .await;
+        // A compute queue can't gain a service environment order...
+        let msg = client_err(
+            &s,
+            "updatejobqueue",
+            json!({"jobQueue": "cq",
+                   "serviceEnvironmentOrder": [{"order": 1, "serviceEnvironment": "se"}]}),
+        )
+        .await;
+        assert!(msg.contains("both"), "{msg}");
+        // ...nor a service queue a compute environment order.
+        let msg = client_err(
+            &s,
+            "updatejobqueue",
+            json!({"jobQueue": "smq",
+                   "computeEnvironmentOrder": [{"order": 1, "computeEnvironment": "ce"}]}),
+        )
+        .await;
+        assert!(msg.contains("both"), "{msg}");
+        // Replacing the compute order with a service order sets the type.
+        ok(
+            &s,
+            "updatejobqueue",
+            json!({"jobQueue": "cq", "computeEnvironmentOrder": [],
+                   "serviceEnvironmentOrder": [{"order": 1, "serviceEnvironment": "se"}]}),
+        )
+        .await;
+        let d = ok(&s, "describejobqueues", json!({"jobQueues": ["cq"]})).await;
+        assert_eq!(d["jobQueues"][0]["jobQueueType"], "SAGEMAKER_TRAINING");
+    }
+
     async fn sagemaker_queue(s: &BatchService) -> String {
         ok(
             s,
