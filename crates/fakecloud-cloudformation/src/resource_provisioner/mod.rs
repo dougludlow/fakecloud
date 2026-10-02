@@ -6219,7 +6219,7 @@ mod tests {
             .expect("SQS::Queue is an updatable type");
         assert_eq!(updated.physical_id, created.physical_id);
         let sqs = prov.sqs_state.read();
-        let acct = sqs.get("123456789012").unwrap();
+        let acct = sqs.regional("123456789012", "us-east-1").unwrap();
         let queue = acct.queues.get(&created.physical_id).unwrap();
         assert_eq!(
             queue
@@ -7006,7 +7006,7 @@ mod tests {
 
         {
             let mut accounts = prov.sqs_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             let stored = state.queues[&queue.physical_id]
                 .attributes
                 .get("Policy")
@@ -7017,7 +7017,7 @@ mod tests {
         prov.delete_resource(&sr).unwrap();
         {
             let mut accounts = prov.sqs_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             assert!(!state.queues[&queue.physical_id]
                 .attributes
                 .contains_key("Policy"));
@@ -7051,7 +7051,7 @@ mod tests {
 
         {
             let mut accounts = prov.sns_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             let stored = state.topics[&topic.physical_id]
                 .attributes
                 .get("Policy")
@@ -7062,7 +7062,7 @@ mod tests {
         prov.delete_resource(&sr).unwrap();
         {
             let mut accounts = prov.sns_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             assert!(!state.topics[&topic.physical_id]
                 .attributes
                 .contains_key("Policy"));
@@ -7097,7 +7097,7 @@ mod tests {
 
         {
             let mut accounts = prov.s3_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             let stored = state.buckets[&bucket.physical_id]
                 .policy
                 .as_ref()
@@ -7108,7 +7108,7 @@ mod tests {
         prov.delete_resource(&sr).unwrap();
         {
             let mut accounts = prov.s3_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             assert!(state.buckets[&bucket.physical_id].policy.is_none());
         }
     }
@@ -9482,7 +9482,7 @@ mod tests {
         {
             let sqs = prov.sqs_state.read();
             let q = sqs
-                .get("123456789012")
+                .regional("123456789012", "us-east-1")
                 .unwrap()
                 .queues
                 .get(&created.physical_id)
@@ -9505,7 +9505,7 @@ mod tests {
         .unwrap();
         let sqs = prov.sqs_state.read();
         let q = sqs
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .queues
             .get(&created.physical_id)
