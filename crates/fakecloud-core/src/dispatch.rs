@@ -76,7 +76,7 @@ pub async fn dispatch(
     let remote_addr = Some(remote_addr);
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     // Set only by [`dispatch_to_service`]: the request is for this service,
     // whatever its headers or query say.
     let pinned = parts.extensions.get::<PinnedService>().map(|p| p.0);
@@ -500,6 +500,14 @@ pub async fn dispatch(
                 );
             }
         }
+    }
+
+    // A SigV4 presigned S3 URL can carry request headers as query parameters
+    // (the JS v3 presigner hoists every `x-amz-*` header this way). S3 applies
+    // them as if they were headers, so lift them into the header map now that
+    // the signature over the raw query has been verified.
+    if detected.service == "s3" && query_params.contains_key("X-Amz-Credential") {
+        hoist_presigned_query_headers(&mut parts.headers, &query_params);
     }
 
     // Build path segments. For S3 virtual-hosted-style requests the bucket
@@ -1234,6 +1242,49 @@ fn streaming_route(
     }
 
     None
+}
+
+/// The SigV4 query-authentication parameters themselves. They authenticate
+/// a presigned request and are not request headers.
+const PRESIGN_AUTH_PARAMS: &[&str] = &[
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+];
+
+/// Copy the `x-amz-*` request headers a presigned URL carries in its query
+/// string into `headers`, skipping the SigV4 auth parameters. A header the
+/// client also sent directly wins over the query parameter. A non-ASCII user
+/// metadata value is RFC 2047-encoded so S3 stores it as the UTF-8 the
+/// percent-encoded query string meant, not as ISO-8859-1 header bytes.
+fn hoist_presigned_query_headers(
+    headers: &mut http::HeaderMap,
+    query_params: &HashMap<String, String>,
+) {
+    for (key, value) in query_params {
+        let lower = key.to_ascii_lowercase();
+        if !lower.starts_with("x-amz-") || PRESIGN_AUTH_PARAMS.contains(&lower.as_str()) {
+            continue;
+        }
+        let Ok(name) = http::HeaderName::from_bytes(lower.as_bytes()) else {
+            continue;
+        };
+        if headers.contains_key(&name) {
+            continue;
+        }
+        let value = if lower.starts_with("x-amz-meta-") {
+            crate::rfc2047::encode(value)
+        } else {
+            value.clone()
+        };
+        if let Ok(value) = http::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// Default request-body buffering cap. fakecloud reads the entire
@@ -2620,6 +2671,44 @@ mod tests {
             ),
             Some(("ecr", "")),
         );
+    }
+
+    #[test]
+    fn hoist_presigned_query_headers_skips_auth_params_and_keeps_direct_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-meta-color", "red".parse().unwrap());
+        let query: HashMap<String, String> = [
+            (
+                "X-Amz-Credential",
+                "AKID/20260101/us-east-1/s3/aws4_request",
+            ),
+            ("X-Amz-Signature", "00"),
+            ("X-Amz-Security-Token", "tok"),
+            ("x-amz-meta-color", "blue"),
+            ("X-Amz-Meta-Shape", "round"),
+            ("x-amz-meta-name", "café"),
+            ("x-amz-tagging", "env=test"),
+            ("response-content-type", "text/plain"),
+            ("partNumber", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        hoist_presigned_query_headers(&mut headers, &query);
+
+        assert_eq!(headers["x-amz-meta-color"], "red");
+        assert_eq!(headers["x-amz-meta-shape"], "round");
+        assert_eq!(headers["x-amz-meta-name"], "=?UTF-8?B?Y2Fmw6k=?=");
+        assert_eq!(headers["x-amz-tagging"], "env=test");
+        for absent in [
+            "x-amz-credential",
+            "x-amz-signature",
+            "x-amz-security-token",
+            "response-content-type",
+            "partnumber",
+        ] {
+            assert!(headers.get(absent).is_none(), "{absent}");
+        }
     }
 
     #[test]

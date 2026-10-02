@@ -1127,15 +1127,7 @@ impl S3Service {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let mut metadata = std::collections::BTreeMap::new();
-        for (name, value) in &req.headers {
-            if name.as_str().starts_with("x-amz-meta-") {
-                if let Ok(v) = value.to_str() {
-                    let key = name.as_str()["x-amz-meta-".len()..].to_string();
-                    metadata.insert(key, v.to_string());
-                }
-            }
-        }
+        let metadata = crate::service::extract_user_metadata(&req.headers);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(account_id);

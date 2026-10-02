@@ -539,9 +539,17 @@ impl S3Service {
             if !forwardable {
                 continue;
             }
+            // Browser form fields are UTF-8. A non-ASCII metadata value is
+            // carried as an RFC 2047 encoded-word so the PutObject sink
+            // decodes it as UTF-8 rather than as raw ISO-8859-1 header bytes.
+            let value = if lower.starts_with("x-amz-meta-") {
+                fakecloud_core::rfc2047::encode(&f.value)
+            } else {
+                f.value.clone()
+            };
             if let (Ok(name), Ok(value)) = (
                 lower.parse::<http::header::HeaderName>(),
-                f.value.parse::<http::HeaderValue>(),
+                value.parse::<http::HeaderValue>(),
             ) {
                 synth_headers.insert(name, value);
             }
