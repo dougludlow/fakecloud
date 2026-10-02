@@ -472,16 +472,26 @@ impl AcmService {
                     .and_then(Value::as_str)
                     .ok_or_else(|| validation("Expiration.Type is required"))?;
                 let d = match unit {
-                    "MINUTES" => Duration::minutes(value),
-                    "HOURS" => Duration::hours(value),
-                    "DAYS" => Duration::days(value),
+                    "MINUTES" => Duration::try_minutes(value),
+                    "HOURS" => Duration::try_hours(value),
+                    "DAYS" => Duration::try_days(value),
                     other => {
                         return Err(validation(format!(
                             "Expiration.Type has an invalid value '{other}'"
                         )))
                     }
                 };
-                Some(Utc::now() + d)
+                // The model only bounds Value below (min 1); a value whose
+                // expiry is not a representable timestamp is rejected rather
+                // than overflowing the date arithmetic.
+                let at = d
+                    .and_then(|d| Utc::now().checked_add_signed(d))
+                    .ok_or_else(|| {
+                        validation(format!(
+                            "Expiration.Value {value} {unit} is out of the supported range"
+                        ))
+                    })?;
+                Some(at)
             }
         };
 
@@ -1097,6 +1107,39 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code(), "ConflictException");
+    }
+
+    #[test]
+    fn huge_binding_expiration_is_a_validation_error_not_a_panic() {
+        let s = svc();
+        let endpoint = make_endpoint(&s);
+        for unit in ["MINUTES", "HOURS", "DAYS"] {
+            for value in [i64::MAX, i64::MAX / 60, 1_000_000_000_000] {
+                let body = json!({
+                    "AcmeEndpointArn": endpoint,
+                    "RoleArn": "arn:aws:iam::123456789012:role/acme",
+                    "Expiration": { "Value": value, "Type": unit },
+                });
+                let err = s
+                    .create_acme_external_account_binding(&req(
+                        "CreateAcmeExternalAccountBinding",
+                        body,
+                    ))
+                    .err()
+                    .unwrap_or_else(|| panic!("{value} {unit} accepted"));
+                assert_eq!(err.code(), "ValidationException", "{value} {unit}");
+            }
+        }
+        // Huge value against a missing endpoint still fails on validation, not
+        // a panic in the date arithmetic.
+        let body = json!({
+            "AcmeEndpointArn": "arn:aws:acm:us-east-1:123456789012:acme-endpoint/nope",
+            "RoleArn": "arn:aws:iam::123456789012:role/acme",
+            "Expiration": { "Value": i64::MAX, "Type": "DAYS" },
+        });
+        assert!(s
+            .create_acme_external_account_binding(&req("CreateAcmeExternalAccountBinding", body))
+            .is_err());
     }
 
     #[test]

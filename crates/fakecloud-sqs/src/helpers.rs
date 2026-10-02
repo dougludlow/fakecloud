@@ -30,7 +30,7 @@ pub(crate) fn looks_like_fakecloud_envelope(body: &str) -> bool {
 /// MaximumMessageSize (1024–1 MiB) if present in the caller-supplied queue
 /// attributes. All match AWS's documented ranges; we return the same error
 /// code/message the real service does.
-pub(crate) fn validate_create_queue_attributes(
+pub fn validate_create_queue_attributes(
     attrs: &BTreeMap<String, String>,
 ) -> Result<(), AwsServiceError> {
     if let Some(ds) = attrs.get("DelaySeconds") {

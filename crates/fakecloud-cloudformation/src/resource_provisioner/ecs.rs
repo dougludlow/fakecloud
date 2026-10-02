@@ -260,7 +260,8 @@ impl ResourceProvisioner {
         let desired_count = props
             .get("DesiredCount")
             .and_then(cfn_as_i64)
-            .map(|n| n as i32)
+            .map(cfn_desired_count)
+            .transpose()?
             .unwrap_or(1);
         let launch_type = props
             .get("LaunchType")
@@ -572,6 +573,11 @@ impl ResourceProvisioner {
         let Some((cluster_name, service_name)) = parse_service_arn(&service_arn) else {
             return Err(format!("Cannot parse service ARN: {service_arn}"));
         };
+        let new_desired = props
+            .get("DesiredCount")
+            .and_then(cfn_as_i64)
+            .map(cfn_desired_count)
+            .transpose()?;
         let key = format!("{cluster_name}/{service_name}");
         let mut accounts = self.ecs_state.write();
         let state = accounts.get_or_create(&self.account_id);
@@ -585,8 +591,8 @@ impl ResourceProvisioner {
             svc.family = family;
             svc.revision = revision;
         }
-        if let Some(n) = props.get("DesiredCount").and_then(cfn_as_i64) {
-            svc.desired_count = n as i32;
+        if let Some(n) = new_desired {
+            svc.desired_count = n;
         }
         if let Some(s) = props.get("LaunchType").and_then(|v| v.as_str()) {
             svc.launch_type = s.to_string();
@@ -730,5 +736,18 @@ impl ResourceProvisioner {
             "Arn" => Some(cp.arn.clone()),
             _ => None,
         }
+    }
+}
+
+/// `DesiredCount` must be within 0..=the ECS tasks-per-service quota, as the
+/// underlying CreateService / UpdateService calls enforce.
+fn cfn_desired_count(n: i64) -> Result<i32, String> {
+    let max = fakecloud_ecs::MAX_TASKS_PER_SERVICE;
+    if (0..=i64::from(max)).contains(&n) {
+        Ok(n as i32)
+    } else {
+        Err(format!(
+            "Invalid request provided: CreateService error: DesiredCount {n} must be between 0 and {max}"
+        ))
     }
 }

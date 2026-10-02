@@ -9089,6 +9089,82 @@ fn token_validity_honored_from_client_config() {
 }
 
 #[test]
+fn token_validity_out_of_range_is_rejected() {
+    let (svc, pool_id) = setup_svc_with_pool();
+    let bad = [
+        json!({"AccessTokenValidity": i64::MAX, "TokenValidityUnits": {"AccessToken": "days"}}),
+        json!({"AccessTokenValidity": 86400}), // hours by default: far over 1 day
+        json!({"IdTokenValidity": 4, "TokenValidityUnits": {"IdToken": "minutes"}}),
+        json!({"RefreshTokenValidity": 3651}), // days: over 10 years
+        json!({"RefreshTokenValidity": 59, "TokenValidityUnits": {"RefreshToken": "minutes"}}),
+        json!({"AccessTokenValidity": -1}),
+    ];
+    for extra in &bad {
+        let mut body = json!({"UserPoolId": pool_id, "ClientName": "c"});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let err = svc
+            .create_user_pool_client(&make_req("CreateUserPoolClient", &body.to_string()))
+            .err()
+            .unwrap_or_else(|| panic!("accepted {extra}"));
+        assert_eq!(err.code(), "InvalidParameterException", "{extra}");
+        assert_eq!(err.message(), "Invalid range for token validity.");
+    }
+    // Boundaries and the RefreshTokenValidity=0 default are accepted.
+    let resp = svc
+        .create_user_pool_client(&make_req(
+            "CreateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientName": "ok",
+                    "AccessTokenValidity": 1, "IdTokenValidity": 5,
+                    "RefreshTokenValidity": 0,
+                    "TokenValidityUnits": {"AccessToken": "days", "IdToken": "minutes"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let client_id = resp_json(&resp)["UserPoolClient"]["ClientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // UpdateUserPoolClient validates the effective values and leaves the
+    // client untouched on failure.
+    let err = svc
+        .update_user_pool_client(&make_req(
+            "UpdateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientId": client_id, "ClientName": "renamed",
+                    "AccessTokenValidity": i64::MAX})
+            .to_string(),
+        ))
+        .err()
+        .expect("huge AccessTokenValidity accepted on update");
+    assert_eq!(err.code(), "InvalidParameterException");
+    let accounts = svc.state.read();
+    let client = &accounts.get("123456789012").unwrap().user_pool_clients[&client_id];
+    assert_eq!(client.client_name, "ok");
+    assert_eq!(client.access_token_validity, Some(1));
+    assert_eq!(refresh_token_validity_secs(client), 30 * 86_400);
+}
+
+#[test]
+fn stored_huge_token_validity_is_clamped_not_a_panic() {
+    let (svc, pool_id, client_id) = setup_signin(json!([]), json!({}));
+    {
+        let mut accounts = svc.state.write();
+        let client = accounts
+            .get_mut("123456789012")
+            .unwrap()
+            .user_pool_clients
+            .get_mut(&client_id)
+            .unwrap();
+        client.access_token_validity = Some(i64::MAX);
+        client.id_token_validity = Some(i64::MAX);
+        client.refresh_token_validity = Some(i64::MAX);
+    }
+    let result = admin_signin(&svc, &pool_id, &client_id, "signinuser");
+    assert_eq!(result["AuthenticationResult"]["ExpiresIn"], 86_400);
+}
+
+#[test]
 fn token_validity_defaults_to_one_hour() {
     let (svc, pool_id, client_id) = setup_signin(json!([]), json!({}));
     let result = admin_signin(&svc, &pool_id, &client_id, "signinuser");

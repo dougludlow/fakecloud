@@ -16,7 +16,7 @@ use super::{
     parse_sign_in_policy, parse_sms_configuration, parse_string_array, parse_tags,
     parse_token_validity_units, parse_verification_message_template, require_str,
     user_pool_client_to_json, user_pool_to_json, validate_enum, validate_range,
-    validate_string_length, CognitoService,
+    validate_string_length, validate_token_validity, CognitoService,
 };
 
 impl CognitoService {
@@ -538,6 +538,16 @@ impl CognitoService {
                 )
             })?;
 
+        validate_token_validity(
+            body["AccessTokenValidity"].as_i64(),
+            body["IdTokenValidity"].as_i64(),
+            body["RefreshTokenValidity"].as_i64(),
+            parse_token_validity_units(&body["TokenValidityUnits"]).as_ref(),
+        )
+        .map_err(|m| {
+            AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidParameterException", m)
+        })?;
+
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
@@ -707,6 +717,30 @@ impl CognitoService {
                 "ResourceNotFoundException",
                 format!("User pool client {client_id} does not exist."),
             ));
+        }
+
+        // Validate the effective token lifetimes before mutating anything.
+        {
+            let units = if body["TokenValidityUnits"].is_object() {
+                parse_token_validity_units(&body["TokenValidityUnits"])
+            } else {
+                client.token_validity_units.clone()
+            };
+            validate_token_validity(
+                body["AccessTokenValidity"]
+                    .as_i64()
+                    .or(client.access_token_validity),
+                body["IdTokenValidity"]
+                    .as_i64()
+                    .or(client.id_token_validity),
+                body["RefreshTokenValidity"]
+                    .as_i64()
+                    .or(client.refresh_token_validity),
+                units.as_ref(),
+            )
+            .map_err(|m| {
+                AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidParameterException", m)
+            })?;
         }
 
         // Update fields that are present

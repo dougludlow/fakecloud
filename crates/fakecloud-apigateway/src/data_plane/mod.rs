@@ -1886,6 +1886,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quota_window_extreme_offsets_do_not_panic() {
+        let now = chrono::Utc::now();
+        for offset in [i64::MAX, i64::MIN, -1, 1_000_000_000] {
+            for period in [QuotaPeriod::Day, QuotaPeriod::Week, QuotaPeriod::Month] {
+                let _ = current_quota_window(now, period, offset);
+            }
+        }
+        // Near the minimum representable date the subtraction saturates.
+        let _ = current_quota_window(
+            chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            QuotaPeriod::Day,
+            27,
+        );
+    }
+
     #[tokio::test]
     async fn token_authorizer_cache_short_circuits_second_invocation() {
         // Two requests with the same identity-source value must hit the

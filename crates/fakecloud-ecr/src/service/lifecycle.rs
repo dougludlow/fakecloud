@@ -11,8 +11,9 @@ impl EcrService {
         let name = req_str(&body, "repositoryName")?.to_string();
         let policy = req_str(&body, "lifecyclePolicyText")?.to_string();
         // Parse sanity-check.
-        serde_json::from_str::<Value>(&policy)
+        let doc = serde_json::from_str::<Value>(&policy)
             .map_err(|_| invalid_parameter("lifecyclePolicyText is not valid JSON"))?;
+        validate_lifecycle_policy_counts(&doc)?;
         let account = target_account_id(request, &body);
         let mut accounts = self.state.write();
         let state = accounts
@@ -115,13 +116,14 @@ impl EcrService {
                 // preview succeeded; otherwise malformed input lands on
                 // `lifecycle_policy_preview` and downstream GetLifecyclePolicyPreview
                 // returns a bogus "successful" result.
-                if serde_json::from_str::<serde_json::Value>(s).is_err() {
-                    return Err(AwsServiceError::aws_error(
+                let doc = serde_json::from_str::<serde_json::Value>(s).map_err(|_| {
+                    AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "InvalidParameterException",
                         "lifecyclePolicyText is not valid JSON",
-                    ));
-                }
+                    )
+                })?;
+                validate_lifecycle_policy_counts(&doc)?;
                 s.to_string()
             }
             None => {

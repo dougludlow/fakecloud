@@ -4717,3 +4717,79 @@ async fn sfn_dynamodb_put_then_delete_keeps_key_lookups_correct() {
         "overwritten"
     );
 }
+
+/// A huge `TimeoutSeconds` is rejected at CreateStateMachine instead of being
+/// stored and later overflowing the task deadline arithmetic.
+#[tokio::test]
+async fn sfn_rejects_out_of_range_timeout_seconds() {
+    let server = TestServer::start().await;
+    let client = server.sfn_client().await;
+    let def = json!({
+        "StartAt": "T",
+        "States": {
+            "T": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "TimeoutSeconds": u64::MAX,
+                "End": true
+            }
+        }
+    })
+    .to_string();
+    let err = client
+        .create_state_machine()
+        .name("huge-timeout")
+        .definition(def)
+        .role_arn("arn:aws:iam::123456789012:role/test-role")
+        .send()
+        .await
+        .expect_err("huge TimeoutSeconds accepted");
+    let svc_err = err.into_service_error();
+    assert!(svc_err.is_invalid_definition(), "{svc_err:?}");
+}
+
+/// `States.ArrayRange` beyond AWS's 1000-item cap fails the execution with
+/// `States.IntrinsicFailure` rather than allocating (or overflowing) without
+/// bound.
+#[tokio::test]
+async fn sfn_array_range_cap_fails_execution() {
+    let server = TestServer::start().await;
+    let client = server.sfn_client().await;
+    let def = json!({
+        "StartAt": "P",
+        "States": {
+            "P": {
+                "Type": "Pass",
+                "Parameters": {
+                    "r.$": "States.ArrayRange($.lo, $.hi, 1)"
+                },
+                "End": true
+            }
+        }
+    })
+    .to_string();
+    let create = client
+        .create_state_machine()
+        .name("array-range-cap")
+        .definition(def)
+        .role_arn("arn:aws:iam::123456789012:role/test-role")
+        .send()
+        .await
+        .unwrap();
+    let start = client
+        .start_execution()
+        .state_machine_arn(create.state_machine_arn())
+        .input(json!({"lo": i64::MIN, "hi": i64::MAX}).to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = wait_for_execution(&client, start.execution_arn()).await;
+    assert_eq!(status, "FAILED");
+    let desc = client
+        .describe_execution()
+        .execution_arn(start.execution_arn())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(desc.error().unwrap(), "States.IntrinsicFailure");
+}

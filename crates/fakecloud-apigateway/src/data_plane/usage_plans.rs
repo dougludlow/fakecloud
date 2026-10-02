@@ -189,7 +189,13 @@ pub(super) fn current_quota_window(
     offset: i64,
 ) -> String {
     use chrono::Datelike;
-    let date = now.date_naive() - chrono::Duration::days(offset);
+    // The offset is validated to 0..=27 at write time; clamp anyway so a plan
+    // persisted before that validation cannot overflow the date arithmetic.
+    let offset = offset.clamp(0, 27) as u64;
+    let date = now
+        .date_naive()
+        .checked_sub_days(chrono::Days::new(offset))
+        .unwrap_or(chrono::NaiveDate::MIN);
     match period {
         QuotaPeriod::Day => format!("D:{date}"),
         QuotaPeriod::Week => {

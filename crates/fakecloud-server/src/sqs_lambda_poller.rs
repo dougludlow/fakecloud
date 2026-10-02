@@ -183,11 +183,7 @@ impl SqsLambdaPoller {
                 None => return,
             };
 
-            let visibility_timeout: i64 = queue
-                .attributes
-                .get("VisibilityTimeout")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30);
+            let visibility_timeout: i64 = queue.visibility_timeout_secs();
             let visible_at = now + chrono::Duration::seconds(visibility_timeout);
 
             // Same effective-key logic as the SQS service: SSE-KMS

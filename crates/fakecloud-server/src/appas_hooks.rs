@@ -194,6 +194,9 @@ impl EcsServiceHook for EcsServiceHookImpl {
             .services
             .get_mut(&key)
             .ok_or_else(|| format!("service {service_name} not found in cluster {cluster_name}"))?;
+        // A scalable target's capacity bounds are not capped at the ECS
+        // tasks-per-service quota; ECS itself never runs more than that.
+        let desired_count = desired_count.clamp(0, fakecloud_ecs::MAX_TASKS_PER_SERVICE);
         service.desired_count = desired_count;
         if let Some(d) = service
             .deployments

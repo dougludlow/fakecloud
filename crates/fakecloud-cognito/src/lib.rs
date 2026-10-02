@@ -10,18 +10,19 @@ pub mod webauthn;
 pub use service::{
     ensure_pool_signing_key, handle_oauth2_authorize, handle_oauth2_revoke, handle_oauth2_token,
     handle_oauth2_userinfo, mint_authorization_code, oidc_discovery_document,
-    pool_existence_and_domain, pool_jwks_document, save_cognito_snapshot, CognitoIdentityService,
-    CognitoService, MintAuthorizationCodeError, MintAuthorizationCodeRequest, OAuth2AuthorizeError,
-    OAuth2AuthorizeOutcome, OAuth2AuthorizeRequest, OAuthRevokeError, OAuthTokenError,
-    OAuthTokenResponse, OAuthUserInfoError,
+    pool_existence_and_domain, pool_jwks_document, save_cognito_snapshot, validate_token_validity,
+    CognitoIdentityService, CognitoService, MintAuthorizationCodeError,
+    MintAuthorizationCodeRequest, OAuth2AuthorizeError, OAuth2AuthorizeOutcome,
+    OAuth2AuthorizeRequest, OAuthRevokeError, OAuthTokenError, OAuthTokenResponse,
+    OAuthUserInfoError,
 };
 pub use state::{
     default_schema_attributes, AccountRecoverySetting, AdminCreateUserConfig,
     AuthorizationCodeData, CognitoIdentityProvider, CognitoSnapshot, CognitoState,
     CustomDomainConfig, EmailConfiguration, FederatedIdentity, IdentityPool,
     IdentityPoolRoleAttachment, PasswordPolicy, PoolPolicies, PreTokenGenInvocation,
-    RecoveryOption, SchemaAttribute, SharedCognitoState, SignInPolicy, SmsConfiguration, UserPool,
-    UserPoolClient, UserPoolDomain, COGNITO_SNAPSHOT_SCHEMA_VERSION,
+    RecoveryOption, SchemaAttribute, SharedCognitoState, SignInPolicy, SmsConfiguration,
+    TokenValidityUnits, UserPool, UserPoolClient, UserPoolDomain, COGNITO_SNAPSHOT_SCHEMA_VERSION,
 };
 
 /// A user pool's ARN, in the partition of `region`.

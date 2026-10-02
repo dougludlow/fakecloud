@@ -89,6 +89,29 @@ pub struct SqsQueue {
     pub receive_attempt_cache: BTreeMap<String, ReceiveAttemptEntry>,
 }
 
+impl SqsQueue {
+    /// The queue's `VisibilityTimeout` in seconds (default 30), clamped to
+    /// SQS's 0-43200 range. The API validates the attribute, but a queue
+    /// provisioned from a template or an older snapshot may carry any string,
+    /// and an out-of-range value must not overflow visibility arithmetic.
+    pub fn visibility_timeout_secs(&self) -> i64 {
+        self.attributes
+            .get("VisibilityTimeout")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(0, 43_200)
+    }
+
+    /// The queue's `DelaySeconds`, clamped to SQS's 0-900 range for the same
+    /// reason as [`Self::visibility_timeout_secs`].
+    pub fn delay_secs(&self) -> Option<i64> {
+        self.attributes
+            .get("DelaySeconds")
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|d| d.clamp(0, 900))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiveAttemptEntry {
     pub message_ids: Vec<String>,

@@ -4396,7 +4396,14 @@ impl RdsService {
                 let start = get_param(req, "StartTime")
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|| now - chrono::Duration::minutes(duration_minutes));
+                    .unwrap_or_else(|| {
+                        // An unrepresentable look-back (a huge `Duration`)
+                        // covers every event; no event predates the epoch.
+                        chrono::Duration::try_minutes(duration_minutes)
+                            .and_then(|d| now.checked_sub_signed(d))
+                            .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                            .max(chrono::DateTime::UNIX_EPOCH)
+                    });
                 let end = get_param(req, "EndTime")
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc))

@@ -796,6 +796,23 @@ pub(crate) fn service_not_active(name: &str) -> AwsServiceError {
     )
 }
 
+/// Validate a request `desiredCount`: ECS rejects negatives and anything above
+/// the per-service task quota with `InvalidParameterException`.
+pub(crate) fn validate_desired_count(n: i64) -> Result<i32, AwsServiceError> {
+    if n < 0 {
+        return Err(invalid_parameter(format!(
+            "desiredCount cannot be negative. desiredCount={n}"
+        )));
+    }
+    if n > i64::from(crate::state::MAX_TASKS_PER_SERVICE) {
+        return Err(invalid_parameter(format!(
+            "desiredCount={n} exceeds the maximum number of tasks per service ({}).",
+            crate::state::MAX_TASKS_PER_SERVICE
+        )));
+    }
+    Ok(n as i32)
+}
+
 /// Spawn N tasks for a service by cloning the task-definition containers
 /// and inserting `Task` rows in the shared state. The task IDs are
 /// returned so the caller can hand them to `EcsRuntime::run_task` after
@@ -815,6 +832,10 @@ pub(crate) fn spawn_service_tasks(
     if count <= 0 {
         return Vec::new();
     }
+    // A desired count persisted before request validation (or set by a path
+    // that does not validate) must not allocate billions of tasks under the
+    // state write lock.
+    let count = count.min(crate::state::MAX_TASKS_PER_SERVICE);
     let Some(revisions) = state.task_definitions.get(&service.family) else {
         return Vec::new();
     };

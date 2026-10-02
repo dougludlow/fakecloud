@@ -858,8 +858,14 @@ impl SecretsManagerService {
             if let Some(ref rules) = secret.rotation_rules {
                 if let Some(days) = rules.automatically_after_days {
                     let base = secret.last_rotated_at.unwrap_or(secret.created_at);
-                    let next = base + chrono::Duration::days(days);
-                    response["NextRotationDate"] = json!(next.timestamp_millis() as f64 / 1000.0);
+                    // Rules are validated to 1-1000 days on write; a stored
+                    // value out of range just omits the date.
+                    if let Some(next) =
+                        chrono::Duration::try_days(days).and_then(|d| base.checked_add_signed(d))
+                    {
+                        response["NextRotationDate"] =
+                            json!(next.timestamp_millis() as f64 / 1000.0);
+                    }
                 }
             }
         }

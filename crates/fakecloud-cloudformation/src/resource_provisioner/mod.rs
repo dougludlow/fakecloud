@@ -10826,6 +10826,140 @@ mod tests {
     }
 
     #[test]
+    fn cognito_user_pool_client_token_validity_honors_units_and_range() {
+        let prov = make_provisioner();
+        let pool = prov
+            .create_resource(&make_resource(
+                "AWS::Cognito::UserPool",
+                "UP",
+                serde_json::json!({"PoolName": "pool"}),
+            ))
+            .expect("pool provisions");
+        // 60 minutes is valid only because TokenValidityUnits is honored.
+        let created = prov
+            .create_resource(&make_resource(
+                "AWS::Cognito::UserPoolClient",
+                "Client",
+                serde_json::json!({
+                    "UserPoolId": pool.physical_id,
+                    "ClientName": "c1",
+                    "AccessTokenValidity": 60,
+                    "TokenValidityUnits": {"AccessToken": "minutes"}
+                }),
+            ))
+            .expect("client provisions");
+        {
+            let cognito = prov.cognito_state.read();
+            let client =
+                &cognito.get("123456789012").unwrap().user_pool_clients[&created.physical_id];
+            assert_eq!(
+                client
+                    .token_validity_units
+                    .as_ref()
+                    .and_then(|u| u.access_token.as_deref()),
+                Some("minutes")
+            );
+        }
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::Cognito::UserPoolClient",
+                "Client2",
+                serde_json::json!({
+                    "UserPoolId": pool.physical_id,
+                    "ClientName": "c2",
+                    "AccessTokenValidity": i64::MAX,
+                }),
+            ))
+            .expect_err("huge AccessTokenValidity accepted");
+        assert!(err.contains("token validity"), "{err}");
+        let err = prov
+            .update_resource(
+                &created,
+                &make_resource(
+                    "AWS::Cognito::UserPoolClient",
+                    "Client",
+                    serde_json::json!({
+                        "UserPoolId": pool.physical_id,
+                        "ClientName": "c1",
+                        "RefreshTokenValidity": i64::MAX,
+                    }),
+                ),
+            )
+            .expect_err("huge RefreshTokenValidity accepted on update");
+        assert!(err.contains("token validity"), "{err}");
+    }
+
+    #[test]
+    fn sqs_queue_out_of_range_attributes_fail_create_and_update() {
+        let prov = make_provisioner();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::SQS::Queue",
+                "Q",
+                serde_json::json!({ "QueueName": "q1", "VisibilityTimeout": i64::MAX }),
+            ))
+            .expect_err("huge VisibilityTimeout accepted");
+        assert!(err.contains("VisibilityTimeout"), "{err}");
+        let created = prov
+            .create_resource(&make_resource(
+                "AWS::SQS::Queue",
+                "Q",
+                serde_json::json!({ "QueueName": "q2", "VisibilityTimeout": 30 }),
+            ))
+            .expect("queue provisions");
+        let err = prov
+            .update_resource(
+                &created,
+                &make_resource(
+                    "AWS::SQS::Queue",
+                    "Q",
+                    serde_json::json!({ "QueueName": "q2", "DelaySeconds": 901 }),
+                ),
+            )
+            .expect_err("DelaySeconds 901 accepted on update");
+        assert!(err.contains("DelaySeconds"), "{err}");
+        let sqs = prov.sqs_state.read();
+        let queue = &sqs.get("123456789012").unwrap().queues[&created.physical_id];
+        assert_eq!(
+            queue.attributes.get("DelaySeconds").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn ecs_service_desired_count_above_quota_fails() {
+        let prov = make_provisioner();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::ECS::Service",
+                "Svc",
+                serde_json::json!({
+                    "ServiceName": "s",
+                    "TaskDefinition": "arn:aws:ecs:us-east-1:123456789012:task-definition/web:1",
+                    "DesiredCount": i64::MAX,
+                }),
+            ))
+            .expect_err("huge DesiredCount accepted");
+        assert!(err.contains("DesiredCount"), "{err}");
+    }
+
+    #[test]
+    fn secrets_rotation_schedule_days_out_of_range_fails() {
+        let prov = make_provisioner();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::SecretsManager::RotationSchedule",
+                "Rot",
+                serde_json::json!({
+                    "SecretId": "arn:aws:secretsmanager:us-east-1:123456789012:secret:s",
+                    "RotationRules": {"AutomaticallyAfterDays": i64::MAX},
+                }),
+            ))
+            .expect_err("huge AutomaticallyAfterDays accepted");
+        assert!(err.contains("AutomaticallyAfterDays"), "{err}");
+    }
+
+    #[test]
     fn update_stack_applies_rds_db_instance_config() {
         let prov = make_provisioner();
         let created = prov

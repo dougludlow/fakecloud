@@ -324,7 +324,10 @@ fn stable_offset_seconds(schedule_arn: &str, now: DateTime<Utc>, window_minutes:
     now.timestamp().div_euclid(60).hash(&mut h);
     let seed = h.finish();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let upper = (window_minutes * 60).max(0) as u64;
+    // The window is validated to 1..=1440 minutes on write; clamp so a value
+    // persisted before that check cannot overflow here or in the caller's
+    // `now + offset`.
+    let upper = (window_minutes.clamp(0, 1440) * 60) as u64;
     // Inclusive upper: AWS's FlexibleTimeWindow spec covers the whole
     // [0, MaximumWindowInMinutes*60] window.
     rng.gen_range(0..=upper) as i64
@@ -825,6 +828,16 @@ mod tests {
         // Defensive: 0 and negatives shouldn't panic.
         assert_eq!(super::backoff_seconds(0), 1);
         assert_eq!(super::backoff_seconds(-1), 1);
+    }
+
+    #[test]
+    fn stable_offset_seconds_clamps_huge_windows() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 1, 12, 30, 15).unwrap();
+        let arn = "arn:aws:scheduler:us-east-1:1:schedule/default/foo";
+        for w in [i64::MAX, i64::MAX / 60 + 1, 1_000_000] {
+            let off = super::stable_offset_seconds(arn, now, w);
+            assert!((0..=1440 * 60).contains(&off), "{w}: {off}");
+        }
     }
 
     #[test]

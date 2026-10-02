@@ -2002,3 +2002,61 @@ fn execution_started_event_carries_the_role_recorded_at_start() {
         );
     });
 }
+
+fn insert_token(state: &SharedStepFunctionsState, token: &str, status: &str) {
+    let mut accounts = state.write();
+    let s = accounts.get_or_create("123456789012");
+    s.task_tokens.insert(
+        token.to_string(),
+        crate::state::TaskTokenState {
+            activity_arn: String::new(),
+            status: status.to_string(),
+            output: Some("{\"ok\":true}".to_string()),
+            error: None,
+            cause: None,
+            input: None,
+            created_at: Utc::now() - chrono::Duration::days(1),
+            last_heartbeat_at: None,
+            heartbeat_seconds: None,
+            timeout_seconds: None,
+        },
+    );
+}
+
+/// `TimeoutSeconds` / `HeartbeatSeconds` of `u64::MAX` (e.g. persisted before
+/// definition validation capped them) must not overflow the deadline
+/// arithmetic, and the heartbeat window must not wrap negative.
+#[tokio::test]
+async fn poll_task_token_huge_timeouts_do_not_panic() {
+    let state = make_state();
+    insert_token(&state, "done", "SUCCEEDED");
+    let out = poll_task_token(
+        &state,
+        "123456789012",
+        "done",
+        Some(u64::MAX),
+        Some(u64::MAX),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, json!({"ok": true}));
+
+    // IN_PROGRESS with a day-old start: a wrapped (-1) heartbeat window would
+    // fail immediately with States.HeartbeatTimeout; it must keep polling.
+    insert_token(&state, "busy", "IN_PROGRESS");
+    let polled = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        poll_task_token(
+            &state,
+            "123456789012",
+            "busy",
+            Some(u64::MAX),
+            Some(u64::MAX),
+        ),
+    )
+    .await;
+    assert!(polled.is_err(), "expected still polling, got {polled:?}");
+
+    assert!(sync_deadline(Some(u64::MAX)).is_none());
+    assert!(sync_deadline(Some(10)).is_some());
+}

@@ -616,6 +616,8 @@ fn validate_definition(definition: &str) -> Result<(), AwsServiceError> {
         ));
     }
 
+    validate_timeout_field("<root>", &parsed, "TimeoutSeconds")?;
+
     // Reject malformed JSONPath reference fields. AWS rejects bad reference
     // paths at CreateStateMachine; accepting them here lets a panic-inducing
     // path reach the interpreter at execution time.
@@ -631,6 +633,8 @@ fn validate_definition(definition: &str) -> Result<(), AwsServiceError> {
 /// `Iterator`/`ItemProcessor` of Map states. Returns an `InvalidDefinition`
 /// error for any syntactically malformed path or payload-template key.
 fn validate_state_paths(state_name: &str, state: &Value) -> Result<(), AwsServiceError> {
+    validate_timeout_field(state_name, state, "TimeoutSeconds")?;
+    validate_timeout_field(state_name, state, "HeartbeatSeconds")?;
     for field in ["InputPath", "OutputPath", "ResultPath"] {
         if let Some(p) = state.get(field).and_then(|v| v.as_str()) {
             // `InputPath`/`OutputPath` accept the literal "null" to mean "no
@@ -699,6 +703,34 @@ fn validate_state_paths(state_name: &str, state: &Value) -> Result<(), AwsServic
     }
 
     Ok(())
+}
+
+/// Largest `TimeoutSeconds` / `HeartbeatSeconds` AWS accepts in an ASL definition.
+const MAX_TIMEOUT_SECONDS: u64 = 99_999_999;
+
+/// AWS requires `TimeoutSeconds` / `HeartbeatSeconds` to be a positive integer
+/// no larger than 99999999 and rejects anything else at CreateStateMachine /
+/// UpdateStateMachine with `SCHEMA_VALIDATION_FAILED`.
+fn validate_timeout_field(
+    state_name: &str,
+    state: &Value,
+    field: &str,
+) -> Result<(), AwsServiceError> {
+    let Some(v) = state.get(field) else {
+        return Ok(());
+    };
+    match v.as_u64() {
+        Some(n) if (1..=MAX_TIMEOUT_SECONDS).contains(&n) => Ok(()),
+        _ => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidDefinition",
+            format!(
+                "Invalid State Machine Definition: 'SCHEMA_VALIDATION_FAILED' \
+                 (The value of field '{field}' of state '{state_name}' must be a positive \
+                 integer between 1 and {MAX_TIMEOUT_SECONDS}, got {v})"
+            ),
+        )),
+    }
 }
 
 /// Validate every state inside a nested definition (a Parallel branch or a Map
@@ -2014,6 +2046,39 @@ mod tests {
         assert!(validate_definition("not json").is_err());
         assert!(validate_definition(r#"{"States":{}}"#).is_err()); // missing StartAt
         assert!(validate_definition(r#"{"StartAt":"S"}"#).is_err()); // missing States
+    }
+
+    #[test]
+    fn test_validate_definition_timeout_range() {
+        let task = |field: &str, v: &str| {
+            format!(
+                r#"{{"StartAt":"T","States":{{"T":{{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","{field}":{v},"End":true}}}}}}"#
+            )
+        };
+        for field in ["TimeoutSeconds", "HeartbeatSeconds"] {
+            assert!(validate_definition(&task(field, "1")).is_ok());
+            assert!(validate_definition(&task(field, "99999999")).is_ok());
+            for bad in [
+                "0",
+                "-1",
+                "100000000",
+                "18446744073709551615",
+                "1.5",
+                "\"10\"",
+            ] {
+                let err = validate_definition(&task(field, bad)).unwrap_err();
+                assert!(
+                    err.to_string().contains("InvalidDefinition"),
+                    "{field}={bad}: {err}"
+                );
+            }
+        }
+        // Top-level TimeoutSeconds.
+        let def = r#"{"StartAt":"P","TimeoutSeconds":18446744073709551615,"States":{"P":{"Type":"Pass","End":true}}}"#;
+        assert!(validate_definition(def).is_err());
+        // Nested inside a Parallel branch.
+        let def = r#"{"StartAt":"Par","States":{"Par":{"Type":"Parallel","End":true,"Branches":[{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","TimeoutSeconds":100000000,"End":true}}}]}}}"#;
+        assert!(validate_definition(def).is_err());
     }
 
     #[test]

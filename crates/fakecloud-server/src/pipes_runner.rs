@@ -404,11 +404,7 @@ impl PipesRunner {
         let Some(queue) = sqs.queues.values_mut().find(|q| q.arn == source_arn) else {
             return Vec::new();
         };
-        let visibility_timeout: i64 = queue
-            .attributes
-            .get("VisibilityTimeout")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
+        let visibility_timeout: i64 = queue.visibility_timeout_secs();
         let visible_at = now + chrono::Duration::seconds(visibility_timeout);
         // Bodies are stored encrypted at rest on an SSE-KMS / managed-SSE
         // queue; decrypt before forwarding so the target sees plaintext.

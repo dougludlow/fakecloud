@@ -277,13 +277,21 @@ impl ResourceProvisioner {
         };
 
         let now = Utc::now();
+        let token_validity_units = parse_cfn_token_validity_units(props.get("TokenValidityUnits"));
+        fakecloud_cognito::validate_token_validity(
+            props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
+            props.get("IdTokenValidity").and_then(|v| v.as_i64()),
+            props.get("RefreshTokenValidity").and_then(|v| v.as_i64()),
+            token_validity_units.as_ref(),
+        )
+        .map_err(str::to_string)?;
         let client = UserPoolClient {
             client_id: client_id.clone(),
             client_name,
             user_pool_id: pool_id.clone(),
             client_secret: client_secret.clone(),
             explicit_auth_flows: parse_cognito_string_array(props.get("ExplicitAuthFlows")),
-            token_validity_units: None,
+            token_validity_units,
             access_token_validity: props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
             id_token_validity: props.get("IdTokenValidity").and_then(|v| v.as_i64()),
             refresh_token_validity: Some(
@@ -366,6 +374,27 @@ impl ResourceProvisioner {
             .get_mut(client_id)
             .ok_or_else(|| format!("User pool client {client_id} not yet provisioned"))?;
 
+        let token_validity_units = match props.get("TokenValidityUnits") {
+            Some(v) => parse_cfn_token_validity_units(Some(v)),
+            None => client.token_validity_units.clone(),
+        };
+        fakecloud_cognito::validate_token_validity(
+            props
+                .get("AccessTokenValidity")
+                .and_then(|v| v.as_i64())
+                .or(client.access_token_validity),
+            props
+                .get("IdTokenValidity")
+                .and_then(|v| v.as_i64())
+                .or(client.id_token_validity),
+            props
+                .get("RefreshTokenValidity")
+                .and_then(|v| v.as_i64())
+                .or(client.refresh_token_validity),
+            token_validity_units.as_ref(),
+        )
+        .map_err(str::to_string)?;
+        client.token_validity_units = token_validity_units;
         if let Some(name) = props.get("ClientName").and_then(|v| v.as_str()) {
             client.client_name = name.to_string();
         }
@@ -743,4 +772,19 @@ impl ResourceProvisioner {
         state.identity_pool_role_attachments.remove(physical_id);
         Ok(())
     }
+}
+
+/// `TokenValidityUnits` (`AccessToken` / `IdToken` / `RefreshToken`) from a
+/// template, so the validity integers are interpreted in the units the
+/// template names rather than Cognito's defaults.
+fn parse_cfn_token_validity_units(
+    v: Option<&serde_json::Value>,
+) -> Option<fakecloud_cognito::TokenValidityUnits> {
+    let v = v.filter(|v| v.is_object())?;
+    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    Some(fakecloud_cognito::TokenValidityUnits {
+        access_token: field("AccessToken"),
+        id_token: field("IdToken"),
+        refresh_token: field("RefreshToken"),
+    })
 }

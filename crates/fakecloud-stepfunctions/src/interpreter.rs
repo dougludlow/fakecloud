@@ -434,7 +434,8 @@ async fn execute_task_state(
                     input: None,
                     created_at: chrono::Utc::now(),
                     last_heartbeat_at: None,
-                    heartbeat_seconds: heartbeat_seconds.map(|s| s as i64),
+                    heartbeat_seconds: heartbeat_seconds
+                        .map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
                     timeout_seconds: timeout_seconds.map(|s| s as i64),
                 },
             );
@@ -445,11 +446,8 @@ async fn execute_task_state(
     };
 
     let task_input = if let Some(params) = state_def.get("Parameters") {
-        if let Some((_, ctx)) = &task_token {
-            apply_parameters(params, &effective_input, Some(ctx))
-        } else {
-            apply_parameters(params, &effective_input, None)
-        }
+        let ctx = task_token.as_ref().map(|(_, ctx)| ctx);
+        try_apply_parameters(params, &effective_input, ctx)?
     } else {
         effective_input
     };
@@ -1730,7 +1728,7 @@ async fn sync_wait(
                     }
                     _ => {}
                 }
-                if std::time::Instant::now() >= deadline {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     return Err((
                         "States.Timeout".to_string(),
                         format!(
@@ -1849,7 +1847,7 @@ async fn sync_wait_ecs_run_task(
             }
             return Ok(described);
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Err((
                 "States.Timeout".to_string(),
                 format!(
@@ -1910,7 +1908,7 @@ async fn sync_wait_athena_query(
             }
             _ => {}
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Err((
                 "States.Timeout".to_string(),
                 format!(
@@ -1974,7 +1972,7 @@ async fn sync_wait_states_start_execution(
             }
             _ => {}
         }
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Err((
                 "States.Timeout".to_string(),
                 format!(
@@ -1991,8 +1989,8 @@ fn sync_timeout_secs(timeout_seconds: Option<u64>) -> u64 {
     timeout_seconds.unwrap_or(SYNC_DEFAULT_TIMEOUT_SECS)
 }
 
-fn sync_deadline(timeout_seconds: Option<u64>) -> std::time::Instant {
-    std::time::Instant::now() + std::time::Duration::from_secs(sync_timeout_secs(timeout_seconds))
+fn sync_deadline(timeout_seconds: Option<u64>) -> Option<std::time::Instant> {
+    deadline_after_secs(sync_timeout_secs(timeout_seconds))
 }
 
 #[derive(Clone, Copy)]
@@ -2144,7 +2142,7 @@ async fn invoke_activity(
                 input: Some(input_str),
                 created_at: now,
                 last_heartbeat_at: None,
-                heartbeat_seconds: heartbeat_seconds.map(|s| s as i64),
+                heartbeat_seconds: heartbeat_seconds.map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
                 timeout_seconds: timeout_seconds.map(|s| s as i64),
             },
         );
