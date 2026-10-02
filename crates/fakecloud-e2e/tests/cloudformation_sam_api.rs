@@ -364,3 +364,102 @@ Resources:
         }
     }
 }
+
+fn http_definition_template(description: &str) -> String {
+    format!(
+        r#"
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  Http:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: {description}
+      Auth:
+        Authorizers:
+          Jwt:
+            JwtConfiguration:
+              issuer: https://issuer.example.com
+              audience: [app]
+            IdentitySource: $request.header.Authorization
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: sam-http-def
+          version: "1"
+        paths: {{}}
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sam-http-def-fn
+      Runtime: python3.12
+      Handler: index.handler
+      InlineCode: "def handler(e, c): return {{}}"
+      Events:
+        Open:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Http
+            Path: /open
+            Method: GET
+        Secured:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Http
+            Path: /secured
+            Method: GET
+            Auth:
+              Authorizer: Jwt
+"#
+    )
+}
+
+/// An HttpApi with a DefinitionBody keeps its event routes across a stack
+/// update that only changes another property: the unauthenticated route is
+/// part of the definition, and the JWT-secured route (a separate resource)
+/// is not wiped by re-importing an unchanged definition.
+#[tokio::test]
+async fn sam_http_api_definition_body_keeps_event_routes_on_update() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    cfn.create_stack()
+        .stack_name("sam-http-def")
+        .template_body(http_definition_template("first"))
+        .capabilities(Capability::CapabilityNamedIam)
+        .capabilities(Capability::CapabilityAutoExpand)
+        .send()
+        .await
+        .expect("create_stack");
+    let (status, reason) = wait_terminal(&cfn, "sam-http-def").await;
+    assert_eq!(status, "CREATE_COMPLETE", "{reason}");
+    let api_id = physical_id(&cfn, "sam-http-def", "Http").await;
+    let v2 = server.apigatewayv2_client().await;
+    let route_keys = || async {
+        let mut keys: Vec<String> = v2
+            .get_routes()
+            .api_id(&api_id)
+            .send()
+            .await
+            .unwrap()
+            .items()
+            .iter()
+            .filter_map(|r| r.route_key().map(str::to_string))
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(route_keys().await, vec!["GET /open", "GET /secured"]);
+
+    cfn.update_stack()
+        .stack_name("sam-http-def")
+        .template_body(http_definition_template("second"))
+        .capabilities(Capability::CapabilityNamedIam)
+        .capabilities(Capability::CapabilityAutoExpand)
+        .send()
+        .await
+        .expect("update_stack");
+    let (status, reason) = wait_terminal(&cfn, "sam-http-def").await;
+    assert_eq!(status, "UPDATE_COMPLETE", "{reason}");
+    let api = v2.get_api().api_id(&api_id).send().await.unwrap();
+    assert_eq!(api.description(), Some("second"));
+    assert_eq!(route_keys().await, vec!["GET /open", "GET /secured"]);
+}

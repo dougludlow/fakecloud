@@ -474,7 +474,8 @@ fn event_source_mapping_keeps_alias_qualifier_and_self_managed_config() {
     assert_eq!(esm.function_arn, alias_arn);
     assert_eq!(
         esm.self_managed_event_source,
-        Some(json!({"Endpoints": {"KafkaBootstrapServers": ["b1:9092"]}}))
+        Some(json!({"Endpoints": {"KAFKA_BOOTSTRAP_SERVERS": ["b1:9092"]}})),
+        "stored in the Lambda API's shape"
     );
     assert_eq!(
         esm.self_managed_kafka_event_source_config,
@@ -651,7 +652,10 @@ fn sam_cognito_logs_iot_and_kafka_events_provision() {
     let lam = prov.lambda_state.read();
     let mapping = &lam.get(ACCT).unwrap().event_source_mappings[&esm.physical_id];
     assert_eq!(mapping.topics, vec!["orders".to_string()]);
-    assert!(mapping.self_managed_event_source.is_some());
+    assert_eq!(
+        mapping.self_managed_event_source,
+        Some(json!({"Endpoints": {"KAFKA_BOOTSTRAP_SERVERS": ["broker:9092"]}}))
+    );
 }
 
 #[test]
@@ -683,4 +687,55 @@ fn sam_deployment_preference_creates_codedeploy_group_and_alias() {
     let lam = lam.get(ACCT).unwrap();
     assert!(lam.aliases.contains_key("dp-fn:live"));
     assert_eq!(lam.provisioned_concurrency["dp-fn:live"].requested, 2);
+}
+
+#[test]
+fn http_api_update_that_keeps_the_body_preserves_other_routes() {
+    let prov = make_provisioner();
+    let api_def = |desc: &str, path: &str| {
+        make_resource(
+            "AWS::ApiGatewayV2::Api",
+            "H",
+            json!({"Description": desc, "Body": openapi_body(path)}),
+        )
+    };
+    let api = prov.create_resource(&api_def("one", "/items")).unwrap();
+    let integ = create(
+        &prov,
+        "AWS::ApiGatewayV2::Integration",
+        "I",
+        json!({"ApiId": api.physical_id, "IntegrationType": "AWS_PROXY",
+               "IntegrationUri": "arn:aws:lambda:us-east-1:123456789012:function:f",
+               "PayloadFormatVersion": "2.0"}),
+    );
+    create(
+        &prov,
+        "AWS::ApiGatewayV2::Route",
+        "R",
+        json!({"ApiId": api.physical_id, "RouteKey": "GET /extra",
+               "Target": format!("integrations/{}", integ.physical_id)}),
+    );
+    let route_keys = |prov: &ResourceProvisioner| -> Vec<String> {
+        let st = prov.apigatewayv2_state.read();
+        let mut keys: Vec<String> = st.get(ACCT).unwrap().routes[&api.physical_id]
+            .values()
+            .map(|r| r.route_key.clone())
+            .collect();
+        keys.sort();
+        keys
+    };
+    // Only Description changes: the imported and the separate route stay.
+    prov.update_resource(&api, &api_def("two", "/items"))
+        .unwrap();
+    assert_eq!(route_keys(&prov), vec!["GET /extra", "GET /items"]);
+    assert_eq!(
+        prov.apigatewayv2_state.read().get(ACCT).unwrap().apis[&api.physical_id]
+            .description
+            .as_deref(),
+        Some("two")
+    );
+    // A changed definition is re-imported.
+    prov.update_resource(&api, &api_def("two", "/other"))
+        .unwrap();
+    assert_eq!(route_keys(&prov), vec!["GET /other"]);
 }

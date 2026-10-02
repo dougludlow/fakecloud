@@ -1343,4 +1343,56 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("S3 bucket in the same template"), "{err}");
     }
+
+    #[test]
+    fn http_api_definition_body_absorbs_unauthenticated_event_routes() {
+        let expanded = expand_sam(&sam(json!({
+            "Http": {
+                "Type": "AWS::Serverless::HttpApi",
+                "Properties": {"DefinitionBody": {"openapi": "3.0.1", "info": {"title": "t"}, "paths": {}}}
+            },
+            "Fn": function(json!({
+                "Get": {"Type": "HttpApi", "Properties": {"ApiId": {"Ref": "Http"}, "Path": "/x", "Method": "GET"}}
+            }))
+        })))
+        .unwrap();
+        let r = &expanded["Resources"];
+        let integ = &r["Http"]["Properties"]["Body"]["paths"]["/x"]["get"]
+            ["x-amazon-apigateway-integration"];
+        assert_eq!(integ["type"], "aws_proxy");
+        assert_eq!(integ["uri"], json!({"Fn::GetAtt": ["Fn", "Arn"]}));
+        assert_eq!(integ["payloadFormatVersion"], "2.0");
+        assert!(r.get("FnGetRoute").is_none());
+        assert!(r.get("FnGetIntegration").is_none());
+        assert_eq!(r["FnGetPermission"]["Type"], "AWS::Lambda::Permission");
+    }
+
+    #[test]
+    fn api_condition_reaches_every_generated_resource() {
+        let expanded = expand_sam(&sam(json!({
+            "Rest": {"Type": "AWS::Serverless::Api", "Condition": "IsProd", "Properties": {"StageName": "p"}},
+            "Http": {"Type": "AWS::Serverless::HttpApi", "Condition": "IsProd", "Properties": {}},
+            "Fn": function(json!({
+                "A": {"Type": "Api", "Properties": {"RestApiId": {"Ref": "Rest"}, "Path": "/a", "Method": "get"}},
+                "B": {"Type": "HttpApi", "Properties": {"ApiId": {"Ref": "Http"}, "Path": "/b", "Method": "GET"}}
+            }))
+        })))
+        .unwrap();
+        let r = expanded["Resources"].as_object().unwrap();
+        for (id, res) in r {
+            if id.starts_with("Rest")
+                || id.starts_with("Http")
+                || id.starts_with("FnA")
+                || id.starts_with("FnB")
+            {
+                assert_eq!(
+                    res["Condition"], "IsProd",
+                    "{id} carries the API's Condition"
+                );
+            }
+        }
+        assert!(r.contains_key("RestpStage"));
+        assert!(r.contains_key("FnBRoute"));
+        assert!(r["Fn"].get("Condition").is_none());
+    }
 }

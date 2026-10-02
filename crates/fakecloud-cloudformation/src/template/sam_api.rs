@@ -657,6 +657,7 @@ pub(super) fn build_rest_api(
             route_permission(id, route),
         ));
     }
+    propagate_condition(def, &mut out);
     let refs = vec![
         (format!("{id}.Stage"), stage_id),
         (format!("{id}.Deployment"), deployment_id),
@@ -730,6 +731,7 @@ pub(super) fn build_http_api(def: &ApiDef, routes: &[&ApiRoute]) -> Result<ApiEx
         api.insert(k.clone(), v.clone());
     }
     out.push((id.to_string(), Value::Object(api)));
+    let api_index = out.len() - 1;
 
     // --- Authorizers ---
     let auth = auth
@@ -853,6 +855,67 @@ pub(super) fn build_http_api(def: &ApiDef, routes: &[&ApiRoute]) -> Result<ApiEx
 
     // --- Routes ---
     for route in routes {
+        let authorizer = route
+            .auth
+            .as_ref()
+            .and_then(|a| a.get("Authorizer"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| default_authorizer.clone());
+        // With a DefinitionBody, SAM adds the event's route to the definition
+        // itself, so it is part of what the API imports (and re-imports on an
+        // update) rather than a separate route the import would replace. A
+        // route needing an authorizer stays a separate resource: the
+        // authorizer is created after the API it belongs to.
+        if let (Some(path), None | Some("NONE")) = (&route.path, authorizer.as_deref()) {
+            if let Some(body) = out[api_index]
+                .1
+                .pointer_mut("/Properties/Body")
+                .and_then(Value::as_object_mut)
+            {
+                let paths = body
+                    .entry("paths")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| invalid(id, "DefinitionBody paths must be a map."))?;
+                let path_obj = paths
+                    .entry(path.clone())
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| invalid(id, &format!("Path '{path}' must be a map.")))?;
+                let op = path_obj
+                    .entry(op_key(&route.method))
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        invalid(id, &format!("Method on path '{path}' must be a map."))
+                    })?;
+                if op.contains_key("x-amazon-apigateway-integration") {
+                    return Err(invalid(
+                        id,
+                        &format!(
+                            "Event {} of function {} adds method {} on path {path}, which is already defined.",
+                            route.event_name, route.target.function_id, route.method
+                        ),
+                    ));
+                }
+                let mut integration = json!({
+                    "type": "aws_proxy",
+                    "httpMethod": "POST",
+                    "uri": route.target.arn.clone(),
+                    "payloadFormatVersion": route.payload_format_version.clone().unwrap_or(json!("2.0")),
+                });
+                if let Some(t) = &route.timeout_in_millis {
+                    integration["timeoutInMillis"] = t.clone();
+                }
+                op.insert("x-amazon-apigateway-integration".to_string(), integration);
+                out.push((
+                    format!("{}Permission", route.id_base),
+                    route_permission(id, route),
+                ));
+                continue;
+            }
+        }
         let integ_id = format!("{}Integration", route.id_base);
         let mut integ = json!({
             "ApiId": { "Ref": id },
@@ -876,13 +939,6 @@ pub(super) fn build_http_api(def: &ApiDef, routes: &[&ApiRoute]) -> Result<ApiEx
             "RouteKey": route_key,
             "Target": { "Fn::Sub": format!("integrations/${{{integ_id}}}") },
         });
-        let authorizer = route
-            .auth
-            .as_ref()
-            .and_then(|a| a.get("Authorizer"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| default_authorizer.clone());
         match authorizer.as_deref() {
             None | Some("NONE") => {}
             Some("AWS_IAM") => {
@@ -923,5 +979,23 @@ pub(super) fn build_http_api(def: &ApiDef, routes: &[&ApiRoute]) -> Result<ApiEx
             route_permission(id, route),
         ));
     }
+    propagate_condition(def, &mut out);
     Ok((out, vec![(format!("{id}.Stage"), stage_id)]))
+}
+
+/// SAM puts an API's `Condition` on every resource it generates for it
+/// (deployment, stage, authorizers, routes, integrations, permissions), so a
+/// condition that drops the API drops all of them.
+fn propagate_condition(def: &ApiDef, out: &mut [(String, Value)]) {
+    let Some(condition) = def.attributes.get("Condition") else {
+        return;
+    };
+    for (logical_id, resource) in out.iter_mut() {
+        if logical_id == &def.logical_id {
+            continue;
+        }
+        if let Some(obj) = resource.as_object_mut() {
+            obj.entry("Condition").or_insert_with(|| condition.clone());
+        }
+    }
 }

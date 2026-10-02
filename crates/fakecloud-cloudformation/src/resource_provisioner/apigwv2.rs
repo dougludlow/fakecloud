@@ -56,6 +56,44 @@ fn parse_cfn_tag_map(v: Option<&serde_json::Value>) -> Option<BTreeMap<String, S
     None
 }
 
+/// Whether every route `routes` (built from a definition) describes is already
+/// on the API with the same integration, i.e. re-importing it would change
+/// nothing about the imported routes.
+fn definition_routes_present(
+    state: &fakecloud_apigatewayv2::ApiGatewayV2State,
+    api_id: &str,
+    routes: &BTreeMap<String, ApiGwV2Route>,
+    integrations: &BTreeMap<String, ApiGwV2Integration>,
+) -> bool {
+    let existing_routes = state.routes.get(api_id);
+    let existing_integrations = state.integrations.get(api_id);
+    let integration_of =
+        |target: Option<&String>, pool: Option<&BTreeMap<String, ApiGwV2Integration>>| {
+            target
+                .and_then(|t| t.strip_prefix("integrations/"))
+                .and_then(|id| pool.and_then(|p| p.get(id)))
+                .map(|i| {
+                    (
+                        i.integration_type.clone(),
+                        i.integration_uri.clone(),
+                        i.payload_format_version.clone(),
+                        i.timeout_in_millis,
+                        i.integration_method.clone(),
+                    )
+                })
+        };
+    routes.values().all(|wanted| {
+        let want = integration_of(wanted.target.as_ref(), Some(integrations));
+        existing_routes
+            .into_iter()
+            .flat_map(|m| m.values())
+            .any(|have| {
+                have.route_key == wanted.route_key
+                    && integration_of(have.target.as_ref(), existing_integrations) == want
+            })
+    })
+}
+
 impl ResourceProvisioner {
     // --- API Gateway v2 (HTTP/WebSocket APIs) ---
 
@@ -993,8 +1031,19 @@ impl ResourceProvisioner {
         let mut accounts = self.apigatewayv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         // A changed definition rebuilds the routes and integrations, as
-        // ReimportApi does.
-        if let Some(definition) = &definition {
+        // ReimportApi does. An unchanged one (the update touched other
+        // properties) leaves them alone, so routes other stack resources added
+        // to the API (separate AWS::ApiGatewayV2::Route resources, which the
+        // update does not reprovision) survive.
+        let changed = definition.as_ref().is_some_and(|definition| {
+            let (_, routes, integrations) = fakecloud_apigatewayv2::extras::build_api_from_spec(
+                definition,
+                api_id.clone(),
+                &self.region,
+            );
+            !definition_routes_present(state, &api_id, &routes, &integrations)
+        });
+        if let Some(definition) = definition.as_ref().filter(|_| changed) {
             let (spec_api, routes, integrations) =
                 fakecloud_apigatewayv2::extras::build_api_from_spec(
                     definition,

@@ -232,7 +232,17 @@ pub fn import_openapi(
         .and_then(Value::as_object)
     {
         for (name, cfg) in validators {
-            let id = make_id();
+            // A validator the API already has under this name (a merge
+            // re-import) keeps its id, as authorizers do.
+            let id = state
+                .request_validators
+                .get(api_id)
+                .and_then(|m| {
+                    m.iter()
+                        .find(|(_, v)| v.get("name").and_then(Value::as_str) == Some(name))
+                        .map(|(id, _)| id.clone())
+                })
+                .unwrap_or_else(make_id);
             state
                 .request_validators
                 .entry(api_id.to_string())
@@ -665,6 +675,35 @@ mod tests {
         assert!(!state.resources[&id].values().any(|r| r.path == "/pets"));
         assert_eq!(state.resources[&id].len(), 2);
         assert!(!state.authorizers.contains_key(&id));
+    }
+
+    #[test]
+    fn merge_reimport_reuses_request_validators_by_name() {
+        let (mut state, id, _) = state_with_api();
+        let spec = json!({
+            "swagger": "2.0",
+            "x-amazon-apigateway-request-validators": {
+                "body": {"validateRequestBody": true}
+            },
+            "x-amazon-apigateway-request-validator": "body",
+            "paths": {"/v": {"post": {}}}
+        });
+        import_openapi(&mut state, &id, &spec, ImportMode::Overwrite).unwrap();
+        let first: Vec<String> = state.request_validators[&id].keys().cloned().collect();
+        import_openapi(&mut state, &id, &spec, ImportMode::Merge).unwrap();
+        let second: Vec<String> = state.request_validators[&id].keys().cloned().collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first, second, "merge must not duplicate the validator");
+        let res = state.resources[&id]
+            .values()
+            .find(|r| r.path == "/v")
+            .unwrap();
+        assert_eq!(
+            state.methods[&format!("{id}/{}/POST", res.id)]
+                .request_validator_id
+                .as_deref(),
+            Some(first[0].as_str())
+        );
     }
 
     #[test]

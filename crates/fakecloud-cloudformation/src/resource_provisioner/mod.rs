@@ -687,6 +687,19 @@ struct LambdaEventSourceMappingProps {
 /// Parse the `Properties` value of an `AWS::Lambda::EventSourceMapping`
 /// resource. `EventSourceArn` is required on create; updates re-parse but
 /// the value is ignored since the field is immutable.
+/// CloudFormation spells a self-managed Kafka source's endpoint key
+/// `KafkaBootstrapServers`; the Lambda API (and so Get/List) uses
+/// `KAFKA_BOOTSTRAP_SERVERS`. Translate so the mapping reads back in the
+/// API's shape.
+fn self_managed_event_source_to_api(mut source: serde_json::Value) -> serde_json::Value {
+    if let Some(endpoints) = source.get_mut("Endpoints").and_then(|e| e.as_object_mut()) {
+        if let Some(servers) = endpoints.remove("KafkaBootstrapServers") {
+            endpoints.insert("KAFKA_BOOTSTRAP_SERVERS".to_string(), servers);
+        }
+    }
+    source
+}
+
 fn parse_lambda_event_source_mapping_props(
     props: &serde_json::Value,
 ) -> Result<LambdaEventSourceMappingProps, String> {
@@ -784,7 +797,8 @@ fn parse_lambda_event_source_mapping_props(
         .cloned()
         .unwrap_or_default();
     let object = |key: &str| props.get(key).filter(|v| v.is_object()).cloned();
-    let self_managed_event_source = object("SelfManagedEventSource");
+    let self_managed_event_source =
+        object("SelfManagedEventSource").map(self_managed_event_source_to_api);
     let self_managed_kafka_event_source_config = object("SelfManagedKafkaEventSourceConfig");
     let document_db_event_source_config = object("DocumentDBEventSourceConfig");
 
