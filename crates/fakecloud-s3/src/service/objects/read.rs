@@ -148,14 +148,7 @@ impl S3Service {
         if let Some(exp) = q("response-expires").or_else(|| obj.expires.clone()) {
             insert_str_header(&mut headers, "expires", &exp);
         }
-        for (k, v) in &obj.metadata {
-            if let (Ok(name), Ok(val)) = (
-                format!("x-amz-meta-{k}").parse::<http::header::HeaderName>(),
-                v.parse::<http::header::HeaderValue>(),
-            ) {
-                headers.insert(name, val);
-            }
-        }
+        insert_user_metadata_headers(&mut headers, &obj.metadata);
         if let Some(ref redirect) = obj.website_redirect_location {
             insert_str_header(&mut headers, "x-amz-website-redirect-location", redirect);
         }
@@ -533,14 +526,7 @@ impl S3Service {
         } else {
             headers.insert("content-length", total_size.to_string().parse().unwrap());
         }
-        for (k, v) in &obj.metadata {
-            if let (Ok(name), Ok(val)) = (
-                format!("x-amz-meta-{k}").parse::<http::header::HeaderName>(),
-                v.parse::<http::header::HeaderValue>(),
-            ) {
-                headers.insert(name, val);
-            }
-        }
+        insert_user_metadata_headers(&mut headers, &obj.metadata);
         if let Some(ref redirect) = obj.website_redirect_location {
             insert_str_header(&mut headers, "x-amz-website-redirect-location", redirect);
         }

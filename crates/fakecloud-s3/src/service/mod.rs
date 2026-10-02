@@ -3376,18 +3376,39 @@ pub(crate) fn url_encode_s3_key(s: &str) -> String {
 
 pub(crate) use fakecloud_aws::xml::xml_escape;
 
+/// The `x-amz-meta-*` user metadata on a request, keyed without the prefix.
+/// Values are RFC 2047-decoded the way S3 does before storing them, so a
+/// non-ASCII value is kept rather than dropped (see
+/// [`fakecloud_core::rfc2047::decode`]).
 pub(crate) fn extract_user_metadata(
     headers: &HeaderMap,
 ) -> std::collections::BTreeMap<String, String> {
     let mut meta = std::collections::BTreeMap::new();
     for (name, value) in headers {
         if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
-            if let Ok(v) = value.to_str() {
-                meta.insert(key.to_string(), v.to_string());
-            }
+            meta.insert(
+                key.to_string(),
+                fakecloud_core::rfc2047::decode(value.as_bytes()),
+            );
         }
     }
     meta
+}
+
+/// Emit stored user metadata as `x-amz-meta-*` response headers. A value
+/// that is not pure US-ASCII is RFC 2047-encoded, as S3 returns it.
+pub(crate) fn insert_user_metadata_headers(
+    headers: &mut HeaderMap,
+    metadata: &std::collections::BTreeMap<String, String>,
+) {
+    for (k, v) in metadata {
+        if let (Ok(name), Ok(val)) = (
+            format!("x-amz-meta-{k}").parse::<http::header::HeaderName>(),
+            http::HeaderValue::from_str(&fakecloud_core::rfc2047::encode(v)),
+        ) {
+            headers.insert(name, val);
+        }
+    }
 }
 
 /// Every value of the Smithy `StorageClass` enum. Keep this in step with
