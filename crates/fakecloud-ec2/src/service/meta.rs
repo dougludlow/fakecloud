@@ -78,21 +78,17 @@ pub(crate) fn describe_availability_zones(
     };
     let opt_in_status = optin.as_deref().unwrap_or("opt-in-not-required");
 
-    let items: Vec<String> = ["a", "b", "c"]
-        .iter()
-        .enumerate()
-        .map(|(i, suffix)| (format!("{region}{suffix}"), i + 1))
+    let items: Vec<String> = crate::defaults::region_zones(region)
+        .into_iter()
         .filter(|(zone, _)| requested.is_empty() || requested.iter().any(|x| x == zone))
-        .map(|(zone, idx)| {
-            // zoneId uses AWS's `<region-short>-az<N>` convention.
-            let short = crate::defaults::az_id_prefix(region);
+        .map(|(zone, zone_id)| {
             format!(
                 "{}{}{}{}{}{}{}",
                 ec2_elem("zoneName", &zone),
                 ec2_elem("zoneState", "available"),
                 ec2_elem("optInStatus", opt_in_status),
                 ec2_elem("regionName", region),
-                ec2_elem("zoneId", &format!("{short}-az{idx}")),
+                ec2_elem("zoneId", &zone_id),
                 ec2_elem("zoneType", "availability-zone"),
                 ec2_elem("groupName", region),
             )

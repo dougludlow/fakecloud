@@ -7605,16 +7605,23 @@ async fn aurora_member_joins_a_cluster_persisted_with_an_invalid_version() {
     );
     svc.create_db_instance(&req)
         .await
-        .expect("member with an explicit version");
+        .expect("member of the repaired cluster");
 
     let accounts = svc.state.read();
     let state = accounts.default_ref();
+    // The first member repairs the cluster's version; later members inherit
+    // it (a request version no longer overrides a valid cluster version), so
+    // the cluster and its members agree.
     assert_eq!(
         state.instances["legacy-default"].engine_version,
         "8.0.mysql_aurora.3.04.0"
     );
     assert_eq!(
         state.instances["legacy-explicit"].engine_version,
-        "8.0.mysql_aurora.3.08.0"
+        "8.0.mysql_aurora.3.04.0"
+    );
+    assert_eq!(
+        state.extras["clusters"]["legacy-my"]["EngineVersion"],
+        "8.0.mysql_aurora.3.04.0"
     );
 }

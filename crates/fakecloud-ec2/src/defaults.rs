@@ -145,41 +145,33 @@ pub(crate) fn zone_id_for(zone: &str) -> String {
     }
 }
 
-/// Whether `zone` is an availability zone (or Local Zone) of `region`:
-/// `{region}{letter}`, or `{region}-{location}-{n}{letter}`.
+/// The availability zones of `region`, as `(zone name, zone id)`: exactly
+/// what DescribeAvailabilityZones reports, and so exactly what a subnet can
+/// be placed in by name or by id.
+pub(crate) fn region_zones(region: &str) -> Vec<(String, String)> {
+    DEFAULT_AZ_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let zone = format!("{region}{suffix}");
+            let id = zone_id_for(&zone);
+            (zone, id)
+        })
+        .collect()
+}
+
+/// Whether `zone` is one of `region`'s availability zones.
 pub(crate) fn zone_in_region(region: &str, zone: &str) -> bool {
-    let Some(rest) = zone.strip_prefix(region) else {
-        return false;
-    };
-    let mut chars = rest.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => chars.next().is_none(),
-        Some('-') => {
-            let local = &rest[1..];
-            local.ends_with(|c: char| c.is_ascii_lowercase())
-                && local.split('-').count() == 2
-                && local
-                    .split('-')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()))
-        }
-        _ => false,
-    }
+    region_zones(region).iter().any(|(name, _)| name == zone)
 }
 
 /// The availability-zone name a zone id denotes in `region`
-/// (`use1-az2 -> us-east-1b`), or `None` when the id belongs to another
-/// region or is malformed.
+/// (`use1-az2 -> us-east-1b`), or `None` when the id is not one of the
+/// region's zones.
 pub(crate) fn zone_name_for_id(region: &str, zone_id: &str) -> Option<String> {
-    let (prefix, n) = zone_id.rsplit_once("-az")?;
-    if prefix != az_id_prefix(region) {
-        return None;
-    }
-    let n: u32 = n.parse().ok()?;
-    if !(1..=26).contains(&n) {
-        return None;
-    }
-    let letter = char::from_u32(u32::from('a') + n - 1)?;
-    Some(format!("{region}{letter}"))
+    region_zones(region)
+        .into_iter()
+        .find(|(_, id)| id == zone_id)
+        .map(|(name, _)| name)
 }
 
 /// The default VPC id for an account (also exposed so request handlers can
@@ -774,6 +766,11 @@ mod tests {
         // An id from another region is not a zone of this one.
         assert_eq!(zone_name_for_id("ap-southeast-1", "aps1-az1"), None);
         assert_eq!(zone_name_for_id("us-east-1", "use1-az0"), None);
+        assert_eq!(zone_name_for_id("us-east-1", "use1-az4"), None);
+        // Every listed zone round-trips by id.
+        for (name, id) in region_zones("ap-south-1") {
+            assert_eq!(zone_name_for_id("ap-south-1", &id), Some(name));
+        }
         assert_eq!(zone_name_for_id("us-east-1", "garbage"), None);
     }
 
@@ -790,8 +787,9 @@ mod tests {
     #[test]
     fn zone_membership_follows_the_region() {
         assert!(zone_in_region("us-east-1", "us-east-1a"));
-        assert!(zone_in_region("us-east-1", "us-east-1f"));
-        assert!(zone_in_region("us-west-2", "us-west-2-lax-1a"));
+        assert!(zone_in_region("us-east-1", "us-east-1c"));
+        // Only the zones DescribeAvailabilityZones lists.
+        assert!(!zone_in_region("us-east-1", "us-east-1f"));
         assert!(!zone_in_region("us-east-1", "us-west-2a"));
         assert!(!zone_in_region("us-east-1", "us-east-1"));
         assert!(!zone_in_region("us-east-1", "us-east-1ab"));

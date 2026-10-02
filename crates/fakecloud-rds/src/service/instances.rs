@@ -48,8 +48,7 @@ impl RdsService {
     /// For an Aurora engine, the engine version the new instance takes: an
     /// Aurora instance is a member of a DB cluster and runs the cluster's
     /// engine version, so the cluster must be named, exist, and be of the
-    /// same engine. `None` for every non-Aurora engine, and for a cluster
-    /// whose stored version is not valid for its engine.
+    /// same engine. `None` for every non-Aurora engine.
     fn aurora_member_engine_version(
         &self,
         request: &AwsRequest,
@@ -67,11 +66,11 @@ impl RdsService {
                 ),
             ));
         };
-        let accounts = self.state.read();
+        let mut accounts = self.state.write();
         let cluster = accounts
-            .get(&request.account_id)
-            .and_then(|state| state.extras.get("clusters"))
-            .and_then(|clusters| clusters.get(&cluster_id))
+            .get_mut(&request.account_id)
+            .and_then(|state| state.extras.get_mut("clusters"))
+            .and_then(|clusters| clusters.get_mut(&cluster_id))
             .ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::NOT_FOUND,
@@ -79,7 +78,10 @@ impl RdsService {
                     format!("DBCluster {cluster_id} not found."),
                 )
             })?;
-        let cluster_engine = cluster["Engine"].as_str().unwrap_or("aurora-postgresql");
+        let cluster_engine = cluster["Engine"]
+            .as_str()
+            .unwrap_or("aurora-postgresql")
+            .to_string();
         if cluster_engine != engine {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -89,15 +91,29 @@ impl RdsService {
                 ),
             ));
         }
+        if let Some(stored) = cluster["EngineVersion"]
+            .as_str()
+            .filter(|v| service_helpers::engine_version_supported(engine, v))
+        {
+            return Ok(Some(stored.to_string()));
+        }
         // A cluster persisted by an older build may carry a version that is
         // not one of its engine's (every version-less cluster used to get
         // `15.3`, aurora-mysql included). Such a value can never start a
-        // member, so the request's EngineVersion (or the engine default)
-        // applies instead of wedging the cluster forever.
-        Ok(cluster["EngineVersion"]
-            .as_str()
-            .filter(|v| service_helpers::engine_version_supported(engine, v))
-            .map(str::to_string))
+        // member, so this member's version (the request's, else the engine
+        // default) becomes the cluster's: later members inherit it and
+        // DescribeDBClusters agrees with them.
+        let resolved = optional_query_param(request, "EngineVersion")
+            .unwrap_or_else(|| default_engine_version(engine).to_string());
+        if service_helpers::engine_version_supported(engine, &resolved) {
+            if let Some(obj) = cluster.as_object_mut() {
+                obj.insert(
+                    "EngineVersion".to_string(),
+                    serde_json::Value::String(resolved.clone()),
+                );
+            }
+        }
+        Ok(Some(resolved))
     }
 
     pub(super) async fn create_db_instance(

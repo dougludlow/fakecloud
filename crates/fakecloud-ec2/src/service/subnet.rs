@@ -120,7 +120,13 @@ fn default_az(req: &AwsRequest) -> Result<String, AwsServiceError> {
     } else {
         &req.region
     };
-    let valid = || format!("{region}a, {region}b, {region}c");
+    let valid = || {
+        crate::defaults::region_zones(region)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if let Some(az) = req.query_params.get("AvailabilityZone") {
         if !crate::defaults::zone_in_region(region, az) {
             return Err(invalid_parameter_value(format!(
