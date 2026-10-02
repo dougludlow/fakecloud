@@ -1424,3 +1424,102 @@ async fn describe_tasks_emits_per_container_aws_shape_fields() {
         }
     }
 }
+
+#[tokio::test]
+async fn ecs_daemons_and_express_gateway_services_are_taggable() {
+    use aws_sdk_ecs::types::{DaemonContainerDefinition, ExpressGatewayContainer};
+    let server = TestServer::start().await;
+    let ecs = server.ecs_client().await;
+
+    ecs.create_cluster()
+        .cluster_name("tag-cluster")
+        .send()
+        .await
+        .unwrap();
+    let td_arn = ecs
+        .register_daemon_task_definition()
+        .family("agent")
+        .container_definitions(
+            DaemonContainerDefinition::builder()
+                .name("agent")
+                .image("busybox")
+                .build()
+                .unwrap(),
+        )
+        .tags(Tag::builder().key("env").value("prod").build())
+        .send()
+        .await
+        .unwrap()
+        .daemon_task_definition_arn()
+        .unwrap()
+        .to_string();
+    let daemon_arn = ecs
+        .create_daemon()
+        .daemon_name("d1")
+        .cluster_arn("tag-cluster")
+        .daemon_task_definition_arn(&td_arn)
+        .set_capacity_provider_arns(Some(vec![]))
+        .tags(Tag::builder().key("env").value("prod").build())
+        .send()
+        .await
+        .unwrap()
+        .daemon_arn()
+        .unwrap()
+        .to_string();
+    let eg_arn = ecs
+        .create_express_gateway_service()
+        .cluster("tag-cluster")
+        .service_name("eg1")
+        .execution_role_arn("arn:aws:iam::123456789012:role/exec")
+        .infrastructure_role_arn("arn:aws:iam::123456789012:role/infra")
+        .primary_container(
+            ExpressGatewayContainer::builder()
+                .image("nginx")
+                .build()
+                .unwrap(),
+        )
+        .tags(Tag::builder().key("env").value("prod").build())
+        .send()
+        .await
+        .unwrap()
+        .service()
+        .and_then(|s| s.service_arn())
+        .unwrap()
+        .to_string();
+
+    for arn in [&td_arn, &daemon_arn, &eg_arn] {
+        let listed = ecs
+            .list_tags_for_resource()
+            .resource_arn(arn)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("list tags {arn}: {e:?}"));
+        assert!(
+            listed
+                .tags()
+                .iter()
+                .any(|t| t.key() == Some("env") && t.value() == Some("prod")),
+            "{arn}"
+        );
+        ecs.tag_resource()
+            .resource_arn(arn)
+            .tags(Tag::builder().key("team").value("infra").build())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("tag {arn}: {e:?}"));
+        ecs.untag_resource()
+            .resource_arn(arn)
+            .tag_keys("env")
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("untag {arn}: {e:?}"));
+        let listed = ecs
+            .list_tags_for_resource()
+            .resource_arn(arn)
+            .send()
+            .await
+            .unwrap();
+        let keys: Vec<&str> = listed.tags().iter().filter_map(|t| t.key()).collect();
+        assert_eq!(keys, vec!["team"], "{arn}");
+    }
+}

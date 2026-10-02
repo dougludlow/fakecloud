@@ -1232,3 +1232,118 @@ async fn access_point_validates_name_and_recovery_point() {
     .await;
     assert_eq!(code, "ResourceNotFoundException");
 }
+
+#[tokio::test]
+async fn access_point_create_tags_are_listed_tagged_and_dropped_on_delete() {
+    let svc = service();
+    let resource = "arn:aws:ec2:us-east-1:000000000000:volume/vol-aptag";
+    let rp = make_recovery_point(&svc, "aptagvault", resource).await;
+    let created = body_of(
+        &call(
+            &svc,
+            req(
+                Method::PUT,
+                "/backup-access-point/create",
+                json!({
+                    "Name": "tagged-ap",
+                    "RecoveryPointArn": rp,
+                    "Tags": { "env": "dev" },
+                }),
+            ),
+        )
+        .await,
+    );
+    let ap_arn = created["AccessPointArn"].as_str().unwrap().to_string();
+    let enc = percent(&ap_arn);
+    let l = body_of(&call(&svc, req(Method::GET, &format!("/tags/{enc}"), json!({}))).await);
+    assert_eq!(l["Tags"], json!({ "env": "dev" }));
+
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("/untag/{enc}"),
+            json!({ "TagKeyList": ["env"] }),
+        ),
+    )
+    .await;
+    let l = body_of(&call(&svc, req(Method::GET, &format!("/tags/{enc}"), json!({}))).await);
+    assert!(l["Tags"].get("env").is_none(), "{l}");
+
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("/tags/{enc}"),
+            json!({ "Tags": { "team": "core" } }),
+        ),
+    )
+    .await;
+    call(
+        &svc,
+        req(
+            Method::DELETE,
+            &format!("/backup-access-point/delete/{enc}"),
+            json!({}),
+        ),
+    )
+    .await;
+    // Recreating the same name must not resurrect the deleted point's tags.
+    call(
+        &svc,
+        req(
+            Method::PUT,
+            "/backup-access-point/create",
+            json!({ "Name": "tagged-ap", "RecoveryPointArn": rp }),
+        ),
+    )
+    .await;
+    let l = body_of(&call(&svc, req(Method::GET, &format!("/tags/{enc}"), json!({}))).await);
+    assert!(l["Tags"].get("team").is_none(), "{l}");
+}
+
+#[tokio::test]
+async fn restore_access_vault_tags_are_listed() {
+    let svc = service();
+    let source = make_vault(&svc, "rasource").await;
+    let created = body_of(
+        &call(
+            &svc,
+            req(
+                Method::PUT,
+                "/restore-access-backup-vaults",
+                json!({
+                    "SourceBackupVaultArn": source,
+                    "BackupVaultName": "ravault",
+                    "BackupVaultTags": { "owner": "ops" },
+                }),
+            ),
+        )
+        .await,
+    );
+    let arn = created["RestoreAccessBackupVaultArn"].as_str().unwrap();
+    let enc = percent(arn);
+    let l = body_of(&call(&svc, req(Method::GET, &format!("/tags/{enc}"), json!({}))).await);
+    assert_eq!(l["Tags"], json!({ "owner": "ops" }));
+}
+
+#[tokio::test]
+async fn deleted_vault_tags_do_not_resurrect_on_recreate() {
+    let svc = service();
+    let arn = make_vault(&svc, "retag").await;
+    let enc = percent(&arn);
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("/tags/{enc}"),
+            json!({ "Tags": { "env": "prod" } }),
+        ),
+    )
+    .await;
+    call(&svc, req(Method::DELETE, "/backup-vaults/retag", json!({}))).await;
+    let again = make_vault(&svc, "retag").await;
+    assert_eq!(again, arn);
+    let l = body_of(&call(&svc, req(Method::GET, &format!("/tags/{enc}"), json!({}))).await);
+    assert!(l["Tags"].get("env").is_none(), "{l}");
+}

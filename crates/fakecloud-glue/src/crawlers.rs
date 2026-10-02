@@ -81,6 +81,15 @@ fn settle_crawler(crawler: &mut Value) {
     }
 }
 
+/// Render a crawler's `Schedule` structure from the request's cron string:
+/// a non-empty expression is `SCHEDULED`, absent/empty is `NOT_SCHEDULED`.
+fn schedule_from_expr(expr: Option<&str>) -> Value {
+    match expr.filter(|e| !e.is_empty()) {
+        Some(e) => json!({"ScheduleExpression": e, "State": "SCHEDULED"}),
+        None => json!({"State": "NOT_SCHEDULED"}),
+    }
+}
+
 impl GlueService {
     pub(crate) fn create_crawler(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
@@ -98,11 +107,17 @@ impl GlueService {
                 ("CreationTime", json!(now)),
                 ("LastUpdated", json!(now)),
                 ("Version", json!(1)),
+                (
+                    "Schedule",
+                    schedule_from_expr(body.get("Schedule").and_then(Value::as_str)),
+                ),
             ],
         );
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut state.crawlers, &name, stored, "Crawler")?;
+        let arn = crate::common::resource_arn(&req.region, &req.account_id, "crawler", &name);
+        state.put_create_tags(&arn, &body);
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -159,10 +174,27 @@ impl GlueService {
     }
 
     pub(crate) fn list_crawlers(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let names: Vec<String> = accounts
             .get(&req.account_id)
-            .map(|s| s.crawlers.keys().cloned().collect())
+            .map(|s| {
+                s.crawlers
+                    .keys()
+                    .filter(|k| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "crawler",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "CrawlerNames": names })))
     }
@@ -177,6 +209,9 @@ impl GlueService {
                     updates.push((f, v.clone()));
                 }
             }
+        }
+        if let Some(expr) = body.get("Schedule").and_then(Value::as_str) {
+            updates.push(("Schedule", schedule_from_expr(Some(expr))));
         }
         updates.push(("LastUpdated", json!(now_ts())));
         let mut accounts = self.state.write();
@@ -198,6 +233,8 @@ impl GlueService {
             return Err(crawler_running(&name));
         }
         generic::delete(&mut state.crawlers, &name, "Crawler")?;
+        let arn = crate::common::resource_arn(&req.region, &req.account_id, "crawler", &name);
+        state.remove_tags(&arn);
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -265,11 +302,16 @@ impl GlueService {
             .crawlers
             .get_mut(&name)
             .ok_or_else(|| entity_not_found(format!("Crawler {name} not found")))?;
+        // Start/StopCrawlerSchedule only flip the state; the cron expression
+        // set at create/update time is kept.
         if let Some(obj) = crawler.as_object_mut() {
-            obj.insert(
-                "Schedule".into(),
-                json!({"State": if start { "SCHEDULED" } else { "NOT_SCHEDULED" }}),
-            );
+            let mut sched = obj
+                .get("Schedule")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            sched["State"] = json!(if start { "SCHEDULED" } else { "NOT_SCHEDULED" });
+            obj.insert("Schedule".into(), sched);
         }
         Ok(AwsResponse::ok_json(json!({})))
     }

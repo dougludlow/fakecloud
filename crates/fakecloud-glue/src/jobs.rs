@@ -73,6 +73,8 @@ pub(crate) fn job_to_json(j: &Job) -> Value {
         "MaintenanceWindow": j.maintenance_window,
         "LogUri": j.log_uri,
         "AllocatedCapacity": j.allocated_capacity,
+        "JobMode": j.job_mode,
+        "JobRunQueuingEnabled": j.job_run_queuing_enabled,
     })
 }
 
@@ -148,8 +150,12 @@ impl GlueService {
             maintenance_window: body["MaintenanceWindow"].as_str().map(String::from),
             log_uri: body["LogUri"].as_str().map(String::from),
             allocated_capacity: body["AllocatedCapacity"].as_i64(),
+            job_mode: body["JobMode"].as_str().map(String::from),
+            job_run_queuing_enabled: body["JobRunQueuingEnabled"].as_bool(),
         };
         state.jobs.insert(name.to_string(), job);
+        let arn = crate::common::resource_arn(&req.region, &req.account_id, "job", name);
+        state.put_create_tags(&arn, &body);
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -184,7 +190,18 @@ impl GlueService {
         let accounts = self.state.read();
         let names: Vec<Value> = accounts
             .get(&req.account_id)
-            .map(|s| s.jobs.keys().map(|k| json!(k)).collect())
+            .map(|s| {
+                s.jobs
+                    .keys()
+                    .filter(|k| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(&req.region, &req.account_id, "job", k),
+                            &body,
+                        )
+                    })
+                    .map(|k| json!(k))
+                    .collect()
+            })
             .unwrap_or_default();
         let (page, token) = crate::common::paginate_body(&req.action, &body, names)?;
         let mut resp = json!({ "JobNames": page });
@@ -267,6 +284,12 @@ impl GlueService {
         if let Some(n) = update["AllocatedCapacity"].as_i64() {
             job.allocated_capacity = Some(n);
         }
+        if let Some(s) = update["JobMode"].as_str() {
+            job.job_mode = Some(s.to_string());
+        }
+        if let Some(b) = update["JobRunQueuingEnabled"].as_bool() {
+            job.job_run_queuing_enabled = Some(b);
+        }
         job.last_modified_on = Utc::now();
         Ok(AwsResponse::ok_json(json!({ "JobName": name })))
     }
@@ -277,7 +300,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         // DeleteJob does not declare EntityNotFoundException; idempotent delete.
-        state.jobs.remove(name);
+        if state.jobs.remove(name).is_some() {
+            let arn = crate::common::resource_arn(&req.region, &req.account_id, "job", name);
+            state.remove_tags(&arn);
+        }
         Ok(AwsResponse::ok_json(json!({ "JobName": name })))
     }
 

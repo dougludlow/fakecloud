@@ -122,14 +122,34 @@ pub(crate) fn create_snapshots(
                 (v.volume_id.clone(), v.size, v.encrypted, key)
             })
             .collect();
+        // `CopyTagsFromSource=volume` copies each source volume's tags onto
+        // its snapshot; `TagSpecification` tags are applied on top.
+        let copy_volume_tags = req
+            .query_params
+            .get("CopyTagsFromSource")
+            .is_some_and(|v| v == "volume");
         let mut rendered = Vec::new();
         for (vol_id, size, encrypted, kms_key_id) in sources {
+            let volume_tags = if copy_volume_tags {
+                state.tags_for(&vol_id).to_vec()
+            } else {
+                Vec::new()
+            };
             let mut snap = build_snapshot(vol_id, description.clone());
             snap.volume_size = size;
             snap.encrypted = encrypted;
             snap.kms_key_id = kms_key_id;
             let id = snap.snapshot_id.clone();
-            rendered.push(snapshot_xml(&snap, &[], &owner));
+            if !volume_tags.is_empty() {
+                state.upsert_tags(&id, &volume_tags);
+            }
+            crate::service::tags::apply_tag_specifications(
+                state,
+                &req.query_params,
+                &id,
+                "snapshot",
+            );
+            rendered.push(snapshot_xml(&snap, state.tags_for(&id), &owner));
             state.snapshots.insert(id, snap);
         }
         rendered
@@ -298,20 +318,20 @@ pub(crate) fn copy_snapshot(
         };
     }
     let id = snap.snapshot_id.clone();
-    {
+    let tags = {
         let mut accounts = svc.state.write();
-        accounts
-            .get_or_create(&req.account_id)
-            .snapshots
-            .insert(id.clone(), snap);
-    }
+        let state = accounts.get_or_create(&req.account_id);
+        crate::service::tags::apply_tag_specifications(state, &req.query_params, &id, "snapshot");
+        state.snapshots.insert(id.clone(), snap);
+        state.tags_for(&id).to_vec()
+    };
     Ok(Ec2Service::respond(
         "CopySnapshot",
         &req.request_id,
         &format!(
             "{}{}",
             ec2_elem("snapshotId", &id),
-            super::tags::tag_set_xml(&[])
+            super::tags::tag_set_xml(&tags)
         ),
     ))
 }
@@ -1219,5 +1239,161 @@ mod modify_tests {
             ],
         )
         .contains("<snapshotId>snap-9</snapshotId>"));
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+    use crate::test_support::{ec2_request as req, seed_instance};
+
+    fn body_of(resp: AwsResponse) -> String {
+        String::from_utf8_lossy(resp.body.expect_bytes()).to_string()
+    }
+
+    fn snap_ids(xml: &str) -> Vec<String> {
+        xml.split("<snapshotId>")
+            .skip(1)
+            .filter_map(|s| s.split("</snapshotId>").next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn describe(svc: &Ec2Service, id: &str) -> String {
+        body_of(
+            describe_snapshots(svc, &req("DescribeSnapshots", &[("SnapshotId.1", id)])).unwrap(),
+        )
+    }
+
+    /// Create a volume tagged `team=core` and attach it to `instance`.
+    fn tagged_attached_volume(svc: &Ec2Service, instance: &str) -> String {
+        let vol = body_of(
+            crate::service::volume::create_volume(
+                svc,
+                &req(
+                    "CreateVolume",
+                    &[
+                        ("AvailabilityZone", "us-east-1a"),
+                        ("Size", "10"),
+                        ("TagSpecification.1.ResourceType", "volume"),
+                        ("TagSpecification.1.Tag.1.Key", "team"),
+                        ("TagSpecification.1.Tag.1.Value", "core"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        let vol_id = vol
+            .split("<volumeId>")
+            .nth(1)
+            .and_then(|s| s.split("</volumeId>").next())
+            .unwrap()
+            .to_string();
+        let mut accounts = svc.state.write();
+        let st = accounts.get_or_create("000000000000");
+        st.volumes
+            .get_mut(&vol_id)
+            .unwrap()
+            .attachments
+            .push(crate::state::VolumeAttachment {
+                volume_id: vol_id.clone(),
+                instance_id: instance.to_string(),
+                device: "/dev/sdf".into(),
+                status: "attached".into(),
+                delete_on_termination: false,
+            });
+        vol_id
+    }
+
+    #[test]
+    fn create_snapshots_copies_volume_tags_and_applies_tag_specifications() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-tags");
+        tagged_attached_volume(&svc, "i-tags");
+        let out = body_of(
+            create_snapshots(
+                &svc,
+                &req(
+                    "CreateSnapshots",
+                    &[
+                        ("InstanceSpecification.InstanceId", "i-tags"),
+                        ("CopyTagsFromSource", "volume"),
+                        ("TagSpecification.1.ResourceType", "snapshot"),
+                        ("TagSpecification.1.Tag.1.Key", "env"),
+                        ("TagSpecification.1.Tag.1.Value", "dev"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        let ids = snap_ids(&out);
+        assert_eq!(ids.len(), 1, "{out}");
+        assert!(
+            out.contains("<key>team</key>") && out.contains("<key>env</key>"),
+            "{out}"
+        );
+        let d = describe(&svc, &ids[0]);
+        assert!(
+            d.contains("<key>team</key>") && d.contains("<value>core</value>"),
+            "{d}"
+        );
+        assert!(
+            d.contains("<key>env</key>") && d.contains("<value>dev</value>"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn create_snapshots_without_copy_flag_does_not_inherit_volume_tags() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-notags");
+        tagged_attached_volume(&svc, "i-notags");
+        let out = body_of(
+            create_snapshots(
+                &svc,
+                &req(
+                    "CreateSnapshots",
+                    &[("InstanceSpecification.InstanceId", "i-notags")],
+                ),
+            )
+            .unwrap(),
+        );
+        let ids = snap_ids(&out);
+        assert!(!describe(&svc, &ids[0]).contains("<key>team</key>"));
+    }
+
+    #[test]
+    fn copy_snapshot_applies_tag_specifications() {
+        let svc = Ec2Service::new();
+        {
+            let mut accounts = svc.state.write();
+            accounts.get_or_create("000000000000").snapshots.insert(
+                "snap-src".to_string(),
+                build_snapshot("vol-1".into(), "d".into()),
+            );
+        }
+        let out = body_of(
+            copy_snapshot(
+                &svc,
+                &req(
+                    "CopySnapshot",
+                    &[
+                        ("SourceRegion", "us-east-1"),
+                        ("SourceSnapshotId", "snap-src"),
+                        ("TagSpecification.1.ResourceType", "snapshot"),
+                        ("TagSpecification.1.Tag.1.Key", "env"),
+                        ("TagSpecification.1.Tag.1.Value", "copy"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains("<key>env</key>"), "{out}");
+        let id = snap_ids(&out).remove(0);
+        let d = describe(&svc, &id);
+        assert!(
+            d.contains("<key>env</key>") && d.contains("<value>copy</value>"),
+            "{d}"
+        );
     }
 }

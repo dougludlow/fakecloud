@@ -968,18 +968,17 @@ impl RedshiftService {
         // the caller narrow by `ResourceName` (a specific ARN) and/or
         // `ResourceType`; honour both.
         let name_filter = param(req, "ResourceName");
-        let type_filter = param(req, "ResourceType");
+        let type_filter = param(req, "ResourceType").map(|t| canonical_resource_type(&t));
         let guard = self.state.read();
         let mut rows = String::new();
         if let Some(acct) = guard.accounts.get(&req.account_id) {
             let region = &req.region;
             let account_id = &req.account_id;
-            let mut push = |resource_type: &str, name: &str, tags: &[crate::state::Tag]| {
-                let arn = crate::state::redshift_arn(region, account_id, resource_type, name);
-                if name_filter.as_ref().is_some_and(|n| n != &arn) {
+            let mut push = |resource_type: &str, arn: &str, tags: &[crate::state::Tag]| {
+                if name_filter.as_deref().is_some_and(|n| n != arn) {
                     return;
                 }
-                if type_filter.as_ref().is_some_and(|t| t != resource_type) {
+                if type_filter.as_deref().is_some_and(|t| t != resource_type) {
                     return;
                 }
                 for t in tags {
@@ -987,47 +986,90 @@ impl RedshiftService {
                         "<TaggedResource><Tag><Key>{}</Key><Value>{}</Value></Tag><ResourceName>{}</ResourceName><ResourceType>{}</ResourceType></TaggedResource>",
                         xml_escape(&t.key),
                         xml_escape(&t.value),
-                        xml_escape(&arn),
+                        xml_escape(arn),
                         xml_escape(resource_type)
                     ));
                 }
             };
+            let arn = |resource_type: &str, name: &str| {
+                crate::state::redshift_arn(region, account_id, resource_type, name)
+            };
             for c in acct.clusters.values() {
-                push("cluster", &c.cluster_identifier, &c.tags);
+                push("cluster", &arn("cluster", &c.cluster_identifier), &c.tags);
             }
+            // A snapshot's ARN carries its cluster (`snapshot:<cluster>/<id>`);
+            // report the one the snapshot was created with.
             for s in acct.snapshots.values() {
-                push("snapshot", &s.snapshot_identifier, &s.tags);
+                push("snapshot", &s.snapshot_arn, &s.tags);
             }
             for g in acct.parameter_groups.values() {
-                push("parametergroup", &g.parameter_group_name, &g.tags);
+                push(
+                    "parametergroup",
+                    &arn("parametergroup", &g.parameter_group_name),
+                    &g.tags,
+                );
             }
             for g in acct.subnet_groups.values() {
-                push("subnetgroup", &g.cluster_subnet_group_name, &g.tags);
+                push(
+                    "subnetgroup",
+                    &arn("subnetgroup", &g.cluster_subnet_group_name),
+                    &g.tags,
+                );
             }
             for g in acct.security_groups.values() {
-                push("securitygroup", &g.cluster_security_group_name, &g.tags);
+                push(
+                    "securitygroup",
+                    &arn("securitygroup", &g.cluster_security_group_name),
+                    &g.tags,
+                );
             }
             for g in acct.snapshot_copy_grants.values() {
-                push("snapshotcopygrant", &g.snapshot_copy_grant_name, &g.tags);
+                push(
+                    "snapshotcopygrant",
+                    &arn("snapshotcopygrant", &g.snapshot_copy_grant_name),
+                    &g.tags,
+                );
             }
             for s in acct.snapshot_schedules.values() {
-                push("snapshotschedule", &s.schedule_identifier, &s.tags);
+                push(
+                    "snapshotschedule",
+                    &arn("snapshotschedule", &s.schedule_identifier),
+                    &s.tags,
+                );
             }
             for h in acct.hsm_client_certificates.values() {
                 push(
                     "hsmclientcertificate",
-                    &h.hsm_client_certificate_identifier,
+                    &arn("hsmclientcertificate", &h.hsm_client_certificate_identifier),
                     &h.tags,
                 );
             }
             for h in acct.hsm_configurations.values() {
-                push("hsmconfiguration", &h.hsm_configuration_identifier, &h.tags);
+                push(
+                    "hsmconfiguration",
+                    &arn("hsmconfiguration", &h.hsm_configuration_identifier),
+                    &h.tags,
+                );
             }
             for s in acct.event_subscriptions.values() {
-                push("eventsubscription", &s.subscription_name, &s.tags);
+                push(
+                    "eventsubscription",
+                    &arn("eventsubscription", &s.subscription_name),
+                    &s.tags,
+                );
             }
             for u in acct.usage_limits.values() {
-                push("usagelimit", &u.usage_limit_id, &u.tags);
+                push("usagelimit", &arn("usagelimit", &u.usage_limit_id), &u.tags);
+            }
+            for i in acct.integrations.values() {
+                push("integration", &i.integration_arn, &i.tags);
+            }
+            for a in acct.idc_applications.values() {
+                push(
+                    "redshiftidcapplication",
+                    &a.redshift_idc_application_arn,
+                    &a.tags,
+                );
             }
         }
         Ok(xml_resp(
@@ -1038,7 +1080,30 @@ impl RedshiftService {
     }
 }
 
-/// Resolve an ARN of the form `arn:aws:redshift:<region>:<account>:<type>:<name>`
+/// Map a `DescribeTags` `ResourceType` to the ARN resource-type segment it
+/// selects. AWS documents the values in display form ("Cluster",
+/// "Subnet group", "HSM certificate", ...) and reports the ARN form
+/// ("cluster", "subnetgroup", ...) back in `TaggedResource.ResourceType`;
+/// both spellings are accepted, case-insensitively.
+fn canonical_resource_type(raw: &str) -> String {
+    let folded: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect();
+    match folded.as_str() {
+        "clustersecuritygroup" => "securitygroup",
+        "clusterparametergroup" => "parametergroup",
+        "clustersubnetgroup" => "subnetgroup",
+        "hsmcertificate" => "hsmclientcertificate",
+        "hsmconnection" => "hsmconfiguration",
+        "zeroetlintegration" => "integration",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Resolve an ARN of the form `arn:<partition>:redshift:<region>:<account>:<type>:<name>`
 /// to a mutable handle on that resource's tag list, so CreateTags/DeleteTags
 /// mutate real state. Returns `None` for an unparseable ARN or an unknown /
 /// missing resource.
@@ -1055,10 +1120,15 @@ fn resolve_tags_mut<'a>(
     let name = parts[6];
     match resource_type {
         "cluster" => acct.clusters.get_mut(name).map(|c| &mut c.tags),
+        // Snapshot ARNs are `snapshot:<cluster>/<snapshot>`, the form
+        // DescribeClusterSnapshots and DescribeTags report; only that exact
+        // ARN names the snapshot.
         "snapshot" => {
-            // Snapshot ARNs are `snapshot:<cluster>/<snapshot>`; key on the id.
-            let snap_id = name.rsplit('/').next().unwrap_or(name);
-            acct.snapshots.get_mut(snap_id).map(|s| &mut s.tags)
+            let (_, snap_id) = name.split_once('/')?;
+            acct.snapshots
+                .get_mut(snap_id)
+                .filter(|s| s.snapshot_arn == arn)
+                .map(|s| &mut s.tags)
         }
         "parametergroup" => acct.parameter_groups.get_mut(name).map(|g| &mut g.tags),
         "subnetgroup" => acct.subnet_groups.get_mut(name).map(|g| &mut g.tags),
@@ -1072,6 +1142,9 @@ fn resolve_tags_mut<'a>(
         "hsmconfiguration" => acct.hsm_configurations.get_mut(name).map(|h| &mut h.tags),
         "eventsubscription" => acct.event_subscriptions.get_mut(name).map(|s| &mut s.tags),
         "usagelimit" => acct.usage_limits.get_mut(name).map(|u| &mut u.tags),
+        // Integrations and IdC applications are keyed by their full ARN.
+        "integration" => acct.integrations.get_mut(arn).map(|i| &mut i.tags),
+        "redshiftidcapplication" => acct.idc_applications.get_mut(arn).map(|a| &mut a.tags),
         _ => None,
     }
 }

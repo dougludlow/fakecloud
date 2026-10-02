@@ -322,8 +322,14 @@ fn db_snapshot_xml_emits_extended_fields() {
         storage_throughput: Some(125),
         snapshot_attributes: std::collections::BTreeMap::new(),
     };
+    let mut snapshot = snapshot;
+    snapshot.tags = vec![RdsTag {
+        key: "env".to_string(),
+        value: "prod".to_string(),
+    }];
 
     let xml = db_snapshot_xml(&snapshot);
+    assert!(xml.contains("<TagList><Tag><Key>env</Key><Value>prod</Value></Tag></TagList>"));
 
     assert!(xml.contains("<AvailabilityZone>us-east-1a</AvailabilityZone>"));
     assert!(xml.contains("<VpcId>vpc-abc</VpcId>"));
@@ -7658,5 +7664,176 @@ async fn aurora_member_joins_a_cluster_persisted_with_an_invalid_version() {
     assert_eq!(
         state.extras["clusters"]["legacy-my"]["EngineVersion"],
         "8.0.mysql_aurora.3.04.0"
+    );
+}
+
+// ── Create-time tags (write-then-read loss) ──────────────────────
+
+fn tag(key: &str, value: &str) -> RdsTag {
+    RdsTag {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
+}
+
+fn entry_tags(entry: &serde_json::Value) -> Vec<(String, String)> {
+    super::json_tags(entry)
+        .into_iter()
+        .map(|t| (t.key, t.value))
+        .collect()
+}
+
+fn cluster_snapshot_entry(svc: &RdsService, id: &str) -> serde_json::Value {
+    svc.state
+        .read()
+        .default_ref()
+        .extras
+        .get("cluster_snapshots")
+        .and_then(|m| m.get(id))
+        .cloned()
+        .unwrap_or_else(|| panic!("cluster snapshot {id} not recorded"))
+}
+
+#[test]
+fn inherited_tags_prefers_request_then_copied_source() {
+    let source = vec![tag("src", "1")];
+    assert_eq!(
+        super::inherited_tags(vec![tag("req", "2")], true, &source),
+        vec![tag("req", "2")]
+    );
+    assert_eq!(super::inherited_tags(Vec::new(), true, &source), source);
+    assert!(super::inherited_tags(Vec::new(), false, &source).is_empty());
+}
+
+#[tokio::test]
+async fn create_db_cluster_snapshot_applies_request_tags() {
+    let svc = make_service();
+    seed_cluster_entry(
+        &svc,
+        "clu-1",
+        serde_json::json!({
+            "CopyTagsToSnapshot": true,
+            "Tags": [{"Key": "cluster", "Value": "c"}],
+        }),
+    );
+    let req = request(
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "snap-req"),
+            ("DBClusterIdentifier", "clu-1"),
+            ("Tags.Tag.1.Key", "snap"),
+            ("Tags.Tag.1.Value", "s"),
+        ],
+    );
+    let body = body_of(svc.create_db_cluster_snapshot(&req).await.unwrap());
+    assert!(body.contains("<Key>snap</Key>"), "{body}");
+    assert_eq!(
+        entry_tags(&cluster_snapshot_entry(&svc, "snap-req")),
+        vec![("snap".to_string(), "s".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn create_db_cluster_snapshot_copies_cluster_tags_only_with_copy_tags_to_snapshot() {
+    let svc = make_service();
+    seed_cluster_entry(
+        &svc,
+        "copying",
+        serde_json::json!({
+            "CopyTagsToSnapshot": true,
+            "Tags": [{"Key": "cluster", "Value": "c"}],
+        }),
+    );
+    seed_cluster_entry(
+        &svc,
+        "plain",
+        serde_json::json!({"Tags": [{"Key": "cluster", "Value": "c"}]}),
+    );
+    for (snapshot, cluster) in [("snap-copy", "copying"), ("snap-plain", "plain")] {
+        let req = request(
+            "CreateDBClusterSnapshot",
+            &[
+                ("DBClusterSnapshotIdentifier", snapshot),
+                ("DBClusterIdentifier", cluster),
+            ],
+        );
+        svc.create_db_cluster_snapshot(&req).await.unwrap();
+    }
+    assert_eq!(
+        entry_tags(&cluster_snapshot_entry(&svc, "snap-copy")),
+        vec![("cluster".to_string(), "c".to_string())]
+    );
+    assert!(entry_tags(&cluster_snapshot_entry(&svc, "snap-plain")).is_empty());
+}
+
+#[tokio::test]
+async fn cluster_restores_take_the_request_tags_not_the_source_tags() {
+    let svc = make_service();
+    seed_cluster_entry(
+        &svc,
+        "src",
+        serde_json::json!({"Tags": [{"Key": "source", "Value": "x"}]}),
+    );
+    {
+        let mut accounts = svc.state.write();
+        accounts
+            .default_mut()
+            .extras
+            .entry("cluster_snapshots".to_string())
+            .or_default()
+            .insert(
+                "snap-1".to_string(),
+                serde_json::json!({
+                    "DBClusterSnapshotIdentifier": "snap-1",
+                    "DBClusterIdentifier": "src",
+                    "Engine": "aurora-postgresql",
+                    "Tags": [{"Key": "snapshot", "Value": "y"}],
+                }),
+            );
+    }
+
+    let req = request(
+        "RestoreDBClusterFromSnapshot",
+        &[
+            ("DBClusterIdentifier", "from-snap"),
+            ("SnapshotIdentifier", "snap-1"),
+            ("Tags.Tag.1.Key", "restored"),
+            ("Tags.Tag.1.Value", "r"),
+        ],
+    );
+    svc.restore_db_cluster_from_snapshot(&req).await.unwrap();
+    assert_eq!(
+        entry_tags(&cluster_entry(&svc, "from-snap")),
+        vec![("restored".to_string(), "r".to_string())]
+    );
+
+    let req = request(
+        "RestoreDBClusterToPointInTime",
+        &[
+            ("DBClusterIdentifier", "pitr"),
+            ("SourceDBClusterIdentifier", "src"),
+            ("UseLatestRestorableTime", "true"),
+        ],
+    );
+    svc.restore_db_cluster_to_point_in_time(&req).await.unwrap();
+    assert!(
+        entry_tags(&cluster_entry(&svc, "pitr")).is_empty(),
+        "PITR target inherited the source cluster's tags"
+    );
+
+    let req = request(
+        "RestoreDBClusterToPointInTime",
+        &[
+            ("DBClusterIdentifier", "pitr-tagged"),
+            ("SourceDBClusterIdentifier", "src"),
+            ("UseLatestRestorableTime", "true"),
+            ("Tags.Tag.1.Key", "pitr"),
+            ("Tags.Tag.1.Value", "p"),
+        ],
+    );
+    svc.restore_db_cluster_to_point_in_time(&req).await.unwrap();
+    assert_eq!(
+        entry_tags(&cluster_entry(&svc, "pitr-tagged")),
+        vec![("pitr".to_string(), "p".to_string())]
     );
 }

@@ -184,7 +184,15 @@ impl IotDataService {
             "ListNamedShadowsForThing" => self.list_named_shadows(&ctx, a(0), &q),
             "Publish" => {
                 let pfi = header_value(req, "x-amz-mqtt5-payload-format-indicator");
-                self.publish(&ctx, a(0), &q, pfi.as_deref(), &req.body)
+                let user_props = header_value(req, "x-amz-mqtt5-user-properties");
+                self.publish(
+                    &ctx,
+                    a(0),
+                    &q,
+                    pfi.as_deref(),
+                    user_props.as_deref(),
+                    &req.body,
+                )
             }
             "GetRetainedMessage" => self.get_retained_message(&ctx, a(0)),
             "ListRetainedMessages" => self.list_retained_messages(&ctx, &q),
@@ -350,6 +358,7 @@ impl IotDataService {
         topic: &str,
         q: &[(String, String)],
         payload_format_indicator: Option<&str>,
+        user_properties: Option<&str>,
         body: &[u8],
     ) -> Result<AwsResponse, AwsServiceError> {
         validate::validate_payload_format_indicator(payload_format_indicator)?;
@@ -364,16 +373,17 @@ impl IotDataService {
                 data.retained.remove(topic);
             } else {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(body);
-                data.retained.insert(
-                    topic.to_string(),
-                    json!({
-                        "topic": topic,
-                        "payload": encoded,
-                        "payloadSize": body.len() as i64,
-                        "qos": qos,
-                        "lastModifiedTime": shared::now_millis(),
-                    }),
-                );
+                let mut msg = json!({
+                    "topic": topic,
+                    "payload": encoded,
+                    "payloadSize": body.len() as i64,
+                    "qos": qos,
+                    "lastModifiedTime": shared::now_millis(),
+                });
+                if let Some(props) = user_properties.and_then(user_properties_blob) {
+                    msg["userProperties"] = json!(props);
+                }
+                data.retained.insert(topic.to_string(), msg);
             }
         }
         // Publish returns an empty body (`Unit` output). No live broker fan-out.
@@ -391,6 +401,7 @@ impl IotDataService {
         copy_present(&mut out, msg, "payload");
         copy_present(&mut out, msg, "qos");
         copy_present(&mut out, msg, "lastModifiedTime");
+        copy_present(&mut out, msg, "userProperties");
         ok_json(Value::Object(out))
     }
 
@@ -541,6 +552,23 @@ fn copy_present(out: &mut Map<String, Value>, src: &Value, key: &str) {
         if !v.is_null() {
             out.insert(key.to_string(), v.clone());
         }
+    }
+}
+
+/// Normalize the `x-amz-mqtt5-user-properties` header to the base64 blob
+/// `GetRetainedMessage` returns. SDKs send the JSON user-property array
+/// base64-encoded (a JSON-media-type header); a raw JSON value from a client
+/// that skipped the encoding is encoded here so the read-back is the same.
+fn user_properties_blob(header: &str) -> Option<String> {
+    let header = header.trim();
+    if header.is_empty() {
+        return None;
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    if engine.decode(header).is_ok() {
+        Some(header.to_string())
+    } else {
+        Some(engine.encode(header.as_bytes()))
     }
 }
 

@@ -50,6 +50,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut state.connections, &name, stored, "Connection")?;
+        state.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "connection", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(
             json!({ "CreateConnectionStatus": "READY" }),
         ))
@@ -122,6 +126,12 @@ impl GlueService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut state.connections, &name, "Connection")?;
+        state.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "connection",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -212,6 +222,7 @@ impl GlueService {
                 "ConnectionProperties": body.get("ConnectionProperties").cloned().unwrap_or(json!({})),
             }),
         );
+        state.put_create_tags(&arn, &body);
         Ok(AwsResponse::ok_json(json!({ "ConnectionTypeArn": arn })))
     }
 
@@ -224,6 +235,12 @@ impl GlueService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut state.connection_types, &ct, "ConnectionType")?;
+        state.remove_tags(&resource_arn(
+            &req.region,
+            &req.account_id,
+            "connectionType",
+            &ct,
+        ));
         Ok(AwsResponse::ok_json(json!({})))
     }
 

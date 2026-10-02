@@ -1568,3 +1568,111 @@ async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
     );
     assert_eq!(reported_key(&copy), None);
 }
+
+/// CreateDBCluster's `CopyTagsToSnapshot` and
+/// `ServerlessV2ScalingConfiguration` were dropped, and ModifyDBCluster
+/// ignored those plus `StorageType`; each is now stored and read back.
+#[tokio::test]
+async fn cluster_copy_tags_serverless_and_storage_type_round_trip() {
+    let svc = service();
+    call(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "sv2"),
+            ("Engine", "neptune"),
+            ("CopyTagsToSnapshot", "true"),
+            ("StorageType", "iopt1"),
+            ("ServerlessV2ScalingConfiguration.MinCapacity", "2.5"),
+            ("ServerlessV2ScalingConfiguration.MaxCapacity", "64"),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "graph"),
+        ],
+    )
+    .await;
+    let xml = body(
+        &call(
+            &svc,
+            "DescribeDBClusters",
+            &[("DBClusterIdentifier", "sv2")],
+        )
+        .await,
+    );
+    assert!(
+        xml.contains("<CopyTagsToSnapshot>true</CopyTagsToSnapshot>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<StorageType>iopt1</StorageType>"), "{xml}");
+    assert!(
+        xml.contains(
+            "<ServerlessV2ScalingConfiguration><MinCapacity>2.5</MinCapacity>\
+             <MaxCapacity>64</MaxCapacity></ServerlessV2ScalingConfiguration>"
+        ),
+        "{xml}"
+    );
+
+    // A snapshot taken without its own tags inherits the cluster's.
+    call(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "sv2-snap"),
+            ("DBClusterIdentifier", "sv2"),
+        ],
+    )
+    .await;
+    let arn = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:sv2-snap";
+    let tags = body(&call(&svc, "ListTagsForResource", &[("ResourceName", arn)]).await);
+    assert!(tags.contains("<Key>team</Key>"), "{tags}");
+
+    call(
+        &svc,
+        "ModifyDBCluster",
+        &[
+            ("DBClusterIdentifier", "sv2"),
+            ("CopyTagsToSnapshot", "false"),
+            ("StorageType", "standard"),
+            ("ServerlessV2ScalingConfiguration.MaxCapacity", "128"),
+        ],
+    )
+    .await;
+    let xml = body(
+        &call(
+            &svc,
+            "DescribeDBClusters",
+            &[("DBClusterIdentifier", "sv2")],
+        )
+        .await,
+    );
+    assert!(
+        xml.contains("<CopyTagsToSnapshot>false</CopyTagsToSnapshot>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<StorageType>standard</StorageType>"), "{xml}");
+    // The bound left out keeps its value.
+    assert!(
+        xml.contains("<MinCapacity>2.5</MinCapacity><MaxCapacity>128</MaxCapacity>"),
+        "{xml}"
+    );
+
+    // A cluster never given a range renders none.
+    call(
+        &svc,
+        "CreateDBCluster",
+        &[("DBClusterIdentifier", "plain"), ("Engine", "neptune")],
+    )
+    .await;
+    let xml = body(
+        &call(
+            &svc,
+            "DescribeDBClusters",
+            &[("DBClusterIdentifier", "plain")],
+        )
+        .await,
+    );
+    assert!(!xml.contains("ServerlessV2ScalingConfiguration"), "{xml}");
+    assert!(
+        xml.contains("<CopyTagsToSnapshot>false</CopyTagsToSnapshot>"),
+        "{xml}"
+    );
+}

@@ -412,6 +412,8 @@ pub struct Integration {
     pub create_time: DateTime<Utc>,
     pub description: Option<String>,
     pub kms_key_id: Option<String>,
+    #[serde(default)]
+    pub additional_encryption_context: BTreeMap<String, String>,
     pub tags: Vec<Tag>,
 }
 
@@ -424,8 +426,36 @@ pub struct RedshiftIdcApplication {
     pub idc_display_name: String,
     pub iam_role_arn: String,
     pub idc_managed_application_arn: String,
-    pub authorized_token_issuer_list: Vec<String>,
-    pub service_integrations: Vec<String>,
+    #[serde(default)]
+    pub authorized_token_issuer_list: Vec<AuthorizedTokenIssuer>,
+    #[serde(default)]
+    pub service_integrations: Vec<ServiceIntegration>,
+    /// `None` or `Lakehouse`; absent when the caller named neither.
+    #[serde(default)]
+    pub application_type: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
+    #[serde(default)]
+    pub sso_tag_keys: Vec<String>,
+}
+
+/// One `AuthorizedTokenIssuer` of an IdC application: a trusted token
+/// issuer and the audiences it may mint tokens for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizedTokenIssuer {
+    pub trusted_token_issuer_arn: Option<String>,
+    pub authorized_audiences: Vec<String>,
+}
+
+/// One member of an IdC application's `ServiceIntegrations` union list.
+/// `service` names the union variant (`LakeFormation`, `S3AccessGrants`,
+/// `Redshift`); each scope entry is that service's single scope variant
+/// (`LakeFormationQuery`, `ReadWriteAccess`, `Connect`) and its
+/// `Authorization` value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceIntegration {
+    pub service: String,
+    pub scope_authorizations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

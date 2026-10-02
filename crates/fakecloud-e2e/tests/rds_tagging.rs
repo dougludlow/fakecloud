@@ -224,10 +224,8 @@ async fn rds_tagging_db_proxy() {
     let server = TestServer::start().await;
     let client = server.rds_client().await;
 
-    // CreateDBProxy emits a flat XML body without a <DBProxy> wrapper,
-    // so we construct the ARN deterministically rather than parsing it
-    // out of the SDK response. The dispatcher under test resolves the
-    // ARN to the `proxies` extras bucket regardless.
+    // The ARN is built deterministically; the dispatcher under test
+    // resolves it to the `proxies` extras bucket.
     client
         .create_db_proxy()
         .db_proxy_name("tag-proxy")
@@ -314,4 +312,307 @@ async fn rds_tagging_missing_resource_returns_typed_not_found() {
         Some("DBInstanceNotFound"),
         "missing DB should map to DBInstanceNotFound"
     );
+}
+
+fn tag(key: &str, value: &str) -> Tag {
+    Tag::builder().key(key).value(value).build()
+}
+
+fn tag_keys(tags: &[Tag]) -> Vec<String> {
+    tags.iter()
+        .filter_map(|t| t.key().map(str::to_string))
+        .collect()
+}
+
+/// Tags named on CreateDBCluster are stored, not dropped: the
+/// DescribeDBClusters TagList and ListTagsForResource both report them.
+#[tokio::test]
+async fn rds_create_db_cluster_keeps_request_tags() {
+    let server = TestServer::start().await;
+    let client = server.rds_client().await;
+
+    let created = client
+        .create_db_cluster()
+        .db_cluster_identifier("tagged-cluster")
+        .engine("aurora-postgresql")
+        .tags(tag("env", "prod"))
+        .send()
+        .await
+        .unwrap();
+    let cluster = created.db_cluster().expect("cluster");
+    assert_eq!(tag_keys(cluster.tag_list()), vec!["env"]);
+    let arn = cluster.db_cluster_arn().unwrap().to_string();
+
+    let described = client
+        .describe_db_clusters()
+        .db_cluster_identifier("tagged-cluster")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tag_keys(described.db_clusters()[0].tag_list()), vec!["env"]);
+    assert_eq!(list_tag_keys(&client, &arn).await, vec!["env"]);
+}
+
+/// Cluster snapshots and the clusters restored from them take the tags
+/// named on the request; a copy carries the source's tags only with
+/// CopyTags, and request tags win over CopyTags.
+#[tokio::test]
+async fn rds_cluster_snapshot_copy_and_restore_tags() {
+    let server = TestServer::start().await;
+    let client = server.rds_client().await;
+
+    client
+        .create_db_cluster()
+        .db_cluster_identifier("snap-src-cluster")
+        .engine("aurora-postgresql")
+        .tags(tag("cluster", "c"))
+        .send()
+        .await
+        .unwrap();
+
+    let snapshot = client
+        .create_db_cluster_snapshot()
+        .db_cluster_identifier("snap-src-cluster")
+        .db_cluster_snapshot_identifier("tagged-csnap")
+        .tags(tag("snap", "s"))
+        .send()
+        .await
+        .unwrap();
+    let snapshot = snapshot.db_cluster_snapshot().expect("snapshot");
+    assert_eq!(tag_keys(snapshot.tag_list()), vec!["snap"]);
+    let snapshot_arn = snapshot.db_cluster_snapshot_arn().unwrap().to_string();
+    assert_eq!(list_tag_keys(&client, &snapshot_arn).await, vec!["snap"]);
+
+    // The cluster has no CopyTagsToSnapshot, so an untagged snapshot of
+    // it starts untagged.
+    let bare = client
+        .create_db_cluster_snapshot()
+        .db_cluster_identifier("snap-src-cluster")
+        .db_cluster_snapshot_identifier("bare-csnap")
+        .send()
+        .await
+        .unwrap();
+    assert!(bare.db_cluster_snapshot().unwrap().tag_list().is_empty());
+
+    for (target, copy_tags, request_tag, expected) in [
+        ("copy-plain", false, None, vec![]),
+        ("copy-copied", true, None, vec!["snap"]),
+        ("copy-named", true, Some(tag("copy", "x")), vec!["copy"]),
+    ] {
+        let mut call = client
+            .copy_db_cluster_snapshot()
+            .source_db_cluster_snapshot_identifier("tagged-csnap")
+            .target_db_cluster_snapshot_identifier(target)
+            .copy_tags(copy_tags);
+        if let Some(t) = request_tag {
+            call = call.tags(t);
+        }
+        let copied = call.send().await.unwrap();
+        let arn = copied
+            .db_cluster_snapshot()
+            .and_then(|s| s.db_cluster_snapshot_arn())
+            .unwrap()
+            .to_string();
+        assert_eq!(list_tag_keys(&client, &arn).await, expected, "[{target}]");
+    }
+
+    let restored = client
+        .restore_db_cluster_from_snapshot()
+        .db_cluster_identifier("restored-tagged")
+        .snapshot_identifier("tagged-csnap")
+        .engine("aurora-postgresql")
+        .tags(tag("restored", "r"))
+        .send()
+        .await
+        .unwrap();
+    let arn = restored
+        .db_cluster()
+        .and_then(|c| c.db_cluster_arn())
+        .unwrap()
+        .to_string();
+    assert_eq!(list_tag_keys(&client, &arn).await, vec!["restored"]);
+
+    let pitr = client
+        .restore_db_cluster_to_point_in_time()
+        .db_cluster_identifier("pitr-tagged")
+        .source_db_cluster_identifier("snap-src-cluster")
+        .use_latest_restorable_time(true)
+        .tags(tag("pitr", "p"))
+        .send()
+        .await
+        .unwrap();
+    let arn = pitr
+        .db_cluster()
+        .and_then(|c| c.db_cluster_arn())
+        .unwrap()
+        .to_string();
+    assert_eq!(list_tag_keys(&client, &arn).await, vec!["pitr"]);
+}
+
+/// CreateDBClusterParameterGroup keeps its tags, and the copy keeps the
+/// source's family and parameters with the request's own description
+/// and tags.
+#[tokio::test]
+async fn rds_cluster_parameter_group_create_and_copy_keep_state() {
+    let server = TestServer::start().await;
+    let client = server.rds_client().await;
+
+    let arn = client
+        .create_db_cluster_parameter_group()
+        .db_cluster_parameter_group_name("cpg-src")
+        .db_parameter_group_family("aurora-mysql8.0")
+        .description("source")
+        .tags(tag("env", "prod"))
+        .send()
+        .await
+        .unwrap()
+        .db_cluster_parameter_group()
+        .and_then(|g| g.db_cluster_parameter_group_arn())
+        .map(str::to_string)
+        .unwrap();
+    assert_eq!(list_tag_keys(&client, &arn).await, vec!["env"]);
+
+    let copy = client
+        .copy_db_cluster_parameter_group()
+        .source_db_cluster_parameter_group_identifier("cpg-src")
+        .target_db_cluster_parameter_group_identifier("cpg-dst")
+        .target_db_cluster_parameter_group_description("the copy")
+        .tags(tag("team", "data"))
+        .send()
+        .await
+        .unwrap();
+    let group = copy.db_cluster_parameter_group().unwrap();
+    assert_eq!(group.db_parameter_group_family(), Some("aurora-mysql8.0"));
+    assert_eq!(group.description(), Some("the copy"));
+    let dst_arn = group.db_cluster_parameter_group_arn().unwrap().to_string();
+    assert_eq!(list_tag_keys(&client, &dst_arn).await, vec!["team"]);
+
+    let described = client
+        .describe_db_cluster_parameter_groups()
+        .db_cluster_parameter_group_name("cpg-dst")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        described.db_cluster_parameter_groups()[0].db_parameter_group_family(),
+        Some("aurora-mysql8.0")
+    );
+}
+
+/// CopyDBParameterGroup tags the copy with the request's tags.
+#[tokio::test]
+async fn rds_copy_db_parameter_group_keeps_request_tags() {
+    let server = TestServer::start().await;
+    let client = server.rds_client().await;
+
+    client
+        .create_db_parameter_group()
+        .db_parameter_group_name("pg-src")
+        .db_parameter_group_family("postgres16")
+        .description("source")
+        .tags(tag("env", "prod"))
+        .send()
+        .await
+        .unwrap();
+    let arn = client
+        .copy_db_parameter_group()
+        .source_db_parameter_group_identifier("pg-src")
+        .target_db_parameter_group_identifier("pg-dst")
+        .target_db_parameter_group_description("copy")
+        .tags(tag("team", "data"))
+        .send()
+        .await
+        .unwrap()
+        .db_parameter_group()
+        .and_then(|g| g.db_parameter_group_arn())
+        .map(str::to_string)
+        .unwrap();
+    assert_eq!(list_tag_keys(&client, &arn).await, vec!["team"]);
+}
+
+/// CreateDBProxy / CreateDBProxyEndpoint keep what the request set:
+/// auth, role, subnets, security groups, settings and tags.
+#[tokio::test]
+async fn rds_create_db_proxy_and_endpoint_keep_request_settings() {
+    let server = TestServer::start().await;
+    let client = server.rds_client().await;
+
+    let created = client
+        .create_db_proxy()
+        .db_proxy_name("full-proxy")
+        .engine_family(aws_sdk_rds::types::EngineFamily::Mysql)
+        .auth(
+            UserAuthConfig::builder()
+                .auth_scheme(aws_sdk_rds::types::AuthScheme::Secrets)
+                .secret_arn("arn:aws:secretsmanager:us-east-1:123456789012:secret:db")
+                .iam_auth(aws_sdk_rds::types::IamAuthMode::Disabled)
+                .build(),
+        )
+        .role_arn("arn:aws:iam::123456789012:role/proxy")
+        .vpc_subnet_ids("subnet-aaa")
+        .vpc_subnet_ids("subnet-bbb")
+        .vpc_security_group_ids("sg-111")
+        .require_tls(true)
+        .idle_client_timeout(900)
+        .tags(tag("env", "prod"))
+        .send()
+        .await
+        .unwrap();
+    let proxy = created.db_proxy().expect("CreateDBProxy returns the proxy");
+    assert_eq!(proxy.db_proxy_name(), Some("full-proxy"));
+    let proxy_arn = proxy.db_proxy_arn().unwrap().to_string();
+
+    let described = client.describe_db_proxies().send().await.unwrap();
+    let proxy = described
+        .db_proxies()
+        .iter()
+        .find(|p| p.db_proxy_name() == Some("full-proxy"))
+        .expect("proxy listed");
+    assert_eq!(
+        proxy.role_arn(),
+        Some("arn:aws:iam::123456789012:role/proxy")
+    );
+    assert_eq!(proxy.vpc_subnet_ids(), ["subnet-aaa", "subnet-bbb"]);
+    assert_eq!(proxy.vpc_security_group_ids(), ["sg-111"]);
+    assert_eq!(proxy.require_tls(), Some(true));
+    assert_eq!(proxy.idle_client_timeout(), Some(900));
+    assert!(proxy.endpoint().is_some());
+    assert_eq!(proxy.auth().len(), 1);
+    assert_eq!(
+        proxy.auth()[0].auth_scheme(),
+        Some(&aws_sdk_rds::types::AuthScheme::Secrets)
+    );
+    assert_eq!(
+        proxy.auth()[0].secret_arn(),
+        Some("arn:aws:secretsmanager:us-east-1:123456789012:secret:db")
+    );
+    assert_eq!(list_tag_keys(&client, &proxy_arn).await, vec!["env"]);
+
+    let endpoint = client
+        .create_db_proxy_endpoint()
+        .db_proxy_name("full-proxy")
+        .db_proxy_endpoint_name("full-proxy-ro")
+        .vpc_subnet_ids("subnet-aaa")
+        .target_role(aws_sdk_rds::types::DbProxyEndpointTargetRole::ReadOnly)
+        .tags(tag("tier", "read"))
+        .send()
+        .await
+        .unwrap();
+    let endpoint = endpoint.db_proxy_endpoint().expect("endpoint");
+    let endpoint_arn = endpoint.db_proxy_endpoint_arn().unwrap().to_string();
+
+    let described = client.describe_db_proxy_endpoints().send().await.unwrap();
+    let endpoint = described
+        .db_proxy_endpoints()
+        .iter()
+        .find(|e| e.db_proxy_endpoint_name() == Some("full-proxy-ro"))
+        .expect("endpoint listed");
+    assert_eq!(endpoint.db_proxy_name(), Some("full-proxy"));
+    assert_eq!(endpoint.vpc_subnet_ids(), ["subnet-aaa"]);
+    assert_eq!(
+        endpoint.target_role(),
+        Some(&aws_sdk_rds::types::DbProxyEndpointTargetRole::ReadOnly)
+    );
+    assert_eq!(endpoint.is_default(), Some(false));
+    assert_eq!(list_tag_keys(&client, &endpoint_arn).await, vec!["tier"]);
 }

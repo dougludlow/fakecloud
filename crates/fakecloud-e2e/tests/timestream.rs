@@ -301,3 +301,80 @@ async fn timestream_scheduled_query_and_account_settings() {
         .await
         .expect("delete_scheduled_query");
 }
+
+#[tokio::test]
+async fn timestream_delete_drops_tags_on_same_name_recreate() {
+    use aws_sdk_timestreamwrite::types::Tag;
+    let server = TestServer::start().await;
+    let write = server.timestream_write_client().await;
+    let tag = || Tag::builder().key("env").value("prod").build().unwrap();
+
+    let db_arn = write
+        .create_database()
+        .database_name("tagdb")
+        .tags(tag())
+        .send()
+        .await
+        .expect("create db")
+        .database()
+        .and_then(|d| d.arn())
+        .expect("db arn")
+        .to_string();
+    let tb_arn = write
+        .create_table()
+        .database_name("tagdb")
+        .table_name("tagtb")
+        .tags(tag())
+        .send()
+        .await
+        .expect("create table")
+        .table()
+        .and_then(|t| t.arn())
+        .expect("table arn")
+        .to_string();
+    for arn in [&db_arn, &tb_arn] {
+        let tags = write
+            .list_tags_for_resource()
+            .resource_arn(arn)
+            .send()
+            .await
+            .expect("list tags");
+        assert_eq!(tags.tags().len(), 1);
+    }
+
+    write
+        .delete_table()
+        .database_name("tagdb")
+        .table_name("tagtb")
+        .send()
+        .await
+        .expect("delete table");
+    write
+        .delete_database()
+        .database_name("tagdb")
+        .send()
+        .await
+        .expect("delete db");
+    write
+        .create_database()
+        .database_name("tagdb")
+        .send()
+        .await
+        .expect("recreate db");
+    write
+        .create_table()
+        .database_name("tagdb")
+        .table_name("tagtb")
+        .send()
+        .await
+        .expect("recreate table");
+    for arn in [&db_arn, &tb_arn] {
+        let tags = write
+            .list_tags_for_resource()
+            .resource_arn(arn)
+            .send()
+            .await
+            .expect("list tags after recreate");
+        assert!(tags.tags().is_empty(), "tags leaked on {arn}");
+    }
+}

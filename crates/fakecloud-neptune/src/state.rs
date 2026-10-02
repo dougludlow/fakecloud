@@ -59,6 +59,14 @@ pub struct ClusterRole {
     pub feature_name: Option<String>,
 }
 
+/// Serverless v2 capacity range of a cluster
+/// (`ServerlessV2ScalingConfiguration`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ServerlessV2Scaling {
+    pub min_capacity: Option<f64>,
+    pub max_capacity: Option<f64>,
+}
+
 /// A Neptune DB cluster (control-plane record).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbCluster {
@@ -78,11 +86,16 @@ pub struct DbCluster {
     pub storage_encrypted: bool,
     pub kms_key_id: Option<String>,
     pub deletion_protection: bool,
+    /// Copy the cluster's tags onto snapshots taken of it.
+    #[serde(default)]
+    pub copy_tags_to_snapshot: bool,
     pub iam_database_authentication_enabled: bool,
     pub backup_retention_period: i32,
     pub preferred_backup_window: String,
     pub preferred_maintenance_window: String,
     pub storage_type: String,
+    #[serde(default)]
+    pub serverless_v2_scaling: Option<ServerlessV2Scaling>,
     pub availability_zones: Vec<String>,
     pub vpc_security_group_ids: Vec<String>,
     pub enabled_cloudwatch_logs_exports: Vec<String>,

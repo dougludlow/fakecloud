@@ -3636,3 +3636,102 @@ fn record_without_partition_key_omits_it_on_read() {
     assert_eq!(record["Data"], "aGk=");
     assert!(record.get("PartitionKey").is_none());
 }
+
+#[test]
+fn create_stream_honors_warm_throughput_and_max_record_size() {
+    let (svc, _) = make_service();
+    svc.create_stream(&request(
+        "CreateStream",
+        json!({
+            "StreamName": "big",
+            "StreamModeDetails": {"StreamMode": "ON_DEMAND"},
+            "WarmThroughputMiBps": 50,
+            "MaxRecordSizeInKiB": 2048,
+        }),
+    ))
+    .unwrap();
+    let summary = json_response(
+        svc.describe_stream_summary(&request(
+            "DescribeStreamSummary",
+            json!({"StreamName": "big"}),
+        ))
+        .unwrap(),
+    );
+    let s = &summary["StreamDescriptionSummary"];
+    assert_eq!(s["MaxRecordSizeInKiB"], 2048);
+    assert_eq!(s["WarmThroughput"]["TargetMiBps"], 50);
+
+    // The create-time ceiling is enforced: 1.5 MiB fits under 2 MiB...
+    svc.put_record(&request(
+        "PutRecord",
+        json!({"StreamName": "big", "Data": b64(&vec![b'x'; 1536 * 1024]), "PartitionKey": "k"}),
+    ))
+    .unwrap();
+    // ...but 2 MiB + 1 byte does not.
+    let res = svc.put_record(&request(
+        "PutRecord",
+        json!({"StreamName": "big", "Data": b64(&vec![b'x'; 2048 * 1024 + 1]), "PartitionKey": "k"}),
+    ));
+    assert_code_kinesis(res, "ValidationException");
+}
+
+#[test]
+fn create_stream_rejects_out_of_range_max_record_size() {
+    let (svc, _) = make_service();
+    let res = svc.create_stream(&request(
+        "CreateStream",
+        json!({"StreamName": "s", "ShardCount": 1, "MaxRecordSizeInKiB": 512}),
+    ));
+    assert_code_kinesis(res, "ValidationException");
+}
+
+#[test]
+fn consumer_tags_round_trip_through_tags_v2() {
+    let (svc, state) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let stream_arn = state.read().default_ref().stream_arn("us-east-1", "orders");
+    let reg = json_response(
+        svc.register_stream_consumer(&request(
+            "RegisterStreamConsumer",
+            json!({"StreamARN": stream_arn, "ConsumerName": "c1", "Tags": {"env": "dev"}}),
+        ))
+        .unwrap(),
+    );
+    let consumer_arn = reg["Consumer"]["ConsumerARN"].as_str().unwrap().to_string();
+    let list = |svc: &KinesisService| {
+        json_response(
+            svc.list_tags_for_resource(&request(
+                "ListTagsForResource",
+                json!({"ResourceARN": consumer_arn}),
+            ))
+            .unwrap(),
+        )["Tags"]
+            .clone()
+    };
+    assert_eq!(list(&svc), json!([{"Key": "env", "Value": "dev"}]));
+
+    svc.tag_resource(&request(
+        "TagResource",
+        json!({"ResourceARN": consumer_arn, "Tags": {"team": "core"}}),
+    ))
+    .unwrap();
+    svc.untag_resource(&request(
+        "UntagResource",
+        json!({"ResourceARN": consumer_arn, "TagKeys": ["env"]}),
+    ))
+    .unwrap();
+    assert_eq!(list(&svc), json!([{"Key": "team", "Value": "core"}]));
+    // The stream's own tags are untouched.
+    assert!(state.read().default_ref().streams["orders"].tags.is_empty());
+
+    svc.deregister_stream_consumer(&request(
+        "DeregisterStreamConsumer",
+        json!({"ConsumerARN": consumer_arn}),
+    ))
+    .unwrap();
+    let res = svc.list_tags_for_resource(&request(
+        "ListTagsForResource",
+        json!({"ResourceARN": consumer_arn}),
+    ));
+    assert_code_kinesis(res, "ResourceNotFoundException");
+}

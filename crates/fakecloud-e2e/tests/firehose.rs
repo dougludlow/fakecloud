@@ -483,3 +483,40 @@ async fn firehose_tags_roundtrip() {
         .expect("list tags");
     assert_eq!(listed.tags().len(), 0);
 }
+
+#[tokio::test]
+async fn firehose_create_with_encryption_reflected_in_describe() {
+    use aws_sdk_firehose::types::{DeliveryStreamEncryptionConfigurationInput, KeyType};
+    let server = TestServer::start().await;
+    let firehose = setup(&server, "fh-bucket-enc").await;
+    let key = "arn:aws:kms:us-east-1:123456789012:key/1234abcd";
+
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("fh-enc")
+        .extended_s3_destination_configuration(ext_s3("arn:aws:s3:::fh-bucket-enc"))
+        .delivery_stream_encryption_configuration_input(
+            DeliveryStreamEncryptionConfigurationInput::builder()
+                .key_type(KeyType::CustomerManagedCmk)
+                .key_arn(key)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("create");
+    let desc = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("fh-enc")
+        .send()
+        .await
+        .expect("describe");
+    let enc = desc
+        .delivery_stream_description()
+        .unwrap()
+        .delivery_stream_encryption_configuration()
+        .expect("encryption configuration");
+    assert_eq!(enc.status().map(|s| s.as_str()), Some("ENABLED"));
+    assert_eq!(enc.key_type(), Some(&KeyType::CustomerManagedCmk));
+    assert_eq!(enc.key_arn(), Some(key));
+}

@@ -259,6 +259,8 @@ pub(crate) fn require_resource_arn(body: &Value) -> Result<&str, AwsServiceError
 pub(crate) enum TaggedResource {
     Stream(String),
     Channel(String),
+    /// Keyed by the stored consumer ARN.
+    Consumer(String),
 }
 
 /// Resolve a Tags v2 `ResourceARN` to the resource it names. Both arms key off
@@ -268,6 +270,23 @@ pub(crate) fn resolve_tagged_resource(
     state: &crate::state::KinesisState,
     resource_arn: &str,
 ) -> Result<TaggedResource, AwsServiceError> {
+    if resource_arn.contains("/consumer/") {
+        // Consumers are keyed by their full ARN; fall back to matching the
+        // resource segment so a caller whose credential scope names a
+        // different region still resolves it (as the stream arm does).
+        if state.consumers.contains_key(resource_arn) {
+            return Ok(TaggedResource::Consumer(resource_arn.to_string()));
+        }
+        let resource_segment = |arn: &str| arn.splitn(6, ':').nth(5).map(str::to_string);
+        let wanted = resource_segment(resource_arn);
+        return state
+            .consumers
+            .keys()
+            .find(|k| wanted.is_some() && resource_segment(k) == wanted)
+            .cloned()
+            .map(TaggedResource::Consumer)
+            .ok_or_else(|| resource_not_found_arn(resource_arn));
+    }
     if resource_arn.contains(":channel/") {
         return state
             .channel_name_from_arn(resource_arn)
@@ -292,6 +311,7 @@ pub(crate) fn resource_tags_mut<'a>(
     match resource {
         TaggedResource::Stream(name) => Ok(&mut state.streams.get_mut(&name).unwrap().tags),
         TaggedResource::Channel(name) => Ok(&mut state.channels.get_mut(&name).unwrap().tags),
+        TaggedResource::Consumer(arn) => Ok(&mut state.consumers.get_mut(&arn).unwrap().tags),
     }
 }
 
@@ -304,6 +324,7 @@ pub(crate) fn resource_tags<'a>(
     match resource {
         TaggedResource::Stream(name) => Ok(&state.streams[&name].tags),
         TaggedResource::Channel(name) => Ok(&state.channels[&name].tags),
+        TaggedResource::Consumer(arn) => Ok(&state.consumers[&arn].tags),
     }
 }
 

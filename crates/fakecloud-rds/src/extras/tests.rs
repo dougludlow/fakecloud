@@ -548,9 +548,20 @@ fn cluster_param_groups_lifecycle() {
         "CreateDBClusterParameterGroup",
         &[("DBClusterParameterGroupName", "cpg")],
     );
-    ok(
+    let svc = svc();
+    ok_on(
+        &svc,
+        "CreateDBClusterParameterGroup",
+        &[("DBClusterParameterGroupName", "cpg")],
+    );
+    ok_on(
+        &svc,
         "CopyDBClusterParameterGroup",
-        &[("TargetDBClusterParameterGroupIdentifier", "cpg2")],
+        &[
+            ("SourceDBClusterParameterGroupIdentifier", "cpg"),
+            ("TargetDBClusterParameterGroupIdentifier", "cpg2"),
+            ("TargetDBClusterParameterGroupDescription", "copy"),
+        ],
     );
     ok(
         "ModifyDBClusterParameterGroup",
@@ -7065,4 +7076,260 @@ async fn failing_db_snapshot_copy_mints_no_key() {
         .read()
         .get("000000000000")
         .is_none_or(|s| s.keys.is_empty()));
+}
+
+// ── Create-time tags and settings (write-then-read loss) ─────────
+
+fn body_on(svc: &RdsService, action: &str, params: &[(&str, &str)]) -> String {
+    let resp = svc
+        .handle_extra_action(&req(action, params))
+        .unwrap_or_else(|e| panic!("{action} failed: {e:?}"));
+    String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+}
+
+fn list_tags_body(svc: &RdsService, arn: &str) -> String {
+    let resp = futures_block(svc, "ListTagsForResource", &[("ResourceName", arn)]);
+    String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+}
+
+fn futures_block(
+    svc: &RdsService,
+    action: &str,
+    params: &[(&str, &str)],
+) -> fakecloud_core::service::AwsResponse {
+    use fakecloud_core::service::AwsService;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(svc.handle(req(action, params)))
+        .unwrap_or_else(|e| panic!("{action} failed: {e:?}"))
+}
+
+#[test]
+fn create_db_cluster_stores_request_tags() {
+    let svc = svc();
+    let create = body_on(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "tagged"),
+            ("Tags.Tag.1.Key", "env"),
+            ("Tags.Tag.1.Value", "prod"),
+        ],
+    );
+    let tag = "<TagList><Tag><Key>env</Key><Value>prod</Value></Tag></TagList>";
+    assert!(create.contains(tag), "{create}");
+    let describe = body_on(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "tagged")],
+    );
+    assert!(describe.contains(tag), "{describe}");
+    let listed = list_tags_body(&svc, "arn:aws:rds:us-east-1:000000000000:cluster:tagged");
+    assert!(
+        listed.contains("<Key>env</Key><Value>prod</Value>"),
+        "{listed}"
+    );
+}
+
+#[test]
+fn copy_db_cluster_snapshot_tags_follow_request_then_copy_tags() {
+    let svc = svc();
+    snapshot_cluster(&svc, "src", "c1");
+    // Give the source snapshot a tag of its own.
+    futures_block(
+        &svc,
+        "AddTagsToResource",
+        &[
+            (
+                "ResourceName",
+                "arn:aws:rds:us-east-1:000000000000:cluster-snapshot:src",
+            ),
+            ("Tags.Tag.1.Key", "source"),
+            ("Tags.Tag.1.Value", "s"),
+        ],
+    );
+    ok_on(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "src"),
+            ("TargetDBClusterSnapshotIdentifier", "plain"),
+        ],
+    );
+    ok_on(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "src"),
+            ("TargetDBClusterSnapshotIdentifier", "copied"),
+            ("CopyTags", "true"),
+        ],
+    );
+    let named = body_on(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "src"),
+            ("TargetDBClusterSnapshotIdentifier", "named"),
+            ("CopyTags", "true"),
+            ("Tags.Tag.1.Key", "copy"),
+            ("Tags.Tag.1.Value", "c"),
+        ],
+    );
+    assert!(named.contains("<Key>copy</Key>"), "{named}");
+    let tags_of = |id: &str| {
+        crate::service::service_helpers::json_tags(&extras_value(&svc, "cluster_snapshots", id))
+            .into_iter()
+            .map(|t| t.key)
+            .collect::<Vec<_>>()
+    };
+    assert!(tags_of("plain").is_empty());
+    assert_eq!(tags_of("copied"), vec!["source".to_string()]);
+    assert_eq!(tags_of("named"), vec!["copy".to_string()]);
+    let describe = body_on(
+        &svc,
+        "DescribeDBClusterSnapshots",
+        &[("DBClusterSnapshotIdentifier", "copied")],
+    );
+    assert!(describe.contains("<Key>source</Key>"), "{describe}");
+}
+
+#[test]
+fn cluster_parameter_group_create_and_copy_keep_tags_family_and_parameters() {
+    let svc = svc();
+    ok_on(
+        &svc,
+        "CreateDBClusterParameterGroup",
+        &[
+            ("DBClusterParameterGroupName", "src"),
+            ("DBParameterGroupFamily", "aurora-mysql8.0"),
+            ("Description", "source"),
+            ("Tags.Tag.1.Key", "env"),
+            ("Tags.Tag.1.Value", "prod"),
+        ],
+    );
+    let listed = list_tags_body(&svc, "arn:aws:rds:us-east-1:000000000000:cluster-pg:src");
+    assert!(listed.contains("<Key>env</Key>"), "{listed}");
+    ok_on(
+        &svc,
+        "ModifyDBClusterParameterGroup",
+        &[
+            ("DBClusterParameterGroupName", "src"),
+            ("Parameters.Parameter.1.ParameterName", "max_connections"),
+            ("Parameters.Parameter.1.ParameterValue", "100"),
+            ("Parameters.Parameter.1.ApplyMethod", "immediate"),
+        ],
+    );
+    let copy = body_on(
+        &svc,
+        "CopyDBClusterParameterGroup",
+        &[
+            ("SourceDBClusterParameterGroupIdentifier", "src"),
+            ("TargetDBClusterParameterGroupIdentifier", "dst"),
+            ("TargetDBClusterParameterGroupDescription", "the copy"),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "data"),
+        ],
+    );
+    assert!(
+        copy.contains("<DBParameterGroupFamily>aurora-mysql8.0</DBParameterGroupFamily>"),
+        "{copy}"
+    );
+    assert!(
+        copy.contains("<Description>the copy</Description>"),
+        "{copy}"
+    );
+    let dst = extras_value(&svc, "cluster_param_groups", "dst");
+    assert_eq!(dst["Parameters"]["max_connections"].as_str(), Some("100"));
+    let listed = list_tags_body(&svc, "arn:aws:rds:us-east-1:000000000000:cluster-pg:dst");
+    assert!(listed.contains("<Key>team</Key>"), "{listed}");
+    assert!(!listed.contains("<Key>env</Key>"), "{listed}");
+
+    // A missing source is the declared not-found fault, not a fresh group.
+    let err = svc
+        .handle_extra_action(&req(
+            "CopyDBClusterParameterGroup",
+            &[
+                ("SourceDBClusterParameterGroupIdentifier", "ghost"),
+                ("TargetDBClusterParameterGroupIdentifier", "dst2"),
+                ("TargetDBClusterParameterGroupDescription", "x"),
+            ],
+        ))
+        .err()
+        .expect("copy of a missing group accepted");
+    assert_eq!(err.code(), "DBParameterGroupNotFound");
+}
+
+#[test]
+fn create_db_proxy_and_endpoint_store_request_settings_and_tags() {
+    let svc = svc();
+    let create = body_on(
+        &svc,
+        "CreateDBProxy",
+        &[
+            ("DBProxyName", "p1"),
+            ("EngineFamily", "MYSQL"),
+            ("RoleArn", "arn:aws:iam::000000000000:role/proxy"),
+            ("VpcSubnetIds.member.1", "subnet-a"),
+            ("VpcSubnetIds.member.2", "subnet-b"),
+            ("VpcSecurityGroupIds.member.1", "sg-1"),
+            ("RequireTLS", "true"),
+            ("IdleClientTimeout", "900"),
+            ("Auth.member.1.AuthScheme", "SECRETS"),
+            (
+                "Auth.member.1.SecretArn",
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:s",
+            ),
+            ("Auth.member.1.IAMAuth", "DISABLED"),
+            ("Tags.Tag.1.Key", "env"),
+            ("Tags.Tag.1.Value", "prod"),
+        ],
+    );
+    assert!(create.contains("<DBProxy>"), "{create}");
+    let describe = body_on(&svc, "DescribeDBProxies", &[]);
+    for needle in [
+        "<RoleArn>arn:aws:iam::000000000000:role/proxy</RoleArn>",
+        "<VpcSubnetIds><member>subnet-a</member><member>subnet-b</member></VpcSubnetIds>",
+        "<VpcSecurityGroupIds><member>sg-1</member></VpcSecurityGroupIds>",
+        "<RequireTLS>true</RequireTLS>",
+        "<IdleClientTimeout>900</IdleClientTimeout>",
+        "<AuthScheme>SECRETS</AuthScheme>",
+        "<IAMAuth>DISABLED</IAMAuth>",
+        "<Endpoint>p1.proxy-",
+    ] {
+        assert!(describe.contains(needle), "missing {needle}: {describe}");
+    }
+    let listed = list_tags_body(&svc, "arn:aws:rds:us-east-1:000000000000:db-proxy:p1");
+    assert!(listed.contains("<Key>env</Key>"), "{listed}");
+
+    let endpoint = body_on(
+        &svc,
+        "CreateDBProxyEndpoint",
+        &[
+            ("DBProxyName", "p1"),
+            ("DBProxyEndpointName", "pe1"),
+            ("VpcSubnetIds.member.1", "subnet-a"),
+            ("TargetRole", "READ_ONLY"),
+            ("Tags.Tag.1.Key", "tier"),
+            ("Tags.Tag.1.Value", "read"),
+        ],
+    );
+    let arn = "arn:aws:rds:us-east-1:000000000000:db-proxy-endpoint:pe1";
+    assert!(
+        endpoint.contains(&format!("<DBProxyEndpointArn>{arn}</DBProxyEndpointArn>")),
+        "{endpoint}"
+    );
+    let describe = body_on(&svc, "DescribeDBProxyEndpoints", &[]);
+    for needle in [
+        "<DBProxyName>p1</DBProxyName>",
+        "<TargetRole>READ_ONLY</TargetRole>",
+        "<VpcSubnetIds><member>subnet-a</member></VpcSubnetIds>",
+        "<IsDefault>false</IsDefault>",
+    ] {
+        assert!(describe.contains(needle), "missing {needle}: {describe}");
+    }
+    let listed = list_tags_body(&svc, arn);
+    assert!(listed.contains("<Key>tier</Key>"), "{listed}");
 }

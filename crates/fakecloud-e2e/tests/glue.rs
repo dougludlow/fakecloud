@@ -1257,3 +1257,121 @@ async fn get_job_runs_orders_most_recent_first() {
         "job runs must be ordered by StartedOn descending, got {starts:?}"
     );
 }
+
+#[tokio::test]
+async fn glue_create_time_tags_job_mode_and_catalog_input_round_trip() {
+    use aws_sdk_glue::types::{
+        CatalogInput, FederatedCatalog, JobCommand, JobMode, TargetRedshiftCatalog,
+    };
+    let server = TestServer::start().await;
+    let glue = server.glue_client().await;
+    let prefix = "arn:aws:glue:us-east-1:123456789012";
+
+    glue.create_job()
+        .name("tagged-job")
+        .role("arn:aws:iam::123456789012:role/glue")
+        .command(JobCommand::builder().name("glueetl").build())
+        .job_mode(JobMode::Visual)
+        .job_run_queuing_enabled(true)
+        .tags("env", "dev")
+        .send()
+        .await
+        .expect("create job");
+    let job = glue
+        .get_job()
+        .job_name("tagged-job")
+        .send()
+        .await
+        .expect("get job");
+    let job = job.job().unwrap();
+    assert_eq!(job.job_mode(), Some(&JobMode::Visual));
+    assert_eq!(job.job_run_queuing_enabled(), Some(true));
+    let tags = glue
+        .get_tags()
+        .resource_arn(format!("{prefix}:job/tagged-job"))
+        .send()
+        .await
+        .expect("get tags");
+    assert_eq!(
+        tags.tags().unwrap().get("env").map(String::as_str),
+        Some("dev")
+    );
+
+    glue.create_custom_entity_type()
+        .name("cet")
+        .regex_string("[0-9]+")
+        .tags("team", "data")
+        .send()
+        .await
+        .expect("create cet");
+    let tags = glue
+        .get_tags()
+        .resource_arn(format!("{prefix}:customEntityType/cet"))
+        .send()
+        .await
+        .expect("get tags");
+    assert_eq!(
+        tags.tags().unwrap().get("team").map(String::as_str),
+        Some("data")
+    );
+
+    glue.create_catalog()
+        .name("fedcat")
+        .catalog_input(
+            CatalogInput::builder()
+                .description("federated")
+                .federated_catalog(
+                    FederatedCatalog::builder()
+                        .identifier("fid")
+                        .connection_name("conn")
+                        .build(),
+                )
+                .target_redshift_catalog(
+                    TargetRedshiftCatalog::builder()
+                        .catalog_arn(format!("{prefix}:catalog/rs"))
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .tags("env", "prod")
+        .send()
+        .await
+        .expect("create catalog");
+    let cat = glue
+        .get_catalog()
+        .catalog_id("fedcat")
+        .send()
+        .await
+        .expect("get catalog");
+    let cat = cat.catalog().unwrap();
+    assert_eq!(cat.description(), Some("federated"));
+    assert_eq!(cat.federated_catalog().unwrap().identifier(), Some("fid"));
+    assert_eq!(
+        cat.target_redshift_catalog().unwrap().catalog_arn(),
+        format!("{prefix}:catalog/rs")
+    );
+    let tags = glue
+        .get_tags()
+        .resource_arn(format!("{prefix}:catalog/fedcat"))
+        .send()
+        .await
+        .expect("get tags");
+    assert_eq!(
+        tags.tags().unwrap().get("env").map(String::as_str),
+        Some("prod")
+    );
+
+    glue.delete_job()
+        .job_name("tagged-job")
+        .send()
+        .await
+        .expect("delete job");
+    let tags = glue
+        .get_tags()
+        .resource_arn(format!("{prefix}:job/tagged-job"))
+        .send()
+        .await
+        .expect("get tags");
+    assert!(tags.tags().map(|t| t.is_empty()).unwrap_or(true));
+}

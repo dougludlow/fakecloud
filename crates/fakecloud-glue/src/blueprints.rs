@@ -30,6 +30,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.blueprints, &name, stored, "Blueprint")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "blueprint", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -68,10 +72,27 @@ impl GlueService {
     }
 
     pub(crate) fn list_blueprints(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let names: Vec<String> = accounts
             .get(&req.account_id)
-            .map(|s| s.blueprints.keys().cloned().collect())
+            .map(|s| {
+                s.blueprints
+                    .keys()
+                    .filter(|k| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "blueprint",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "Blueprints": names })))
     }
@@ -107,6 +128,12 @@ impl GlueService {
         // DeleteBlueprint does not declare EntityNotFoundException; treat as
         // idempotent so a missing blueprint doesn't surface an undeclared error.
         st.blueprints.remove(&name);
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "blueprint",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -224,6 +251,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.dev_endpoints, &name, stored, "DevEndpoint")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "devEndpoint", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({
             "EndpointName": name,
             "RoleArn": role,
@@ -288,10 +319,27 @@ impl GlueService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let names: Vec<String> = accounts
             .get(&req.account_id)
-            .map(|s| s.dev_endpoints.keys().cloned().collect())
+            .map(|s| {
+                s.dev_endpoints
+                    .keys()
+                    .filter(|k| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "devEndpoint",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "DevEndpointNames": names })))
     }
@@ -370,6 +418,12 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut st.dev_endpoints, &name, "DevEndpoint")?;
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "devEndpoint",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({})))
     }
 }

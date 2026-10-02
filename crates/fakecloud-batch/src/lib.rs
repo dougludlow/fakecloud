@@ -1,12 +1,13 @@
 //! AWS Batch (`batch`) restJson1 service for fakecloud.
 //!
-//! Batch 0 (foundation): vendored Smithy model + crate scaffold + restJson1
-//! routing for all 45 operations + the core control plane (compute
-//! environments, job queues, job definitions, tags). Real container-backed job
-//! execution (SubmitJob -> ECS task) and the remaining resource families land
-//! in later batches; unimplemented operations return a faithful
-//! `ServerException`/not-implemented error rather than a fake success.
+//! Full control plane (compute environments, job queues, job definitions,
+//! scheduling policies, consumable resources, service environments, quota
+//! shares, tags) plus job execution: `SubmitJob` runs a real container-backed
+//! ECS task when a container runtime is attached. Service jobs (SageMaker
+//! Training through Batch) are queued and validated but wait at `RUNNABLE`,
+//! since fakecloud has no SageMaker training executor to dispatch them to.
 
+mod extended;
 pub mod service;
 pub mod state;
 

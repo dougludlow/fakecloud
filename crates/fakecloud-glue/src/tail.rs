@@ -60,6 +60,9 @@ impl GlueService {
         let st = accounts.get_or_create(&req.account_id, &req.region);
         // CreateIntegration declares ConflictException (not AlreadyExistsException);
         // persist idempotently rather than emit an undeclared error.
+        if let Some(arn) = v["IntegrationArn"].as_str() {
+            st.put_create_tags(arn, &body);
+        }
         st.integrations.insert(name, v.clone());
         Ok(AwsResponse::ok_json(v))
     }
@@ -105,6 +108,9 @@ impl GlueService {
             .integrations
             .remove(&id)
             .ok_or_else(|| entity_not_found(format!("Integration {id} not found")))?;
+        if let Some(arn) = v["IntegrationArn"].as_str() {
+            st.remove_tags(arn);
+        }
         if let Some(obj) = v.as_object_mut() {
             obj.insert("Status".into(), json!("DELETING"));
         }
@@ -152,6 +158,7 @@ impl GlueService {
         });
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
+        st.put_create_tags(&format!("{arn}/property"), &body);
         st.integration_resource_props.insert(arn, v.clone());
         Ok(AwsResponse::ok_json(v))
     }
@@ -197,6 +204,7 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         st.integration_resource_props.remove(&arn);
+        st.remove_tags(&format!("{arn}/property"));
         Ok(AwsResponse::ok_json(json!({})))
     }
 

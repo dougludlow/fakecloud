@@ -168,6 +168,7 @@ impl ResourceProvisioner {
             consumer_status: "ACTIVE".to_string(),
             consumer_creation_timestamp: now,
             stream_arn: stream_arn.clone(),
+            tags: BTreeMap::new(),
         };
         state.consumers.insert(consumer_arn.clone(), consumer);
 

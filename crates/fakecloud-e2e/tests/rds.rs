@@ -666,6 +666,12 @@ async fn rds_create_describe_delete_snapshot() {
         .create_db_snapshot()
         .db_instance_identifier("orders-snapshot-test-db")
         .db_snapshot_identifier("test-snapshot")
+        .tags(
+            aws_sdk_rds::types::Tag::builder()
+                .key("env")
+                .value("prod")
+                .build(),
+        )
         .send()
         .await
         .unwrap();
@@ -692,6 +698,17 @@ async fn rds_create_describe_delete_snapshot() {
     assert!(snapshot.instance_create_time().is_some());
     assert!(!snapshot.encrypted().unwrap_or(true));
     assert_eq!(snapshot.iam_database_authentication_enabled(), Some(false));
+    // The request's tags land on the snapshot.
+    assert_eq!(snapshot.tag_list().len(), 1);
+    assert_eq!(snapshot.tag_list()[0].key(), Some("env"));
+    let listed = client
+        .list_tags_for_resource()
+        .resource_name(snapshot.db_snapshot_arn().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.tag_list().len(), 1);
+    assert_eq!(listed.tag_list()[0].value(), Some("prod"));
 
     let describe_response = client
         .describe_db_snapshots()
@@ -907,6 +924,12 @@ async fn rds_create_and_query_read_replica() {
         .create_db_instance_read_replica()
         .db_instance_identifier("orders-replica-db")
         .source_db_instance_identifier("orders-source-db")
+        .tags(
+            aws_sdk_rds::types::Tag::builder()
+                .key("role")
+                .value("replica")
+                .build(),
+        )
         .send()
         .await
         .unwrap();
@@ -916,6 +939,15 @@ async fn rds_create_and_query_read_replica() {
         replica_instance.db_instance_identifier(),
         Some("orders-replica-db")
     );
+    // The request's tags land on the replica.
+    let replica_tags = client
+        .list_tags_for_resource()
+        .resource_name(replica_instance.db_instance_arn().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replica_tags.tag_list().len(), 1);
+    assert_eq!(replica_tags.tag_list()[0].key(), Some("role"));
     assert_eq!(
         replica_instance.read_replica_source_db_instance_identifier(),
         Some("orders-source-db")

@@ -39,6 +39,24 @@ pub fn guardrail_arn(region: &str, account_id: &str, id: &str) -> String {
     bedrock_arn(region, account_id, &format!("guardrail/{id}"))
 }
 
+pub fn guardrail_profile_arn(region: &str, account_id: &str, id: &str) -> String {
+    bedrock_arn(region, account_id, &format!("guardrail-profile/{id}"))
+}
+
+/// Resolve a `KmsKeyId` (key id, alias name, or ARN) to the ARN form Bedrock
+/// reports back as `kmsKeyArn`.
+pub fn kms_key_arn(region: &str, account_id: &str, key_id: &str) -> String {
+    if key_id.starts_with("arn:") {
+        return key_id.to_string();
+    }
+    let resource = if key_id.starts_with("alias/") {
+        key_id.to_string()
+    } else {
+        format!("key/{key_id}")
+    };
+    Arn::regional("kms", region, account_id, &resource).to_string()
+}
+
 pub fn prompt_router_arn(region: &str, account_id: &str, id: &str) -> String {
     bedrock_arn(region, account_id, &format!("prompt-router/{id}"))
 }

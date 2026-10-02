@@ -829,6 +829,82 @@ fn settle_pipeline_executions(
     changed
 }
 
+/// Resolve an execution's pipeline variables: every variable the pipeline
+/// declares, at its `defaultValue`, overridden by the values passed to
+/// StartPipelineExecution. Rendered as `ResolvedPipelineVariable`s
+/// (`name` / `resolvedValue`) in declaration order, then any extra overrides.
+fn resolve_pipeline_variables(decl: &Value, overrides: Option<&Value>) -> Vec<Value> {
+    let mut resolved: Vec<(String, Option<String>)> = decl
+        .get("variables")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let name = v.get("name")?.as_str()?.to_string();
+            let default = v
+                .get("defaultValue")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Some((name, default))
+        })
+        .collect();
+    for v in overrides.and_then(Value::as_array).into_iter().flatten() {
+        let (Some(name), Some(value)) = (
+            v.get("name").and_then(Value::as_str),
+            v.get("value").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        match resolved.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = Some(value.to_string()),
+            None => resolved.push((name.to_string(), Some(value.to_string()))),
+        }
+    }
+    resolved
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| json!({ "name": name, "resolvedValue": v })))
+        .collect()
+}
+
+/// Map StartPipelineExecution `sourceRevisions` overrides onto the execution's
+/// `artifactRevisions` (keyed by the overridden source action's output
+/// artifact) and the summary's `sourceRevisions` (keyed by action name).
+fn source_revision_overrides(
+    decl: &Value,
+    overrides: Option<&Value>,
+    now: DateTime<Utc>,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut artifacts = Vec::new();
+    let mut sources = Vec::new();
+    for o in overrides.and_then(Value::as_array).into_iter().flatten() {
+        let (Some(action), Some(revision)) = (
+            o.get("actionName").and_then(Value::as_str),
+            o.get("revisionValue").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        sources.push(json!({ "actionName": action, "revisionId": revision }));
+        let output = decl
+            .get("stages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|st| st.get("actions").and_then(Value::as_array))
+            .flatten()
+            .find(|a| a.get("name").and_then(Value::as_str) == Some(action))
+            .and_then(|a| a.pointer("/outputArtifacts/0/name"))
+            .and_then(Value::as_str);
+        if let Some(artifact) = output {
+            artifacts.push(json!({
+                "name": artifact,
+                "revisionId": revision,
+                "created": ts(now),
+            }));
+        }
+    }
+    (artifacts, sources)
+}
+
 impl CodePipelineService {
     /// The pipeline's configured `executionMode` (defaults to `SUPERSEDED`,
     /// matching CodePipeline's default for pipelines that don't set it).
@@ -859,7 +935,10 @@ impl CodePipelineService {
             .get("executionMode")
             .cloned()
             .unwrap_or_else(|| json!("SUPERSEDED"));
-        let exec = json!({
+        let variables = resolve_pipeline_variables(decl, b.get("variables"));
+        let (artifact_revisions, source_revisions) =
+            source_revision_overrides(decl, b.get("sourceRevisions"), now);
+        let mut exec = json!({
             "pipelineName": name,
             "pipelineVersion": version,
             "pipelineExecutionId": exec_id,
@@ -870,6 +949,17 @@ impl CodePipelineService {
             "lastUpdateTime": ts(now),
             "trigger": { "triggerType": "StartPipelineExecution", "triggerDetail": "user" },
         });
+        if let Some(obj) = exec.as_object_mut() {
+            if !variables.is_empty() {
+                obj.insert("variables".into(), Value::Array(variables));
+            }
+            if !artifact_revisions.is_empty() {
+                obj.insert("artifactRevisions".into(), Value::Array(artifact_revisions));
+            }
+            if !source_revisions.is_empty() {
+                obj.insert("sourceRevisions".into(), Value::Array(source_revisions));
+            }
+        }
         st.executions.insert(exec_id.clone(), exec);
         st.execution_order
             .entry(name)
@@ -920,6 +1010,8 @@ impl CodePipelineService {
             "pipelineExecutionId",
             "status",
             "statusSummary",
+            "artifactRevisions",
+            "variables",
             "executionMode",
             "executionType",
             "trigger",
@@ -967,6 +1059,7 @@ impl CodePipelineService {
                     "statusSummary",
                     "startTime",
                     "lastUpdateTime",
+                    "sourceRevisions",
                     "executionMode",
                     "executionType",
                     "trigger",
@@ -2315,6 +2408,66 @@ mod tests {
         assert_eq!(
             got["pipelineExecution"]["statusSummary"],
             json!("manual stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn start_execution_variables_and_source_revisions_round_trip() {
+        let svc = svc();
+        let mut decl = pipeline_decl("p", None);
+        let obj = decl.as_object_mut().unwrap();
+        obj.insert("pipelineType".into(), json!("V2"));
+        obj.insert(
+            "variables".into(),
+            json!([
+                { "name": "Env", "defaultValue": "dev" },
+                { "name": "Region", "defaultValue": "us-east-1" },
+            ]),
+        );
+        decl["stages"][0]["actions"][0]["outputArtifacts"] = json!([{ "name": "SourceOut" }]);
+        svc.handle(req("CreatePipeline", json!({ "pipeline": decl })))
+            .await
+            .unwrap();
+        let started = body_of(
+            &svc,
+            "StartPipelineExecution",
+            json!({
+                "name": "p",
+                "variables": [{ "name": "Env", "value": "prod" }],
+                "sourceRevisions": [{
+                    "actionName": "Src",
+                    "revisionType": "S3_OBJECT_VERSION_ID",
+                    "revisionValue": "v-123",
+                }],
+            }),
+        )
+        .await;
+        let exec_id = started["pipelineExecutionId"].as_str().unwrap().to_string();
+        let got = body_of(
+            &svc,
+            "GetPipelineExecution",
+            json!({ "pipelineName": "p", "pipelineExecutionId": exec_id }),
+        )
+        .await;
+        let pe = &got["pipelineExecution"];
+        assert_eq!(
+            pe["variables"],
+            json!([
+                { "name": "Env", "resolvedValue": "prod" },
+                { "name": "Region", "resolvedValue": "us-east-1" },
+            ])
+        );
+        assert_eq!(pe["artifactRevisions"][0]["name"], json!("SourceOut"));
+        assert_eq!(pe["artifactRevisions"][0]["revisionId"], json!("v-123"));
+        let list = body_of(
+            &svc,
+            "ListPipelineExecutions",
+            json!({ "pipelineName": "p" }),
+        )
+        .await;
+        assert_eq!(
+            list["pipelineExecutionSummaries"][0]["sourceRevisions"],
+            json!([{ "actionName": "Src", "revisionId": "v-123" }])
         );
     }
 

@@ -1498,3 +1498,48 @@ async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
     );
     assert_eq!(reported_key(&copy), None);
 }
+
+/// ModifyDBCluster ignored `StorageType` and
+/// `ServerlessV2ScalingConfiguration`, and CreateDBCluster dropped the
+/// latter; both are now stored and read back.
+#[tokio::test]
+async fn cluster_storage_type_and_serverless_round_trip() {
+    let svc = service();
+    call(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "st"),
+            ("Engine", "docdb"),
+            ("ServerlessV2ScalingConfiguration.MinCapacity", "0.5"),
+            ("ServerlessV2ScalingConfiguration.MaxCapacity", "16"),
+        ],
+    )
+    .await;
+    let xml = body(&call(&svc, "DescribeDBClusters", &[("DBClusterIdentifier", "st")]).await);
+    assert!(xml.contains("<StorageType>standard</StorageType>"), "{xml}");
+    assert!(
+        xml.contains(
+            "<ServerlessV2ScalingConfiguration><MinCapacity>0.5</MinCapacity>\
+             <MaxCapacity>16</MaxCapacity></ServerlessV2ScalingConfiguration>"
+        ),
+        "{xml}"
+    );
+
+    call(
+        &svc,
+        "ModifyDBCluster",
+        &[
+            ("DBClusterIdentifier", "st"),
+            ("StorageType", "iopt1"),
+            ("ServerlessV2ScalingConfiguration.MinCapacity", "1"),
+        ],
+    )
+    .await;
+    let xml = body(&call(&svc, "DescribeDBClusters", &[("DBClusterIdentifier", "st")]).await);
+    assert!(xml.contains("<StorageType>iopt1</StorageType>"), "{xml}");
+    assert!(
+        xml.contains("<MinCapacity>1</MinCapacity><MaxCapacity>16</MaxCapacity>"),
+        "{xml}"
+    );
+}

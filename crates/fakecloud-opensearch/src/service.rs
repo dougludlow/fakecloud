@@ -1399,6 +1399,8 @@ impl OpenSearchService {
         if let Some(st) = accounts.get(&req.account_id) {
             if let Some(d) = st.domains.values().find(|d| d.arn == arn) {
                 tags = d.tags.clone();
+            } else if let Some(a) = st.applications.values().find(|a| a.arn == arn) {
+                tags = a.tags.clone();
             }
             if let Some(t) = st.tags.get(&arn) {
                 tags.extend(t.clone());
@@ -2188,7 +2190,9 @@ impl OpenSearchService {
         let id = label(l.id.as_deref())?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        st.applications.remove(&id);
+        if let Some(app) = st.applications.remove(&id) {
+            st.tags.remove(&app.arn);
+        }
         Ok(ok(json!({})))
     }
 
@@ -3624,8 +3628,9 @@ fn parse_tag_list(v: Option<&Value>) -> crate::state::TagMap {
     m
 }
 
-/// Apply a mutation to the tag set of `arn`, whether it names a domain (tags
-/// live on the domain) or any other resource (tags live in the side map).
+/// Apply a mutation to the tag set of `arn`, whether it names a domain or an
+/// application (tags live on the resource itself, which is what Describe /
+/// GetApplication render) or any other resource (tags live in the side map).
 fn apply_tag_target(
     st: &mut crate::state::OpenSearchState,
     arn: &str,
@@ -3633,6 +3638,13 @@ fn apply_tag_target(
 ) {
     if let Some(d) = st.domains.values_mut().find(|d| d.arn == arn) {
         f(&mut d.tags);
+    } else if let Some(a) = st.applications.values_mut().find(|a| a.arn == arn) {
+        // Fold in any tags an older build parked in the side map for this
+        // application so they stay removable.
+        if let Some(side) = st.tags.remove(arn) {
+            a.tags.extend(side);
+        }
+        f(&mut a.tags);
     } else {
         f(st.tags.entry(arn.to_string()).or_default());
     }

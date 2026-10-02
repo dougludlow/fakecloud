@@ -258,8 +258,8 @@ impl XrayService {
             "TagResource" => self.tag_resource(&ctx, &body),
             "UntagResource" => self.untag_resource(&ctx, &body),
             "ListTagsForResource" => self.list_tags_for_resource(&ctx, &body),
-            "GetIndexingRules" => Self::get_indexing_rules(),
-            "UpdateIndexingRule" => Self::update_indexing_rule(&body),
+            "GetIndexingRules" => self.get_indexing_rules(&ctx),
+            "UpdateIndexingRule" => self.update_indexing_rule(&ctx, &body),
             "GetTraceSegmentDestination" => self.get_trace_segment_destination(&ctx),
             "UpdateTraceSegmentDestination" => self.update_trace_segment_destination(&ctx, &body),
             "PutTelemetryRecords" => Ok(ok(json!({}))),
@@ -861,22 +861,44 @@ impl XrayService {
 
     // ===================== indexing rules =====================
 
-    fn get_indexing_rules() -> Result<AwsResponse, AwsServiceError> {
-        Ok(ok(json!({ "IndexingRules": [default_indexing_rule()] })))
+    fn get_indexing_rules(&self, ctx: &Ctx) -> Result<AwsResponse, AwsServiceError> {
+        let guard = self.state.read();
+        let rules: Vec<Value> = guard
+            .get(&ctx.account)
+            .map(|d| d.indexing_rules.values().cloned().collect())
+            .unwrap_or_default();
+        Ok(ok(json!({ "IndexingRules": rules })))
     }
 
-    fn update_indexing_rule(body: &Value) -> Result<AwsResponse, AwsServiceError> {
-        let name = body
-            .get("Name")
-            .and_then(Value::as_str)
-            .unwrap_or("Default");
-        Ok(ok(json!({
-            "IndexingRule": {
-                "Name": name,
-                "ModifiedAt": now_epoch(),
-                "Rule": body.get("Rule").cloned().unwrap_or_else(|| default_indexing_rule()["Rule"].clone()),
-            }
-        })))
+    fn update_indexing_rule(
+        &self,
+        ctx: &Ctx,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let name = body.get("Name").and_then(Value::as_str).unwrap_or_default();
+        // `IndexingRuleValueUpdate` is a union whose only member is
+        // `Probabilistic`.
+        let Some(probabilistic) = body.pointer("/Rule/Probabilistic") else {
+            return Err(invalid(
+                "Rule must specify a Probabilistic indexing rule value.",
+            ));
+        };
+        let desired = probabilistic
+            .get("DesiredSamplingPercentage")
+            .and_then(Value::as_f64);
+        let mut guard = self.state.write();
+        let data = guard.get_or_create(&ctx.account);
+        let Some(rule) = data.indexing_rules.get_mut(name) else {
+            return Err(not_found(&format!("Indexing rule {name} not found.")));
+        };
+        if let Some(desired) = desired {
+            rule["Rule"] = json!({ "Probabilistic": {
+                "DesiredSamplingPercentage": desired,
+                "ActualSamplingPercentage": desired,
+            } });
+        }
+        rule["ModifiedAt"] = json!(now_epoch());
+        Ok(ok(json!({ "IndexingRule": rule.clone() })))
     }
 
     // ===================== trace-segment destination =====================
@@ -1083,14 +1105,6 @@ fn sampling_rule_arn(region: &str, account: &str, name: &str) -> String {
 
 fn default_encryption_config() -> Value {
     json!({ "Type": "NONE", "Status": "ACTIVE" })
-}
-
-fn default_indexing_rule() -> Value {
-    json!({
-        "Name": "Default",
-        "ModifiedAt": now_epoch(),
-        "Rule": { "Probabilistic": { "DesiredSamplingPercentage": 100.0, "ActualSamplingPercentage": 100.0 } },
-    })
 }
 
 fn insights_config(input: Option<&Value>) -> Value {
@@ -1619,6 +1633,44 @@ mod tests {
             rule["SamplingRule"]["RuleARN"],
             "arn:aws:xray:us-east-1:000000000000:sampling-rule/Default"
         );
+    }
+
+    #[tokio::test]
+    async fn update_indexing_rule_persists_and_get_returns_it() {
+        let s = svc();
+        // Seeds the built-in Default rule.
+        let out = s.handle(req("/GetIndexingRules")).await.unwrap();
+        let rules = body_json(&out)["IndexingRules"].clone();
+        assert_eq!(rules.as_array().unwrap().len(), 1);
+        assert_eq!(rules[0]["Name"], "Default");
+
+        let updated = body_json(
+            &s.update_indexing_rule(
+                &ctx(),
+                &json!({ "Name": "Default", "Rule": { "Probabilistic": { "DesiredSamplingPercentage": 42.5 } } }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            updated["IndexingRule"]["Rule"]["Probabilistic"]["DesiredSamplingPercentage"],
+            json!(42.5)
+        );
+
+        let out = s.handle(req("/GetIndexingRules")).await.unwrap();
+        let rules = body_json(&out)["IndexingRules"].clone();
+        assert_eq!(rules.as_array().unwrap().len(), 1);
+        assert_eq!(
+            rules[0]["Rule"]["Probabilistic"]["DesiredSamplingPercentage"],
+            json!(42.5)
+        );
+
+        let err = err_of(s.update_indexing_rule(
+            &ctx(),
+            &json!({ "Name": "nope", "Rule": { "Probabilistic": { "DesiredSamplingPercentage": 5.0 } } }),
+        ));
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let err = err_of(s.update_indexing_rule(&ctx(), &json!({ "Name": "Default", "Rule": {} })));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

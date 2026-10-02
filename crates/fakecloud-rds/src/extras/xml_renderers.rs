@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// A JSON row's `Tags` as the `<TagList>` member DBCluster and
+/// DBClusterSnapshot carry -- the same tags ListTagsForResource reports.
+pub(super) fn json_tag_list_xml(v: &Value) -> String {
+    let tags: String = crate::service::service_helpers::json_tags(v)
+        .iter()
+        .map(crate::service::service_helpers::tag_xml)
+        .collect();
+    format!("<TagList>{tags}</TagList>")
+}
+
 /// Render a JSON string array as an AWS query `<Wrapper><member>..</member></Wrapper>`
 /// list, or a self-closing `<Wrapper/>` when empty/absent.
 pub(super) fn json_str_array_xml(v: &Value, wrapper: &str) -> String {
@@ -310,6 +320,7 @@ pub(super) fn db_cluster_member_xml(v: &Value) -> String {
         }
         out.push_str("          </ServerlessV2ScalingConfiguration>\n");
     }
+    out.push_str(&format!("          {}\n", json_tag_list_xml(v)));
     out
 }
 
@@ -369,6 +380,7 @@ pub(super) fn cluster_snapshot_member_xml(v: &Value) -> String {
         "\n          <StorageEncrypted>{}</StorageEncrypted>",
         v["StorageEncrypted"].as_bool().unwrap_or(false)
     ));
+    out.push_str(&format!("\n          {}", json_tag_list_xml(v)));
     out
 }
 
@@ -464,13 +476,98 @@ pub(super) fn cluster_backtrack_xml(v: &Value) -> String {
 }
 
 pub(super) fn proxy_xml(v: &Value) -> String {
-    format!(
+    let mut out = format!(
         "          <DBProxyName>{}</DBProxyName>\n          <DBProxyArn>{}</DBProxyArn>\n          <Status>{}</Status>\n          <EngineFamily>{}</EngineFamily>",
         xml_escape(v["DBProxyName"].as_str().unwrap_or("")),
         xml_escape(v["DBProxyArn"].as_str().unwrap_or("")),
         xml_escape(v["Status"].as_str().unwrap_or("available")),
         xml_escape(v["EngineFamily"].as_str().unwrap_or("POSTGRESQL")),
-    )
+    );
+    // Everything else CreateDBProxy / ModifyDBProxy store, rendered only
+    // when present so a row persisted by an older build reads back as it
+    // was rather than with invented values.
+    for key in [
+        "VpcId",
+        "DefaultAuthScheme",
+        "RoleArn",
+        "Endpoint",
+        "CreatedDate",
+        "UpdatedDate",
+        "EndpointNetworkType",
+        "TargetConnectionNetworkType",
+    ] {
+        if let Some(s) = v[key].as_str() {
+            out.push_str(&format!("\n          <{key}>{}</{key}>", xml_escape(s)));
+        }
+    }
+    for key in ["VpcSecurityGroupIds", "VpcSubnetIds"] {
+        if v[key].is_array() {
+            out.push_str(&format!("\n          {}", json_str_array_xml(&v[key], key)));
+        }
+    }
+    for key in ["RequireTLS", "DebugLogging"] {
+        if let Some(b) = v[key].as_bool() {
+            out.push_str(&format!("\n          <{key}>{b}</{key}>"));
+        }
+    }
+    if let Some(n) = v["IdleClientTimeout"].as_i64() {
+        out.push_str(&format!(
+            "\n          <IdleClientTimeout>{n}</IdleClientTimeout>"
+        ));
+    }
+    if let Some(auth) = v["Auth"].as_array() {
+        out.push_str("\n          <Auth>");
+        for entry in auth {
+            out.push_str("<member>");
+            for key in [
+                "Description",
+                "UserName",
+                "AuthScheme",
+                "SecretArn",
+                "IAMAuth",
+                "ClientPasswordAuthType",
+            ] {
+                if let Some(s) = entry[key].as_str() {
+                    out.push_str(&format!("<{key}>{}</{key}>", xml_escape(s)));
+                }
+            }
+            out.push_str("</member>");
+        }
+        out.push_str("</Auth>");
+    }
+    out
+}
+
+/// One `DBProxyEndpoint`, rendering what CreateDBProxyEndpoint /
+/// ModifyDBProxyEndpoint stored.
+pub(super) fn proxy_endpoint_xml(v: &Value) -> String {
+    let mut out = format!(
+        "        <DBProxyEndpointName>{}</DBProxyEndpointName>\n        <Status>{}</Status>",
+        xml_escape(v["DBProxyEndpointName"].as_str().unwrap_or("")),
+        xml_escape(v["Status"].as_str().unwrap_or("available")),
+    );
+    for key in [
+        "DBProxyEndpointArn",
+        "DBProxyName",
+        "VpcId",
+        "Endpoint",
+        "CreatedDate",
+        "TargetRole",
+        "EndpointNetworkType",
+    ] {
+        if let Some(s) = v[key].as_str() {
+            out.push_str(&format!("\n        <{key}>{}</{key}>", xml_escape(s)));
+        }
+    }
+    for key in ["VpcSecurityGroupIds", "VpcSubnetIds"] {
+        if v[key].is_array() {
+            out.push_str(&format!("\n        {}", json_str_array_xml(&v[key], key)));
+        }
+    }
+    if let Some(b) = v["IsDefault"].as_bool() {
+        out.push_str(&format!("\n        <IsDefault>{b}</IsDefault>"));
+    }
+    out
 }
 
 pub(super) fn security_group_xml(v: &Value) -> String {

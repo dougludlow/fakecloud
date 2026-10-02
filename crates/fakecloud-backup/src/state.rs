@@ -106,8 +106,10 @@ pub struct AccessPointRecord {
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
     pub policy: Option<String>,
-    #[serde(default)]
-    pub tags: BTreeMap<String, String>,
+    /// Tags older builds stored on the record itself. Read only from old
+    /// snapshots and moved into `BackupState::tags` on load; never written.
+    #[serde(default, rename = "tags", skip_serializing)]
+    pub legacy_tags: BTreeMap<String, String>,
 }
 
 /// A restore-testing plan with its selections.
@@ -179,6 +181,23 @@ pub struct BackupState {
     /// Tags keyed by resource ARN.
     #[serde(default)]
     pub tags: BTreeMap<String, TagMap>,
+}
+
+impl BackupState {
+    /// Move access-point tags persisted on the record by older builds into
+    /// the ARN-keyed tag store that ListTags / TagResource read. Tags already
+    /// in the store win on a key clash.
+    pub fn migrate_legacy_access_point_tags(&mut self) {
+        for (arn, ap) in self.access_points.iter_mut() {
+            if ap.legacy_tags.is_empty() {
+                continue;
+            }
+            let tags = self.tags.entry(arn.clone()).or_default();
+            for (k, v) in std::mem::take(&mut ap.legacy_tags) {
+                tags.entry(k).or_insert(v);
+            }
+        }
+    }
 }
 
 impl AccountState for BackupState {

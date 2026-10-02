@@ -225,6 +225,11 @@ pub struct Job {
     pub log_uri: Option<String>,
     #[serde(default)]
     pub allocated_capacity: Option<i64>,
+    /// `SCRIPT` / `VISUAL` / `NOTEBOOK`; absent when the caller never set it.
+    #[serde(default)]
+    pub job_mode: Option<String>,
+    #[serde(default)]
+    pub job_run_queuing_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +255,40 @@ impl GlueState {
             job_runs: BTreeMap::new(),
             ..Default::default()
         }
+    }
+
+    /// Seed the tag store for a newly created resource from the request's
+    /// `Tags` map (a create-time `Tags` is equivalent to a follow-up
+    /// `TagResource`). A create without `Tags` leaves the store untouched.
+    pub fn put_create_tags(&mut self, arn: &str, body: &Value) {
+        let Some(obj) = body.get("Tags").and_then(Value::as_object) else {
+            return;
+        };
+        let tags: BTreeMap<String, String> = obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        if !tags.is_empty() {
+            self.tags.entry(arn.to_string()).or_default().extend(tags);
+        }
+    }
+
+    /// Whether the resource at `arn` carries every key/value in the request's
+    /// `Tags` filter (the `List*` ops' "return only these tagged resources").
+    /// No filter matches everything.
+    pub fn matches_tag_filter(&self, arn: &str, body: &Value) -> bool {
+        let Some(filter) = body.get("Tags").and_then(Value::as_object) else {
+            return true;
+        };
+        let have = self.tags.get(arn);
+        filter
+            .iter()
+            .all(|(k, v)| have.and_then(|t| t.get(k)).map(String::as_str) == v.as_str())
+    }
+
+    /// Drop every tag attached to a deleted resource.
+    pub fn remove_tags(&mut self, arn: &str) {
+        self.tags.remove(arn);
     }
 
     pub fn dbs_in(&self, region: &str) -> Option<&BTreeMap<String, Database>> {

@@ -44,6 +44,7 @@ pub(crate) fn create_custom_model(
     let mut accts = state.write();
     let s = accts.get_or_create(&req.account_id);
     s.custom_models.insert(model_arn.clone(), model);
+    crate::guardrails::store_tags(s, &model_arn, body.get("modelTags"));
 
     Ok(AwsResponse::json_value(
         StatusCode::CREATED,
@@ -76,13 +77,17 @@ pub(crate) fn get_custom_model(
             )
         })?;
 
-    Ok(AwsResponse::ok_json(json!({
+    let mut out = json!({
         "modelArn": model.model_arn,
         "modelName": model.model_name,
         "baseModelArn": model.base_model_arn,
         "modelStatus": model.model_status,
         "creationTime": model.creation_time.to_rfc3339(),
-    })))
+    });
+    if let Some(ref kms) = model.model_kms_key_arn {
+        out["modelKmsKeyArn"] = json!(kms);
+    }
+    Ok(AwsResponse::ok_json(out))
 }
 
 pub(crate) fn list_custom_models(
@@ -160,6 +165,7 @@ pub(crate) fn delete_custom_model(
     match key {
         Some(k) => {
             s.custom_models.remove(&k);
+            s.tags.remove(&k);
             Ok(AwsResponse::json(StatusCode::OK, "{}".to_string()))
         }
         None => Err(AwsServiceError::aws_error(

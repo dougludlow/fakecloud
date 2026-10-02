@@ -164,6 +164,7 @@ impl GlueService {
             }),
             "Registry",
         )?;
+        st.put_create_tags(&arn, &body);
         Ok(AwsResponse::ok_json(json!({
             "RegistryArn": arn, "RegistryName": name, "Description": desc, "Tags": tags,
         })))
@@ -212,6 +213,9 @@ impl GlueService {
         let st = accounts.get_or_create(&req.account_id, &req.region);
         let arn = stored_registry_arn(st, &name);
         generic::delete(&mut st.registries, &name, "Registry")?;
+        if let Some(a) = arn.as_str() {
+            st.remove_tags(a);
+        }
         Ok(AwsResponse::ok_json(json!({
             "RegistryName": name, "RegistryArn": arn, "Status": "DELETING",
         })))
@@ -286,6 +290,7 @@ impl GlueService {
             "SchemaStatus": "AVAILABLE", "CreatedTime": now.to_string(), "UpdatedTime": now.to_string(),
         });
         generic::create_unique(&mut st.schemas, &key, schema, "Schema")?;
+        st.put_create_tags(&schema_arn, &body);
 
         let mut version_id = Value::Null;
         if has_def {
@@ -341,6 +346,9 @@ impl GlueService {
             .schemas
             .remove(&key)
             .ok_or_else(|| entity_not_found("Schema not found"))?;
+        if let Some(a) = s.get("SchemaArn").and_then(Value::as_str) {
+            st.remove_tags(a);
+        }
         Ok(AwsResponse::ok_json(json!({
             "SchemaArn": s.get("SchemaArn").cloned().unwrap_or(Value::Null),
             "SchemaName": s.get("SchemaName").cloned().unwrap_or(Value::Null),

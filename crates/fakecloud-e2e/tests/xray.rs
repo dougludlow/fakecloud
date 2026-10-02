@@ -202,3 +202,64 @@ async fn xray_trace_data_plane_and_control_plane() {
         .iter()
         .any(|t| t.key() == "team" && t.value() == "observability"));
 }
+
+#[tokio::test]
+async fn update_indexing_rule_is_returned_by_get_indexing_rules() {
+    use aws_sdk_xray::types::{
+        IndexingRuleValue, IndexingRuleValueUpdate, ProbabilisticRuleValueUpdate,
+    };
+    let server = TestServer::start().await;
+    let xray = xray_client(&server).await;
+
+    let updated = xray
+        .update_indexing_rule()
+        .name("Default")
+        .rule(IndexingRuleValueUpdate::Probabilistic(
+            ProbabilisticRuleValueUpdate::builder()
+                .desired_sampling_percentage(42.5)
+                .build()
+                .unwrap(),
+        ))
+        .send()
+        .await
+        .expect("update_indexing_rule");
+    assert_eq!(
+        updated.indexing_rule().and_then(|r| r.name()),
+        Some("Default")
+    );
+
+    let rules = xray
+        .get_indexing_rules()
+        .send()
+        .await
+        .expect("get_indexing_rules");
+    let rule = rules
+        .indexing_rules()
+        .iter()
+        .find(|r| r.name() == Some("Default"))
+        .expect("Default rule");
+    match rule.rule() {
+        Some(IndexingRuleValue::Probabilistic(p)) => {
+            assert_eq!(p.desired_sampling_percentage(), 42.5);
+        }
+        other => panic!("unexpected rule value: {other:?}"),
+    }
+
+    let err = xray
+        .update_indexing_rule()
+        .name("NoSuchRule")
+        .rule(IndexingRuleValueUpdate::Probabilistic(
+            ProbabilisticRuleValueUpdate::builder()
+                .desired_sampling_percentage(5.0)
+                .build()
+                .unwrap(),
+        ))
+        .send()
+        .await
+        .expect_err("unknown rule");
+    assert!(
+        err.as_service_error()
+            .is_some_and(|e| e.is_resource_not_found_exception()),
+        "{err:?}"
+    );
+}

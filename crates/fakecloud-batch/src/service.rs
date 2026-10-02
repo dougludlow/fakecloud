@@ -80,10 +80,22 @@ const MUTATING_ACTIONS: &[&str] = &[
     "TerminateJob",
     "TagResource",
     "UntagResource",
+    "CreateConsumableResource",
+    "UpdateConsumableResource",
+    "DeleteConsumableResource",
+    "CreateServiceEnvironment",
+    "UpdateServiceEnvironment",
+    "DeleteServiceEnvironment",
+    "CreateQuotaShare",
+    "UpdateQuotaShare",
+    "DeleteQuotaShare",
+    "SubmitServiceJob",
+    "TerminateServiceJob",
+    "UpdateServiceJob",
 ];
 
 pub struct BatchService {
-    state: SharedBatchState,
+    pub(crate) state: SharedBatchState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
     /// ECS backend so a submitted job runs as a REAL container (the wedge:
@@ -284,24 +296,46 @@ impl BatchService {
             "TagResource" => self.tag_resource(req),
             "UntagResource" => self.untag_resource(req),
             "ListTagsForResource" => self.list_tags_for_resource(req),
+            "CreateConsumableResource" => self.create_consumable_resource(req),
+            "DescribeConsumableResource" => self.describe_consumable_resource(req),
+            "ListConsumableResources" => self.list_consumable_resources(req),
+            "UpdateConsumableResource" => self.update_consumable_resource(req),
+            "DeleteConsumableResource" => self.delete_consumable_resource(req),
+            "ListJobsByConsumableResource" => self.list_jobs_by_consumable_resource(req),
+            "CreateServiceEnvironment" => self.create_service_environment(req),
+            "DescribeServiceEnvironments" => self.describe_service_environments(req),
+            "UpdateServiceEnvironment" => self.update_service_environment(req),
+            "DeleteServiceEnvironment" => self.delete_service_environment(req),
+            "CreateQuotaShare" => self.create_quota_share(req),
+            "DescribeQuotaShare" => self.describe_quota_share(req),
+            "ListQuotaShares" => self.list_quota_shares(req),
+            "UpdateQuotaShare" => self.update_quota_share(req),
+            "DeleteQuotaShare" => self.delete_quota_share(req),
+            "SubmitServiceJob" => self.submit_service_job(req),
+            "DescribeServiceJob" => self.describe_service_job(req),
+            "ListServiceJobs" => self.list_service_jobs(req),
+            "TerminateServiceJob" => self.terminate_service_job(req),
+            "UpdateServiceJob" => self.update_service_job(req),
+            "GetJobQueueSnapshot" => self.get_job_queue_snapshot(req),
             other => Err(AwsServiceError::action_not_implemented("batch", other)),
         }
     }
 }
 
-fn obj(v: &Value) -> Map<String, Value> {
+pub(crate) fn obj(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
 
-fn client_error(code: &str, msg: impl Into<String>) -> AwsServiceError {
+pub(crate) fn client_error(code: &str, msg: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, code, msg.into())
 }
 
-type TagStore = std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+pub(crate) type TagStore =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
 
 /// Seed the authoritative per-ARN tag store from a resource's inline `tags`
 /// (what Create receives), so `ListTagsForResource` reflects create-time tags.
-fn seed_inline_tags(tags: &mut TagStore, arn: &str, stored: &Map<String, Value>) {
+pub(crate) fn seed_inline_tags(tags: &mut TagStore, arn: &str, stored: &Map<String, Value>) {
     if let Some(inline) = stored.get("tags").and_then(Value::as_object) {
         let entry = tags.entry(arn.to_string()).or_default();
         for (k, v) in inline {
@@ -482,6 +516,23 @@ impl BatchService {
 
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
+        // A service queue's type is the type its service environments share.
+        if let Some(kind) = crate::extended::validate_service_environment_order(Some(st), &body)? {
+            match stored.get("jobQueueType").and_then(Value::as_str) {
+                Some(t) if t != kind => {
+                    return Err(client_error(
+                        "ClientException",
+                        format!(
+                            "jobQueueType {t} does not match the service environment type {kind}"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    stored.insert("jobQueueType".into(), json!(kind));
+                }
+            }
+        }
         if st.job_queues.contains_key(&name) {
             return Err(client_error(
                 "ClientException",
@@ -670,10 +721,67 @@ impl BatchService {
         let name = arn_or_name(&body, "jobQueue")?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
+        let stored = st
+            .job_queues
+            .get(&name)
+            .ok_or_else(|| client_error("ClientException", format!("Object not found: {name}")))?;
+        let current_type = stored
+            .get("jobQueueType")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Validate the queue as it will be after the update, not just the
+        // request: a compute queue can't gain a serviceEnvironmentOrder (and
+        // vice versa) by sending only one of the two lists.
+        let non_empty =
+            |v: Option<&Value>| v.and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        let was_service_queue = non_empty(stored.get("serviceEnvironmentOrder"));
+        let mut new_type = None;
+        let mut clear_type = false;
+        if body.get("serviceEnvironmentOrder").is_some()
+            || body.get("computeEnvironmentOrder").is_some()
+        {
+            let pick = |key: &str| {
+                body.get(key)
+                    .or_else(|| stored.get(key))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let effective = json!({
+                "computeEnvironmentOrder": pick("computeEnvironmentOrder"),
+                "serviceEnvironmentOrder": pick("serviceEnvironmentOrder"),
+            });
+            let kind = crate::extended::validate_service_environment_order(Some(st), &effective)?;
+            match (kind.as_deref(), current_type.as_deref()) {
+                (Some(k), Some(c)) if k != c => {
+                    return Err(client_error(
+                        "ClientException",
+                        format!(
+                            "Service environment type {k} does not match the job queue type {c}"
+                        ),
+                    ));
+                }
+                (Some(k), None) => new_type = Some(k.to_string()),
+                // A service queue switched to a compute order is no longer a
+                // service queue: drop the service environment type it took.
+                (None, Some(_))
+                    if was_service_queue && non_empty(effective.get("computeEnvironmentOrder")) =>
+                {
+                    clear_type = true;
+                }
+                _ => {}
+            }
+        }
         let q = st
             .job_queues
             .get_mut(&name)
             .ok_or_else(|| client_error("ClientException", format!("Object not found: {name}")))?;
+        if let Some(o) = q.as_object_mut() {
+            if let Some(t) = new_type {
+                o.insert("jobQueueType".into(), json!(t));
+            } else if clear_type {
+                o.remove("jobQueueType");
+            }
+        }
         let arn = merge_updates(
             q,
             &body,
@@ -681,6 +789,7 @@ impl BatchService {
                 "state",
                 "priority",
                 "computeEnvironmentOrder",
+                "serviceEnvironmentOrder",
                 "schedulingPolicyArn",
                 "jobStateTimeLimitActions",
             ],
@@ -771,7 +880,7 @@ impl BatchService {
             .scheduling_policies
             .get_mut(&name)
             .ok_or_else(|| client_error("ClientException", format!("Object not found: {name}")))?;
-        merge_updates(p, &body, &["fairsharePolicy"], "arn");
+        merge_updates(p, &body, &["fairsharePolicy", "quotaSharePolicy"], "arn");
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -851,6 +960,23 @@ impl BatchService {
             })
             .unwrap_or_default();
 
+        // Consumable resources the job needs: the submit-time override, else
+        // the job definition's. Every referenced resource must exist.
+        let consumables = body
+            .get("consumableResourcePropertiesOverride")
+            .cloned()
+            .or_else(|| {
+                self.job_definition_field(
+                    &req.account_id,
+                    &job_definition,
+                    "consumableResourceProperties",
+                )
+            });
+        if let Some(props) = &consumables {
+            let accounts = self.state.read();
+            crate::extended::validate_job_consumables(accounts.get(&req.account_id), props)?;
+        }
+
         let mut job = obj(&body);
         job.insert("jobId".into(), json!(job_id));
         job.insert("jobArn".into(), json!(arn));
@@ -858,6 +984,9 @@ impl BatchService {
         job.insert("jobQueue".into(), json!(job_queue));
         job.insert("jobDefinition".into(), json!(job_definition));
         job.insert("createdAt".into(), json!(now));
+        if let Some(props) = &consumables {
+            job.insert("consumableResourceProperties".into(), props.clone());
+        }
 
         // Resolve the job definition's container properties (+ this submit's
         // containerOverrides) so the job runs the right image/command.
@@ -892,6 +1021,9 @@ impl BatchService {
                     "arrayProperties".into(),
                     json!({ "index": index, "statusSummary": {} }),
                 );
+                if let Some(props) = &consumables {
+                    child.insert("consumableResourceProperties".into(), props.clone());
+                }
                 {
                     let mut accounts = self.state.write();
                     accounts
@@ -983,10 +1115,37 @@ impl BatchService {
         .await;
     }
 
+    /// Read one top-level field of the job definition a job references
+    /// (`name:revision`, bare name -> latest revision, or ARN).
+    fn job_definition_field(
+        &self,
+        account_id: &str,
+        job_definition: &str,
+        field: &str,
+    ) -> Option<Value> {
+        let key = job_definition.rsplit('/').next().unwrap_or(job_definition);
+        let accounts = self.state.read();
+        let st = accounts.get(account_id)?;
+        let jd = if key.contains(':') {
+            st.job_definitions.get(key)
+        } else {
+            st.job_definitions
+                .iter()
+                .filter(|(k, _)| k.rsplit_once(':').map(|(n, _)| n) == Some(key))
+                .max_by_key(|(k, _)| {
+                    k.rsplit_once(':')
+                        .and_then(|(_, r)| r.parse::<i64>().ok())
+                        .unwrap_or(0)
+                })
+                .map(|(_, v)| v)
+        }?;
+        jd.get(field).filter(|v| !v.is_null()).cloned()
+    }
+
     /// Resolve `containerProperties` from the stored job definition (by
     /// `name:revision`, bare name -> latest, or ARN), then overlay this
     /// submit's `containerOverrides` (command / environment / resourceRequirements).
-    fn resolve_container(
+    pub(crate) fn resolve_container(
         &self,
         account_id: &str,
         job_definition: &str,
@@ -1328,6 +1487,129 @@ async fn launch(
     if container.get("image").and_then(Value::as_str).is_none() {
         return;
     }
+    // Consumable resources gate dispatch: a job whose requirements don't fit
+    // right now waits at RUNNABLE until capacity is returned.
+    let admission = {
+        let mut accounts = ctx.batch_state.write();
+        crate::extended::admit_job(accounts.get_or_create(account), job_id)
+    };
+    if let crate::extended::Admission::Wait = admission {
+        spawn_consumable_waiter(
+            ctx.clone(),
+            account.to_string(),
+            region.to_string(),
+            request_id.to_string(),
+            job_id.to_string(),
+            job_name.to_string(),
+            container,
+            now,
+        );
+        return;
+    }
+    launch_now(
+        ctx, ecs_state, account, region, request_id, job_id, job_name, container, now,
+    )
+    .await;
+}
+
+/// Admit a retrying job's consumable resources, waiting at RUNNABLE until
+/// they fit. Returns false when the job left RUNNABLE meanwhile (cancelled,
+/// terminated) or is gone, so the retry must not relaunch.
+pub(crate) async fn wait_for_retry_admission(
+    batch_state: &SharedBatchState,
+    account_id: &str,
+    job_id: &str,
+) -> bool {
+    loop {
+        {
+            let mut accounts = batch_state.write();
+            let st = accounts.get_or_create(account_id);
+            let runnable = st
+                .jobs
+                .get(job_id)
+                .and_then(|j| j.get("status"))
+                .and_then(Value::as_str)
+                == Some("RUNNABLE");
+            if !runnable {
+                return false;
+            }
+            if let crate::extended::Admission::Admitted = crate::extended::admit_job(st, job_id) {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Wait (at RUNNABLE) until a job's consumable resources fit, then launch it.
+/// Exits as soon as the job leaves RUNNABLE (cancelled/terminated) or is gone.
+#[allow(clippy::too_many_arguments)]
+fn spawn_consumable_waiter(
+    ctx: LaunchCtx,
+    account: String,
+    region: String,
+    request_id: String,
+    job_id: String,
+    job_name: String,
+    container: Value,
+    now: i64,
+) {
+    let Some(ecs_state) = ctx.ecs_state.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let admitted = {
+                let mut accounts = ctx.batch_state.write();
+                let st = accounts.get_or_create(&account);
+                let runnable = st
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|j| j.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("RUNNABLE");
+                if !runnable {
+                    return;
+                }
+                matches!(
+                    crate::extended::admit_job(st, &job_id),
+                    crate::extended::Admission::Admitted
+                )
+            };
+            if admitted {
+                launch_now(
+                    &ctx,
+                    ecs_state,
+                    &account,
+                    &region,
+                    &request_id,
+                    &job_id,
+                    &job_name,
+                    container,
+                    now,
+                )
+                .await;
+                save_snapshot_now(&ctx.batch_state, &ctx.snapshot_store, &ctx.snapshot_lock).await;
+                return;
+            }
+        }
+    });
+}
+
+/// Launch the job's ECS task now (admission already granted).
+#[allow(clippy::too_many_arguments)]
+async fn launch_now(
+    ctx: &LaunchCtx,
+    ecs_state: fakecloud_ecs::SharedEcsState,
+    account: &str,
+    region: &str,
+    request_id: &str,
+    job_id: &str,
+    job_name: &str,
+    container: Value,
+    now: i64,
+) {
     let src = bare_request(account, region, request_id);
     match launch_ecs_task(
         &ecs_state,
@@ -1662,6 +1944,13 @@ fn spawn_status_sync(
                     }
                 }
                 save_snapshot_now(&batch_state, &snapshot_store, &snapshot_lock).await;
+                // The retry re-enters dispatch: its consumable resources were
+                // released when the attempt failed, so it must be admitted
+                // again (atomically with the other waiters) before relaunch,
+                // and waits at RUNNABLE while capacity is held by others.
+                if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await {
+                    break;
+                }
                 match launch_ecs_task(
                     &ecs_state,
                     &ecs_runtime,
@@ -1807,7 +2096,7 @@ fn parse_body(resp: &AwsResponse) -> Value {
 
 /// Resolve (vcpus, memoryMiB) from Batch container properties — either the
 /// legacy `vcpus`/`memory` fields or the modern `resourceRequirements` list.
-fn container_resources(container: &Value) -> (f64, i64) {
+pub(crate) fn container_resources(container: &Value) -> (f64, i64) {
     let mut vcpus = container
         .get("vcpus")
         .and_then(Value::as_f64)
@@ -1913,7 +2202,7 @@ fn array_status_summary(children: &[&Value]) -> (Value, &'static str) {
 }
 
 /// Read a JSON string array into a set of owned strings.
-fn string_set(body: &Value, key: &str) -> std::collections::HashSet<String> {
+pub(crate) fn string_set(body: &Value, key: &str) -> std::collections::HashSet<String> {
     body.get(key)
         .and_then(Value::as_array)
         .map(|a| {
@@ -1942,7 +2231,7 @@ fn match_named(
 
 /// Resolve a delete/describe identifier that may be a name or an ARN to the
 /// store key (the resource name = last ARN path segment).
-fn arn_or_name(body: &Value, key: &str) -> Result<String, AwsServiceError> {
+pub(crate) fn arn_or_name(body: &Value, key: &str) -> Result<String, AwsServiceError> {
     let raw = body
         .get(key)
         .and_then(Value::as_str)
@@ -2127,21 +2416,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_op_errors_not_fakes() {
+    async fn every_supported_action_is_dispatched() {
         let s = svc();
-        // CreateConsumableResource is not yet implemented (a later batch); it
-        // must return a faithful 501, never a fake success.
-        let err = match s
-            .handle(req(
-                "/v1/createconsumableresource",
-                json!({"consumableResourceName": "r"}),
-            ))
-            .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("unimplemented op must not fake-succeed"),
-        };
-        assert_eq!(err.status(), StatusCode::NOT_IMPLEMENTED);
+        // No supported action may fall through to a not-implemented error: each
+        // either works or fails with a modelled ClientException.
+        for action in SUPPORTED_ACTIONS {
+            if matches!(
+                *action,
+                "SubmitJob" | "TagResource" | "UntagResource" | "ListTagsForResource"
+            ) {
+                continue;
+            }
+            let path = format!("/v1/{}", action.to_ascii_lowercase());
+            if let Err(e) = s.handle(req(&path, json!({}))).await {
+                assert_ne!(
+                    e.status(),
+                    StatusCode::NOT_IMPLEMENTED,
+                    "{action} is not implemented"
+                );
+            }
+        }
     }
 
     #[tokio::test]

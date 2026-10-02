@@ -53,6 +53,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         st.ml_transforms.insert(id.clone(), stored);
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "mlTransform", &id),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "TransformId": id })))
     }
 
@@ -119,10 +123,27 @@ impl GlueService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let ids: Vec<String> = accounts
             .get(&req.account_id)
-            .map(|s| s.ml_transforms.keys().cloned().collect())
+            .map(|s| {
+                s.ml_transforms
+                    .keys()
+                    .filter(|k| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "mlTransform",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "TransformIds": ids })))
     }
@@ -157,6 +178,12 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut st.ml_transforms, &id, "MLTransform")?;
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "mlTransform",
+            &id,
+        ));
         Ok(AwsResponse::ok_json(json!({ "TransformId": id })))
     }
 
@@ -300,6 +327,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.dq_rulesets, &name, stored, "DataQualityRuleset")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "dataQualityRuleset", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -351,6 +382,12 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut st.dq_rulesets, &name, "DataQualityRuleset")?;
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "dataQualityRuleset",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -358,12 +395,25 @@ impl GlueService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let list: Vec<Value> = accounts
             .get(&req.account_id)
             .map(|s| {
                 s.dq_rulesets
-                    .values()
+                    .iter()
+                    .filter(|(k, _)| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "dataQualityRuleset",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .map(|(_, r)| r)
                     .map(|r| {
                         json!({
                             "Name": r.get("Name").cloned().unwrap_or(Value::Null),

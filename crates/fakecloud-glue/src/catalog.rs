@@ -5,9 +5,32 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
-use crate::common::{entity_not_found, missing, now_ts, req_present, req_str};
+use crate::common::{entity_not_found, missing, now_ts, req_present, req_str, resource_arn};
 use crate::generic;
 use crate::service::GlueService;
+
+/// `CatalogInput` members that `Catalog` echoes back verbatim on reads.
+/// `OverwriteChildResourcePermissionsWithDefault` is an input-only directive
+/// (it acts on child resources) and is not part of the `Catalog` output.
+const CATALOG_INPUT_FIELDS: &[&str] = &[
+    "Description",
+    "Parameters",
+    "FederatedCatalog",
+    "TargetRedshiftCatalog",
+    "CatalogProperties",
+    "CreateTableDefaultPermissions",
+    "CreateDatabaseDefaultPermissions",
+    "AllowFullTableExternalDataAccess",
+];
+
+/// Merge the non-null members of a `CatalogInput` into a stored catalog.
+fn apply_catalog_input(catalog: &mut Value, input: &Value) {
+    for f in CATALOG_INPUT_FIELDS {
+        if let Some(v) = input.get(*f).filter(|v| !v.is_null()) {
+            catalog[*f] = v.clone();
+        }
+    }
+}
 
 impl GlueService {
     // --- catalogs ---
@@ -17,15 +40,17 @@ impl GlueService {
         let name = req_str(&body, "Name")?.to_string();
         let input = req_present(&body, "CatalogInput")?;
         let now = now_ts();
-        let catalog = json!({
-            "CatalogId": name, "Name": name,
-            "Description": input.get("Description").cloned().unwrap_or(Value::Null),
+        let arn = resource_arn(&req.region, &req.account_id, "catalog", &name);
+        let mut catalog = json!({
+            "CatalogId": name, "Name": name, "ResourceArn": arn,
             "Parameters": input.get("Parameters").cloned().unwrap_or(json!({})),
             "CreateTime": now, "UpdateTime": now,
         });
+        apply_catalog_input(&mut catalog, input);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.catalogs, &name, catalog, "Catalog")?;
+        st.put_create_tags(&arn, &body);
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -53,17 +78,14 @@ impl GlueService {
         let body = req.json_body();
         let id = req_str(&body, "CatalogId")?.to_string();
         let input = req_present(&body, "CatalogInput")?;
-        let mut updates: Vec<(&str, Value)> = vec![("UpdateTime", json!(now_ts()))];
-        for f in ["Description", "Parameters"] {
-            if let Some(v) = input.get(f) {
-                if !v.is_null() {
-                    updates.push((f, v.clone()));
-                }
-            }
-        }
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
-        generic::update_merge(&mut st.catalogs, &id, "Catalog", updates)?;
+        let catalog = st
+            .catalogs
+            .get_mut(&id)
+            .ok_or_else(|| entity_not_found(format!("Catalog {id} not found")))?;
+        apply_catalog_input(catalog, input);
+        catalog["UpdateTime"] = json!(now_ts());
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -73,6 +95,7 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut st.catalogs, &id, "Catalog")?;
+        st.remove_tags(&resource_arn(&req.region, &req.account_id, "catalog", &id));
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -97,6 +120,8 @@ impl GlueService {
             stored,
             "CustomEntityType",
         )?;
+        let arn = resource_arn(&req.region, &req.account_id, "customEntityType", &name);
+        st.put_create_tags(&arn, &body);
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -123,6 +148,12 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::delete(&mut st.custom_entity_types, &name, "CustomEntityType")?;
+        st.remove_tags(&resource_arn(
+            &req.region,
+            &req.account_id,
+            "customEntityType",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -130,10 +161,22 @@ impl GlueService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let list: Vec<Value> = accounts
             .get(&req.account_id)
-            .map(|s| s.custom_entity_types.values().cloned().collect())
+            .map(|s| {
+                s.custom_entity_types
+                    .iter()
+                    .filter(|(k, _)| {
+                        s.matches_tag_filter(
+                            &resource_arn(&req.region, &req.account_id, "customEntityType", k),
+                            &body,
+                        )
+                    })
+                    .map(|(_, v)| v.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "CustomEntityTypes": list })))
     }
@@ -295,6 +338,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.usage_profiles, &name, stored, "UsageProfile")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "usageProfile", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -342,6 +389,12 @@ impl GlueService {
         let st = accounts.get_or_create(&req.account_id, &req.region);
         // DeleteUsageProfile does not declare EntityNotFoundException; idempotent.
         st.usage_profiles.remove(&name);
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "usageProfile",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({})))
     }
 

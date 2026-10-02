@@ -179,6 +179,8 @@ impl AthenaService {
             total_execution_time_ms: 2,
             result_rows: rows,
             result_columns: columns,
+            result_reuse_configuration: body.get("ResultReuseConfiguration").cloned(),
+            execution_parameters: body.get("ExecutionParameters").cloned(),
         };
         account.query_executions.insert(id.clone(), qe);
         Ok(AwsResponse::ok_json(json!({ "QueryExecutionId": id })))

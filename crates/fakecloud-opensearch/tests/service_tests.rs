@@ -1136,6 +1136,83 @@ async fn create_application_returns_create_shape() {
 }
 
 #[tokio::test]
+async fn application_create_tags_are_listed_and_mutable_via_tag_apis() {
+    let svc = service();
+    let v = json_of(
+        &call(
+            &svc,
+            req(
+                Method::POST,
+                &format!("{OS}/opensearch/application"),
+                json!({"name": "tagapp", "tagList": [{"Key": "env", "Value": "dev"}]}),
+            ),
+        )
+        .await,
+    );
+    let arn = v["arn"].as_str().unwrap().to_string();
+    let id = v["id"].as_str().unwrap().to_string();
+    let listed = json_of(
+        &call(
+            &svc,
+            with_query(
+                req(Method::GET, &format!("{OS}/tags"), json!({})),
+                "arn",
+                &arn,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(listed["TagList"], json!([{"Key": "env", "Value": "dev"}]));
+
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("{OS}/tags"),
+            json!({"ARN": arn, "TagList": [{"Key": "team", "Value": "search"}]}),
+        ),
+    )
+    .await;
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("{OS}/tags-removal"),
+            json!({"ARN": arn, "TagKeys": ["env"]}),
+        ),
+    )
+    .await;
+    let listed = json_of(
+        &call(
+            &svc,
+            with_query(
+                req(Method::GET, &format!("{OS}/tags"), json!({})),
+                "arn",
+                &arn,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        listed["TagList"],
+        json!([{"Key": "team", "Value": "search"}])
+    );
+    // GetApplication renders the same tag set.
+    let got = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/application/{id}"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(got["tagList"], json!([{"Key": "team", "Value": "search"}]));
+}
+
+#[tokio::test]
 async fn purchase_reserved_instance_uses_api_specific_field() {
     let svc = service();
     let os = json_of(

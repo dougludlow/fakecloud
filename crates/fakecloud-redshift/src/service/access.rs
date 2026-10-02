@@ -11,8 +11,9 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use super::helpers::*;
 use super::RedshiftService;
 use crate::state::{
-    AuthenticationProfile, CustomDomainAssociation, DataShare, EndpointAccess,
-    EndpointAuthorization, Integration, Partner, RedshiftIdcApplication, ReservedNode,
+    AuthenticationProfile, AuthorizedTokenIssuer, CustomDomainAssociation, DataShare,
+    EndpointAccess, EndpointAuthorization, Integration, Partner, RedshiftIdcApplication,
+    ReservedNode, ServiceIntegration,
 };
 
 fn render_endpoint(e: &EndpointAccess) -> String {
@@ -100,7 +101,7 @@ fn render_integration(i: &Integration) -> String {
     format!(
         "<IntegrationArn>{arn}</IntegrationArn><IntegrationName>{name}</IntegrationName>\
          <SourceArn>{source}</SourceArn><TargetArn>{target}</TargetArn><Status>{status}</Status>\
-         <CreateTime>{created}</CreateTime>{desc}{kms}{tags}",
+         <CreateTime>{created}</CreateTime>{desc}{kms}{context}{tags}",
         arn = xml_escape(&i.integration_arn),
         name = xml_escape(&i.integration_name),
         source = xml_escape(&i.source_arn),
@@ -109,16 +110,93 @@ fn render_integration(i: &Integration) -> String {
         created = i.create_time.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
         desc = opt_elem("Description", i.description.as_deref()),
         kms = opt_elem("KMSKeyId", i.kms_key_id.as_deref()),
+        context = render_encryption_context(&i.additional_encryption_context),
         tags = render_tags(&i.tags),
     )
 }
 
+/// `<AdditionalEncryptionContext>` map entries; omitted when empty.
+fn render_encryption_context(context: &std::collections::BTreeMap<String, String>) -> String {
+    if context.is_empty() {
+        return String::new();
+    }
+    let entries: String = context
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "<entry><key>{}</key><value>{}</value></entry>",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect();
+    format!("<AdditionalEncryptionContext>{entries}</AdditionalEncryptionContext>")
+}
+
+/// Parse `AdditionalEncryptionContext.entry.N.{key,value}`.
+fn parse_encryption_context(req: &AwsRequest) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for n in 1.. {
+        let Some(k) = param(req, &format!("AdditionalEncryptionContext.entry.{n}.key")) else {
+            break;
+        };
+        let v =
+            param(req, &format!("AdditionalEncryptionContext.entry.{n}.value")).unwrap_or_default();
+        out.insert(k, v);
+    }
+    out
+}
+
 fn render_idc_application(a: &RedshiftIdcApplication) -> String {
+    let issuers: String = a
+        .authorized_token_issuer_list
+        .iter()
+        .map(|i| {
+            let audiences: String = i
+                .authorized_audiences
+                .iter()
+                .map(|aud| format!("<member>{}</member>", xml_escape(aud)))
+                .collect();
+            format!(
+                "<member>{arn}<AuthorizedAudiencesList>{audiences}</AuthorizedAudiencesList></member>",
+                arn = opt_elem("TrustedTokenIssuerArn", i.trusted_token_issuer_arn.as_deref()),
+            )
+        })
+        .collect();
+    let integrations: String = a
+        .service_integrations
+        .iter()
+        .filter_map(|si| {
+            let scope = service_integration_scope(&si.service)?;
+            let scopes: String = si
+                .scope_authorizations
+                .iter()
+                .map(|auth| {
+                    format!(
+                        "<member><{scope}><Authorization>{}</Authorization></{scope}></member>",
+                        xml_escape(auth)
+                    )
+                })
+                .collect();
+            Some(format!(
+                "<member><{svc}>{scopes}</{svc}></member>",
+                svc = si.service
+            ))
+        })
+        .collect();
+    let sso_keys: String = a
+        .sso_tag_keys
+        .iter()
+        .map(|k| format!("<TagKey>{}</TagKey>", xml_escape(k)))
+        .collect();
     format!(
         "<RedshiftIdcApplicationName>{name}</RedshiftIdcApplicationName>\
          <RedshiftIdcApplicationArn>{arn}</RedshiftIdcApplicationArn>{namespace}\
          <IdcInstanceArn>{instance}</IdcInstanceArn><IdcDisplayName>{display}</IdcDisplayName>\
-         <IamRoleArn>{iam}</IamRoleArn><IdcManagedApplicationArn>{managed}</IdcManagedApplicationArn>",
+         <IamRoleArn>{iam}</IamRoleArn><IdcManagedApplicationArn>{managed}</IdcManagedApplicationArn>\
+         <AuthorizedTokenIssuerList>{issuers}</AuthorizedTokenIssuerList>\
+         <ServiceIntegrations>{integrations}</ServiceIntegrations>{app_type}{tags}\
+         <SsoTagKeys>{sso_keys}</SsoTagKeys>",
         name = xml_escape(&a.redshift_idc_application_name),
         arn = xml_escape(&a.redshift_idc_application_arn),
         namespace = opt_elem("IdentityNamespace", a.identity_namespace.as_deref()),
@@ -126,7 +204,91 @@ fn render_idc_application(a: &RedshiftIdcApplication) -> String {
         display = xml_escape(&a.idc_display_name),
         iam = xml_escape(&a.iam_role_arn),
         managed = xml_escape(&a.idc_managed_application_arn),
+        app_type = opt_elem("ApplicationType", a.application_type.as_deref()),
+        tags = render_tags(&a.tags),
     )
+}
+
+/// The single scope variant each `ServiceIntegrationsUnion` member carries.
+fn service_integration_scope(service: &str) -> Option<&'static str> {
+    match service {
+        "LakeFormation" => Some("LakeFormationQuery"),
+        "S3AccessGrants" => Some("ReadWriteAccess"),
+        "Redshift" => Some("Connect"),
+        _ => None,
+    }
+}
+
+/// Parse `AuthorizedTokenIssuerList.member.N.{TrustedTokenIssuerArn,
+/// AuthorizedAudiencesList.member.M}`. `None` when the request carries no
+/// list at all; an explicitly empty list (`AuthorizedTokenIssuerList=`)
+/// is `Some(vec![])`.
+fn parse_authorized_token_issuers(req: &AwsRequest) -> Option<Vec<AuthorizedTokenIssuer>> {
+    let mut out = Vec::new();
+    for n in 1.. {
+        let base = format!("AuthorizedTokenIssuerList.member.{n}");
+        let arn = param(req, &format!("{base}.TrustedTokenIssuerArn"));
+        let audiences = member_list(req, &format!("{base}.AuthorizedAudiencesList"), "member");
+        let present = arn.is_some()
+            || !audiences.is_empty()
+            || req
+                .query_params
+                .keys()
+                .any(|k| k.starts_with(&format!("{base}.")));
+        if !present {
+            break;
+        }
+        out.push(AuthorizedTokenIssuer {
+            trusted_token_issuer_arn: arn,
+            authorized_audiences: audiences,
+        });
+    }
+    if out.is_empty() && !req.query_params.contains_key("AuthorizedTokenIssuerList") {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse `ServiceIntegrations.member.N.<Service>.member.M.<Scope>.Authorization`.
+/// `None` when the request carries no list; an explicitly empty list is
+/// `Some(vec![])`.
+fn parse_service_integrations(req: &AwsRequest) -> Option<Vec<ServiceIntegration>> {
+    let mut out = Vec::new();
+    for n in 1.. {
+        let base = format!("ServiceIntegrations.member.{n}");
+        let found = ["LakeFormation", "S3AccessGrants", "Redshift"]
+            .into_iter()
+            .find_map(|service| {
+                let scope = service_integration_scope(service)?;
+                let prefix = format!("{base}.{service}");
+                if !req
+                    .query_params
+                    .keys()
+                    .any(|k| k == &prefix || k.starts_with(&format!("{prefix}.")))
+                {
+                    return None;
+                }
+                let mut auths = Vec::new();
+                for m in 1.. {
+                    match param(req, &format!("{prefix}.member.{m}.{scope}.Authorization")) {
+                        Some(a) => auths.push(a),
+                        None => break,
+                    }
+                }
+                Some(ServiceIntegration {
+                    service: service.to_string(),
+                    scope_authorizations: auths,
+                })
+            });
+        match found {
+            Some(si) => out.push(si),
+            None => break,
+        }
+    }
+    if out.is_empty() && !req.query_params.contains_key("ServiceIntegrations") {
+        return None;
+    }
+    Some(out)
 }
 
 fn render_custom_domain(c: &CustomDomainAssociation) -> String {
@@ -887,7 +1049,8 @@ impl RedshiftService {
             create_time: Utc::now(),
             description: param(req, "Description"),
             kms_key_id: param(req, "KMSKeyId"),
-            tags: parse_tags(req),
+            additional_encryption_context: parse_encryption_context(req),
+            tags: parse_tags_at(req, "TagList"),
         };
         acct.integrations.insert(arn, integ.clone());
         Ok(xml_resp(
@@ -1015,8 +1178,11 @@ impl RedshiftService {
                 "application/fakecloud",
             )
             .to_string(),
-            authorized_token_issuer_list: Vec::new(),
-            service_integrations: Vec::new(),
+            authorized_token_issuer_list: parse_authorized_token_issuers(req).unwrap_or_default(),
+            service_integrations: parse_service_integrations(req).unwrap_or_default(),
+            application_type: param(req, "ApplicationType"),
+            tags: parse_tags(req),
+            sso_tag_keys: member_list(req, "SsoTagKeys", "TagKey"),
         };
         acct.idc_applications.insert(arn, app.clone());
         Ok(xml_resp(
@@ -1085,6 +1251,12 @@ impl RedshiftService {
         }
         if let Some(v) = param(req, "IdentityNamespace") {
             app.identity_namespace = Some(v);
+        }
+        if let Some(v) = parse_authorized_token_issuers(req) {
+            app.authorized_token_issuer_list = v;
+        }
+        if let Some(v) = parse_service_integrations(req) {
+            app.service_integrations = v;
         }
         Ok(xml_resp(
             "ModifyRedshiftIdcApplication",

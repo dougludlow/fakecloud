@@ -46,6 +46,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.triggers, &name, stored, "Trigger")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "trigger", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -70,10 +74,27 @@ impl GlueService {
     }
 
     pub(crate) fn list_triggers(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
         let accounts = self.state.read();
         let names: Vec<String> = accounts
             .get(&req.account_id)
-            .map(|s| s.triggers.keys().cloned().collect())
+            .map(|s| {
+                s.triggers
+                    .keys()
+                    .filter(|k| {
+                        s.matches_tag_filter(
+                            &crate::common::resource_arn(
+                                &req.region,
+                                &req.account_id,
+                                "trigger",
+                                k,
+                            ),
+                            &body,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "TriggerNames": names })))
     }
@@ -133,6 +154,12 @@ impl GlueService {
         let st = accounts.get_or_create(&req.account_id, &req.region);
         // DeleteTrigger does not declare EntityNotFoundException; idempotent.
         st.triggers.remove(&name);
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "trigger",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -195,6 +222,10 @@ impl GlueService {
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         generic::create_unique(&mut st.workflows, &name, stored, "Workflow")?;
+        st.put_create_tags(
+            &crate::common::resource_arn(&req.region, &req.account_id, "workflow", &name),
+            &body,
+        );
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 
@@ -266,6 +297,12 @@ impl GlueService {
         let st = accounts.get_or_create(&req.account_id, &req.region);
         // DeleteWorkflow does not declare EntityNotFoundException; idempotent.
         st.workflows.remove(&name);
+        st.remove_tags(&crate::common::resource_arn(
+            &req.region,
+            &req.account_id,
+            "workflow",
+            &name,
+        ));
         Ok(AwsResponse::ok_json(json!({ "Name": name })))
     }
 

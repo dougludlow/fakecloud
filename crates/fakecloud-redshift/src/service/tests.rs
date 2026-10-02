@@ -1162,3 +1162,291 @@ fn reencrypting_a_customer_key_cluster_mints_nothing() {
         .get("123456789012")
         .is_none_or(|st| st.keys.is_empty()));
 }
+
+/// DescribeTags reported snapshots as `snapshot:<id>`, an ARN no other
+/// operation returns; it now reports the `snapshot:<cluster>/<id>` ARN
+/// that CreateClusterSnapshot returned, and CreateTags/DeleteTags act on
+/// exactly that ARN.
+#[test]
+fn snapshot_tags_use_the_snapshot_arn() {
+    let svc = service();
+    ok(
+        &svc,
+        "CreateCluster",
+        &[
+            ("ClusterIdentifier", "tagc"),
+            ("NodeType", "ra3.xlplus"),
+            ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Passw0rd123"),
+        ],
+    );
+    ok(
+        &svc,
+        "CreateClusterSnapshot",
+        &[("SnapshotIdentifier", "ts1"), ("ClusterIdentifier", "tagc")],
+    );
+    let arn = "arn:aws:redshift:us-east-1:123456789012:snapshot:tagc/ts1";
+    ok(
+        &svc,
+        "CreateTags",
+        &[
+            ("ResourceName", arn),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "data"),
+        ],
+    );
+    let listed = ok(&svc, "DescribeTags", &[("ResourceName", arn)]);
+    assert!(
+        listed.contains(&format!("<ResourceName>{arn}</ResourceName>")),
+        "{listed}"
+    );
+    assert!(listed.contains("<Key>team</Key>"), "{listed}");
+    assert!(listed.contains("<ResourceType>snapshot</ResourceType>"));
+
+    // The cluster-less form names no resource.
+    let bare = "arn:aws:redshift:us-east-1:123456789012:snapshot:ts1";
+    assert_eq!(
+        err_code(
+            &svc,
+            "CreateTags",
+            &[
+                ("ResourceName", bare),
+                ("Tags.Tag.1.Key", "k"),
+                ("Tags.Tag.1.Value", "v"),
+            ],
+        ),
+        "ResourceNotFoundFault"
+    );
+
+    // A copy gets its own ARN, so tagging the source leaves the copy alone.
+    let copy = ok(
+        &svc,
+        "CopyClusterSnapshot",
+        &[
+            ("SourceSnapshotIdentifier", "ts1"),
+            ("TargetSnapshotIdentifier", "ts2"),
+        ],
+    );
+    let copy_arn = "arn:aws:redshift:us-east-1:123456789012:snapshot:tagc/ts2";
+    assert!(copy.contains(copy_arn), "{copy}");
+
+    ok(
+        &svc,
+        "DeleteTags",
+        &[("ResourceName", arn), ("TagKeys.TagKey.1", "team")],
+    );
+    let listed = ok(&svc, "DescribeTags", &[("ResourceName", arn)]);
+    assert!(!listed.contains("<Key>team</Key>"), "{listed}");
+}
+
+/// DescribeTags' ResourceType filter takes AWS's documented display
+/// values ("Cluster", "Subnet group", ...) case-insensitively, as well as
+/// the ARN form it reports back.
+#[test]
+fn describe_tags_resource_type_matches_documented_values() {
+    let svc = service();
+    ok(
+        &svc,
+        "CreateCluster",
+        &[
+            ("ClusterIdentifier", "rtc"),
+            ("NodeType", "ra3.xlplus"),
+            ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Passw0rd123"),
+            ("Tags.Tag.1.Key", "on"),
+            ("Tags.Tag.1.Value", "cluster"),
+        ],
+    );
+    ok(
+        &svc,
+        "CreateClusterParameterGroup",
+        &[
+            ("ParameterGroupName", "rtpg"),
+            ("ParameterGroupFamily", "redshift-1.0"),
+            ("Description", "d"),
+            ("Tags.Tag.1.Key", "on"),
+            ("Tags.Tag.1.Value", "pg"),
+        ],
+    );
+    for value in ["Cluster", "cluster", "CLUSTER"] {
+        let listed = ok(&svc, "DescribeTags", &[("ResourceType", value)]);
+        assert!(
+            listed.contains("<Value>cluster</Value>"),
+            "{value}: {listed}"
+        );
+        assert!(!listed.contains("<Value>pg</Value>"), "{value}: {listed}");
+        assert!(listed.contains("<ResourceType>cluster</ResourceType>"));
+    }
+    for value in ["Parameter group", "parametergroup"] {
+        let listed = ok(&svc, "DescribeTags", &[("ResourceType", value)]);
+        assert!(listed.contains("<Value>pg</Value>"), "{value}: {listed}");
+        assert!(
+            !listed.contains("<Value>cluster</Value>"),
+            "{value}: {listed}"
+        );
+    }
+}
+
+/// Integrations were invisible to CreateTags/DescribeTags, and
+/// CreateIntegration dropped its `TagList` and
+/// `AdditionalEncryptionContext`.
+#[test]
+fn integration_tags_round_trip() {
+    let svc = service();
+    let created = ok(
+        &svc,
+        "CreateIntegration",
+        &[
+            ("IntegrationName", "zetl"),
+            (
+                "SourceArn",
+                "arn:aws:dynamodb:us-east-1:123456789012:table/t",
+            ),
+            (
+                "TargetArn",
+                "arn:aws:redshift:us-east-1:123456789012:namespace:ns",
+            ),
+            ("TagList.Tag.1.Key", "team"),
+            ("TagList.Tag.1.Value", "etl"),
+            ("AdditionalEncryptionContext.entry.1.key", "purpose"),
+            ("AdditionalEncryptionContext.entry.1.value", "zetl"),
+        ],
+    );
+    assert!(created.contains("<Key>team</Key>"), "{created}");
+    assert!(
+        created.contains("<entry><key>purpose</key><value>zetl</value></entry>"),
+        "{created}"
+    );
+    let start = created.find("<IntegrationArn>").unwrap() + "<IntegrationArn>".len();
+    let end = created.find("</IntegrationArn>").unwrap();
+    let arn = created[start..end].to_string();
+
+    ok(
+        &svc,
+        "CreateTags",
+        &[
+            ("ResourceName", &arn),
+            ("Tags.Tag.1.Key", "env"),
+            ("Tags.Tag.1.Value", "dev"),
+        ],
+    );
+    let listed = ok(&svc, "DescribeTags", &[("ResourceName", &arn)]);
+    assert!(listed.contains("<Key>team</Key>"), "{listed}");
+    assert!(listed.contains("<Key>env</Key>"), "{listed}");
+    assert!(listed.contains("<ResourceType>integration</ResourceType>"));
+
+    let described = ok(&svc, "DescribeIntegrations", &[("IntegrationArn", &arn)]);
+    assert!(described.contains("<Key>env</Key>"), "{described}");
+    assert!(described.contains("<key>purpose</key>"), "{described}");
+
+    ok(
+        &svc,
+        "DeleteTags",
+        &[("ResourceName", &arn), ("TagKeys.TagKey.1", "team")],
+    );
+    let listed = ok(&svc, "DescribeTags", &[("ResourceName", &arn)]);
+    assert!(!listed.contains("<Key>team</Key>"), "{listed}");
+}
+
+/// CreateRedshiftIdcApplication dropped Tags, ApplicationType,
+/// AuthorizedTokenIssuerList, ServiceIntegrations and SsoTagKeys.
+#[test]
+fn idc_application_create_fields_round_trip() {
+    let svc = service();
+    ok(
+        &svc,
+        "CreateRedshiftIdcApplication",
+        &[
+            (
+                "IdcInstanceArn",
+                "arn:aws:sso:::instance/ssoins-1111111111111111",
+            ),
+            ("RedshiftIdcApplicationName", "idcapp"),
+            ("IdcDisplayName", "Idc App"),
+            ("IamRoleArn", "arn:aws:iam::123456789012:role/idc"),
+            ("ApplicationType", "Lakehouse"),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "bi"),
+            ("SsoTagKeys.TagKey.1", "dept"),
+            (
+                "AuthorizedTokenIssuerList.member.1.TrustedTokenIssuerArn",
+                "arn:aws:sso::123456789012:trustedTokenIssuer/ssoins-1/tti-1",
+            ),
+            (
+                "AuthorizedTokenIssuerList.member.1.AuthorizedAudiencesList.member.1",
+                "aud-a",
+            ),
+            (
+                "ServiceIntegrations.member.1.LakeFormation.member.1.LakeFormationQuery.Authorization",
+                "ENABLED",
+            ),
+        ],
+    );
+    let listed = ok(&svc, "DescribeRedshiftIdcApplications", &[]);
+    assert!(
+        listed.contains("<ApplicationType>Lakehouse</ApplicationType>"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("<Tags><Tag><Key>team</Key><Value>bi</Value></Tag></Tags>"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("<SsoTagKeys><TagKey>dept</TagKey></SsoTagKeys>"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "<AuthorizedTokenIssuerList><member><TrustedTokenIssuerArn>\
+             arn:aws:sso::123456789012:trustedTokenIssuer/ssoins-1/tti-1\
+             </TrustedTokenIssuerArn><AuthorizedAudiencesList><member>aud-a</member>\
+             </AuthorizedAudiencesList></member></AuthorizedTokenIssuerList>"
+        ),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "<ServiceIntegrations><member><LakeFormation><member><LakeFormationQuery>\
+             <Authorization>ENABLED</Authorization></LakeFormationQuery></member>\
+             </LakeFormation></member></ServiceIntegrations>"
+        ),
+        "{listed}"
+    );
+
+    // ModifyRedshiftIdcApplication replaces the issuer list.
+    let start =
+        listed.find("<RedshiftIdcApplicationArn>").unwrap() + "<RedshiftIdcApplicationArn>".len();
+    let end = listed.find("</RedshiftIdcApplicationArn>").unwrap();
+    let arn = listed[start..end].to_string();
+    ok(
+        &svc,
+        "ModifyRedshiftIdcApplication",
+        &[
+            ("RedshiftIdcApplicationArn", &arn),
+            (
+                "AuthorizedTokenIssuerList.member.1.TrustedTokenIssuerArn",
+                "arn:aws:sso::123456789012:trustedTokenIssuer/ssoins-1/tti-2",
+            ),
+        ],
+    );
+    let listed = ok(&svc, "DescribeRedshiftIdcApplications", &[]);
+    assert!(
+        listed.contains("tti-2") && !listed.contains("tti-1"),
+        "{listed}"
+    );
+    // The other create-time fields survive a modify that does not name them.
+    assert!(listed.contains("<Authorization>ENABLED</Authorization>"));
+
+    // The application's ARN is taggable and listed by DescribeTags.
+    ok(
+        &svc,
+        "CreateTags",
+        &[
+            ("ResourceName", &arn),
+            ("Tags.Tag.1.Key", "env"),
+            ("Tags.Tag.1.Value", "prod"),
+        ],
+    );
+    let tags = ok(&svc, "DescribeTags", &[("ResourceName", &arn)]);
+    assert!(tags.contains("<Key>team</Key>") && tags.contains("<Key>env</Key>"));
+}

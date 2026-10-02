@@ -21,6 +21,7 @@ impl RdsService {
         // group; only when it's omitted does it inherit the source's group
         // (handled by the builder below).
         let db_subnet_group_name = optional_query_param(request, "DBSubnetGroupName");
+        let request_tags = parse_tags(request)?;
 
         let (source_instance, db_name) = {
             let mut accounts = self.state.write();
@@ -142,6 +143,10 @@ impl RdsService {
                     self.storage_kms_key(Some(&named), &request.account_id, &request.region);
             }
         }
+
+        // The replica is tagged with the request's tags; the builder
+        // starts it untagged.
+        replica.tags = request_tags;
 
         replica.db_instance_status = "creating".to_string();
         replica.endpoint_address = String::new();

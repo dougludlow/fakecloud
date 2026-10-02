@@ -39,6 +39,39 @@ pub struct AccountState {
     pub acme_accounts: BTreeMap<String, AcmeAccount>,
 }
 
+impl AccountState {
+    /// The tag set of any taggable ACM resource (certificate, ACME endpoint,
+    /// external account binding, or domain validation) by its ARN.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(c) = self.certificates.get(arn) {
+            return Some(&c.tags);
+        }
+        if let Some(e) = self.acme_endpoints.get(arn) {
+            return Some(&e.tags);
+        }
+        if let Some(b) = self.acme_bindings.get(arn) {
+            return Some(&b.tags);
+        }
+        self.acme_domain_validations.get(arn).map(|d| &d.tags)
+    }
+
+    /// Mutable counterpart of [`AccountState::resource_tags`].
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(c) = self.certificates.get_mut(arn) {
+            return Some(&mut c.tags);
+        }
+        if let Some(e) = self.acme_endpoints.get_mut(arn) {
+            return Some(&mut e.tags);
+        }
+        if let Some(b) = self.acme_bindings.get_mut(arn) {
+            return Some(&mut b.tags);
+        }
+        self.acme_domain_validations
+            .get_mut(arn)
+            .map(|d| &mut d.tags)
+    }
+}
+
 /// An ACME endpoint: the directory a client talks to, plus the CA it issues
 /// from.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -499,6 +499,35 @@ fn s3_destination_json(dest: &S3Destination) -> Value {
     })
 }
 
+/// Parse a `DeliveryStreamEncryptionConfigurationInput` (shared by
+/// CreateDeliveryStream and StartDeliveryStreamEncryption) into the ENABLED
+/// SSE config it requests. `KeyType` defaults to `AWS_OWNED_CMK`; a
+/// `CUSTOMER_MANAGED_CMK` requires `KeyARN`.
+fn parse_encryption_input(config: &Value) -> Result<EncryptionConfig, AwsServiceError> {
+    let key_type = config["KeyType"]
+        .as_str()
+        .unwrap_or("AWS_OWNED_CMK")
+        .to_string();
+    if key_type != "AWS_OWNED_CMK" && key_type != "CUSTOMER_MANAGED_CMK" {
+        return Err(invalid_argument(format!(
+            "KeyType must be AWS_OWNED_CMK or CUSTOMER_MANAGED_CMK, got {key_type}"
+        )));
+    }
+    let key_arn = if key_type == "CUSTOMER_MANAGED_CMK" {
+        let arn = config["KeyARN"].as_str().ok_or_else(|| {
+            invalid_argument("KeyARN is required when KeyType is CUSTOMER_MANAGED_CMK")
+        })?;
+        Some(arn.to_string())
+    } else {
+        None
+    };
+    Ok(EncryptionConfig {
+        status: "ENABLED".to_string(),
+        key_type: Some(key_type),
+        key_arn,
+    })
+}
+
 fn encryption_config_json(enc: &EncryptionConfig) -> Value {
     let mut v = json!({ "Status": enc.status });
     if let Some(kt) = &enc.key_type {
@@ -559,6 +588,13 @@ impl FirehoseService {
             }
         }
 
+        // Create-time SSE: same semantics as a follow-up
+        // StartDeliveryStreamEncryption.
+        let encryption = match &body["DeliveryStreamEncryptionConfigurationInput"] {
+            Value::Null => None,
+            config => Some(parse_encryption_input(config)?),
+        };
+
         let now = Utc::now();
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
@@ -581,7 +617,7 @@ impl FirehoseService {
             version_id: "1".to_string(),
             destination: s3_dest,
             tags: create_tags,
-            encryption: None,
+            encryption,
             extra_destinations,
         };
         streams.insert(name, stream);
@@ -983,24 +1019,8 @@ impl FirehoseService {
             .as_str()
             .ok_or_else(|| missing("DeliveryStreamName"))?;
 
-        let config = &body["DeliveryStreamEncryptionConfigurationInput"];
-        let key_type = config["KeyType"]
-            .as_str()
-            .unwrap_or("AWS_OWNED_CMK")
-            .to_string();
-        if key_type != "AWS_OWNED_CMK" && key_type != "CUSTOMER_MANAGED_CMK" {
-            return Err(invalid_argument(format!(
-                "KeyType must be AWS_OWNED_CMK or CUSTOMER_MANAGED_CMK, got {key_type}"
-            )));
-        }
-        let key_arn = if key_type == "CUSTOMER_MANAGED_CMK" {
-            let arn = config["KeyARN"].as_str().ok_or_else(|| {
-                invalid_argument("KeyARN is required when KeyType is CUSTOMER_MANAGED_CMK")
-            })?;
-            Some(arn.to_string())
-        } else {
-            None
-        };
+        let encryption =
+            parse_encryption_input(&body["DeliveryStreamEncryptionConfigurationInput"])?;
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
@@ -1008,11 +1028,7 @@ impl FirehoseService {
             .streams_mut(&req.region)
             .get_mut(name)
             .ok_or_else(|| not_found(name))?;
-        stream.encryption = Some(EncryptionConfig {
-            status: "ENABLED".to_string(),
-            key_type: Some(key_type),
-            key_arn,
-        });
+        stream.encryption = Some(encryption);
         stream.last_update = Utc::now();
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -1275,6 +1291,52 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         body["DeliveryStreamDescription"]["DeliveryStreamEncryptionConfiguration"].clone()
+    }
+
+    #[test]
+    fn create_with_encryption_input_reflected_in_describe() {
+        let svc = service();
+        let key = "arn:aws:kms:us-east-1:123456789012:key/abcd";
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "enc-at-create",
+                "DeliveryStreamEncryptionConfigurationInput": {
+                    "KeyType": "CUSTOMER_MANAGED_CMK",
+                    "KeyARN": key
+                }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            describe_encryption(&svc, "enc-at-create"),
+            json!({"Status": "ENABLED", "KeyType": "CUSTOMER_MANAGED_CMK", "KeyARN": key})
+        );
+
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "enc-default",
+                "DeliveryStreamEncryptionConfigurationInput": {}
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            describe_encryption(&svc, "enc-default"),
+            json!({"Status": "ENABLED", "KeyType": "AWS_OWNED_CMK"})
+        );
+
+        let err = svc
+            .create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "enc-bad",
+                    "DeliveryStreamEncryptionConfigurationInput": {"KeyType": "CUSTOMER_MANAGED_CMK"}
+                }),
+            ))
+            .err()
+            .expect("CUSTOMER_MANAGED_CMK without KeyARN is rejected");
+        assert_eq!(err.code(), "InvalidArgumentException");
     }
 
     #[test]

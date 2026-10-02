@@ -98,8 +98,14 @@ pub(crate) fn member_list(req: &AwsRequest, prefix: &str, alt: &str) -> Vec<Stri
 
 /// Parse `Tags.member.N.Key` / `.Value` into a tag list.
 pub(crate) fn parse_tags(req: &AwsRequest) -> Vec<Tag> {
+    parse_tags_at(req, "Tags")
+}
+
+/// Parse a tag list sent under `list` (`<list>.member.N.Key` or
+/// `<list>.Tag.N.Key`); CreateIntegration names its list `TagList`.
+pub(crate) fn parse_tags_at(req: &AwsRequest, list: &str) -> Vec<Tag> {
     let mut out = Vec::new();
-    for wire in ["Tags.member", "Tags.Tag"] {
+    for wire in [format!("{list}.member"), format!("{list}.Tag")] {
         for n in 1..=50 {
             match req.query_params.get(&format!("{wire}.{n}.Key")) {
                 Some(k) => {

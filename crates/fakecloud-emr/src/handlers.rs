@@ -34,6 +34,58 @@ fn key_values_to_map(list: Option<&Value>) -> Value {
     Value::Object(map)
 }
 
+/// The `TagList` a stored resource record was created with. Native creates
+/// keep tags only in `EmrState::tags`; records written by CloudFormation or
+/// loaded from older snapshots may still carry an inline `Tags` member, which
+/// seeds the tag store the first time the resource's tags are read or mutated.
+fn record_tags(acct: &EmrState, resource_id: &str) -> Vec<Value> {
+    let record = acct
+        .clusters
+        .get(resource_id)
+        .or_else(|| acct.studios.get(resource_id))
+        .or_else(|| acct.notebook_executions.get(resource_id))
+        .or_else(|| acct.persistent_app_uis.get(resource_id))
+        .or_else(|| acct.sessions.values().find(|s| sf(s, "Id") == Some(resource_id)));
+    record
+        .and_then(|r| r.get("Tags"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The current tags of an EMR resource: the tag store (written by create,
+/// `AddTags` and `RemoveTags`) is authoritative once it has an entry.
+fn current_tags(acct: &EmrState, resource_id: &str) -> Vec<Value> {
+    match acct.tags.get(resource_id) {
+        Some(tags) => tags.clone(),
+        None => record_tags(acct, resource_id),
+    }
+}
+
+/// Render a stored record with its `Tags` member taken from the tag store, so
+/// `AddTags`/`RemoveTags` are reflected by every Describe/Get.
+fn render_tagged(acct: &EmrState, record: &Value, resource_id: &str) -> Value {
+    let mut out = record.clone();
+    if let Some(obj) = out.as_object_mut() {
+        let tags = current_tags(acct, resource_id);
+        if tags.is_empty() {
+            obj.remove("Tags");
+        } else {
+            obj.insert("Tags".into(), Value::Array(tags));
+        }
+    }
+    out
+}
+
+/// Store the create-time `Tags` of a new resource in the tag store.
+fn store_create_tags(acct: &mut EmrState, resource_id: &str, body: &Value) {
+    if let Some(tags) = body.get("Tags").and_then(Value::as_array) {
+        if !tags.is_empty() {
+            acct.tags.insert(resource_id.to_string(), tags.clone());
+        }
+    }
+}
+
 impl EmrService {
     // ---- clusters / job flows --------------------------------------------
 
@@ -98,7 +150,7 @@ impl EmrService {
                 cluster.insert(out_key.into(), json!(v));
             }
         }
-        for key in ["Applications", "Tags", "Configurations"] {
+        for key in ["Applications", "Configurations"] {
             if let Some(arr) = body.get(key).filter(|v| v.is_array()) {
                 cluster.insert(key.into(), arr.clone());
             }
@@ -143,11 +195,7 @@ impl EmrService {
             if !bootstrap.is_empty() {
                 acct.bootstrap_actions.insert(id.clone(), bootstrap);
             }
-            if let Some(tags) = body.get("Tags").and_then(Value::as_array) {
-                if !tags.is_empty() {
-                    acct.tags.insert(id.clone(), tags.clone());
-                }
-            }
+            store_create_tags(acct, &id, &body);
             if let Some(p) = managed_scaling_policy {
                 acct.managed_scaling_policies.insert(id.clone(), p);
             }
@@ -286,7 +334,7 @@ impl EmrService {
         let body = req.json_body();
         let id = sf(&body, "ClusterId").unwrap_or_default().to_string();
         self.with_account(req, |acct| match acct.clusters.get(&id) {
-            Some(c) => ok(json!({ "Cluster": c })),
+            Some(c) => ok(json!({ "Cluster": render_tagged(acct, c, &id) })),
             None => Err(invalid_request(format!("Cluster id '{id}' is not valid."))),
         })
     }
@@ -830,9 +878,6 @@ impl EmrService {
         if let Some(v) = body.get("SubnetIds").filter(|v| v.is_array()) {
             studio.insert("SubnetIds".into(), v.clone());
         }
-        if let Some(v) = body.get("Tags").filter(|v| v.is_array()) {
-            studio.insert("Tags".into(), v.clone());
-        }
         if let Some(v) = body.get("TrustedIdentityPropagationEnabled").and_then(Value::as_bool) {
             studio.insert("TrustedIdentityPropagationEnabled".into(), json!(v));
         }
@@ -840,6 +885,7 @@ impl EmrService {
         self.with_account_mut(req, |acct| {
             acct.studios.insert(id.clone(), studio);
             acct.studio_order.push(id.clone());
+            store_create_tags(acct, &id, &body);
         });
         ok(json!({ "StudioId": id, "Url": url }))
     }
@@ -848,7 +894,7 @@ impl EmrService {
         let body = req.json_body();
         let id = sf(&body, "StudioId").unwrap_or_default().to_string();
         self.with_account(req, |acct| match acct.studios.get(&id) {
-            Some(s) => ok(json!({ "Studio": s })),
+            Some(s) => ok(json!({ "Studio": render_tagged(acct, s, &id) })),
             None => Err(invalid_request(format!("Studio {id} does not exist."))),
         })
     }
@@ -880,6 +926,7 @@ impl EmrService {
                 return Err(invalid_request(format!("Studio {id} does not exist.")));
             }
             acct.studio_order.retain(|s| s != &id);
+            acct.tags.remove(&id);
             acct.studio_session_mappings
                 .retain(|k, _| !k.starts_with(&format!("{id}\u{1}")));
             ok(json!({}))
@@ -995,12 +1042,13 @@ impl EmrService {
         let resource_id = sf(&body, "ResourceId").unwrap_or_default().to_string();
         let new_tags = body.get("Tags").and_then(Value::as_array).cloned().unwrap_or_default();
         self.with_account_mut(req, |acct| {
-            let tags = acct.tags.entry(resource_id).or_default();
+            let mut tags = current_tags(acct, &resource_id);
             for t in new_tags {
                 let key = sf(&t, "Key").map(String::from);
                 tags.retain(|e| sf(e, "Key").map(String::from) != key);
                 tags.push(t);
             }
+            acct.tags.insert(resource_id, tags);
         });
         ok(json!({}))
     }
@@ -1010,9 +1058,9 @@ impl EmrService {
         let resource_id = sf(&body, "ResourceId").unwrap_or_default().to_string();
         let keys: Vec<String> = string_list(&body, "TagKeys");
         self.with_account_mut(req, |acct| {
-            if let Some(tags) = acct.tags.get_mut(&resource_id) {
-                tags.retain(|t| sf(t, "Key").is_none_or(|k| !keys.iter().any(|x| x == k)));
-            }
+            let mut tags = current_tags(acct, &resource_id);
+            tags.retain(|t| sf(t, "Key").is_none_or(|k| !keys.iter().any(|x| x == k)));
+            acct.tags.insert(resource_id, tags);
         });
         ok(json!({}))
     }
@@ -1153,9 +1201,6 @@ impl EmrService {
                 exec.insert(key.into(), json!(v));
             }
         }
-        if let Some(v) = body.get("Tags").filter(|v| v.is_array()) {
-            exec.insert("Tags".into(), v.clone());
-        }
         let exec = Value::Object(exec);
         self.with_account_mut(req, |acct| {
             if !cluster_id.is_empty() && !acct.clusters.contains_key(&cluster_id) {
@@ -1165,6 +1210,7 @@ impl EmrService {
             }
             acct.notebook_executions.insert(id.clone(), exec);
             acct.notebook_order.push(id.clone());
+            store_create_tags(acct, &id, &body);
             ok(json!({ "NotebookExecutionId": id }))
         })
     }
@@ -1173,7 +1219,7 @@ impl EmrService {
         let body = req.json_body();
         let id = sf(&body, "NotebookExecutionId").unwrap_or_default().to_string();
         self.with_account(req, |acct| match acct.notebook_executions.get(&id) {
-            Some(e) => ok(json!({ "NotebookExecution": e })),
+            Some(e) => ok(json!({ "NotebookExecution": render_tagged(acct, e, &id) })),
             None => Err(invalid_request(format!(
                 "Notebook execution '{id}' does not exist."
             ))),
@@ -1221,12 +1267,10 @@ impl EmrService {
         ui.insert("PersistentAppUIStatus".into(), json!("ATTACHED"));
         ui.insert("CreationTime".into(), json!(now));
         ui.insert("LastModifiedTime".into(), json!(now));
-        if let Some(v) = body.get("Tags").filter(|v| v.is_array()) {
-            ui.insert("Tags".into(), v.clone());
-        }
         let ui = Value::Object(ui);
         self.with_account_mut(req, |acct| {
             acct.persistent_app_uis.insert(id.clone(), ui);
+            store_create_tags(acct, &id, &body);
         });
         ok(json!({ "PersistentAppUIId": id, "RuntimeRoleEnabledCluster": false }))
     }
@@ -1235,7 +1279,7 @@ impl EmrService {
         let body = req.json_body();
         let id = sf(&body, "PersistentAppUIId").unwrap_or_default().to_string();
         self.with_account(req, |acct| match acct.persistent_app_uis.get(&id) {
-            Some(u) => ok(json!({ "PersistentAppUI": u })),
+            Some(u) => ok(json!({ "PersistentAppUI": render_tagged(acct, u, &id) })),
             None => Err(invalid_request(format!(
                 "Persistent app UI '{id}' does not exist."
             ))),
@@ -1294,15 +1338,13 @@ impl EmrService {
         if let Some(v) = sf(&body, "ReleaseLabel") {
             session.insert("ReleaseLabel".into(), json!(v));
         }
-        if let Some(v) = body.get("Tags").filter(|v| v.is_array()) {
-            session.insert("Tags".into(), v.clone());
-        }
         let session = Value::Object(session);
         self.with_account_mut(req, |acct| {
             if !acct.clusters.contains_key(&cluster_id) {
                 return Err(invalid_request(format!("Cluster id '{cluster_id}' is not valid.")));
             }
             acct.sessions.insert(format!("{cluster_id}\u{1}{session_id}"), session);
+            store_create_tags(acct, &session_id, &body);
             ok(json!({
                 "Id": session_id,
                 "ClusterId": cluster_id,
@@ -1319,7 +1361,7 @@ impl EmrService {
         let session_id = sf(&body, "SessionId").unwrap_or_default();
         let key = format!("{cluster_id}\u{1}{session_id}");
         self.with_account(req, |acct| match acct.sessions.get(&key) {
-            Some(s) => ok(json!({ "Session": s })),
+            Some(s) => ok(json!({ "Session": render_tagged(acct, s, session_id) })),
             None => Err(invalid_request(format!("Session '{session_id}' is not valid."))),
         })
     }
@@ -1371,7 +1413,7 @@ impl EmrService {
                 .sessions
                 .iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| render_tagged(acct, v, sf(v, "Id").unwrap_or_default()))
                 .filter(|s| {
                     states.is_empty()
                         || sf(s, "State").is_some_and(|st| states.iter().any(|x| x == st))
@@ -1815,5 +1857,182 @@ mod run_job_flow_tests {
             notebook_execution_arn("cn-north-1", "000000000000", "ex-1"),
             "arn:aws-cn:elasticmapreduce:cn-north-1:000000000000:notebook-execution/ex-1"
         );
+    }
+}
+
+#[cfg(test)]
+mod tag_store_tests {
+    use super::*;
+    use crate::state::SharedEmrState;
+    use fakecloud_core::multi_account::MultiAccountState;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    fn svc() -> EmrService {
+        let state: SharedEmrState = Arc::new(RwLock::new(MultiAccountState::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        )));
+        EmrService::new(state)
+    }
+
+    fn req(action: &str, body: Value) -> AwsRequest {
+        AwsRequest {
+            service: "emr".into(),
+            action: action.into(),
+            region: "us-east-1".into(),
+            account_id: "000000000000".into(),
+            request_id: "test".into(),
+            headers: http::HeaderMap::new(),
+            query_params: std::collections::HashMap::new(),
+            body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec![],
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn json_of(resp: AwsResponse) -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    fn tag_keys(v: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = v
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| sf(t, "Key").map(String::from)).collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn add_and_remove_tags_are_reflected_by_describe_studio() {
+        let s = svc();
+        let id = json_of(
+            s.create_studio(&req(
+                "CreateStudio",
+                json!({"Name": "st", "Tags": [{"Key": "a", "Value": "1"}]}),
+            ))
+            .unwrap(),
+        )["StudioId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.add_tags(&req(
+            "AddTags",
+            json!({"ResourceId": id, "Tags": [{"Key": "b", "Value": "2"}]}),
+        ))
+        .unwrap();
+        let d = json_of(s.describe_studio(&req("DescribeStudio", json!({"StudioId": id}))).unwrap());
+        assert_eq!(tag_keys(&d["Studio"]["Tags"]), vec!["a", "b"]);
+
+        s.remove_tags(&req("RemoveTags", json!({"ResourceId": id, "TagKeys": ["a", "b"]})))
+            .unwrap();
+        let d = json_of(s.describe_studio(&req("DescribeStudio", json!({"StudioId": id}))).unwrap());
+        assert!(d["Studio"].get("Tags").is_none(), "{d}");
+    }
+
+    #[test]
+    fn add_tags_reflected_by_cluster_notebook_app_ui_and_session() {
+        let s = svc();
+        let cid = json_of(
+            s.run_job_flow(&req(
+                "RunJobFlow",
+                json!({"Name": "c", "Instances": {}, "Tags": [{"Key": "a", "Value": "1"}]}),
+            ))
+            .unwrap(),
+        )["JobFlowId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let nid = json_of(
+            s.start_notebook_execution(&req(
+                "StartNotebookExecution",
+                json!({"ExecutionEngine": {"Id": cid}, "Tags": [{"Key": "a", "Value": "1"}]}),
+            ))
+            .unwrap(),
+        )["NotebookExecutionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let uid = json_of(
+            s.create_persistent_app_ui(&req(
+                "CreatePersistentAppUI",
+                json!({"TargetResourceArn": "x", "Tags": [{"Key": "a", "Value": "1"}]}),
+            ))
+            .unwrap(),
+        )["PersistentAppUIId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sid = json_of(
+            s.start_session(&req(
+                "StartSession",
+                json!({"ClusterId": cid, "Tags": [{"Key": "a", "Value": "1"}]}),
+            ))
+            .unwrap(),
+        )["Id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for id in [&cid, &nid, &uid, &sid] {
+            s.add_tags(&req(
+                "AddTags",
+                json!({"ResourceId": id, "Tags": [{"Key": "b", "Value": "2"}]}),
+            ))
+            .unwrap();
+        }
+        let c = json_of(s.describe_cluster(&req("DescribeCluster", json!({"ClusterId": cid}))).unwrap());
+        assert_eq!(tag_keys(&c["Cluster"]["Tags"]), vec!["a", "b"]);
+        let n = json_of(
+            s.describe_notebook_execution(&req(
+                "DescribeNotebookExecution",
+                json!({"NotebookExecutionId": nid}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(tag_keys(&n["NotebookExecution"]["Tags"]), vec!["a", "b"]);
+        let u = json_of(
+            s.describe_persistent_app_ui(&req(
+                "DescribePersistentAppUI",
+                json!({"PersistentAppUIId": uid}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(tag_keys(&u["PersistentAppUI"]["Tags"]), vec!["a", "b"]);
+        let g = json_of(
+            s.get_session(&req("GetSession", json!({"ClusterId": cid, "SessionId": sid})))
+                .unwrap(),
+        );
+        assert_eq!(tag_keys(&g["Session"]["Tags"]), vec!["a", "b"]);
+        let l = json_of(s.list_sessions(&req("ListSessions", json!({"ClusterId": cid}))).unwrap());
+        assert_eq!(tag_keys(&l["Sessions"][0]["Tags"]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn inline_record_tags_seed_the_store_on_first_mutation() {
+        // CloudFormation-provisioned records (and older snapshots) carry an
+        // inline `Tags` member; AddTags must merge onto it, not replace it.
+        let s = svc();
+        s.with_account_mut(&req("x", json!({})), |acct| {
+            acct.studios.insert(
+                "es-OLD".into(),
+                json!({"StudioId": "es-OLD", "Tags": [{"Key": "a", "Value": "1"}]}),
+            );
+            acct.studio_order.push("es-OLD".into());
+        });
+        s.add_tags(&req(
+            "AddTags",
+            json!({"ResourceId": "es-OLD", "Tags": [{"Key": "b", "Value": "2"}]}),
+        ))
+        .unwrap();
+        let d = json_of(s.describe_studio(&req("DescribeStudio", json!({"StudioId": "es-OLD"}))).unwrap());
+        assert_eq!(tag_keys(&d["Studio"]["Tags"]), vec!["a", "b"]);
     }
 }

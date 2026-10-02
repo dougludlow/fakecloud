@@ -262,6 +262,20 @@ impl KinesisService {
         if record_distribution_strategy == RECORD_DISTRIBUTION_AUTO && stream_mode != "ON_DEMAND" {
             return Err(auto_requires_on_demand());
         }
+        // WarmThroughputMiBps / MaxRecordSizeInKiB configure the stream at
+        // create time exactly like UpdateStreamWarmThroughput /
+        // UpdateMaxRecordSize do afterwards.
+        let warm_throughput_mibps = body["WarmThroughputMiBps"].as_i64();
+        if warm_throughput_mibps.is_some_and(|w| w < 0) {
+            return Err(invalid_argument("WarmThroughputMiBps must be >= 0"));
+        }
+        validate_optional_json_range(
+            "MaxRecordSizeInKiB",
+            &body["MaxRecordSizeInKiB"],
+            1024,
+            10240,
+        )?;
+        let max_record_size_kib = body["MaxRecordSizeInKiB"].as_i64();
         let effective_shard_count = if stream_mode == "ON_DEMAND" {
             4
         } else {
@@ -309,8 +323,8 @@ impl KinesisService {
             shards: build_stream_shards(effective_shard_count),
             next_shard_index: effective_shard_count,
             enhanced_metrics: Vec::new(),
-            warm_throughput_mibps: None,
-            max_record_size_kib: None,
+            warm_throughput_mibps,
+            max_record_size_kib,
             record_distribution_strategy,
             auto_distribution_cursor: 0,
         };
@@ -1485,12 +1499,21 @@ impl KinesisService {
             ));
         }
 
+        let tags: std::collections::BTreeMap<String, String> = body["Tags"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         let consumer = KinesisConsumer {
             consumer_name: consumer_name.to_string(),
             consumer_arn: consumer_arn.clone(),
             consumer_status: "ACTIVE".to_string(),
             consumer_creation_timestamp: now,
             stream_arn: stream_arn.to_string(),
+            tags,
         };
         state.consumers.insert(consumer_arn.clone(), consumer);
 

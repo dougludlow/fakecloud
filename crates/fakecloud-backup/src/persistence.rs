@@ -39,6 +39,10 @@ pub fn load_into(
             supported: BACKUP_SNAPSHOT_SCHEMA_VERSION,
         });
     }
+    let mut snapshot = snapshot;
+    for (_, st) in snapshot.accounts.iter_mut() {
+        st.migrate_legacy_access_point_tags();
+    }
     let accounts = snapshot.accounts.account_count();
     *state.write() = snapshot.accounts;
     Ok(LoadOutcome::Loaded(accounts))
@@ -116,6 +120,51 @@ mod tests {
         };
         let store = MemStore(Mutex::new(Some(serde_json::to_vec(&snap).unwrap())));
         assert_eq!(load_into(&store, &state()).unwrap(), LoadOutcome::Loaded(2));
+    }
+
+    #[test]
+    fn legacy_access_point_tags_move_into_tag_store() {
+        // Snapshot written by a build that kept access-point tags on the
+        // record itself (`access_points.<arn>.tags`).
+        let mut accounts: MultiAccountState<BackupState> =
+            MultiAccountState::new("000000000000", "us-east-1", "");
+        accounts.get_or_create("111122223333");
+        let mut json = serde_json::to_value(BackupSnapshot {
+            schema_version: BACKUP_SNAPSHOT_SCHEMA_VERSION,
+            accounts,
+        })
+        .unwrap();
+        let arn = "arn:aws:backup:us-east-1:111122223333:backup-access-point:ap1";
+        let record = serde_json::json!({
+            "arn": arn,
+            "name": "ap1",
+            "recovery_point_arn": "rp",
+            "backup_vault_name": "v",
+            "backup_vault_arn": "va",
+            "resource_arn": "r",
+            "resource_type": "EBS",
+            "creation_time": "2026-01-01T00:00:00Z",
+            "status": "AVAILABLE",
+            "tags": {"team": "data", "env": "old"}
+        });
+        let acct = json
+            .pointer_mut("/accounts/accounts/111122223333")
+            .expect("account entry in snapshot JSON");
+        acct["access_points"] = serde_json::json!({ arn: record });
+        acct["tags"] = serde_json::json!({ arn: {"env": "new"} });
+        let store = MemStore(Mutex::new(Some(serde_json::to_vec(&json).unwrap())));
+        let shared = state();
+        load_into(&store, &shared).unwrap();
+        let guard = shared.read();
+        let st = guard.get("111122223333").unwrap();
+        let tags = &st.tags[arn];
+        assert_eq!(tags["team"], "data");
+        // The ARN-keyed store wins on a clash.
+        assert_eq!(tags["env"], "new");
+        assert!(st.access_points[arn].legacy_tags.is_empty());
+        // Re-saving does not write the legacy field back.
+        let out = serde_json::to_value(&st.access_points[arn]).unwrap();
+        assert!(out.get("tags").is_none());
     }
 
     #[test]

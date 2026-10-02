@@ -1,6 +1,6 @@
 +++
 title = "Batch"
-description = "AWS Batch — compute environments, job queues, job definitions, scheduling policies, and the job control plane. restJson1 protocol."
+description = "AWS Batch — compute environments, job queues, job definitions, scheduling policies, consumable resources, service environments, quota shares, and the job control plane. restJson1 protocol."
 weight = 29
 +++
 
@@ -24,7 +24,11 @@ containers, and Batch is built to run real jobs on that same engine.
 - **Array jobs** — `SubmitJob` with `arrayProperties.size = N` spawns `N` real child containers (`<jobId>:<index>`), each with `AWS_BATCH_JOB_ARRAY_INDEX` set so it can select its slice of work. The parent's status and `arrayProperties.statusSummary` aggregate the children live — `SUCCEEDED` only when every child exits 0.
 - **Job dependencies** — `SubmitJob` with `dependsOn` parks the job at `PENDING` and launches it only once every dependency has `SUCCEEDED`; if any dependency `FAILED`, the dependent job fails with "Dependent job failed". The wait never blocks the `SubmitJob` call.
 - **Retry + timeout** — `retryStrategy.attempts` re-launches a failed container up to that many times (each prior attempt recorded under `attempts[]`); `timeout.attemptDurationSeconds` caps each attempt and fails the job with "Job attempt duration exceeded timeout" if the container overruns.
-- **Tags** — `TagResource`, `UntagResource`, `ListTagsForResource`.
+- **Consumable resources**: `CreateConsumableResource`, `DescribeConsumableResource`, `ListConsumableResources` (`CONSUMABLE_RESOURCE_NAME` filter with trailing `*` prefix match), `UpdateConsumableResource` (`SET` / `ADD` / `REMOVE`, `clientToken` replay applied once), `DeleteConsumableResource`, and `ListJobsByConsumableResource` (`JOB_STATUS` / `JOB_NAME` filters). Jobs declare requirements via the job definition's `consumableResourceProperties` or `SubmitJob`'s `consumableResourcePropertiesOverride` (unknown resources are rejected). Requirements gate dispatch for real: a job whose quantity doesn't fit waits at `RUNNABLE` until capacity returns. `inUseQuantity` / `availableQuantity` are computed from jobs holding the resource; a `NON_REPLENISHABLE` resource stays consumed once a job has started.
+- **Service environments and service jobs**: `CreateServiceEnvironment` / `DescribeServiceEnvironments` / `UpdateServiceEnvironment` / `DeleteServiceEnvironment` (`SAGEMAKER_TRAINING`, must be `DISABLED` and detached from every queue before delete). Job queues accept `serviceEnvironmentOrder` (and take the environments' `jobQueueType`). `SubmitServiceJob` validates the queue type and state, the JSON `serviceRequestPayload`, fair-share `shareIdentifier` and quota-share `quotaShareName` rules, and `clientToken` reuse; `DescribeServiceJob`, `ListServiceJobs` (status plus `JOB_NAME` / `BEFORE_CREATED_AT` / `AFTER_CREATED_AT` / `SHARE_IDENTIFIER` / `QUOTA_SHARE_NAME` filters), `UpdateServiceJob` (`schedulingPriority`) and `TerminateServiceJob` round-trip. fakecloud's SageMaker has no training executor, so a service job is accepted into the queue and waits at `RUNNABLE` until terminated. It never reports a fabricated training run.
+- **Quota shares**: `CreateQuotaShare`, `DescribeQuotaShare`, `ListQuotaShares`, `UpdateQuotaShare`, `DeleteQuotaShare` (must be `DISABLED`; deleting terminates the share's remaining service jobs).
+- **Queue snapshot**: `GetJobQueueSnapshot` reports the `RUNNABLE` front of the queue in dispatch order, the first job per quota share, and capacity utilization of dispatched jobs (overall, per fair-share identifier, and per quota share).
+- **Tags** — `TagResource`, `UntagResource`, `ListTagsForResource`, on every Batch ARN including consumable resources, service environments, quota shares and service jobs.
 - **CloudFormation** — `AWS::Batch::ComputeEnvironment`, `AWS::Batch::JobQueue`, and `AWS::Batch::JobDefinition` are provisioned into the Batch control plane when a stack is created (and removed on stack delete). The provisioned resources persist across a restart in persistent mode.
 
 Terraform / CloudFormation can provision a full Batch stack
