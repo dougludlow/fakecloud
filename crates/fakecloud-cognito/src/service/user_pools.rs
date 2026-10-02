@@ -10,13 +10,13 @@ use crate::state::{
 };
 
 use super::{
-    default_refresh_token_validity, ensure_user_pool_exists, generate_client_id,
-    generate_client_secret, generate_pool_id, parse_account_recovery_setting,
-    parse_admin_create_user_config, parse_email_configuration, parse_password_policy,
-    parse_refresh_token_rotation, parse_schema_attribute, parse_sign_in_policy,
-    parse_sms_configuration, parse_string_array, parse_tags, parse_token_validity_units,
-    parse_verification_message_template, require_str, user_pool_client_to_json, user_pool_to_json,
-    validate_enum, validate_range, validate_string_length, validate_token_validity, CognitoService,
+    ensure_user_pool_exists, generate_client_id, generate_client_secret, generate_pool_id,
+    parse_account_recovery_setting, parse_admin_create_user_config, parse_email_configuration,
+    parse_password_policy, parse_refresh_token_rotation, parse_schema_attribute,
+    parse_sign_in_policy, parse_sms_configuration, parse_string_array, parse_tags,
+    parse_token_validity_units, parse_verification_message_template, require_str,
+    resolve_token_validity, user_pool_client_to_json, user_pool_to_json, validate_enum,
+    validate_range, validate_string_length, CognitoService,
 };
 
 impl CognitoService {
@@ -538,11 +538,11 @@ impl CognitoService {
                 )
             })?;
 
-        validate_token_validity(
+        let validity = resolve_token_validity(
             body["AccessTokenValidity"].as_i64(),
             body["IdTokenValidity"].as_i64(),
             body["RefreshTokenValidity"].as_i64(),
-            parse_token_validity_units(&body["TokenValidityUnits"]).as_ref(),
+            parse_token_validity_units(&body["TokenValidityUnits"]),
         )
         .map_err(|m| {
             AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidParameterException", m)
@@ -564,27 +564,19 @@ impl CognitoService {
 
         let now = Utc::now();
 
-        let token_validity_units = parse_token_validity_units(&body["TokenValidityUnits"]);
         let client = UserPoolClient {
             client_id: client_id.clone(),
             client_name: client_name.to_string(),
             user_pool_id: pool_id.to_string(),
             client_secret,
             explicit_auth_flows: parse_string_array(&body["ExplicitAuthFlows"]),
-            token_validity_units: token_validity_units.clone(),
-            access_token_validity: body["AccessTokenValidity"].as_i64(),
-            id_token_validity: body["IdTokenValidity"].as_i64(),
+            token_validity_units: validity.units,
+            access_token_validity: validity.access,
+            id_token_validity: validity.id,
             // AWS defaults RefreshTokenValidity to 30 days when unset (or 0)
             // and always reports it, in the client's refresh-token unit;
             // access/id token validity stay unset (0).
-            refresh_token_validity: Some(
-                body["RefreshTokenValidity"]
-                    .as_i64()
-                    .filter(|v| *v != 0)
-                    .unwrap_or_else(|| {
-                        default_refresh_token_validity(token_validity_units.as_ref())
-                    }),
-            ),
+            refresh_token_validity: Some(validity.refresh),
             callback_urls: parse_string_array(&body["CallbackURLs"]),
             logout_urls: parse_string_array(&body["LogoutURLs"]),
             supported_identity_providers: parse_string_array(&body["SupportedIdentityProviders"]),
@@ -728,29 +720,18 @@ impl CognitoService {
             ));
         }
 
-        // Validate the effective token lifetimes before mutating anything.
-        {
-            let units = if body["TokenValidityUnits"].is_object() {
-                parse_token_validity_units(&body["TokenValidityUnits"])
-            } else {
-                client.token_validity_units.clone()
-            };
-            validate_token_validity(
-                body["AccessTokenValidity"]
-                    .as_i64()
-                    .or(client.access_token_validity),
-                body["IdTokenValidity"]
-                    .as_i64()
-                    .or(client.id_token_validity),
-                body["RefreshTokenValidity"]
-                    .as_i64()
-                    .or(client.refresh_token_validity),
-                units.as_ref(),
-            )
-            .map_err(|m| {
-                AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidParameterException", m)
-            })?;
-        }
+        // UpdateUserPoolClient resets omitted fields to their defaults, so the
+        // token lifetimes resolve from the request alone (never from stored
+        // values that may be in different units). Validated before mutating.
+        let validity = resolve_token_validity(
+            body["AccessTokenValidity"].as_i64(),
+            body["IdTokenValidity"].as_i64(),
+            body["RefreshTokenValidity"].as_i64(),
+            parse_token_validity_units(&body["TokenValidityUnits"]),
+        )
+        .map_err(|m| {
+            AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidParameterException", m)
+        })?;
 
         // Update fields that are present
         if let Some(name) = body["ClientName"].as_str() {
@@ -766,18 +747,10 @@ impl CognitoService {
         if body["ExplicitAuthFlows"].is_array() {
             client.explicit_auth_flows = parse_string_array(&body["ExplicitAuthFlows"]);
         }
-        if body["TokenValidityUnits"].is_object() {
-            client.token_validity_units = parse_token_validity_units(&body["TokenValidityUnits"]);
-        }
-        if let Some(v) = body["AccessTokenValidity"].as_i64() {
-            client.access_token_validity = Some(v);
-        }
-        if let Some(v) = body["IdTokenValidity"].as_i64() {
-            client.id_token_validity = Some(v);
-        }
-        if let Some(v) = body["RefreshTokenValidity"].as_i64() {
-            client.refresh_token_validity = Some(v);
-        }
+        client.token_validity_units = validity.units;
+        client.access_token_validity = validity.access;
+        client.id_token_validity = validity.id;
+        client.refresh_token_validity = Some(validity.refresh);
         if body["CallbackURLs"].is_array() {
             client.callback_urls = parse_string_array(&body["CallbackURLs"]);
         }

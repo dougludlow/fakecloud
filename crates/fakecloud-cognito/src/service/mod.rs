@@ -1865,6 +1865,40 @@ pub fn default_refresh_token_validity(units: Option<&TokenValidityUnits>) -> i64
         / token_validity_unit_secs(units.and_then(|u| u.refresh_token.as_deref()), "days")
 }
 
+/// An app client's token-lifetime settings after Cognito's defaults are applied.
+#[derive(Debug, Clone)]
+pub struct ResolvedTokenValidity {
+    pub units: Option<TokenValidityUnits>,
+    pub access: Option<i64>,
+    pub id: Option<i64>,
+    pub refresh: i64,
+}
+
+/// Resolve the token-lifetime fields of a CreateUserPoolClient /
+/// UpdateUserPoolClient request (or a CloudFormation resource model) the way
+/// Cognito does: omitted fields take their defaults rather than keeping a
+/// previous value (UpdateUserPoolClient resets omitted fields), units default
+/// to hours/days, access/id validity stay unset (1 hour), and refresh validity
+/// defaults to 30 days expressed in the effective refresh-token unit. The
+/// result is range-checked with [`validate_token_validity`].
+pub fn resolve_token_validity(
+    access: Option<i64>,
+    id: Option<i64>,
+    refresh: Option<i64>,
+    units: Option<TokenValidityUnits>,
+) -> Result<ResolvedTokenValidity, &'static str> {
+    let refresh = refresh
+        .filter(|v| *v != 0)
+        .unwrap_or_else(|| default_refresh_token_validity(units.as_ref()));
+    validate_token_validity(access, id, Some(refresh), units.as_ref())?;
+    Ok(ResolvedTokenValidity {
+        units,
+        access,
+        id,
+        refresh,
+    })
+}
+
 /// Resolve an app client's (access, id) token lifetimes to seconds, applying
 /// `TokenValidityUnits` (default `hours`) to the raw validity integers.
 /// Clamped to Cognito's accepted range so a client stored without validation

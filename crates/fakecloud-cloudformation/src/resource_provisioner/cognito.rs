@@ -277,12 +277,11 @@ impl ResourceProvisioner {
         };
 
         let now = Utc::now();
-        let token_validity_units = parse_cfn_token_validity_units(props.get("TokenValidityUnits"));
-        fakecloud_cognito::validate_token_validity(
+        let validity = fakecloud_cognito::resolve_token_validity(
             props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
             props.get("IdTokenValidity").and_then(|v| v.as_i64()),
             props.get("RefreshTokenValidity").and_then(|v| v.as_i64()),
-            token_validity_units.as_ref(),
+            parse_cfn_token_validity_units(props.get("TokenValidityUnits")),
         )
         .map_err(str::to_string)?;
         let client = UserPoolClient {
@@ -291,20 +290,10 @@ impl ResourceProvisioner {
             user_pool_id: pool_id.clone(),
             client_secret: client_secret.clone(),
             explicit_auth_flows: parse_cognito_string_array(props.get("ExplicitAuthFlows")),
-            token_validity_units: token_validity_units.clone(),
-            access_token_validity: props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
-            id_token_validity: props.get("IdTokenValidity").and_then(|v| v.as_i64()),
-            refresh_token_validity: Some(
-                props
-                    .get("RefreshTokenValidity")
-                    .and_then(|v| v.as_i64())
-                    .filter(|v| *v != 0)
-                    .unwrap_or_else(|| {
-                        fakecloud_cognito::default_refresh_token_validity(
-                            token_validity_units.as_ref(),
-                        )
-                    }),
-            ),
+            token_validity_units: validity.units,
+            access_token_validity: validity.access,
+            id_token_validity: validity.id,
+            refresh_token_validity: Some(validity.refresh),
             callback_urls: parse_cognito_string_array(props.get("CallbackURLs")),
             logout_urls: parse_cognito_string_array(props.get("LogoutURLs")),
             supported_identity_providers: parse_cognito_string_array(
@@ -383,27 +372,17 @@ impl ResourceProvisioner {
         // TokenValidityUnits reverts to Cognito's default units (hours/days),
         // and removed validity values revert to their defaults (unset access/id,
         // 30-day refresh), so stale values are never reinterpreted in new units.
-        let token_validity_units = parse_cfn_token_validity_units(props.get("TokenValidityUnits"));
-        let access = props.get("AccessTokenValidity").and_then(|v| v.as_i64());
-        let id = props.get("IdTokenValidity").and_then(|v| v.as_i64());
-        let refresh = props
-            .get("RefreshTokenValidity")
-            .and_then(|v| v.as_i64())
-            .filter(|v| *v != 0)
-            .unwrap_or_else(|| {
-                fakecloud_cognito::default_refresh_token_validity(token_validity_units.as_ref())
-            });
-        fakecloud_cognito::validate_token_validity(
-            access,
-            id,
-            Some(refresh),
-            token_validity_units.as_ref(),
+        let validity = fakecloud_cognito::resolve_token_validity(
+            props.get("AccessTokenValidity").and_then(|v| v.as_i64()),
+            props.get("IdTokenValidity").and_then(|v| v.as_i64()),
+            props.get("RefreshTokenValidity").and_then(|v| v.as_i64()),
+            parse_cfn_token_validity_units(props.get("TokenValidityUnits")),
         )
         .map_err(str::to_string)?;
-        client.token_validity_units = token_validity_units;
-        client.access_token_validity = access;
-        client.id_token_validity = id;
-        client.refresh_token_validity = Some(refresh);
+        client.token_validity_units = validity.units;
+        client.access_token_validity = validity.access;
+        client.id_token_validity = validity.id;
+        client.refresh_token_validity = Some(validity.refresh);
         if let Some(name) = props.get("ClientName").and_then(|v| v.as_str()) {
             client.client_name = name.to_string();
         }

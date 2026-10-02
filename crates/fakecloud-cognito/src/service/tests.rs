@@ -9178,6 +9178,44 @@ fn omitted_refresh_validity_defaults_to_30_days_in_the_clients_unit() {
 }
 
 #[test]
+fn update_user_pool_client_resets_omitted_validity_in_the_new_units() {
+    let (svc, pool_id) = setup_svc_with_pool();
+    let resp = svc
+        .create_user_pool_client(&make_req(
+            "CreateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientName": "m",
+                    "AccessTokenValidity": 30,
+                    "TokenValidityUnits": {"AccessToken": "minutes", "RefreshToken": "minutes"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let client_id = resp_json(&resp)["UserPoolClient"]["ClientId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Units switch to days with RefreshTokenValidity omitted: the stored
+    // 43200 (minutes) must not be reread as 43200 days.
+    let resp = svc
+        .update_user_pool_client(&make_req(
+            "UpdateUserPoolClient",
+            &json!({"UserPoolId": pool_id, "ClientId": client_id,
+                    "TokenValidityUnits": {"RefreshToken": "days"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let c = &resp_json(&resp)["UserPoolClient"];
+    assert_eq!(c["RefreshTokenValidity"], json!(30));
+    // Omitted AccessTokenValidity resets to the default (unset, 1 hour).
+    assert!(c
+        .get("AccessTokenValidity")
+        .is_none_or(|v| v.is_null() || v == 0));
+    let accounts = svc.state.read();
+    let client = &accounts.get("123456789012").unwrap().user_pool_clients[&client_id];
+    assert_eq!(client.access_token_validity, None);
+    assert_eq!(refresh_token_validity_secs(client), 30 * 86_400);
+}
+
+#[test]
 fn stored_huge_token_validity_is_clamped_not_a_panic() {
     let (svc, pool_id, client_id) = setup_signin(json!([]), json!({}));
     {
