@@ -905,6 +905,7 @@ mod tests {
         for (service, status, code) in [
             ("monitoring", 400, "ValidationError"),
             ("monitoring", 400, "InvalidParameterValue"),
+            ("elasticloadbalancing", 400, "ValidationError"),
             ("iam", 400, "ValidationError"),
             ("iam", 404, "NoSuchEntity"),
             ("cloudformation", 400, "ValidationError"),

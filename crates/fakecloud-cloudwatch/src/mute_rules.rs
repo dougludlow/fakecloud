@@ -157,12 +157,18 @@ impl CloudWatchService {
     ) -> Result<AwsResponse, AwsServiceError> {
         validate_len(req, "AlarmName", 1, 255)?;
         validate_range_i64(req, "MaxRecords", 1, 100)?;
+        // `AlarmName` narrows the listing to the rules that mute that alarm.
+        let alarm_name = optional_query_param(req, "AlarmName");
         let now = Utc::now();
         let state = self.state.read();
-        let mut inner = String::from("<AlarmMuteRuleSummaries>");
+        let mut inner = String::new();
         if let Some(acct) = state.get(&req.account_id) {
             if let Some(rules) = acct.mute_rules_in(&req.region) {
-                for rule in rules.values() {
+                for rule in rules.values().filter(|r| {
+                    alarm_name
+                        .as_ref()
+                        .is_none_or(|a| r.mute_target_alarm_names.contains(a))
+                }) {
                     inner.push_str("<member>");
                     inner.push_str(&format!(
                         "<AlarmMuteRuleArn>{}</AlarmMuteRuleArn>",
@@ -185,7 +191,8 @@ impl CloudWatchService {
                 }
             }
         }
-        inner.push_str("</AlarmMuteRuleSummaries>");
+        let inner =
+            crate::service::paged_member_list(req, "MaxRecords", "AlarmMuteRuleSummaries", &inner)?;
         Ok(xml_response("ListAlarmMuteRules", &inner, &req.request_id))
     }
 

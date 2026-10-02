@@ -1814,3 +1814,112 @@ async fn cbor_request_gets_cbor_response() {
     let json = fakecloud_core::cbor::decode_to_json(resp.body.expect_bytes()).unwrap();
     assert_eq!(json["Metrics"][0]["MetricName"], "Latency");
 }
+
+/// Walk a paged CloudWatch list by `NextToken`, returning each page's body.
+async fn walk_pages(
+    svc: &CloudWatchService,
+    action: &str,
+    size_param: &str,
+    size: &str,
+    extra: &[(&str, &str)],
+) -> Vec<String> {
+    let mut pages = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut params: Vec<(&str, &str)> = extra.to_vec();
+        params.push((size_param, size));
+        if let Some(t) = &token {
+            params.push(("NextToken", t.as_str()));
+        }
+        let body = body_of(&call(svc, action, &params).await);
+        token = body
+            .split("<NextToken>")
+            .nth(1)
+            .map(|s| s.split("</NextToken>").next().unwrap().to_string());
+        pages.push(body);
+        if token.is_none() {
+            break;
+        }
+        assert!(pages.len() < 100, "{action} pagination does not terminate");
+    }
+    pages
+}
+
+#[tokio::test]
+async fn list_operations_page_with_next_token() {
+    let svc = service();
+    for i in 0..5 {
+        let name = format!("r{i}");
+        call(
+            &svc,
+            "PutInsightRule",
+            &[("RuleName", &name), ("RuleDefinition", "{\"x\":1}")],
+        )
+        .await;
+        let stream = format!("s{i}");
+        call(
+            &svc,
+            "PutMetricStream",
+            &[
+                ("Name", &stream),
+                (
+                    "FirehoseArn",
+                    "arn:aws:firehose:us-east-1:123456789012:deliverystream/d",
+                ),
+                ("RoleArn", "arn:aws:iam::123456789012:role/r"),
+                ("OutputFormat", "json"),
+            ],
+        )
+        .await;
+        let mute = format!("m{i}");
+        call(
+            &svc,
+            "PutAlarmMuteRule",
+            &[
+                ("Name", &mute),
+                ("Rule.Schedule.Expression", "cron(0 2 * * *)"),
+                ("Rule.Schedule.Duration", "PT4H"),
+                (
+                    "MuteTargets.AlarmNames.member.1",
+                    if i % 2 == 0 { "even" } else { "odd" },
+                ),
+            ],
+        )
+        .await;
+        let metric = format!("Metric{i}");
+        call(
+            &svc,
+            "PutAnomalyDetector",
+            &[
+                ("Namespace", "NS"),
+                ("MetricName", &metric),
+                ("Stat", "Average"),
+            ],
+        )
+        .await;
+    }
+    for (action, size_param, tag) in [
+        ("DescribeInsightRules", "MaxResults", "<Name>r"),
+        ("ListMetricStreams", "MaxResults", "<Name>s"),
+        ("ListAlarmMuteRules", "MaxRecords", "alarm-mute-rule/m"),
+        (
+            "DescribeAnomalyDetectors",
+            "MaxResults",
+            "<MetricName>Metric",
+        ),
+    ] {
+        let pages = walk_pages(&svc, action, size_param, "2", &[]).await;
+        assert_eq!(pages.len(), 3, "{action}: {pages:?}");
+        // Some members render their identifying element more than once.
+        let counts: Vec<usize> = pages.iter().map(|p| p.matches(tag).count()).collect();
+        let per = counts[2];
+        assert!(per > 0, "{action}: {counts:?}");
+        assert_eq!(counts, vec![2 * per, 2 * per, per], "{action}");
+        let err = call_err(&svc, action, &[("NextToken", "bogus")]).await;
+        assert_eq!(err.code(), "InvalidNextToken", "{action}");
+    }
+
+    // `AlarmName` narrows mute rules to those that target the alarm.
+    let even = body_of(&call(&svc, "ListAlarmMuteRules", &[("AlarmName", "even")]).await);
+    assert_eq!(even.matches("alarm-mute-rule/m").count(), 3, "{even}");
+}

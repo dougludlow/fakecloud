@@ -579,12 +579,13 @@ impl Elbv2Service {
             lbs = kept;
         }
         lbs.sort_by_key(|a| a.created_time);
-        let inner = format!(
-            "<LoadBalancers>{}</LoadBalancers>",
+        let inner = paged_members(
+            req,
+            "LoadBalancers",
             lbs.iter()
                 .map(|lb| format!("<member>{}</member>", render_lb_xml(lb)))
-                .collect::<String>()
-        );
+                .collect(),
+        )?;
         Ok(xml_resp("DescribeLoadBalancers", inner, &req.request_id))
     }
 
@@ -870,15 +871,15 @@ impl Elbv2Service {
             ("revocation-entries-per-trust-store", "65535"),
             ("network-load-balancer-capacity-reservations", "1500"),
         ];
-        let xml = limits
-            .iter()
-            .map(|(n, m)| format!("<member><Name>{n}</Name><Max>{m}</Max></member>"))
-            .collect::<String>();
-        Ok(xml_resp(
-            "DescribeAccountLimits",
-            format!("<Limits>{xml}</Limits>"),
-            &req.request_id,
-        ))
+        let inner = paged_members(
+            req,
+            "Limits",
+            limits
+                .iter()
+                .map(|(n, m)| format!("<member><Name>{n}</Name><Max>{m}</Max></member>"))
+                .collect(),
+        )?;
+        Ok(xml_resp("DescribeAccountLimits", inner, &req.request_id))
     }
 
     fn describe_ssl_policies(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -941,10 +942,10 @@ impl Elbv2Service {
                     "<member><Name>{name}</Name><SslProtocols>{proto_xml}</SslProtocols><Ciphers>{cipher_xml}</Ciphers></member>"
                 )
             })
-            .collect::<String>();
+            .collect();
         Ok(xml_resp(
             "DescribeSSLPolicies",
-            format!("<SslPolicies>{xml}</SslPolicies>"),
+            paged_members(req, "SslPolicies", xml)?,
             &req.request_id,
         ))
     }
@@ -1140,12 +1141,13 @@ impl Elbv2Service {
             tgs.retain(|t| t.load_balancer_arns.iter().any(|a| a == lb));
         }
         tgs.sort_by_key(|a| a.created_time);
-        let inner = format!(
-            "<TargetGroups>{}</TargetGroups>",
+        let inner = paged_members(
+            req,
+            "TargetGroups",
             tgs.iter()
                 .map(|tg| format!("<member>{}</member>", render_target_group_xml(tg)))
-                .collect::<String>()
-        );
+                .collect(),
+        )?;
         Ok(xml_resp("DescribeTargetGroups", inner, &req.request_id))
     }
 
@@ -1504,13 +1506,14 @@ impl Elbv2Service {
             })
             .collect();
         listeners.sort_by_key(|l| l.port.unwrap_or(0));
-        let inner = format!(
-            "<Listeners>{}</Listeners>",
+        let inner = paged_members(
+            req,
+            "Listeners",
             listeners
                 .iter()
                 .map(|l| format!("<member>{}</member>", render_listener_xml(l)))
-                .collect::<String>()
-        );
+                .collect(),
+        )?;
         Ok(xml_resp("DescribeListeners", inner, &req.request_id))
     }
 
@@ -1699,6 +1702,7 @@ impl Elbv2Service {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        validate_range_i32(req, "PageSize", 1, 400)?;
         let arn = required_query_param(req, "ListenerArn")?;
         let accounts = self.state.read();
         let empty = crate::state::Elbv2State::new(&req.account_id);
@@ -1707,14 +1711,14 @@ impl Elbv2Service {
             .listeners
             .get(&arn)
             .ok_or_else(|| listener_not_found(&arn))?;
-        let cert_xml = listener
+        let certs = listener
             .certificates
             .iter()
             .map(render_certificate_xml)
-            .collect::<String>();
+            .collect();
         Ok(xml_resp(
             "DescribeListenerCertificates",
-            format!("<Certificates>{cert_xml}</Certificates>"),
+            paged_members(req, "Certificates", certs)?,
             &req.request_id,
         ))
     }
@@ -1814,13 +1818,14 @@ impl Elbv2Service {
             let bp = b.priority.parse::<i32>().unwrap_or(i32::MAX);
             ap.cmp(&bp)
         });
-        let inner = format!(
-            "<Rules>{}</Rules>",
+        let inner = paged_members(
+            req,
+            "Rules",
             rules
                 .iter()
                 .map(|r| format!("<member>{}</member>", render_rule_xml(r)))
-                .collect::<String>()
-        );
+                .collect(),
+        )?;
         Ok(xml_resp("DescribeRules", inner, &req.request_id))
     }
 
@@ -2056,13 +2061,14 @@ impl Elbv2Service {
             })
             .collect();
         stores.sort_by_key(|s| s.created_time);
-        let inner = format!(
-            "<TrustStores>{}</TrustStores>",
+        let inner = paged_members(
+            req,
+            "TrustStores",
             stores
                 .iter()
                 .map(|t| format!("<member>{}</member>", render_trust_store_xml(t)))
-                .collect::<String>()
-        );
+                .collect(),
+        )?;
         Ok(xml_resp("DescribeTrustStores", inner, &req.request_id))
     }
 
@@ -2215,6 +2221,7 @@ impl Elbv2Service {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        validate_range_i32(req, "PageSize", 1, 400)?;
         let arn = required_query_param(req, "TrustStoreArn")?;
         let accounts = self.state.read();
         let empty = crate::state::Elbv2State::new(&req.account_id);
@@ -2235,10 +2242,10 @@ impl Elbv2Service {
                     r.number_of_revoked_entries
                 )
             })
-            .collect::<String>();
+            .collect();
         Ok(xml_resp(
             "DescribeTrustStoreRevocations",
-            format!("<TrustStoreRevocations>{revs_xml}</TrustStoreRevocations>"),
+            paged_members(req, "TrustStoreRevocations", revs_xml)?,
             &req.request_id,
         ))
     }
@@ -2271,10 +2278,10 @@ impl Elbv2Service {
                     xml_escape(a)
                 )
             })
-            .collect::<String>();
+            .collect();
         Ok(xml_resp(
             "DescribeTrustStoreAssociations",
-            format!("<TrustStoreAssociations>{xml}</TrustStoreAssociations>"),
+            paged_members(req, "TrustStoreAssociations", xml)?,
             &req.request_id,
         ))
     }
