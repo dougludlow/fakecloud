@@ -34,11 +34,13 @@ returns `NoSuchResourceException`.
 
 - **`GetAWSDefaultServiceQuota`** / **`ListAWSDefaultServiceQuotas`** return
   the AWS default, with a default-quota ARN
-  (`arn:aws:servicequotas:<region>::<service>/<quota>`).
+  (`arn:<partition>:servicequotas:<region>::<service>/<quota>`).
 - **`GetServiceQuota`** / **`ListServiceQuotas`** return the account's applied
   value, with an applied-quota ARN
-  (`arn:aws:servicequotas:<region>:<account>:<service>/<quota>`; global quotas
-  have no region). `QuotaCode` and `QuotaAppliedAtLevel` filter the list.
+  (`arn:<partition>:servicequotas:<region>:<account>:<service>/<quota>`).
+  The partition follows the region (`aws-cn` for `cn-*`, `aws-us-gov` for
+  `us-gov-*`), and global quotas (IAM) leave the region empty in both forms.
+  `QuotaCode` and `QuotaAppliedAtLevel` filter the list.
   Every catalog quota applies at the account level, so `RESOURCE` matches
   nothing and a `ContextId` is rejected.
 
@@ -109,8 +111,9 @@ reserved).
 | Inbound or outbound rules per security group (`vpc`/`L-0EA8095F`) | `AuthorizeSecurityGroupIngress`, `AuthorizeSecurityGroupEgress`, `ModifySecurityGroupRules`, `ValidateSecurityGroupQuotasForInterface` (`RulesPerSecurityGroupLimitExceeded`) |
 
 As on AWS, the rules quota applies to each direction separately and counts
-IPv4 and IPv6 rules separately. A rule that references a security group or
-prefix list counts toward both.
+IPv4 and IPv6 rules separately. A rule that references a security group counts
+toward both. A rule that references a customer-managed prefix list counts as
+the list's maximum number of entries, toward the list's address family.
 
 ## Known limitations
 

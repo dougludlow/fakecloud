@@ -119,7 +119,12 @@ mod tests {
             accounts,
         };
         let store = MemStore(Mutex::new(Some(serde_json::to_vec(&snap).unwrap())));
-        assert_eq!(load_into(&store, &state()).unwrap(), LoadOutcome::Loaded(2));
+        let restored = state();
+        assert_eq!(
+            load_into(&store, &restored).unwrap(),
+            LoadOutcome::Loaded(2)
+        );
+        assert!(restored.read().get("111122223333").is_some());
     }
 
     #[test]

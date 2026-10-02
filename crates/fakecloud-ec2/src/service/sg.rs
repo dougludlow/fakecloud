@@ -6,10 +6,7 @@ use std::collections::HashMap;
 use fakecloud_aws::ec2query::{ec2_bool, ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
-use crate::service::quota::{
-    check_group_count, direction_rule_count, group_rule_count, rules_limit_exceeded,
-    side_grown_past, GroupHolder,
-};
+use crate::service::quota::{check_group_count, rules_limit_exceeded, GroupHolder, RuleWeights};
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     ec2_arn, filter_value_matches, gen_id, indexed_list, invalid_parameter_value,
@@ -618,24 +615,21 @@ fn authorize(
         let state = accounts.get_or_create(&req.account_id);
         // A missing or empty GroupId (or a nonexistent one) is a hard error on
         // AWS, not a silent no-op.
+        let weights = RuleWeights::new(&state.managed_prefix_lists);
         let sg = state
             .security_groups
             .get_mut(&group_id)
             .ok_or_else(|| sg_not_found(&group_id))?;
-        let after = direction_rule_count(
-            sg.rules
-                .iter()
-                .chain(new_rules.iter())
-                .filter(|r| r.is_egress == is_egress),
-        );
-        if after > rule_limit {
+        let after: Vec<SecurityGroupRule> =
+            sg.rules.iter().chain(new_rules.iter()).cloned().collect();
+        if let Some((count, direction)) = weights.side_grown_past(&sg.rules, &after, rule_limit) {
             return Err(rules_limit_exceeded(format!(
                 "The maximum number of rules per security group has been reached: the \
-                 security group '{group_id}' would have {after} {} rules, limit {rule_limit}",
-                if is_egress { "outbound" } else { "inbound" }
+                 security group '{group_id}' would have {count} {direction} rules, limit \
+                 {rule_limit}"
             )));
         }
-        sg.rules.extend(new_rules.clone());
+        sg.rules = after;
     }
     // New rules change what traffic is allowed — re-apply the firewall (ph3).
     svc.spawn_firewall_reconcile();
@@ -756,6 +750,7 @@ pub(crate) fn modify_security_group_rules(
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        let weights = RuleWeights::new(&state.managed_prefix_lists);
         let sg = state.security_groups.get_mut(&group_id).ok_or_else(|| {
             AwsServiceError::aws_error(
                 http::StatusCode::BAD_REQUEST,
@@ -821,7 +816,7 @@ pub(crate) fn modify_security_group_rules(
             }
             n += 1;
         }
-        if let Some((count, direction)) = side_grown_past(&sg.rules, &rules, rule_limit) {
+        if let Some((count, direction)) = weights.side_grown_past(&sg.rules, &rules, rule_limit) {
             return Err(rules_limit_exceeded(format!(
                 "The maximum number of rules per security group has been reached: the \
                  security group '{group_id}' would have {count} {direction} rules, limit \
@@ -1123,12 +1118,13 @@ pub(crate) fn validate_security_group_quotas_for_interface(
         let accounts = svc.state.read();
         let empty = Ec2State::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let weights = RuleWeights::new(&state.managed_prefix_lists);
         for id in &group_ids {
             let sg = state
                 .security_groups
                 .get(id)
                 .ok_or_else(|| sg_not_found(id))?;
-            counts.push((id.clone(), group_rule_count(&sg.rules)));
+            counts.push((id.clone(), weights.group_rule_count(&sg.rules)));
         }
     }
 
@@ -1884,6 +1880,53 @@ mod modify_tests {
                 rules,
             },
         );
+    }
+
+    #[test]
+    fn authorize_weighs_a_prefix_list_rule_by_its_max_entries() {
+        let svc = Ec2Service::new();
+        seed_sized_group(&svc, "sg-a", 0, 0);
+        {
+            let mut accounts = svc.state.write();
+            let state = accounts.get_or_create("000000000000");
+            for (id, max_entries) in [("pl-big", 61), ("pl-small", 60)] {
+                state.managed_prefix_lists.insert(
+                    id.to_string(),
+                    crate::state::ManagedPrefixList {
+                        prefix_list_id: id.into(),
+                        prefix_list_name: id.into(),
+                        address_family: "IPv4".into(),
+                        max_entries,
+                        version: 1,
+                        state: "create-complete".into(),
+                        entries: Vec::new(),
+                        version_history: std::collections::BTreeMap::new(),
+                    },
+                );
+            }
+        }
+        let authorize_pl = |pl: &str| {
+            authorize_security_group_ingress(
+                &svc,
+                &req(
+                    "AuthorizeSecurityGroupIngress",
+                    &[
+                        ("GroupId", "sg-a"),
+                        ("IpPermissions.1.IpProtocol", "tcp"),
+                        ("IpPermissions.1.FromPort", "443"),
+                        ("IpPermissions.1.ToPort", "443"),
+                        ("IpPermissions.1.PrefixListIds.1.PrefixListId", pl),
+                    ],
+                ),
+            )
+        };
+        // One rule, but a 61-entry list: over the default 60.
+        let err = crate::test_support::err_of(authorize_pl("pl-big"));
+        assert_eq!(err.code(), "RulesPerSecurityGroupLimitExceeded");
+        // A 60-entry list fits exactly; nothing more IPv4 fits after it.
+        assert!(authorize_pl("pl-small").is_ok());
+        let err = crate::test_support::err_of(authorize_pl("pl-small"));
+        assert_eq!(err.code(), "RulesPerSecurityGroupLimitExceeded");
     }
 
     fn validate_quotas(svc: &Ec2Service, query: &[(&str, &str)]) -> String {

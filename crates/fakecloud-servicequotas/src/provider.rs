@@ -5,12 +5,15 @@ use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 
+use fakecloud_core::multi_account::MultiAccountState;
 use fakecloud_core::quota::QuotaProvider;
 use fakecloud_organizations::SharedOrganizationsState;
 use fakecloud_persistence::SnapshotHook;
 
 use crate::catalog::{self, QuotaDef};
-use crate::state::{applied_key, QuotaRequest, ServiceQuotasData, SharedServiceQuotasState};
+use crate::state::{
+    applied_key, QuotaRequest, ServiceQuotasData, SharedServiceQuotasState, TemplateEntry,
+};
 
 /// The applied value of `def` for an account: the value an approved increase
 /// raised it to, else the AWS default.
@@ -102,37 +105,37 @@ pub fn apply_template_if_new(
         (org.management_account_id.clone(), joined)
     };
 
-    // Cheap read-locked check first so the common case never takes the write
-    // lock.
-    let (marker, entries) = {
-        let guard = state.read();
-        let Some(mgmt) = guard.get(&management) else {
-            return false;
+    // Which template (if any) is due, read from `guard`. Run once under the
+    // read lock so the common case never takes the write lock, and again
+    // under the write lock so a template the management account edits or
+    // disassociates in between is never applied in its stale form.
+    let due =
+        |guard: &MultiAccountState<ServiceQuotasData>| -> Option<(String, Vec<TemplateEntry>)> {
+            let mgmt = guard.get(&management)?;
+            let associated_at = mgmt.template_associated_at?;
+            let marker = format!("{management}@{}", associated_at.to_rfc3339());
+            if guard
+                .get(account_id)
+                .and_then(|d| d.template_checked.as_deref())
+                == Some(marker.as_str())
+            {
+                return None;
+            }
+            let entries = if joined.is_some_and(|j| j >= associated_at) {
+                mgmt.template.values().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            Some((marker, entries))
         };
-        let Some(associated_at) = mgmt.template_associated_at else {
-            return false;
-        };
-        let marker = format!("{management}@{}", associated_at.to_rfc3339());
-        if guard
-            .get(account_id)
-            .and_then(|d| d.template_checked.as_deref())
-            == Some(marker.as_str())
-        {
-            return false;
-        }
-        let entries: Vec<_> = if joined.is_some_and(|j| j >= associated_at) {
-            mgmt.template.values().cloned().collect()
-        } else {
-            Vec::new()
-        };
-        (marker, entries)
-    };
-
-    let mut guard = state.write();
-    let data = guard.get_or_create(account_id);
-    if data.template_checked.as_deref() == Some(marker.as_str()) {
+    if due(&state.read()).is_none() {
         return false;
     }
+    let mut guard = state.write();
+    let Some((marker, entries)) = due(&guard) else {
+        return false;
+    };
+    let data = guard.get_or_create(account_id);
     data.template_checked = Some(marker);
     for entry in entries {
         let Some(def) = catalog::quota(&entry.service_code, &entry.quota_code) else {

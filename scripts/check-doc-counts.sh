@@ -303,6 +303,17 @@ for f in "${FILES[@]}"; do
         fi
     done < <(grep -oE "\b[0-9]+(( [a-z][a-z-]+){0,2}) (AWS )?services\b" "$f" | sort -u)
 
+    # --- Labelled service totals ("**Total Services**: 105") ---
+    # The label puts the number AFTER the noun, so the claim regex above never
+    # sees it; supported-services.md kept a stale total through a service add.
+    while read -r hit; do
+        [ -z "$hit" ] && continue
+        if [ "$hit" != "$parity_services" ] && ! is_exception "$f" services "$hit"; then
+            problems+=("$f: claims 'Total Services: $hit', expected $parity_services")
+            fail=1
+        fi
+    done < <(grep -oiE "total services\**:\** *[0-9]+" "$f" | grep -oE "[0-9]+$" | sort -u)
+
     # --- Operation total claims ---
     # Comma-formatted thousands only — avoids matching per-service mini-counts
     # like "23 ops" inside feature bullets. "2,592 operations" / "2,592 API operations" etc.

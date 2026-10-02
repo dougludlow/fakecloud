@@ -8,13 +8,13 @@
 use std::sync::Arc;
 
 use fakecloud_core::quota::QuotaUsageSource;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use fakecloud_core::service::AwsServiceError;
 
 use crate::service::Ec2Service;
 use crate::service_helpers::indexed_list;
-use crate::state::{SecurityGroupRule, SharedEc2State};
+use crate::state::{ManagedPrefixList, SecurityGroupRule, SharedEc2State};
 
 pub(crate) use fakecloud_core::quota::{
     DEFAULT_RULES_PER_SECURITY_GROUP, DEFAULT_SECURITY_GROUPS_PER_INTERFACE,
@@ -59,56 +59,90 @@ impl Ec2Service {
     }
 }
 
-/// Rules one direction of a group counts against the rules-per-group quota.
+/// How much each rule weighs against the rules-per-group quota.
 ///
-/// AWS enforces the quota separately for IPv4 and IPv6 rules, and a rule that
-/// references a security group or prefix list counts toward both, so the
-/// binding count is the larger of the two.
-pub(crate) fn direction_rule_count<'a>(
-    rules: impl Iterator<Item = &'a SecurityGroupRule>,
-) -> usize {
-    let [v4, v6] = side_counts(rules);
-    v4.max(v6)
+/// A CIDR or security-group rule weighs one. A rule that references a
+/// customer-managed prefix list weighs the list's `MaxEntries`, as on AWS, and
+/// counts only toward the list's address family. A prefix list fakecloud does
+/// not hold (an AWS-managed one) weighs one on both sides.
+#[derive(Clone, Copy)]
+pub(crate) struct RuleWeights<'a> {
+    prefix_lists: &'a BTreeMap<String, ManagedPrefixList>,
 }
 
-/// IPv4-side and IPv6-side rule counts of one direction's rules.
-pub(crate) fn side_counts<'a>(rules: impl Iterator<Item = &'a SecurityGroupRule>) -> [usize; 2] {
-    let (mut v4, mut v6) = (0usize, 0usize);
-    for r in rules {
-        if r.cidr_ipv6.is_none() {
-            v4 += 1;
-        }
-        if r.cidr_ipv4.is_none() {
-            v6 += 1;
-        }
+impl<'a> RuleWeights<'a> {
+    pub(crate) fn new(prefix_lists: &'a BTreeMap<String, ManagedPrefixList>) -> Self {
+        Self { prefix_lists }
     }
-    [v4, v6]
-}
 
-/// The first quota side (direction x IP version) an edit grows past `limit`,
-/// as `(count, direction)`. A side that was already over the limit and does
-/// not grow is left alone: the edit did not cause it.
-pub(crate) fn side_grown_past(
-    before: &[SecurityGroupRule],
-    after: &[SecurityGroupRule],
-    limit: usize,
-) -> Option<(usize, &'static str)> {
-    for (egress, direction) in [(false, "inbound"), (true, "outbound")] {
-        let b = side_counts(before.iter().filter(|r| r.is_egress == egress));
-        let a = side_counts(after.iter().filter(|r| r.is_egress == egress));
-        for side in 0..2 {
-            if a[side] > limit && a[side] > b[side] {
-                return Some((a[side], direction));
+    /// The rule's IPv4-side and IPv6-side weight.
+    fn sides(&self, r: &SecurityGroupRule) -> [usize; 2] {
+        if let Some(list) = r
+            .prefix_list_id
+            .as_ref()
+            .and_then(|id| self.prefix_lists.get(id))
+        {
+            let weight = list.max_entries.max(1) as usize;
+            return if list.address_family.eq_ignore_ascii_case("IPv6") {
+                [0, weight]
+            } else {
+                [weight, 0]
+            };
+        }
+        [
+            usize::from(r.cidr_ipv6.is_none()),
+            usize::from(r.cidr_ipv4.is_none()),
+        ]
+    }
+
+    /// IPv4-side and IPv6-side rule counts of one direction's rules.
+    pub(crate) fn side_counts<'r>(
+        &self,
+        rules: impl Iterator<Item = &'r SecurityGroupRule>,
+    ) -> [usize; 2] {
+        rules.fold([0, 0], |[v4, v6], r| {
+            let [w4, w6] = self.sides(r);
+            [v4 + w4, v6 + w6]
+        })
+    }
+
+    /// Rules one direction of a group counts against the quota. AWS enforces
+    /// it separately for IPv4 and IPv6 rules, and a security-group reference
+    /// counts toward both, so the binding count is the larger of the two.
+    pub(crate) fn direction_rule_count<'r>(
+        &self,
+        rules: impl Iterator<Item = &'r SecurityGroupRule>,
+    ) -> usize {
+        let [v4, v6] = self.side_counts(rules);
+        v4.max(v6)
+    }
+
+    /// The binding rule count of a group: the busier direction.
+    pub(crate) fn group_rule_count(&self, rules: &[SecurityGroupRule]) -> usize {
+        self.direction_rule_count(rules.iter().filter(|r| !r.is_egress))
+            .max(self.direction_rule_count(rules.iter().filter(|r| r.is_egress)))
+    }
+
+    /// The first quota side (direction x IP version) an edit grows past
+    /// `limit`, as `(count, direction)`. A side that was already over the
+    /// limit and does not grow is left alone: the edit did not cause it.
+    pub(crate) fn side_grown_past(
+        &self,
+        before: &[SecurityGroupRule],
+        after: &[SecurityGroupRule],
+        limit: usize,
+    ) -> Option<(usize, &'static str)> {
+        for (egress, direction) in [(false, "inbound"), (true, "outbound")] {
+            let b = self.side_counts(before.iter().filter(|r| r.is_egress == egress));
+            let a = self.side_counts(after.iter().filter(|r| r.is_egress == egress));
+            for side in 0..2 {
+                if a[side] > limit && a[side] > b[side] {
+                    return Some((a[side], direction));
+                }
             }
         }
+        None
     }
-    None
-}
-
-/// The binding rule count of a group: the busier direction.
-pub(crate) fn group_rule_count(rules: &[SecurityGroupRule]) -> usize {
-    direction_rule_count(rules.iter().filter(|r| !r.is_egress))
-        .max(direction_rule_count(rules.iter().filter(|r| r.is_egress)))
 }
 
 fn bad_request(code: &str, message: String) -> AwsServiceError {
@@ -298,7 +332,10 @@ mod tests {
             rule(true, None, Some("::/0"), None),
         ];
         // Ingress: 3 IPv4-side (two CIDRs + the reference), 2 IPv6-side.
-        assert_eq!(group_rule_count(&rules), 3);
+        assert_eq!(
+            RuleWeights::new(&BTreeMap::new()).group_rule_count(&rules),
+            3
+        );
     }
 
     #[test]
@@ -315,7 +352,9 @@ mod tests {
         let mut after = before.clone();
         after[4].cidr_ipv4 = None;
         after[4].cidr_ipv6 = Some("::/0".into());
-        assert_eq!(side_grown_past(&before, &after, 2), None);
+        let w = BTreeMap::new();
+        let w = RuleWeights::new(&w);
+        assert_eq!(w.side_grown_past(&before, &after, 2), None);
         // Egress growing to 3 IPv6 rules is caught even though ingress, the
         // busier direction, does not change.
         before.push(rule(true, None, Some("::/1"), None));
@@ -323,7 +362,33 @@ mod tests {
         let mut after = before.clone();
         after[3].cidr_ipv4 = None;
         after[3].cidr_ipv6 = Some("::/3".into());
-        assert_eq!(side_grown_past(&before, &after, 2), Some((3, "outbound")));
+        assert_eq!(w.side_grown_past(&before, &after, 2), Some((3, "outbound")));
+    }
+
+    #[test]
+    fn a_prefix_list_rule_weighs_its_max_entries_on_its_family() {
+        let mut lists = BTreeMap::new();
+        lists.insert(
+            "pl-1".to_string(),
+            ManagedPrefixList {
+                prefix_list_id: "pl-1".into(),
+                prefix_list_name: "corp".into(),
+                address_family: "IPv4".into(),
+                max_entries: 10,
+                version: 1,
+                state: "create-complete".into(),
+                entries: Vec::new(),
+                version_history: BTreeMap::new(),
+            },
+        );
+        let mut pl = rule(false, None, None, None);
+        pl.prefix_list_id = Some("pl-1".into());
+        let mut unknown = rule(false, None, None, None);
+        unknown.prefix_list_id = Some("pl-aws".into());
+        let rules = vec![pl, unknown, rule(false, None, Some("::/0"), None)];
+        let w = RuleWeights::new(&lists);
+        // IPv4: 10 (pl-1) + 1 (unknown list); IPv6: 1 (unknown list) + 1.
+        assert_eq!(w.side_counts(rules.iter()), [11, 2]);
     }
 
     struct Fixed(f64);
