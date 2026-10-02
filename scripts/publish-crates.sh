@@ -78,7 +78,7 @@ CRATES=(
   fakecloud-elasticbeanstalk # only core/persistence/aws deps
   fakecloud-memorydb         # only core/persistence/aws deps
   fakecloud-kinesisanalyticsv2 # only core/persistence/aws deps
-  fakecloud-eks              # only core/persistence/aws deps
+  fakecloud-eks              # depends on ec2 (cluster security group)
   fakecloud-efs              # depends on ec2 (subnet AZ/VPC resolution)
   fakecloud-mq               # only core/persistence/aws deps
   fakecloud-kafka            # only core/persistence/aws deps

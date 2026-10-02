@@ -1,10 +1,15 @@
 //! AWS EKS (`eks`) implementation for FakeCloud.
 
+pub mod cluster_sg;
 pub(crate) mod eks_helpers;
 pub mod persistence;
 pub(crate) mod service;
 pub(crate) mod state;
 
+pub use cluster_sg::{
+    create_cluster_security_group, delete_cluster_security_group, ClusterNetwork,
+    CLUSTER_SECURITY_GROUP_DESCRIPTION,
+};
 pub use service::{EksService, EKS_ACTIONS};
 pub use state::{EksSnapshot, EksState, SharedEksState, EKS_SNAPSHOT_SCHEMA_VERSION};
 // Re-exported for the CloudFormation resource_provisioner; the `state` module

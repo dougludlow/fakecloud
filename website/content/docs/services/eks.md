@@ -18,6 +18,13 @@ in persistent mode.
   `DeleteCluster`. Clusters are created with the requested `roleArn`,
   `resourcesVpcConfig`, `version` (default 1.31), and tags, and transition
   `CREATING` -> `ACTIVE` on describe (deterministic, no background timer).
+  Like EKS, `CreateCluster` (and `AWS::EKS::Cluster`) creates the cluster
+  security group in EC2, in the VPC of the cluster's subnets: named
+  `eks-cluster-sg-<cluster>-<id>`, tagged `aws:eks:cluster-name` and
+  `kubernetes.io/cluster/<cluster>=owned`, with a self-referencing all-traffic
+  ingress rule and an all-traffic egress rule. `resourcesVpcConfig` returns it
+  as `clusterSecurityGroupId` (with the subnets' `vpcId`), it can be described,
+  tagged and given rules through EC2, and `DeleteCluster` deletes it.
 - **Cluster updates** — `UpdateClusterConfig`, `UpdateClusterVersion`, each
   minting a tracked `Update` that settles `InProgress` -> `Successful` on
   describe; `DescribeUpdate` and `ListUpdates` return the update history.

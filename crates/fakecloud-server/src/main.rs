@@ -5863,7 +5863,9 @@ async fn main() {
         } else {
             None
         };
-    let mut eks_service = fakecloud_eks::EksService::new(eks_state.clone());
+    let mut eks_service = fakecloud_eks::EksService::new(eks_state.clone())
+        .with_ec2_state(ec2_state.clone())
+        .with_ec2_snapshot_hook(cfn_snapshot_hooks.get("ec2").cloned());
     if let Some(store) = eks_snapshot_store {
         eks_service = eks_service.with_snapshot_store(store);
     }

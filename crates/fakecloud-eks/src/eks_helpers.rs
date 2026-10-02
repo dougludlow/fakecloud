@@ -436,6 +436,25 @@ pub(crate) fn build_vpc_config_response(req: &Value, id: &str) -> Value {
     out
 }
 
+/// Apply an `UpdateClusterConfig` `resourcesVpcConfig` to the stored
+/// `VpcConfigResponse`: only the members present in the request change. The
+/// cluster's VPC and its EKS-managed security group are fixed at creation and
+/// are never replaced.
+pub(crate) fn merge_vpc_config_update(existing: &mut Value, req: &Value) {
+    for key in [
+        "subnetIds",
+        "securityGroupIds",
+        "endpointPublicAccess",
+        "endpointPrivateAccess",
+        "publicAccessCidrs",
+        "controlPlaneEgressMode",
+    ] {
+        if let Some(v) = req.get(key) {
+            existing[key] = v.clone();
+        }
+    }
+}
+
 pub(crate) fn build_k8s_network_config(req: Option<&Value>) -> Value {
     let ip_family = req
         .and_then(|v| v.get("ipFamily"))
