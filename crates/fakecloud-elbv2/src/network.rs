@@ -136,6 +136,50 @@ pub fn restore_canonical_hosted_zone_ids(accounts: &mut crate::state::Elbv2Accou
     fixed
 }
 
+/// The VPC a load balancer really sits in: its stored `VpcId` when EC2 knows
+/// that VPC, otherwise the VPC of the first of its subnets EC2 knows. Load
+/// balancers persisted before VPCs were resolved carry an invented (or empty)
+/// `VpcId`; this re-derives it instead of enforcing it. `None` when neither
+/// resolves.
+pub fn effective_vpc(
+    ec2: &SharedEc2State,
+    account_id: &str,
+    stored_vpc: &str,
+    subnet_ids: &[String],
+) -> Option<String> {
+    let mut accounts = ec2.write();
+    let state = accounts.get_or_create(account_id);
+    if !stored_vpc.is_empty() && state.vpcs.contains_key(stored_vpc) {
+        return Some(stored_vpc.to_string());
+    }
+    subnet_ids
+        .iter()
+        .find_map(|id| state.subnets.get(id).map(|s| s.vpc_id.clone()))
+}
+
+/// Re-derive the `VpcId` of restored load balancers whose stored VPC EC2 does
+/// not know (snapshots taken before VPCs were resolved), from their subnets.
+/// Returns how many were fixed.
+pub fn restore_vpc_ids(accounts: &mut crate::state::Elbv2Accounts, ec2: &SharedEc2State) -> usize {
+    let mut fixed = 0;
+    for (account_id, st) in accounts.iter_mut() {
+        for lb in st.load_balancers.values_mut() {
+            let subnets: Vec<String> = lb
+                .availability_zones
+                .iter()
+                .map(|z| z.subnet_id.clone())
+                .collect();
+            if let Some(vpc) = effective_vpc(ec2, account_id, &lb.vpc_id, &subnets) {
+                if vpc != lb.vpc_id {
+                    lb.vpc_id = vpc;
+                    fixed += 1;
+                }
+            }
+        }
+    }
+    fixed
+}
+
 /// One requested subnet attachment (`Subnets.member.N` or
 /// `SubnetMappings.member.N`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -197,7 +241,7 @@ impl NetworkError {
                 "A load balancer cannot be attached to multiple subnets in the same Availability Zone '{az}'"
             ),
             Self::PrivateIpOutsideSubnet { ip, subnet_id } => format!(
-                "The private IPv4 address '{ip}' is not within the CIDR block of subnet '{subnet_id}'"
+                "The private IPv4 address '{ip}' is not a usable address in the CIDR block of subnet '{subnet_id}'"
             ),
             Self::AllocationIdNotFound(id) => {
                 format!("The allocation ID '{id}' does not exist")
@@ -267,7 +311,9 @@ pub fn resolve_subnets(
             ));
         }
         if let Some(ip) = &req.private_ipv4_address {
-            if !vpc_lookup::ip_in_cidr(ip, &info.cidr_block) {
+            if !vpc_lookup::ip_in_cidr(ip, &info.cidr_block)
+                || vpc_lookup::ip_is_reserved(ip, &info.cidr_block)
+            {
                 return Err(NetworkError::PrivateIpOutsideSubnet {
                     ip: ip.clone(),
                     subnet_id: info.subnet_id.clone(),

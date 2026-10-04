@@ -500,12 +500,26 @@ impl RedshiftService {
             .subnet_groups
             .get_mut(&name)
             .ok_or_else(|| subnet_group_not_found(&name))?;
+        if let Some((vpc_id, subnets)) = placed {
+            if let Some(ec2) = &self.ec2_state {
+                if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                    ec2,
+                    &req.account_id,
+                    &g.vpc_id,
+                    &vpc_id,
+                ) {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                    ));
+                }
+                g.vpc_id = vpc_id;
+            }
+            g.subnets = subnets;
+        }
         if let Some(d) = param(req, "Description") {
             g.description = d;
-        }
-        if let Some((vpc_id, subnets)) = placed {
-            g.vpc_id = vpc_id;
-            g.subnets = subnets;
         }
         let out = render_subnet_group(g);
         Ok(xml_resp(

@@ -255,15 +255,29 @@ impl ElastiCacheService {
             )
         })?;
 
-        if let Some(desc) = description {
-            group.cache_subnet_group_description = desc;
-        }
         if let Some((vpc_id, zones)) = placed {
+            if let Some(ec2) = &self.ec2_state {
+                if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                    ec2,
+                    &request.account_id,
+                    &group.vpc_id,
+                    &vpc_id,
+                ) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                    ));
+                }
+            }
             if !vpc_id.is_empty() {
                 group.vpc_id = vpc_id;
             }
             group.subnet_ids = subnet_ids;
             group.subnet_availability_zones = zones;
+        }
+        if let Some(desc) = description {
+            group.cache_subnet_group_description = desc;
         }
 
         let xml = cache_subnet_group_xml(group, &region);

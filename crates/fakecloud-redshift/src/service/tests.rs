@@ -1520,3 +1520,61 @@ fn idc_application_create_fields_round_trip() {
     let tags = ok(&svc, "DescribeTags", &[("ResourceName", &arn)]);
     assert!(tags.contains("<Key>team</Key>") && tags.contains("<Key>env</Key>"));
 }
+
+#[test]
+fn modify_cluster_subnet_group_cannot_move_vpc() {
+    let ec2: fakecloud_ec2::SharedEc2State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012");
+    // A second VPC with one subnet.
+    {
+        let mut accounts = ec2.write();
+        let state = accounts.get_or_create("123456789012");
+        let mut vpc = state.vpcs.values().next().unwrap().clone();
+        vpc.vpc_id = "vpc-0other".into();
+        vpc.is_default = false;
+        state.vpcs.insert(vpc.vpc_id.clone(), vpc);
+        let mut other = state.subnets[&subnets[0].subnet_id].clone();
+        other.subnet_id = "subnet-0other".into();
+        other.vpc_id = "vpc-0other".into();
+        state.subnets.insert(other.subnet_id.clone(), other);
+    }
+    let svc = service().with_ec2_state(ec2);
+    ok(
+        &svc,
+        "CreateClusterSubnetGroup",
+        &[
+            ("ClusterSubnetGroupName", "g"),
+            ("Description", "first"),
+            ("SubnetIds.member.1", &subnets[0].subnet_id),
+        ],
+    );
+    let err = svc
+        .dispatch(&req(
+            "ModifyClusterSubnetGroup",
+            &[
+                ("ClusterSubnetGroupName", "g"),
+                ("Description", "second"),
+                ("SubnetIds.member.1", "subnet-0other"),
+            ],
+        ))
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidSubnet");
+    let described = ok(
+        &svc,
+        "DescribeClusterSubnetGroups",
+        &[("ClusterSubnetGroupName", "g")],
+    );
+    assert!(described.contains("<Description>first</Description>"));
+    // Same-VPC changes still apply.
+    ok(
+        &svc,
+        "ModifyClusterSubnetGroup",
+        &[
+            ("ClusterSubnetGroupName", "g"),
+            ("SubnetIds.member.1", &subnets[1].subnet_id),
+        ],
+    );
+}

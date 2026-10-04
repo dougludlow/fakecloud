@@ -3602,6 +3602,16 @@ async fn main() {
                                         "set the regional hosted zone id on restored load balancers"
                                     );
                                 }
+                                let fixed = fakecloud_elbv2::network::restore_vpc_ids(
+                                    &mut accounts,
+                                    &ec2_state,
+                                );
+                                if fixed > 0 {
+                                    tracing::info!(
+                                        fixed,
+                                        "re-derived the vpc of restored load balancers from their subnets"
+                                    );
+                                }
                                 *elbv2_state.write() = accounts;
                                 tracing::info!("loaded elbv2 persistence snapshot");
                             }

@@ -302,6 +302,30 @@ async fn database_subnet_groups_report_the_subnets_vpc_and_zones() {
     );
     // Subnets from two VPCs cannot share a group.
     let default_subnets = server.default_subnet_ids().await;
+    // A group's VPC is fixed: modifying it onto another VPC's subnets fails
+    // and leaves it unchanged.
+    let err = rds
+        .modify_db_subnet_group()
+        .db_subnet_group_name("placed-rds")
+        .db_subnet_group_description("moved")
+        .subnet_ids(&default_subnets[0])
+        .subnet_ids(&default_subnets[1])
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidSubnet")
+    );
+    let unchanged = rds
+        .describe_db_subnet_groups()
+        .db_subnet_group_name("placed-rds")
+        .send()
+        .await
+        .unwrap();
+    let unchanged = &unchanged.db_subnet_groups()[0];
+    assert_eq!(unchanged.vpc_id(), Some(vpc_id.as_str()));
+    assert_eq!(unchanged.db_subnet_group_description(), Some("d"));
     let err = rds
         .create_db_subnet_group()
         .db_subnet_group_name("split-rds")
@@ -328,6 +352,17 @@ async fn database_subnet_groups_report_the_subnets_vpc_and_zones() {
         .unwrap();
     let group = group.cache_subnet_group().unwrap();
     assert_eq!(group.vpc_id(), Some(vpc_id.as_str()));
+    let err = elasticache
+        .modify_cache_subnet_group()
+        .cache_subnet_group_name("placed-cache")
+        .subnet_ids(&default_subnets[0])
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidSubnet")
+    );
     assert!(group
         .subnets()
         .iter()

@@ -240,6 +240,20 @@ impl RdsService {
                 )
             })?;
 
+        if let Some(ec2) = &self.ec2_state {
+            if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                ec2,
+                &request.account_id,
+                &subnet_group.vpc_id,
+                &vpc_id,
+            ) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidSubnet",
+                    fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                ));
+            }
+        }
         subnet_group.vpc_id = vpc_id;
         subnet_group.subnet_ids = subnet_ids;
         subnet_group.subnet_availability_zones = subnet_availability_zones;

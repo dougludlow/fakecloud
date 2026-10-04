@@ -1003,6 +1003,20 @@ async fn create_lb_rejects_unknown_subnets_and_security_groups() {
         .err()
         .unwrap();
     assert_eq!(err.code(), "InvalidConfigurationRequest");
+    let err = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "reserved"),
+                ("Type", "network"),
+                ("SubnetMappings.member.1.SubnetId", &subnets[0].subnet_id),
+                ("SubnetMappings.member.1.PrivateIPv4Address", "172.31.0.2"),
+            ],
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidConfigurationRequest");
     // Nothing was created by the rejected calls.
     let body = body_string(&svc.handle(req("DescribeLoadBalancers", &[])).await.unwrap());
     assert!(!body.contains("<LoadBalancerName>"));
@@ -1097,4 +1111,90 @@ async fn listener_actions_round_trip_auth_and_stickiness() {
     assert!(body.contains("<UserPoolClientId>pool-client</UserPoolClientId>"));
     assert!(body.contains("<UserPoolDomain>auth-domain</UserPoolDomain>"));
     assert!(body.contains("<OnUnauthenticatedRequest>deny</OnUnauthenticatedRequest>"));
+}
+
+#[tokio::test]
+async fn legacy_invented_vpc_id_is_re_derived_not_enforced() {
+    let (svc, ec2) = ec2_svc();
+    let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012");
+    let vpc = subnets[0].vpc_id.clone();
+    let default_sg =
+        fakecloud_ec2::vpc_lookup::default_security_group_id(&ec2, "123456789012", &vpc).unwrap();
+    let body = body_string(
+        &svc.handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "legacy"),
+                ("Subnets.member.1", &subnets[0].subnet_id),
+            ],
+        ))
+        .await
+        .unwrap(),
+    );
+    let arn = xml_field(&body, "LoadBalancerArn");
+    // A load balancer restored from an old snapshot carries an invented VPC.
+    {
+        let mut accounts = svc.state.write();
+        let lb = accounts
+            .get_or_create("123456789012")
+            .load_balancers
+            .get_mut(&arn)
+            .unwrap();
+        lb.vpc_id = "vpc-1a2b3c4d".to_string();
+    }
+    svc.handle(req(
+        "SetSecurityGroups",
+        &[
+            ("LoadBalancerArn", &arn),
+            ("SecurityGroups.member.1", &default_sg),
+        ],
+    ))
+    .await
+    .unwrap();
+    svc.handle(req(
+        "SetSubnets",
+        &[
+            ("LoadBalancerArn", &arn),
+            ("Subnets.member.1", &subnets[0].subnet_id),
+            ("Subnets.member.2", &subnets[1].subnet_id),
+        ],
+    ))
+    .await
+    .unwrap();
+    let accounts = svc.state.read();
+    assert_eq!(
+        accounts.get("123456789012").unwrap().load_balancers[&arn].vpc_id,
+        vpc
+    );
+}
+
+#[tokio::test]
+async fn restore_vpc_ids_re_derives_from_subnets() {
+    let ec2 = ec2_state();
+    let subnet = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012").remove(0);
+    let svc = Elbv2Service::new_without_dataplane(Arc::new(RwLock::new(
+        crate::state::Elbv2Accounts::new(),
+    )));
+    let body = body_string(
+        &svc.handle(req(
+            "CreateLoadBalancer",
+            &[("Name", "old"), ("Subnets.member.1", &subnet.subnet_id)],
+        ))
+        .await
+        .unwrap(),
+    );
+    let arn = xml_field(&body, "LoadBalancerArn");
+    let mut accounts = svc.state.write();
+    accounts
+        .get_or_create("123456789012")
+        .load_balancers
+        .get_mut(&arn)
+        .unwrap()
+        .vpc_id = "vpc-0000invented".to_string();
+    assert_eq!(crate::network::restore_vpc_ids(&mut accounts, &ec2), 1);
+    assert_eq!(
+        accounts.get("123456789012").unwrap().load_balancers[&arn].vpc_id,
+        subnet.vpc_id
+    );
+    assert_eq!(crate::network::restore_vpc_ids(&mut accounts, &ec2), 0);
 }

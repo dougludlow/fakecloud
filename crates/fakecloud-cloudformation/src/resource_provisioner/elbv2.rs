@@ -569,19 +569,34 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let arn = existing.physical_id.clone();
-        let (lb_type, lb_vpc) = {
+        let (lb_type, stored_vpc, lb_subnets) = {
             let accounts = self.elbv2_state.read();
             let lb = accounts
                 .get(&self.account_id)
                 .and_then(|st| st.load_balancers.get(&arn))
                 .ok_or_else(|| format!("LoadBalancer {arn} no longer exists"))?;
-            (lb.lb_type.clone(), lb.vpc_id.clone())
+            (
+                lb.lb_type.clone(),
+                lb.vpc_id.clone(),
+                lb.availability_zones
+                    .iter()
+                    .map(|z| z.subnet_id.clone())
+                    .collect::<Vec<_>>(),
+            )
         };
-        let expected_vpc = Some(lb_vpc.as_str()).filter(|v| !v.is_empty());
+        // The VPC the load balancer really sits in (a legacy invented VpcId is
+        // re-derived from its subnets rather than enforced).
+        let lb_vpc = fakecloud_elbv2::network::effective_vpc(
+            &self.ec2_state,
+            &self.account_id,
+            &stored_vpc,
+            &lb_subnets,
+        );
+        let expected_vpc = lb_vpc.as_deref();
         // New subnets must stay in the load balancer's VPC and new security
         // groups must exist there, as SetSubnets / SetSecurityGroups require.
         let subnets = elbv2_subnet_requests(props);
-        let zones = if subnets.is_empty() {
+        let placed = if subnets.is_empty() {
             None
         } else {
             Some(
@@ -591,10 +606,14 @@ impl ResourceProvisioner {
                     &subnets,
                     expected_vpc,
                 )
-                .map_err(|e| e.message())?
-                .availability_zones,
+                .map_err(|e| e.message())?,
             )
         };
+        let lb_vpc = placed
+            .as_ref()
+            .map(|p| p.vpc_id.clone())
+            .or(lb_vpc)
+            .unwrap_or_default();
         let groups = match props.get("SecurityGroups").and_then(|v| v.as_array()) {
             Some(arr) => {
                 let requested: Vec<String> = arr
@@ -626,8 +645,11 @@ impl ResourceProvisioner {
         if let Some(s) = props.get("IpAddressType").and_then(|v| v.as_str()) {
             lb.ip_address_type = s.to_string();
         }
-        if let Some(zones) = zones {
-            lb.availability_zones = zones;
+        if let Some(placed) = placed {
+            lb.availability_zones = placed.availability_zones;
+        }
+        if !lb_vpc.is_empty() {
+            lb.vpc_id = lb_vpc;
         }
         if props.get("Tags").is_some() {
             lb.tags = parse_elb_tags(props.get("Tags"));

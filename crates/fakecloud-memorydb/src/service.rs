@@ -1386,15 +1386,26 @@ impl MemoryDbService {
                 &format!("Subnet group {name} not found."),
             ));
         };
-        if let Some(d) = opt_str(&b, "Description") {
-            g.description = d;
-        }
         if let Some((vpc_id, zones)) = placed {
-            if self.ec2_state.is_some() {
+            if let Some(ec2) = &self.ec2_state {
+                if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                    ec2,
+                    &req.account_id,
+                    &g.vpc_id,
+                    &vpc_id,
+                ) {
+                    return Err(fault(
+                        "InvalidSubnet",
+                        fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                    ));
+                }
                 g.vpc_id = vpc_id;
             }
             g.subnet_ids = ids;
             g.subnet_availability_zones = zones;
+        }
+        if let Some(d) = opt_str(&b, "Description") {
+            g.description = d;
         }
         let out = sg_json(g);
         ok(json!({ "SubnetGroup": out }))

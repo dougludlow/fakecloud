@@ -146,6 +146,29 @@ pub fn resolve_subnet_group(
     Ok(SubnetGroupPlacement { vpc_id, subnets })
 }
 
+/// The `InvalidSubnet` message the database services return when a subnet
+/// group modification names subnets outside the group's VPC.
+pub const SUBNET_GROUP_VPC_CHANGE_MESSAGE: &str =
+    "The new Subnets are not in the same Vpc as the existing subnet group";
+
+/// Whether a subnet group in `existing_vpc` may take subnets in `new_vpc`. A
+/// group's VPC is fixed once created, so only the same VPC is allowed. A group
+/// persisted before VPCs were resolved (empty or invented VPC id EC2 does not
+/// know) is re-resolved instead.
+pub fn subnet_group_vpc_change_allowed(
+    ec2: &SharedEc2State,
+    account_id: &str,
+    existing_vpc: &str,
+    new_vpc: &str,
+) -> bool {
+    if existing_vpc.is_empty() || existing_vpc == new_vpc {
+        return true;
+    }
+    let mut accounts = ec2.write();
+    let state = accounts.get_or_create(account_id);
+    !state.vpcs.contains_key(existing_vpc)
+}
+
 /// The default VPC of the account, when it still exists.
 pub fn default_vpc_id(ec2: &SharedEc2State, account_id: &str) -> Option<String> {
     let mut accounts = ec2.write();
@@ -250,6 +273,18 @@ pub fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
     u32::from(addr) & mask == net
 }
 
+/// Whether `ip` is one of the five addresses AWS reserves in every subnet: the
+/// network address, the next three (VPC router, DNS, future use) and the
+/// broadcast address.
+pub fn ip_is_reserved(ip: &str, cidr: &str) -> bool {
+    let (Some((net, len)), Ok(addr)) = (parse_ipv4_cidr(cidr), ip.parse::<Ipv4Addr>()) else {
+        return false;
+    };
+    let size: u64 = 1u64 << (32 - len);
+    let offset = u64::from(u32::from(addr).wrapping_sub(net));
+    offset < 4 || offset == size - 1
+}
+
 /// Every private IPv4 address already in use in `subnet_id`: network
 /// interfaces (primary and secondary) and instances.
 fn used_ips(state: &Ec2State, subnet_id: &str) -> std::collections::HashSet<String> {
@@ -296,6 +331,8 @@ pub enum EniError {
     IpOutsideSubnet(String),
     /// The requested private IP is already assigned in the subnet.
     IpInUse(String),
+    /// The requested private IP is one AWS reserves in every subnet.
+    IpReserved(String),
     /// The subnet has no free addresses left.
     NoFreeAddresses(String),
 }
@@ -327,6 +364,9 @@ pub fn create_service_eni(
         Some(ip) => {
             if !ip_in_cidr(ip, &subnet.cidr_block) {
                 return Err(EniError::IpOutsideSubnet(ip.to_string()));
+            }
+            if ip_is_reserved(ip, &subnet.cidr_block) {
+                return Err(EniError::IpReserved(ip.to_string()));
             }
             if used_ips(state, &subnet.subnet_id).contains(ip) {
                 return Err(EniError::IpInUse(ip.to_string()));
@@ -543,6 +583,11 @@ mod tests {
 
     #[test]
     fn cidr_math() {
+        for reserved in ["172.31.16.0", "172.31.16.1", "172.31.16.3", "172.31.31.255"] {
+            assert!(ip_is_reserved(reserved, "172.31.16.0/20"), "{reserved}");
+        }
+        assert!(!ip_is_reserved("172.31.16.4", "172.31.16.0/20"));
+        assert!(!ip_is_reserved("172.31.31.254", "172.31.16.0/20"));
         assert!(ip_in_cidr("172.31.16.9", "172.31.16.0/20"));
         assert!(!ip_in_cidr("172.31.32.9", "172.31.16.0/20"));
         assert!(!ip_in_cidr("garbage", "172.31.16.0/20"));
@@ -573,6 +618,10 @@ mod tests {
         assert_eq!(
             create_service_eni(state, spec(Some(&ip_a))).unwrap_err(),
             EniError::IpInUse(ip_a.clone())
+        );
+        assert_eq!(
+            create_service_eni(state, spec(Some("172.31.0.1"))).unwrap_err(),
+            EniError::IpReserved("172.31.0.1".into())
         );
         assert_eq!(
             create_service_eni(state, spec(Some("10.9.9.9"))).unwrap_err(),

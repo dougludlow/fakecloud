@@ -3295,6 +3295,40 @@ async fn addon_pod_identity_associations_are_real_and_stable_on_update() {
         "arn:aws:iam::111122223333:role/cni2"
     );
 
+    // The association belongs to the add-on: it cannot be changed or deleted
+    // directly.
+    for (method, body) in [
+        (
+            Method::POST,
+            json!({ "roleArn": "arn:aws:iam::111122223333:role/other" }).to_string(),
+        ),
+        (Method::DELETE, String::new()),
+    ] {
+        let err = svc
+            .handle(make_request(
+                method,
+                &format!("/clusters/c1/pod-identity-associations/{assoc_id}"),
+                &body,
+            ))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "InvalidRequestException");
+    }
+    let desc = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            &format!("/clusters/c1/pod-identity-associations/{assoc_id}"),
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        desc["association"]["roleArn"],
+        "arn:aws:iam::111122223333:role/cni2"
+    );
+
     // Deleting the add-on deletes its associations.
     svc.handle(make_request(
         Method::DELETE,
@@ -3350,18 +3384,36 @@ async fn update_nodegroup_version_applies_launch_template_version() {
         "lt-0123456789abcdef0"
     );
 
-    // A different launch template is rejected.
+    // A different launch template is rejected, and the rejected request
+    // changes nothing (not even the Kubernetes version it carried).
+    let before = ng["nodegroup"]["version"].clone();
     let err = svc
         .handle(make_request(
             Method::POST,
             "/clusters/c1/node-groups/ng1/update-version",
-            &json!({ "launchTemplate": { "id": "lt-0000000000000000f", "version": "4" } })
-                .to_string(),
+            &json!({
+                "version": "1.99",
+                "releaseVersion": "1.99-x",
+                "launchTemplate": { "id": "lt-0000000000000000f", "version": "4" }
+            })
+            .to_string(),
         ))
         .await
         .err()
         .unwrap();
     assert_eq!(err.code(), "InvalidParameterException");
+    let ng = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            "/clusters/c1/node-groups/ng1",
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(ng["nodegroup"]["version"], before);
+    assert_ne!(ng["nodegroup"]["releaseVersion"], "1.99-x");
+    assert_eq!(ng["nodegroup"]["launchTemplate"]["version"], "3");
 }
 
 #[tokio::test]

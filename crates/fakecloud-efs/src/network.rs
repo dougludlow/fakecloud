@@ -25,6 +25,7 @@ pub enum NetworkError {
     SecurityGroupLimitExceeded,
     IpAddressInUse(String),
     IpAddressOutsideSubnet { ip: String, subnet_id: String },
+    IpAddressReserved { ip: String, subnet_id: String },
     NoFreeAddressesInSubnet(String),
 }
 
@@ -38,7 +39,7 @@ impl NetworkError {
             }
             Self::SecurityGroupLimitExceeded => "SecurityGroupLimitExceeded",
             Self::IpAddressInUse(_) => "IpAddressInUse",
-            Self::IpAddressOutsideSubnet { .. } => "BadRequest",
+            Self::IpAddressOutsideSubnet { .. } | Self::IpAddressReserved { .. } => "BadRequest",
             Self::NoFreeAddressesInSubnet(_) => "NoFreeAddressesInSubnet",
         }
     }
@@ -69,6 +70,9 @@ impl NetworkError {
             }
             Self::IpAddressOutsideSubnet { ip, subnet_id } => format!(
                 "The IP address '{ip}' is not within the CIDR block of subnet '{subnet_id}'."
+            ),
+            Self::IpAddressReserved { ip, subnet_id } => format!(
+                "The IP address '{ip}' is reserved in subnet '{subnet_id}'."
             ),
             Self::NoFreeAddressesInSubnet(id) => {
                 format!("The subnet '{id}' has no free IP addresses.")
@@ -156,6 +160,10 @@ pub fn create_mount_target_eni(
         EniError::SubnetNotFound(id) => NetworkError::SubnetNotFound(id),
         EniError::IpInUse(ip) => NetworkError::IpAddressInUse(ip),
         EniError::IpOutsideSubnet(ip) => NetworkError::IpAddressOutsideSubnet {
+            ip,
+            subnet_id: subnet.subnet_id.clone(),
+        },
+        EniError::IpReserved(ip) => NetworkError::IpAddressReserved {
             ip,
             subnet_id: subnet.subnet_id.clone(),
         },

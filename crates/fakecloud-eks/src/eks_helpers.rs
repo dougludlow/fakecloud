@@ -533,6 +533,25 @@ pub(crate) fn apply_launch_template_version(
     Ok(())
 }
 
+/// An add-on manages the pod identity associations it owns; they can only be
+/// changed or removed through the add-on (`UpdateAddon` / `DeleteAddon`), so
+/// a direct Update/DeletePodIdentityAssociation is refused, as on AWS.
+pub(crate) fn reject_addon_owned_association(
+    a: &PodIdentityAssociation,
+) -> Result<(), AwsServiceError> {
+    match &a.owner_arn {
+        Some(owner) => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequestException",
+            format!(
+                "Pod Identity association {} is owned by {owner}. Update or delete the add-on to change it.",
+                a.association_id
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Build an `AccessConfigResponse` object. The API only reports
 /// `authenticationMode` (bootstrap-creator permission is a create-only input),
 /// defaulting to `CONFIG_MAP` when the caller omits `accessConfig`.

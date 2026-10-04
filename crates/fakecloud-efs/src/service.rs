@@ -2354,6 +2354,15 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code(), "BadRequest");
+        // AWS reserves the first four addresses and the broadcast address.
+        let err = s
+            .create_mount_target(
+                &ctx(),
+                &json!({ "FileSystemId": "fs-1", "SubnetId": subnet, "IpAddress": "172.31.0.1" }),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "BadRequest");
         // Nothing leaked into EC2 from the rejected calls.
         assert!(ec2
             .read()

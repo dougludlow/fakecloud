@@ -1804,12 +1804,25 @@ impl DmsService {
             return Err(not_found(&format!("Subnet group {id} not found.")));
         };
         let obj = group.as_object_mut().unwrap();
-        if let Some(desc) = opt_str(b, "ReplicationSubnetGroupDescription") {
-            obj.insert("ReplicationSubnetGroupDescription".into(), json!(desc));
+        if let Some(ec2) = &self.ec2_state {
+            let existing = obj.get("VpcId").and_then(Value::as_str).unwrap_or_default();
+            if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                ec2,
+                &ctx.account,
+                existing,
+                &vpc_id,
+            ) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidSubnet",
+                    fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                ));
+            }
+            obj.insert("VpcId".into(), json!(vpc_id));
         }
         obj.insert("Subnets".into(), json!(subnets));
-        if self.ec2_state.is_some() {
-            obj.insert("VpcId".into(), json!(vpc_id));
+        if let Some(desc) = opt_str(b, "ReplicationSubnetGroupDescription") {
+            obj.insert("ReplicationSubnetGroupDescription".into(), json!(desc));
         }
         let group = group.clone();
         ok(json!({ "ReplicationSubnetGroup": group }))

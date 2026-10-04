@@ -2260,14 +2260,26 @@ impl NeptuneService {
             .subnet_groups
             .get_mut(&name)
             .ok_or_else(|| subnet_group_not_found(&name))?;
-        if let Some(v) = optional_query_param(req, "DBSubnetGroupDescription") {
-            group.db_subnet_group_description = v;
-        }
         if let Some((vpc_id, subnets)) = placed {
-            if self.ec2_state.is_some() {
+            if let Some(ec2) = &self.ec2_state {
+                if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                    ec2,
+                    &req.account_id,
+                    &group.vpc_id,
+                    &vpc_id,
+                ) {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                    ));
+                }
                 group.vpc_id = vpc_id;
             }
             group.subnets = subnets;
+        }
+        if let Some(v) = optional_query_param(req, "DBSubnetGroupDescription") {
+            group.db_subnet_group_description = v;
         }
         let group = group.clone();
         Ok(ok_xml(

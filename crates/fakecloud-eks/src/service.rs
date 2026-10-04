@@ -1409,14 +1409,8 @@ impl EksService {
             .ok_or_else(not_found_nodegroup(name))?;
 
         let mut params = Vec::new();
-        if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
-            ng.version = version.to_string();
-            params.push(("Version".to_string(), version.to_string()));
-        }
-        if let Some(release) = body.get("releaseVersion").and_then(|v| v.as_str()) {
-            ng.release_version = release.to_string();
-            params.push(("ReleaseVersion".to_string(), release.to_string()));
-        }
+        // The launch template is validated (and applied) first so a rejected
+        // request leaves the node group untouched.
         if let Some(lt) = body.get("launchTemplate").filter(|v| v.is_object()) {
             apply_launch_template_version(ng, lt)?;
             for (key, param) in [
@@ -1428,6 +1422,14 @@ impl EksService {
                     params.push((param.to_string(), v.to_string()));
                 }
             }
+        }
+        if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
+            ng.version = version.to_string();
+            params.push(("Version".to_string(), version.to_string()));
+        }
+        if let Some(release) = body.get("releaseVersion").and_then(|v| v.as_str()) {
+            ng.release_version = release.to_string();
+            params.push(("ReleaseVersion".to_string(), release.to_string()));
         }
         ng.modified_at = Utc::now();
 
@@ -2614,6 +2616,12 @@ impl EksService {
         if !state.clusters.contains_key(cluster_name) {
             return Err(not_found_cluster(cluster_name)());
         }
+        let existing = state
+            .pod_identity_associations
+            .get(cluster_name)
+            .and_then(|m| m.get(association_id))
+            .ok_or_else(not_found_pod_identity_association(association_id))?;
+        reject_addon_owned_association(existing)?;
         let assoc = state
             .pod_identity_associations
             .get_mut(cluster_name)
@@ -2642,6 +2650,7 @@ impl EksService {
             .get_mut(cluster_name)
             .and_then(|m| m.get_mut(association_id))
             .ok_or_else(not_found_pod_identity_association(association_id))?;
+        reject_addon_owned_association(assoc)?;
 
         if let Some(role) = body.get("roleArn").and_then(|v| v.as_str()) {
             assoc.role_arn = role.to_string();

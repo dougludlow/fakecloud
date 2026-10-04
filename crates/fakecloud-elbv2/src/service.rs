@@ -399,6 +399,37 @@ impl Elbv2Service {
         Ok((network.vpc_id, network.availability_zones, groups))
     }
 
+    /// A load balancer's type, the VPC it really sits in (see
+    /// [`crate::network::effective_vpc`]; the stored one without EC2) and
+    /// its security groups.
+    fn lb_placement(
+        &self,
+        req: &AwsRequest,
+        arn: &str,
+    ) -> Result<(String, Option<String>, Vec<String>), AwsServiceError> {
+        let (lb_type, stored_vpc, subnets, groups) = {
+            let accounts = self.state.read();
+            let lb = accounts
+                .get(&req.account_id)
+                .and_then(|st| st.load_balancers.get(arn))
+                .ok_or_else(|| lb_not_found(arn))?;
+            (
+                lb.lb_type.clone(),
+                lb.vpc_id.clone(),
+                lb.availability_zones
+                    .iter()
+                    .map(|z| z.subnet_id.clone())
+                    .collect::<Vec<_>>(),
+                lb.security_groups.clone(),
+            )
+        };
+        let vpc = match &self.ec2_state {
+            Some(ec2) => crate::network::effective_vpc(ec2, &req.account_id, &stored_vpc, &subnets),
+            None => Some(stored_vpc).filter(|v| !v.is_empty()),
+        };
+        Ok((lb_type, vpc, groups))
+    }
+
     fn create_load_balancer(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let name = required_query_param(req, "Name")?;
         validate_lb_name(&name)?;
@@ -606,27 +637,11 @@ impl Elbv2Service {
         if let Some(ref ipt) = new_ip_address_type {
             validate_ip_address_type(ipt)?;
         }
-        let (lb_type, lb_vpc, lb_groups) = {
-            let accounts = self.state.read();
-            let lb = accounts
-                .get(&req.account_id)
-                .and_then(|st| st.load_balancers.get(&arn))
-                .ok_or_else(|| lb_not_found(&arn))?;
-            (
-                lb.lb_type.clone(),
-                lb.vpc_id.clone(),
-                lb.security_groups.clone(),
-            )
-        };
+        let (lb_type, lb_vpc, lb_groups) = self.lb_placement(req, &arn)?;
         // The new subnets must be in the load balancer's VPC; its security
         // groups are kept as they are.
-        let (_, availability_zones, _) = self.place_load_balancer(
-            req,
-            &lb_type,
-            &subnets,
-            &lb_groups,
-            Some(lb_vpc.as_str()).filter(|v| !v.is_empty()),
-        )?;
+        let (vpc_id, availability_zones, _) =
+            self.place_load_balancer(req, &lb_type, &subnets, &lb_groups, lb_vpc.as_deref())?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let lb = st
@@ -634,6 +649,9 @@ impl Elbv2Service {
             .get_mut(&arn)
             .ok_or_else(|| lb_not_found(&arn))?;
         lb.availability_zones = availability_zones;
+        if !vpc_id.is_empty() {
+            lb.vpc_id = vpc_id;
+        }
         if let Some(ipt) = new_ip_address_type {
             lb.ip_address_type = ipt;
         }
@@ -658,23 +676,28 @@ impl Elbv2Service {
         let enforce =
             optional_query_param(req, "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic");
         if let Some(ec2) = &self.ec2_state {
-            let vpc_id = {
-                let accounts = self.state.read();
-                accounts
-                    .get(&req.account_id)
-                    .and_then(|st| st.load_balancers.get(&arn))
-                    .map(|lb| lb.vpc_id.clone())
-                    .ok_or_else(|| lb_not_found(&arn))?
-            };
+            let (_, vpc_id, _) = self.lb_placement(req, &arn)?;
             if !sgs.is_empty() {
-                crate::network::resolve_security_groups(
-                    ec2,
-                    &req.account_id,
-                    &vpc_id,
-                    "network",
-                    &sgs,
-                )
-                .map_err(|e| e.to_aws())?;
+                match vpc_id {
+                    Some(vpc_id) => {
+                        crate::network::resolve_security_groups(
+                            ec2,
+                            &req.account_id,
+                            &vpc_id,
+                            "network",
+                            &sgs,
+                        )
+                        .map_err(|e| e.to_aws())?;
+                    }
+                    // A load balancer whose VPC cannot be resolved: the
+                    // groups must still exist.
+                    None => {
+                        fakecloud_ec2::vpc_lookup::security_group_vpcs(ec2, &req.account_id, &sgs)
+                            .map_err(|id| {
+                                crate::network::NetworkError::SecurityGroupNotFound(id).to_aws()
+                            })?;
+                    }
+                }
             }
         }
         let mut accounts = self.state.write();
