@@ -616,14 +616,15 @@ async fn wait_for_db_available(client: &aws_sdk_rds::Client, db_instance_identif
 #[tokio::test]
 async fn rds_create_db_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     let response = client
         .create_db_subnet_group()
         .db_subnet_group_name("conf-subnet-group")
         .db_subnet_group_description("Test subnet group")
-        .subnet_ids("subnet-12345")
-        .subnet_ids("subnet-67890")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -644,14 +645,15 @@ async fn rds_create_db_subnet_group() {
 #[tokio::test]
 async fn rds_describe_db_subnet_groups() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("conf-subnet-group")
         .db_subnet_group_description("Test subnet group")
-        .subnet_ids("subnet-12345")
-        .subnet_ids("subnet-67890")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -675,14 +677,15 @@ async fn rds_describe_db_subnet_groups() {
 #[tokio::test]
 async fn rds_modify_db_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("conf-subnet-group")
         .db_subnet_group_description("Test subnet group")
-        .subnet_ids("subnet-12345")
-        .subnet_ids("subnet-67890")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -690,9 +693,9 @@ async fn rds_modify_db_subnet_group() {
     let response = client
         .modify_db_subnet_group()
         .db_subnet_group_name("conf-subnet-group")
-        .subnet_ids("subnet-11111")
-        .subnet_ids("subnet-22222")
-        .subnet_ids("subnet-33333")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
+        .subnet_ids(&vpc_subnets[2])
         .send()
         .await
         .unwrap();
@@ -705,14 +708,15 @@ async fn rds_modify_db_subnet_group() {
 #[tokio::test]
 async fn rds_delete_db_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("conf-subnet-group")
         .db_subnet_group_description("Test subnet group")
-        .subnet_ids("subnet-12345")
-        .subnet_ids("subnet-67890")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -1120,6 +1124,7 @@ async fn rds_describe_db_parameter_groups_pagination() {
 #[tokio::test]
 async fn rds_describe_db_subnet_groups_pagination() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     // Create 3 subnet groups (each with 2 subnets in different AZs)
@@ -1128,8 +1133,8 @@ async fn rds_describe_db_subnet_groups_pagination() {
             .create_db_subnet_group()
             .db_subnet_group_name(format!("conf-subgrp-{}", i))
             .db_subnet_group_description(format!("Test subnet group {}", i))
-            .subnet_ids(format!("subnet-{}a", i))
-            .subnet_ids(format!("subnet-{}b", i))
+            .subnet_ids(&vpc_subnets[0])
+            .subnet_ids(&vpc_subnets[1])
             .send()
             .await
             .unwrap();

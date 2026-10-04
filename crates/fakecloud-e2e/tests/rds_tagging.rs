@@ -91,14 +91,15 @@ async fn rds_tagging_db_parameter_group() {
 #[tokio::test]
 async fn rds_tagging_db_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     let arn = client
         .create_db_subnet_group()
         .db_subnet_group_name("tag-subnet")
         .db_subnet_group_description("tag dispatch test")
-        .subnet_ids("subnet-aaa")
-        .subnet_ids("subnet-bbb")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap()
@@ -222,6 +223,7 @@ async fn rds_tagging_option_group() {
 #[tokio::test]
 async fn rds_tagging_db_proxy() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     // The ARN is built deterministically; the dispatcher under test
@@ -237,8 +239,8 @@ async fn rds_tagging_db_proxy() {
                 .build(),
         )
         .role_arn("arn:aws:iam::123:role/dummy")
-        .vpc_subnet_ids("subnet-aaa")
-        .vpc_subnet_ids("subnet-bbb")
+        .vpc_subnet_ids(vpc_subnets[0].as_str())
+        .vpc_subnet_ids(vpc_subnets[1].as_str())
         .send()
         .await
         .unwrap();

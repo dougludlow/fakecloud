@@ -352,7 +352,21 @@ pub(crate) fn create_security_group(
     let description = require(&req.query_params, "GroupDescription")
         .or_else(|_| require(&req.query_params, "Description"))?;
     let name = require(&req.query_params, "GroupName")?;
-    let vpc_id = req.query_params.get("VpcId").cloned().unwrap_or_default();
+    // Without a `VpcId` the group is created in the account's default VPC,
+    // as on AWS.
+    let vpc_id = match req.query_params.get("VpcId").filter(|v| !v.is_empty()) {
+        Some(v) => v.clone(),
+        None => {
+            let mut accounts = svc.state.write();
+            let state = accounts.get_or_create(&req.account_id);
+            state
+                .vpcs
+                .values()
+                .find(|v| v.is_default)
+                .map(|v| v.vpc_id.clone())
+                .unwrap_or_default()
+        }
+    };
     let group_id = gen_id("sg");
     // Default egress: allow all outbound.
     let egress = SecurityGroupRule {
@@ -1322,6 +1336,30 @@ mod modify_tests {
         let rules = &accounts.get("000000000000").unwrap().security_groups["sg-1"].rules;
         assert_eq!(rules.len(), 1, "only the port-22 rule should be revoked");
         assert_eq!(rules[0].rule_id, "sgr-b");
+    }
+
+    #[test]
+    fn create_security_group_without_vpc_lands_in_default_vpc() {
+        let svc = Ec2Service::new();
+        let resp = create_security_group(
+            &svc,
+            &req(
+                "CreateSecurityGroup",
+                &[("GroupName", "novpc"), ("GroupDescription", "d")],
+            ),
+        )
+        .unwrap();
+        let body = String::from_utf8_lossy(resp.body.expect_bytes()).to_string();
+        let sg_id = body
+            .split("<groupId>")
+            .nth(1)
+            .and_then(|s| s.split("</groupId>").next())
+            .unwrap()
+            .to_string();
+        let accounts = svc.state.read();
+        let state = accounts.get("000000000000").unwrap();
+        let default_vpc = state.vpcs.values().find(|v| v.is_default).unwrap();
+        assert_eq!(state.security_groups[&sg_id].vpc_id, default_vpc.vpc_id);
     }
 
     #[test]

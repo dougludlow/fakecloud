@@ -106,6 +106,9 @@ pub struct Elbv2Service {
     pub region: String,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// EC2 state: a load balancer's subnets, security groups and Elastic IPs
+    /// resolve there. `None` (memory-only unit tests) takes them as given.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 impl Elbv2Service {
@@ -131,6 +134,7 @@ impl Elbv2Service {
             region: "us-east-1".to_string(),
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            ec2_state: None,
         }
     }
 
@@ -148,6 +152,7 @@ impl Elbv2Service {
             region: "us-east-1".to_string(),
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            ec2_state: None,
         }
     }
 
@@ -192,6 +197,11 @@ impl Elbv2Service {
     /// Plug in the WAFv2 shared state so the ALB dataplane can resolve
     /// the WebACL associated with each load balancer and evaluate
     /// incoming requests before the listener-rule router runs.
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
     pub fn with_waf_state(mut self, waf_state: SharedWafv2State) -> Self {
         self.waf_state = Some(waf_state);
         self
@@ -355,16 +365,71 @@ impl AwsService for Elbv2Service {
     }
 }
 
-// ───────────────────────── helpers ─────────────────────────
-
-pub(crate) struct SubnetMapping {
-    subnet_id: Option<String>,
-    allocation_id: Option<String>,
-}
-
 // ───────────────────────── operations ─────────────────────────
 
 impl Elbv2Service {
+    /// Resolve a load balancer's VPC, Availability Zones and security groups
+    /// from EC2. Without EC2 state (memory-only unit tests) the request is
+    /// taken as given.
+    fn place_load_balancer(
+        &self,
+        req: &AwsRequest,
+        lb_type: &str,
+        subnets: &[crate::network::SubnetRequest],
+        groups: &[String],
+        expected_vpc: Option<&str>,
+    ) -> Result<(String, Vec<AvailabilityZone>, Vec<String>), AwsServiceError> {
+        let Some(ec2) = &self.ec2_state else {
+            return Ok((
+                expected_vpc.unwrap_or_default().to_string(),
+                unresolved_availability_zones(&req.region, subnets),
+                groups.to_vec(),
+            ));
+        };
+        let network = crate::network::resolve_subnets(ec2, &req.account_id, subnets, expected_vpc)
+            .map_err(|e| e.to_aws())?;
+        let groups = crate::network::resolve_security_groups(
+            ec2,
+            &req.account_id,
+            &network.vpc_id,
+            lb_type,
+            groups,
+        )
+        .map_err(|e| e.to_aws())?;
+        Ok((network.vpc_id, network.availability_zones, groups))
+    }
+
+    /// A load balancer's type, the VPC it really sits in (see
+    /// [`crate::network::effective_vpc`]; the stored one without EC2) and
+    /// its security groups.
+    fn lb_placement(
+        &self,
+        req: &AwsRequest,
+        arn: &str,
+    ) -> Result<(String, Option<String>, Vec<String>), AwsServiceError> {
+        let (lb_type, stored_vpc, subnets, groups) = {
+            let accounts = self.state.read();
+            let lb = accounts
+                .get(&req.account_id)
+                .and_then(|st| st.load_balancers.get(arn))
+                .ok_or_else(|| lb_not_found(arn))?;
+            (
+                lb.lb_type.clone(),
+                lb.vpc_id.clone(),
+                lb.availability_zones
+                    .iter()
+                    .map(|z| z.subnet_id.clone())
+                    .collect::<Vec<_>>(),
+                lb.security_groups.clone(),
+            )
+        };
+        let vpc = match &self.ec2_state {
+            Some(ec2) => crate::network::effective_vpc(ec2, &req.account_id, &stored_vpc, &subnets),
+            None => Some(stored_vpc).filter(|v| !v.is_empty()),
+        };
+        Ok((lb_type, vpc, groups))
+    }
+
     fn create_load_balancer(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let name = required_query_param(req, "Name")?;
         validate_lb_name(&name)?;
@@ -402,21 +467,10 @@ impl Elbv2Service {
             }
         }
 
-        let subnets_explicit = parse_member_list(req, "Subnets");
-        let subnet_mappings = parse_subnet_mappings(req);
-        let subnets: Vec<(String, Option<String>)> = if !subnets_explicit.is_empty() {
-            subnets_explicit
-                .into_iter()
-                .map(|s| (s, None::<String>))
-                .collect()
-        } else {
-            subnet_mappings
-                .iter()
-                .filter_map(|m| m.subnet_id.clone().map(|s| (s, m.allocation_id.clone())))
-                .collect()
-        };
-
-        let security_groups = parse_member_list(req, "SecurityGroups");
+        let subnets = parse_subnet_requests(req);
+        let requested_groups = parse_member_list(req, "SecurityGroups");
+        let (vpc_id, availability_zones, security_groups) =
+            self.place_load_balancer(req, &lb_type, &subnets, &requested_groups, None)?;
         let mut tags = parse_tags(req);
 
         let mut accounts = self.state.write();
@@ -435,34 +489,10 @@ impl Elbv2Service {
         let arn =
             crate::state::load_balancer_arn(&req.region, &req.account_id, &lb_type, &name, &suffix);
         let dns_name = build_dns_name(&name, &lb_type, &scheme, &req.region, &suffix);
-        let canonical_hosted_zone_id = "Z2P70J7EXAMPLE".to_string();
-        let availability_zones: Vec<AvailabilityZone> = subnets
-            .iter()
-            .map(|(subnet_id, allocation_id)| AvailabilityZone {
-                zone_name: az_for_subnet(&req.region, subnet_id),
-                subnet_id: subnet_id.clone(),
-                outpost_id: None,
-                load_balancer_addresses: allocation_id
-                    .as_ref()
-                    .map(|a| {
-                        vec![LoadBalancerAddress {
-                            ip_address: None,
-                            allocation_id: Some(a.clone()),
-                            private_ipv4_address: None,
-                            ipv6_address: None,
-                            ipv4_prefix: None,
-                            ipv6_prefix: None,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                source_nat_ipv6_prefixes: Vec::new(),
-            })
-            .collect();
+        let canonical_hosted_zone_id =
+            crate::network::canonical_hosted_zone_id(&req.region, &lb_type).to_string();
 
         tags.dedup_by(|a, b| a.key == b.key);
-
-        let vpc_id = optional_query_param(req, "VpcId")
-            .unwrap_or_else(|| format!("vpc-{}", alphanumeric_id(8)));
 
         let lb = LoadBalancer {
             arn: arn.clone(),
@@ -602,48 +632,26 @@ impl Elbv2Service {
 
     fn set_subnets(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_query_param(req, "LoadBalancerArn")?;
-        let subnets_explicit = parse_member_list(req, "Subnets");
-        let mappings = parse_subnet_mappings(req);
+        let subnets = parse_subnet_requests(req);
         let new_ip_address_type = optional_query_param(req, "IpAddressType");
         if let Some(ref ipt) = new_ip_address_type {
             validate_ip_address_type(ipt)?;
         }
+        let (lb_type, lb_vpc, lb_groups) = self.lb_placement(req, &arn)?;
+        // The new subnets must be in the load balancer's VPC; its security
+        // groups are kept as they are.
+        let (vpc_id, availability_zones, _) =
+            self.place_load_balancer(req, &lb_type, &subnets, &lb_groups, lb_vpc.as_deref())?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let lb = st
             .load_balancers
             .get_mut(&arn)
             .ok_or_else(|| lb_not_found(&arn))?;
-        let pairs: Vec<(String, Option<String>)> = if !subnets_explicit.is_empty() {
-            subnets_explicit.into_iter().map(|s| (s, None)).collect()
-        } else {
-            mappings
-                .iter()
-                .filter_map(|m| m.subnet_id.clone().map(|s| (s, m.allocation_id.clone())))
-                .collect()
-        };
-        lb.availability_zones = pairs
-            .iter()
-            .map(|(subnet_id, allocation_id)| AvailabilityZone {
-                zone_name: az_for_subnet(&req.region, subnet_id),
-                subnet_id: subnet_id.clone(),
-                outpost_id: None,
-                load_balancer_addresses: allocation_id
-                    .as_ref()
-                    .map(|a| {
-                        vec![LoadBalancerAddress {
-                            ip_address: None,
-                            allocation_id: Some(a.clone()),
-                            private_ipv4_address: None,
-                            ipv6_address: None,
-                            ipv4_prefix: None,
-                            ipv6_prefix: None,
-                        }]
-                    })
-                    .unwrap_or_default(),
-                source_nat_ipv6_prefixes: Vec::new(),
-            })
-            .collect();
+        lb.availability_zones = availability_zones;
+        if !vpc_id.is_empty() {
+            lb.vpc_id = vpc_id;
+        }
         if let Some(ipt) = new_ip_address_type {
             lb.ip_address_type = ipt;
         }
@@ -667,6 +675,31 @@ impl Elbv2Service {
         let sgs = parse_member_list(req, "SecurityGroups");
         let enforce =
             optional_query_param(req, "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic");
+        if let Some(ec2) = &self.ec2_state {
+            let (_, vpc_id, _) = self.lb_placement(req, &arn)?;
+            if !sgs.is_empty() {
+                match vpc_id {
+                    Some(vpc_id) => {
+                        crate::network::resolve_security_groups(
+                            ec2,
+                            &req.account_id,
+                            &vpc_id,
+                            "network",
+                            &sgs,
+                        )
+                        .map_err(|e| e.to_aws())?;
+                    }
+                    // A load balancer whose VPC cannot be resolved: the
+                    // groups must still exist.
+                    None => {
+                        fakecloud_ec2::vpc_lookup::security_group_vpcs(ec2, &req.account_id, &sgs)
+                            .map_err(|id| {
+                                crate::network::NetworkError::SecurityGroupNotFound(id).to_aws()
+                            })?;
+                    }
+                }
+            }
+        }
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let lb = st
@@ -2332,6 +2365,7 @@ impl Elbv2Service {
 
 #[path = "service_helpers.rs"]
 mod service_helpers;
+pub use service_helpers::normalize_action_config;
 pub(crate) use service_helpers::*;
 
 #[cfg(test)]

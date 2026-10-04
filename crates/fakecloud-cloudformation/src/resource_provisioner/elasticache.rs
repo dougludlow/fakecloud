@@ -89,12 +89,21 @@ impl ResourceProvisioner {
             "subnetgroup",
             &name,
         );
+        // The subnets must exist in one VPC, as the direct
+        // CreateCacheSubnetGroup requires.
+        let placed = fakecloud_ec2::vpc_lookup::resolve_subnet_group(
+            &self.ec2_state,
+            &self.account_id,
+            &subnet_ids,
+        )
+        .map_err(|e| e.message())?;
         let group = CacheSubnetGroup {
             cache_subnet_group_name: name.clone(),
             cache_subnet_group_description: description,
-            vpc_id: String::new(),
+            vpc_id: placed.vpc_id.clone(),
             subnet_ids,
             arn: arn.clone(),
+            subnet_availability_zones: placed.availability_zones(),
         };
         let mut accounts = self.elasticache_state.write();
         let state = accounts.get_or_create(&self.account_id);

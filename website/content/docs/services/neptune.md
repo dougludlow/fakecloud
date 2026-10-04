@@ -53,7 +53,10 @@ persists across restarts in persistent mode:
   `DescribeEngineDefaultParameters` return engine defaults.
 - **Subnet groups**, **global clusters** (with failover / switchover /
   remove-from-global), and **event subscriptions** (SNS topic + source
-  filters) — full CRUD.
+  filters) — full CRUD. Subnet groups resolve their subnets in EC2 and report
+  the subnets' `VpcId` and Availability Zones (`InvalidSubnet` for unknown
+  subnets or ones spanning VPCs, `DBSubnetGroupDoesNotCoverEnoughAZs` below two
+  zones).
 - **Catalog + tagging** — `DescribeDBEngineVersions`,
   `DescribeOrderableDBInstanceOptions`, `DescribeEventCategories`,
   `DescribeEvents`, `DescribePendingMaintenanceActions`,

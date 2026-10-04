@@ -66,12 +66,13 @@ const TEMPLATE: &str = r#"{
 #[tokio::test]
 async fn cfn_provisions_elbv2_lb_tg_listener_rule() {
     let server = TestServer::start().await;
+    let vpc = vpc_fixture(&server).await;
     let cfn = server.cloudformation_client().await;
     let elb = server.elbv2_client().await;
 
     cfn.create_stack()
         .stack_name("elbv2-stack")
-        .template_body(TEMPLATE)
+        .template_body(with_vpc_ids(TEMPLATE, &vpc))
         .capabilities(Capability::CapabilityIam)
         .on_failure(OnFailure::Rollback)
         .send()
@@ -227,12 +228,13 @@ const EXTRAS_TEMPLATE: &str = r#"{
 #[tokio::test]
 async fn cfn_provisions_elbv2_listener_certificate_and_trust_store() {
     let server = TestServer::start().await;
+    let vpc = vpc_fixture(&server).await;
     let cfn = server.cloudformation_client().await;
     let elb = server.elbv2_client().await;
 
     cfn.create_stack()
         .stack_name("elbv2-extras-stack")
-        .template_body(EXTRAS_TEMPLATE)
+        .template_body(with_vpc_ids(EXTRAS_TEMPLATE, &vpc))
         .send()
         .await
         .expect("create_stack");
@@ -436,12 +438,13 @@ const UPDATE_TEMPLATE_V2: &str = r#"{
 #[tokio::test]
 async fn cfn_updates_propagate_to_elbv2_state() {
     let server = TestServer::start().await;
+    let vpc = vpc_fixture(&server).await;
     let cfn = server.cloudformation_client().await;
     let elb = server.elbv2_client().await;
 
     cfn.create_stack()
         .stack_name("elbv2-update-stack")
-        .template_body(UPDATE_TEMPLATE_V1)
+        .template_body(with_vpc_ids(UPDATE_TEMPLATE_V1, &vpc))
         .send()
         .await
         .expect("create_stack");
@@ -453,7 +456,12 @@ async fn cfn_updates_propagate_to_elbv2_state() {
         .await
         .expect("describe_stacks");
     let stack = described.stacks().first().unwrap();
-    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+    assert_eq!(
+        stack.stack_status().unwrap().as_str(),
+        "CREATE_COMPLETE",
+        "{:?}",
+        stack.stack_status_reason()
+    );
 
     let mut lb_arn = None;
     let mut listener_arn = None;
@@ -490,7 +498,7 @@ async fn cfn_updates_propagate_to_elbv2_state() {
 
     cfn.update_stack()
         .stack_name("elbv2-update-stack")
-        .template_body(UPDATE_TEMPLATE_V2)
+        .template_body(with_vpc_ids(UPDATE_TEMPLATE_V2, &vpc))
         .send()
         .await
         .expect("update_stack");
@@ -529,8 +537,14 @@ async fn cfn_updates_propagate_to_elbv2_state() {
         .expect("describe_load_balancers");
     let lb = lbs.load_balancers().first().expect("lb");
     let sgs: Vec<&str> = lb.security_groups().iter().map(|s| s.as_str()).collect();
-    assert!(sgs.contains(&"sg-new-1"), "sg updated: {sgs:?}");
-    assert!(sgs.contains(&"sg-new-2"), "sg updated: {sgs:?}");
+    assert!(
+        sgs.contains(&vpc_id_for(&vpc, "sg-new-1")),
+        "sg updated: {sgs:?}"
+    );
+    assert!(
+        sgs.contains(&vpc_id_for(&vpc, "sg-new-2")),
+        "sg updated: {sgs:?}"
+    );
     assert_eq!(lb.ip_address_type().map(|s| s.as_str()), Some("dualstack"));
 
     let tgs = elb
@@ -583,4 +597,48 @@ async fn cfn_updates_propagate_to_elbv2_state() {
         .send()
         .await;
     assert!(after.is_err(), "lb gone after stack deletion");
+}
+
+/// Real default-VPC ids standing in for the templates' placeholders: the
+/// default subnets, the VPC's default security group (`sg-deadbeef`) and three
+/// security groups created for the update test.
+async fn vpc_fixture(server: &TestServer) -> Vec<(&'static str, String)> {
+    let subnets = server.default_subnet_ids().await;
+    let ec2 = server.ec2_client().await;
+    let mut out = vec![
+        ("subnet-aaa", subnets[0].clone()),
+        ("subnet-bbb", subnets[1].clone()),
+        ("sg-deadbeef", server.default_security_group_id().await),
+    ];
+    for name in ["sg-old", "sg-new-1", "sg-new-2"] {
+        let id = ec2
+            .create_security_group()
+            .group_name(format!("cfn-elbv2-{name}"))
+            .description("cfn elbv2 test")
+            .send()
+            .await
+            .unwrap()
+            .group_id()
+            .unwrap()
+            .to_string();
+        out.push((name, id));
+    }
+    out
+}
+
+/// The real id standing in for `placeholder`.
+fn vpc_id_for<'a>(vpc: &'a [(&'static str, String)], placeholder: &str) -> &'a str {
+    &vpc.iter().find(|(p, _)| *p == placeholder).unwrap().1
+}
+
+/// The template with its placeholder ids replaced by real ones.
+fn with_vpc_ids(template: &str, vpc: &[(&'static str, String)]) -> String {
+    // Longest placeholders first so `sg-new-1` is not clipped by a prefix.
+    let mut pairs: Vec<_> = vpc.iter().collect();
+    pairs.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+    let mut out = template.to_string();
+    for (p, id) in pairs {
+        out = out.replace(&format!("\"{p}\""), &format!("\"{id}\""));
+    }
+    out
 }

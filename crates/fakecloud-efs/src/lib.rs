@@ -4,8 +4,8 @@
 //! The full 31-operation EFS Smithy model: file systems (with the async
 //! `creating` -> `available` lifecycle, size, performance/throughput modes,
 //! encryption, and replication-overwrite protection), mount targets (one per
-//! Availability Zone per file system, each with a synthesized IP address,
-//! network interface, and VPC/AZ derived deterministically from its subnet),
+//! Availability Zone per file system, each with a requester-managed EC2
+//! network interface whose IP, VPC and AZ come from its real subnet),
 //! access points (POSIX user + root directory), lifecycle configuration,
 //! backup policy, file-system resource policy, replication configurations,
 //! resource tagging (both the resource-id tagging API and the deprecated
@@ -21,6 +21,7 @@
 //! `creating` state and settling to `available` on the next describe (with
 //! in-flight transitions reconciled on restart).
 
+pub mod network;
 pub mod persistence;
 pub mod service;
 pub mod state;

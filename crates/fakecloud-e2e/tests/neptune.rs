@@ -8,6 +8,7 @@ use helpers::TestServer;
 #[tokio::test]
 async fn neptune_full_control_plane_round_trip() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.neptune_client().await;
 
     // 1. Subnet group.
@@ -15,8 +16,8 @@ async fn neptune_full_control_plane_round_trip() {
         .create_db_subnet_group()
         .db_subnet_group_name("neptune-subnets")
         .db_subnet_group_description("neptune test subnets")
-        .subnet_ids("subnet-11111111")
-        .subnet_ids("subnet-22222222")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .expect("create subnet group")

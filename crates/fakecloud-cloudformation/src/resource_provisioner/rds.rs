@@ -34,6 +34,20 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
         let tags = parse_rds_tags(props.get("Tags"));
+        // The subnets must exist in one VPC across two or more Availability
+        // Zones, as the direct CreateDBSubnetGroup requires.
+        let placed = fakecloud_ec2::vpc_lookup::resolve_subnet_group(
+            &self.ec2_state,
+            &self.account_id,
+            &subnet_ids,
+        )
+        .map_err(|e| e.message())?;
+        if placed.distinct_availability_zones() < 2 {
+            return Err(
+                "DB Subnet Group must contain at least 2 subnets in different Availability Zones."
+                    .to_string(),
+            );
+        }
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = state.db_subnet_group_arn(&self.region, &name);
@@ -41,9 +55,9 @@ impl ResourceProvisioner {
             db_subnet_group_name: name.clone(),
             db_subnet_group_arn: arn.clone(),
             db_subnet_group_description: description,
-            vpc_id: String::new(),
+            vpc_id: placed.vpc_id.clone(),
             subnet_ids,
-            subnet_availability_zones: Vec::new(),
+            subnet_availability_zones: placed.availability_zones(),
             tags,
         };
         state.subnet_groups.insert(name.clone(), group);

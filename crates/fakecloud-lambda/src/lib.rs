@@ -5,6 +5,7 @@ pub mod resource_policy;
 pub mod runtime;
 pub(crate) mod service;
 pub(crate) mod state;
+pub mod vpc;
 pub(crate) mod workflows;
 
 pub use service::{validate_execution_role, LambdaService};

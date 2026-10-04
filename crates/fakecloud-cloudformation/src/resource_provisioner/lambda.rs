@@ -122,7 +122,12 @@ impl ResourceProvisioner {
             tracing_mode: cfg.tracing_mode,
             kms_key_arn: cfg.kms_key_arn,
             ephemeral_storage_size: cfg.ephemeral_storage_size,
-            vpc_config: cfg.vpc_config,
+            vpc_config: cfg
+                .vpc_config
+                .map(|c| {
+                    fakecloud_lambda::vpc::resolve_vpc_config(&self.ec2_state, &self.account_id, &c)
+                })
+                .transpose()?,
             snap_start: cfg.snap_start,
             dead_letter_config_arn: cfg.dead_letter_config_arn,
             file_system_configs: cfg.file_system_configs,
@@ -245,6 +250,13 @@ impl ResourceProvisioner {
                 .collect()
         };
 
+        let vpc_config = cfg
+            .vpc_config
+            .clone()
+            .map(|c| {
+                fakecloud_lambda::vpc::resolve_vpc_config(&self.ec2_state, &self.account_id, &c)
+            })
+            .transpose()?;
         let mut accounts = self.lambda_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let func = state.functions.get_mut(&function_name).ok_or_else(|| {
@@ -263,7 +275,7 @@ impl ResourceProvisioner {
         func.tracing_mode = cfg.tracing_mode;
         func.kms_key_arn = cfg.kms_key_arn;
         func.ephemeral_storage_size = cfg.ephemeral_storage_size;
-        func.vpc_config = cfg.vpc_config;
+        func.vpc_config = vpc_config;
         func.snap_start = cfg.snap_start;
         func.dead_letter_config_arn = cfg.dead_letter_config_arn;
         func.file_system_configs = cfg.file_system_configs;

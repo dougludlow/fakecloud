@@ -15,7 +15,7 @@ fakecloud implements **75 of 75** ElastiCache operations at 100% Smithy conforma
 - **Serverless caches** — `CreateServerlessCache`, `ModifyServerlessCache` (Redis/Valkey only — matches AWS)
 - **Snapshots** — `CreateSnapshot`, `CopySnapshot`, `DeleteSnapshot`, `RestoreReplicationGroupFromSnapshot`. Restore reads back the **real RDB file** dumped during snapshot creation and seeds the replacement Redis/Valkey container with `BGSAVE`-captured data, so your test fixture's keys survive snapshot/restore round-trips
 - **Serverless cache snapshots** — CRUD
-- **Subnet groups** — CRUD
+- **Subnet groups** — CRUD. Subnets resolve in EC2: the group reports their `VpcId` and each subnet's Availability Zone (`InvalidSubnet` for unknown subnets or ones spanning VPCs), and the `default` group is the default VPC's subnets
 - **Users and user groups** — IAM-integrated auth. `CreateUser`/`ModifyUser` accept `AccessString` (RBAC rules) and `Passwords`/`NoPasswordRequired`. The container is configured via real Redis `ACL SETUSER` so the engine enforces the rules — unauthorized commands are rejected by the real engine, not stubbed
 - **Parameter groups** — CRUD. `ModifyCacheParameterGroup` parameter changes that map to runtime-tunable Redis options are pushed to the live container via `CONFIG SET`, so `maxmemory-policy`, `timeout`, `tcp-keepalive`, etc. take effect immediately on the running instance
 - **Security groups** — cache security group CRUD

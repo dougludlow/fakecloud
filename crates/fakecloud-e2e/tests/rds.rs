@@ -2096,14 +2096,15 @@ async fn rds_restore_db_instance_to_point_in_time_clones_data() {
 #[tokio::test]
 async fn rds_subnet_group_reports_supported_network_types() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("sg-net")
         .db_subnet_group_description("d")
-        .subnet_ids("subnet-aaaa1111")
-        .subnet_ids("subnet-bbbb2222")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -2123,14 +2124,15 @@ async fn rds_subnet_group_reports_supported_network_types() {
 #[tokio::test]
 async fn rds_db_instance_reports_its_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("private-subnets")
         .db_subnet_group_description("Private subnets for RDS DB instances")
-        .subnet_ids("subnet-aaaa1111")
-        .subnet_ids("subnet-bbbb2222")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -2177,7 +2179,7 @@ async fn rds_db_instance_reports_its_subnet_group() {
         .filter_map(|s| s.subnet_identifier())
         .collect();
     subnets.sort_unstable();
-    assert_eq!(subnets, ["subnet-aaaa1111", "subnet-bbbb2222"]);
+    assert_eq!(subnets, [vpc_subnets[0].as_str(), vpc_subnets[1].as_str()]);
 
     // The group is resolved from state at render time, so a later
     // ModifyDBSubnetGroup shows up on the instance.
@@ -2185,9 +2187,9 @@ async fn rds_db_instance_reports_its_subnet_group() {
         .modify_db_subnet_group()
         .db_subnet_group_name("private-subnets")
         .db_subnet_group_description("Now with three subnets")
-        .subnet_ids("subnet-aaaa1111")
-        .subnet_ids("subnet-bbbb2222")
-        .subnet_ids("subnet-cccc3333")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
+        .subnet_ids(&vpc_subnets[2])
         .send()
         .await
         .unwrap();

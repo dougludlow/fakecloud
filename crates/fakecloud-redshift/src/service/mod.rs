@@ -178,9 +178,51 @@ pub struct RedshiftService {
     /// without a `KmsKeyId` reports the account's real AWS-managed `aws/redshift`
     /// key.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// EC2 state: cluster subnet groups resolve their subnets (VPC and
+    /// Availability Zones) there. `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// Persists EC2 after a managed endpoint changes its EC2 resources.
+    ec2_snapshot_hook: Option<fakecloud_persistence::SnapshotHook>,
 }
 
 impl RedshiftService {
+    pub fn with_ec2_snapshot_hook(
+        mut self,
+        hook: Option<fakecloud_persistence::SnapshotHook>,
+    ) -> Self {
+        self.ec2_snapshot_hook = hook;
+        self
+    }
+
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    /// The VPC a cluster created with `subnet_group` lands in: that group's
+    /// VPC, or the account's default VPC when the cluster names no group.
+    pub(crate) fn cluster_vpc_id(
+        &self,
+        account_id: &str,
+        subnet_group: Option<&str>,
+    ) -> Option<String> {
+        match subnet_group {
+            Some(name) => {
+                let guard = self.state.read();
+                guard
+                    .accounts
+                    .get(account_id)
+                    .and_then(|a| a.subnet_groups.get(name))
+                    .map(|g| g.vpc_id.clone())
+                    .filter(|v| !v.is_empty())
+            }
+            None => self
+                .ec2_state
+                .as_ref()
+                .and_then(|ec2| fakecloud_ec2::vpc_lookup::default_vpc_id(ec2, account_id)),
+        }
+    }
+
     pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
         self.kms_hook = Some(hook);
         self
@@ -192,6 +234,8 @@ impl RedshiftService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             kms_hook: None,
+            ec2_state: None,
+            ec2_snapshot_hook: None,
         }
     }
 
@@ -479,6 +523,16 @@ impl AwsService for RedshiftService {
         let result = self.dispatch(&req);
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
+            // A managed endpoint creates / deletes its VPC endpoint and
+            // network interfaces in EC2.
+            if matches!(
+                req.action.as_str(),
+                "CreateEndpointAccess" | "DeleteEndpointAccess"
+            ) {
+                if let Some(hook) = &self.ec2_snapshot_hook {
+                    hook().await;
+                }
+            }
         }
         result
     }

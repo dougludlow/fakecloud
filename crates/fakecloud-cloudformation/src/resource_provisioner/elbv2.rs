@@ -31,7 +31,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("ipv4")
             .to_string();
-        let security_groups: Vec<String> = props
+        let requested_groups: Vec<String> = props
             .get("SecurityGroups")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -41,6 +41,27 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
         let tags = parse_elb_tags(props.get("Tags"));
+
+        // Subnets / SubnetMappings and security groups resolve against EC2,
+        // exactly as the direct CreateLoadBalancer does.
+        let subnets = elbv2_subnet_requests(props);
+        let network = fakecloud_elbv2::network::resolve_subnets(
+            &self.ec2_state,
+            &self.account_id,
+            &subnets,
+            None,
+        )
+        .map_err(|e| e.message())?;
+        let security_groups = fakecloud_elbv2::network::resolve_security_groups(
+            &self.ec2_state,
+            &self.account_id,
+            &network.vpc_id,
+            &lb_type,
+            &requested_groups,
+        )
+        .map_err(|e| e.message())?;
+        let canonical_hosted_zone_id =
+            fakecloud_elbv2::network::canonical_hosted_zone_id(&self.region, &lb_type);
 
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
@@ -60,35 +81,20 @@ impl ResourceProvisioner {
             self.region
         );
 
-        let mut availability_zones: Vec<fakecloud_elbv2::AvailabilityZone> = Vec::new();
-        if let Some(arr) = props.get("Subnets").and_then(|v| v.as_array()) {
-            for s in arr {
-                if let Some(subnet_id) = s.as_str() {
-                    availability_zones.push(fakecloud_elbv2::AvailabilityZone {
-                        zone_name: format!("{}a", self.region),
-                        subnet_id: subnet_id.to_string(),
-                        outpost_id: None,
-                        load_balancer_addresses: Vec::new(),
-                        source_nat_ipv6_prefixes: Vec::new(),
-                    });
-                }
-            }
-        }
-
         state.load_balancers.insert(
             arn.clone(),
             LoadBalancer {
                 arn: arn.clone(),
                 name: name.clone(),
                 dns_name: dns_name.clone(),
-                canonical_hosted_zone_id: "Z2P70J7EXAMPLE".to_string(),
+                canonical_hosted_zone_id: canonical_hosted_zone_id.to_string(),
                 created_time: Utc::now(),
                 scheme,
-                vpc_id: String::new(),
+                vpc_id: network.vpc_id,
                 state_code: "active".to_string(),
                 state_reason: None,
                 lb_type,
-                availability_zones,
+                availability_zones: network.availability_zones,
                 security_groups,
                 ip_address_type,
                 customer_owned_ipv4_pool: None,
@@ -110,7 +116,7 @@ impl ResourceProvisioner {
             )
             .with("LoadBalancerName", name)
             .with("DNSName", dns_name)
-            .with("CanonicalHostedZoneID", "Z2P70J7EXAMPLE"))
+            .with("CanonicalHostedZoneID", canonical_hosted_zone_id))
     }
 
     pub(crate) fn delete_elbv2_load_balancer(&self, physical_id: &str) -> Result<(), String> {
@@ -563,35 +569,87 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let arn = existing.physical_id.clone();
+        let (lb_type, stored_vpc, lb_subnets) = {
+            let accounts = self.elbv2_state.read();
+            let lb = accounts
+                .get(&self.account_id)
+                .and_then(|st| st.load_balancers.get(&arn))
+                .ok_or_else(|| format!("LoadBalancer {arn} no longer exists"))?;
+            (
+                lb.lb_type.clone(),
+                lb.vpc_id.clone(),
+                lb.availability_zones
+                    .iter()
+                    .map(|z| z.subnet_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // The VPC the load balancer really sits in (a legacy invented VpcId is
+        // re-derived from its subnets rather than enforced).
+        let lb_vpc = fakecloud_elbv2::network::effective_vpc(
+            &self.ec2_state,
+            &self.account_id,
+            &stored_vpc,
+            &lb_subnets,
+        );
+        let expected_vpc = lb_vpc.as_deref();
+        // New subnets must stay in the load balancer's VPC and new security
+        // groups must exist there, as SetSubnets / SetSecurityGroups require.
+        let subnets = elbv2_subnet_requests(props);
+        let placed = if subnets.is_empty() {
+            None
+        } else {
+            Some(
+                fakecloud_elbv2::network::resolve_subnets(
+                    &self.ec2_state,
+                    &self.account_id,
+                    &subnets,
+                    expected_vpc,
+                )
+                .map_err(|e| e.message())?,
+            )
+        };
+        let lb_vpc = placed
+            .as_ref()
+            .map(|p| p.vpc_id.clone())
+            .or(lb_vpc)
+            .unwrap_or_default();
+        let groups = match props.get("SecurityGroups").and_then(|v| v.as_array()) {
+            Some(arr) => {
+                let requested: Vec<String> = arr
+                    .iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect();
+                Some(
+                    fakecloud_elbv2::network::resolve_security_groups(
+                        &self.ec2_state,
+                        &self.account_id,
+                        &lb_vpc,
+                        &lb_type,
+                        &requested,
+                    )
+                    .map_err(|e| e.message())?,
+                )
+            }
+            None => None,
+        };
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let lb = state
             .load_balancers
             .get_mut(&arn)
             .ok_or_else(|| format!("LoadBalancer {arn} no longer exists"))?;
-        if let Some(arr) = props.get("SecurityGroups").and_then(|v| v.as_array()) {
-            lb.security_groups = arr
-                .iter()
-                .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                .collect();
+        if let Some(groups) = groups {
+            lb.security_groups = groups;
         }
         if let Some(s) = props.get("IpAddressType").and_then(|v| v.as_str()) {
             lb.ip_address_type = s.to_string();
         }
-        if let Some(arr) = props.get("Subnets").and_then(|v| v.as_array()) {
-            let mut zones: Vec<fakecloud_elbv2::AvailabilityZone> = Vec::new();
-            for s in arr {
-                if let Some(subnet_id) = s.as_str() {
-                    zones.push(fakecloud_elbv2::AvailabilityZone {
-                        zone_name: format!("{}a", self.region),
-                        subnet_id: subnet_id.to_string(),
-                        outpost_id: None,
-                        load_balancer_addresses: Vec::new(),
-                        source_nat_ipv6_prefixes: Vec::new(),
-                    });
-                }
-            }
-            lb.availability_zones = zones;
+        if let Some(placed) = placed {
+            lb.availability_zones = placed.availability_zones;
+        }
+        if !lb_vpc.is_empty() {
+            lb.vpc_id = lb_vpc;
         }
         if props.get("Tags").is_some() {
             lb.tags = parse_elb_tags(props.get("Tags"));
@@ -864,4 +922,37 @@ impl ResourceProvisioner {
             .with("Name", name)
             .with("Status", status))
     }
+}
+
+/// The `Subnets` / `SubnetMappings` of an `AWS::ElasticLoadBalancingV2::LoadBalancer`.
+fn elbv2_subnet_requests(
+    props: &serde_json::Value,
+) -> Vec<fakecloud_elbv2::network::SubnetRequest> {
+    if let Some(arr) = props.get("Subnets").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            return arr
+                .iter()
+                .filter_map(|s| s.as_str())
+                .map(fakecloud_elbv2::network::SubnetRequest::subnet)
+                .collect();
+        }
+    }
+    props
+        .get("SubnetMappings")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let field = |k: &str| m.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                    Some(fakecloud_elbv2::network::SubnetRequest {
+                        subnet_id: field("SubnetId")?,
+                        allocation_id: field("AllocationId"),
+                        private_ipv4_address: field("PrivateIPv4Address"),
+                        ipv6_address: field("IPv6Address"),
+                        source_nat_ipv6_prefix: field("SourceNatIpv6Prefix"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

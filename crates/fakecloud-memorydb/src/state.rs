@@ -127,6 +127,10 @@ pub struct SubnetGroup {
     pub subnet_ids: Vec<String>,
     pub arn: String,
     pub supported_network_types: Vec<String>,
+    /// Availability Zone of each subnet (parallel to `subnet_ids`), resolved
+    /// from EC2. Empty for groups persisted before zones were tracked.
+    #[serde(default)]
+    pub subnet_availability_zones: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -32,6 +32,13 @@ in persistent mode.
   `ListNodegroups`, `DeleteNodegroup`, plus `UpdateNodegroupConfig` and
   `UpdateNodegroupVersion` (tracked updates). Node groups carry `nodeRole`,
   `subnets`, `scalingConfig`, and transition `CREATING` -> `ACTIVE` on describe.
+  Like EKS, each node group runs as a real EC2 Auto Scaling group
+  (`resources.autoScalingGroups`), tagged `eks:cluster-name`,
+  `eks:nodegroup-name` and the cluster-autoscaler discovery tags, with zones
+  from the node group's subnets: it can be described and tagged through Auto
+  Scaling, follows `UpdateNodegroupConfig` scaling changes, and is deleted with
+  the node group. `UpdateNodegroupVersion` applies a `launchTemplate` version
+  (the template's `id` / `name` must match the node group's).
 - **Fargate profiles** — `CreateFargateProfile`, `DescribeFargateProfile`,
   `ListFargateProfiles`, `DeleteFargateProfile` with `podExecutionRoleArn` and
   `selectors`, their own `CREATING` -> `ACTIVE` transition.
@@ -48,7 +55,11 @@ in persistent mode.
   flagging the default version (coredns and kube-proxy track the cluster's
   Kubernetes minor). `kubernetesVersion`, `addonName`, `types`, `owners`, and
   `publishers` filter it, and `CreateAddon` without an `addonVersion` installs
-  the default for the cluster's version.
+  the default for the cluster's version. An add-on's
+  `podIdentityAssociations` become real pod identity associations in the
+  add-on's namespace, owned by the add-on (`ownerArn`): they resolve through
+  `DescribePodIdentityAssociation`, an `UpdateAddon` keeps the association (and
+  ARN) of a service account that stays, and `DeleteAddon` deletes them.
 - **Access entries** — `CreateAccessEntry`, `DescribeAccessEntry`,
   `ListAccessEntries`, `DeleteAccessEntry`, `UpdateAccessEntry`, plus
   `AssociateAccessPolicy`, `DisassociateAccessPolicy`,

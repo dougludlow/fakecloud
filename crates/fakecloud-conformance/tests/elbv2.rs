@@ -18,12 +18,13 @@ use helpers::TestServer;
 #[tokio::test]
 async fn elbv2_create_load_balancer() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elbv2_client().await;
     let resp = client
         .create_load_balancer()
         .name("confo-create")
-        .subnets("subnet-aaaa1111")
-        .subnets("subnet-bbbb2222")
+        .subnets(&vpc_subnets[0])
+        .subnets(&vpc_subnets[1])
         .r#type(LoadBalancerTypeEnum::Application)
         .send()
         .await
@@ -84,11 +85,12 @@ async fn elbv2_delete_load_balancer() {
 #[tokio::test]
 async fn elbv2_set_subnets() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elbv2_client().await;
     let create = client
         .create_load_balancer()
         .name("confo-subnets")
-        .subnets("subnet-old")
+        .subnets(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -101,8 +103,8 @@ async fn elbv2_set_subnets() {
     let resp = client
         .set_subnets()
         .load_balancer_arn(arn)
-        .subnets("subnet-new1")
-        .subnets("subnet-new2")
+        .subnets(&vpc_subnets[1])
+        .subnets(&vpc_subnets[2])
         .send()
         .await
         .unwrap();
@@ -129,7 +131,7 @@ async fn elbv2_set_security_groups() {
     let resp = client
         .set_security_groups()
         .load_balancer_arn(arn)
-        .security_groups("sg-1234")
+        .security_groups(server.default_security_group_id().await)
         .send()
         .await
         .unwrap();

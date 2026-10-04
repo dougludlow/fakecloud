@@ -25,7 +25,9 @@ state) is real.
 - **Replication instances** (`CreateReplicationInstance`,
   `DescribeReplicationInstances`, `ModifyReplicationInstance`,
   `DeleteReplicationInstance`, `RebootReplicationInstance`). New instances get an
-  `arn:aws:dms:<region>:<acct>:rep:<id>` ARN, a synthesized subnet group, and
+  `arn:aws:dms:<region>:<acct>:rep:<id>` ARN, the subnet group they were placed
+  in (the named `ReplicationSubnetGroupIdentifier`, or the `default` group of
+  the default VPC's subnets), and
   settle straight to `available` so `replication-instance-available` waiters
   complete.
 - **Endpoints** (`CreateEndpoint`, `DescribeEndpoints`, `ModifyEndpoint`,
@@ -41,7 +43,10 @@ state) is real.
   complete. Assessment runs, table statistics, and individual assessments are
   modelled.
 - **Replication subnet groups**, **event subscriptions**, and **certificates**
-  (`ImportCertificate` + describe + delete) — full CRUD.
+  (`ImportCertificate` + describe + delete) — full CRUD. Replication subnet
+  groups resolve their subnets in EC2 (`InvalidSubnet`,
+  `ReplicationSubnetGroupDoesNotCoverEnoughAZs`) and report the subnets'
+  `VpcId` and Availability Zones.
 - **Serverless replication** (`CreateReplicationConfig`, `StartReplication`,
   `StopReplication`, `DescribeReplications`, `ReloadReplicationTables`) drives the
   serverless replication config lifecycle and its `Replication` state.

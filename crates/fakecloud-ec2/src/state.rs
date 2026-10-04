@@ -330,6 +330,11 @@ pub struct NetworkInterface {
     /// reflected back through a Describe.
     #[serde(default)]
     pub public_ip_dns_hostname_type: Option<String>,
+    /// Created by another AWS service in the customer's subnet (an EFS mount
+    /// target, for example) rather than by the account itself. Reported as
+    /// `requesterManaged`; the account cannot delete it directly.
+    #[serde(default)]
+    pub requester_managed: bool,
 }
 
 /// A network-interface permission grant.

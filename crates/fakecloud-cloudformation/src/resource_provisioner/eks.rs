@@ -380,6 +380,15 @@ impl ResourceProvisioner {
             node_repair_config: props.get("NodeRepairConfig").cloned(),
             warm_pool_config: None,
         };
+        // The node group's Auto Scaling group is a real Auto Scaling record,
+        // exactly as the direct CreateNodegroup creates it.
+        fakecloud_eks::nodegroup_asg::create_nodegroup_asg(
+            &self.autoscaling_state,
+            Some(&self.ec2_state),
+            &self.account_id,
+            &self.region,
+            &ng,
+        );
         state
             .nodegroups
             .entry(cluster_name.clone())
@@ -401,8 +410,16 @@ impl ResourceProvisioner {
         };
         let mut accounts = self.eks_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        if let Some(m) = state.nodegroups.get_mut(cluster_name) {
-            m.remove(name);
+        if let Some(ng) = state
+            .nodegroups
+            .get_mut(cluster_name)
+            .and_then(|m| m.remove(name))
+        {
+            fakecloud_eks::nodegroup_asg::delete_nodegroup_asg(
+                &self.autoscaling_state,
+                &self.account_id,
+                &ng,
+            );
         }
         Ok(())
     }
@@ -535,25 +552,6 @@ impl ResourceProvisioner {
         let id = Uuid::new_v4().to_string();
         let arn = addon_arn(&self.region, &self.account_id, &cluster_name, &name, &id);
         let now = Utc::now();
-        // Pod identity association ARNs, if requested.
-        let pod_identity_associations: Vec<String> = props
-            .get("PodIdentityAssociations")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|_| {
-                        let sid = Uuid::new_v4().to_string().replace('-', "");
-                        pod_identity_association_arn(
-                            &self.region,
-                            &self.account_id,
-                            &cluster_name,
-                            &sid[..17.min(sid.len())],
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let mut accounts = self.eks_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let cluster_version = state
@@ -562,6 +560,24 @@ impl ResourceProvisioner {
             .ok_or_else(|| format!("No cluster found for name: {cluster_name}"))?
             .version
             .clone();
+        // Each requested pod identity association becomes a real association
+        // owned by the add-on, exactly as the direct CreateAddon does.
+        let pod_identity_associations = match props.get("PodIdentityAssociations") {
+            Some(v) => {
+                fakecloud_eks::addon_pod_identity::reconcile_addon_pod_identity_associations(
+                    state,
+                    &fakecloud_eks::addon_pod_identity::AddonOwner {
+                        region: &self.region,
+                        account_id: &self.account_id,
+                        cluster: &cluster_name,
+                        addon_arn: &arn,
+                        namespace: fakecloud_eks::addon_pod_identity::DEFAULT_ADDON_NAMESPACE,
+                    },
+                    &cfn_pod_identity_associations(v),
+                )?
+            }
+            None => Vec::new(),
+        };
         let addon = Addon {
             name: name.clone(),
             arn: arn.clone(),
@@ -603,8 +619,16 @@ impl ResourceProvisioner {
         };
         let mut accounts = self.eks_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        if let Some(m) = state.addons.get_mut(cluster_name) {
-            m.remove(name);
+        if let Some(addon) = state
+            .addons
+            .get_mut(cluster_name)
+            .and_then(|m| m.remove(name))
+        {
+            fakecloud_eks::addon_pod_identity::delete_addon_pod_identity_associations(
+                state,
+                cluster_name,
+                &addon.arn,
+            );
         }
         Ok(())
     }
@@ -896,6 +920,7 @@ impl ResourceProvisioner {
                 .map(|s| s.to_string()),
             external_id: None,
             tags: parse_eks_tags(props.get("Tags")),
+            owner_arn: None,
         };
         state
             .pod_identity_associations
@@ -1061,6 +1086,11 @@ impl ResourceProvisioner {
 
         if let Some(v) = props.get("ScalingConfig") {
             ng.scaling_config = cfn_scaling_config(v);
+            fakecloud_eks::nodegroup_asg::sync_nodegroup_asg_scaling(
+                &self.autoscaling_state,
+                &self.account_id,
+                ng,
+            );
         }
         if let Some(v) = props.get("UpdateConfig") {
             ng.update_config = cfn_update_config(v);
@@ -1128,11 +1158,36 @@ impl ResourceProvisioner {
 
         let mut accounts = self.eks_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        let addon_arn = state
+            .addons
+            .get(cluster_name)
+            .and_then(|m| m.get(name))
+            .map(|a| a.arn.clone())
+            .ok_or_else(|| format!("No addon found: {physical_id}"))?;
+        let pod_identity_associations = match props.get("PodIdentityAssociations") {
+            Some(v) => Some(
+                fakecloud_eks::addon_pod_identity::reconcile_addon_pod_identity_associations(
+                    state,
+                    &fakecloud_eks::addon_pod_identity::AddonOwner {
+                        region: &self.region,
+                        account_id: &self.account_id,
+                        cluster: cluster_name,
+                        addon_arn: &addon_arn,
+                        namespace: fakecloud_eks::addon_pod_identity::DEFAULT_ADDON_NAMESPACE,
+                    },
+                    &cfn_pod_identity_associations(v),
+                )?,
+            ),
+            None => None,
+        };
         let addon = state
             .addons
             .get_mut(cluster_name)
             .and_then(|m| m.get_mut(name))
             .ok_or_else(|| format!("No addon found: {physical_id}"))?;
+        if let Some(arns) = pod_identity_associations {
+            addon.pod_identity_associations = arns;
+        }
         if let Some(v) = props.get("AddonVersion").and_then(|v| v.as_str()) {
             addon.addon_version = v.to_string();
         }
@@ -1307,4 +1362,21 @@ fn cfn_fargate_selectors(v: &Value) -> Value {
         })
         .unwrap_or_default();
     json!(items)
+}
+
+/// An `AWS::EKS::Addon` `PodIdentityAssociations` list (`ServiceAccount`,
+/// `RoleArn`) in the API's `podIdentityAssociations` shape.
+fn cfn_pod_identity_associations(v: &Value) -> Value {
+    Value::Array(
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| {
+                json!({
+                    "serviceAccount": i.get("ServiceAccount").cloned().unwrap_or(Value::Null),
+                    "roleArn": i.get("RoleArn").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect(),
+    )
 }

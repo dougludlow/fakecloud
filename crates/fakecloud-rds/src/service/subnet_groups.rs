@@ -3,6 +3,58 @@
 use super::*;
 
 impl RdsService {
+    /// Resolve a DB subnet group's VPC and per-subnet Availability Zones from
+    /// the EC2 subnets: every subnet must exist and share one VPC
+    /// (`InvalidSubnet`), and they must span at least two Availability Zones.
+    /// Without EC2 state (memory-only unit tests) each distinct subnet id is
+    /// given its own zone and the group has no VPC.
+    pub(super) fn place_subnet_group(
+        &self,
+        request: &AwsRequest,
+        subnet_ids: &[String],
+    ) -> Result<(String, Vec<String>), AwsServiceError> {
+        let (vpc_id, zones) = match &self.ec2_state {
+            Some(ec2) => {
+                let placed = fakecloud_ec2::vpc_lookup::resolve_subnet_group(
+                    ec2,
+                    &request.account_id,
+                    subnet_ids,
+                )
+                .map_err(|e| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        e.message(),
+                    )
+                })?;
+                let zones = placed.availability_zones();
+                (placed.vpc_id, zones)
+            }
+            None => {
+                let mut seen: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                let zones = subnet_ids
+                    .iter()
+                    .map(|sid| {
+                        let next = seen.len();
+                        let idx = *seen.entry(sid.as_str()).or_insert(next);
+                        format!("{}{}", request.region, char::from(b'a' + (idx % 26) as u8))
+                    })
+                    .collect();
+                (String::new(), zones)
+            }
+        };
+        let unique: std::collections::HashSet<&String> = zones.iter().collect();
+        if unique.len() < 2 {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "DBSubnetGroupDoesNotCoverEnoughAZs",
+                "DB Subnet Group must contain at least 2 subnets in different Availability Zones.",
+            ));
+        }
+        Ok((vpc_id, zones))
+    }
+
     pub(super) fn create_db_subnet_group(
         &self,
         request: &AwsRequest,
@@ -31,40 +83,7 @@ impl RdsService {
             ));
         }
 
-        let vpc_id = format!("vpc-{}", uuid::Uuid::new_v4().simple());
-        // We don't track real VPC subnet -> AZ mappings, so synthesize
-        // one AZ per subnet by hashing the subnet id. Two distinct
-        // subnet ids land in the same AZ only on hash collision, which
-        // makes the uniqueness check meaningful (the previous version
-        // derived AZ from index and was always unique by construction).
-        // Distinct subnet ids land in distinct AZs (each one gets its
-        // own letter) so the uniqueness check rejects only the case
-        // where the caller actually repeated a subnet id. We don't
-        // simulate real VPC subnet -> AZ mappings, so the previous
-        // hash-to-6-buckets approach produced spurious collisions for
-        // unrelated subnets.
-        let mut subnet_availability_zones: Vec<String> = Vec::with_capacity(subnet_ids.len());
-        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        // Use the request's SigV4 region (as the returned ARN does), not the
-        // server's frozen startup region: a client in eu-west-1 must not get
-        // subnet AZ names like `us-east-1a` alongside a `...:rds:eu-west-1:...`
-        // ARN.
-        let region = request.region.as_str();
-        for sid in &subnet_ids {
-            let next = seen.len();
-            let idx = *seen.entry(sid.as_str()).or_insert(next);
-            let bucket = (idx % 26) as u8;
-            subnet_availability_zones.push(format!("{}{}", region, char::from(b'a' + bucket)));
-        }
-
-        let unique_azs: std::collections::HashSet<_> = subnet_availability_zones.iter().collect();
-        if unique_azs.len() < 2 {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "DBSubnetGroupDoesNotCoverEnoughAZs",
-                "DB Subnet Group must contain at least 2 subnets in different Availability Zones.",
-            ));
-        }
+        let (vpc_id, subnet_availability_zones) = self.place_subnet_group(request, &subnet_ids)?;
 
         let db_subnet_group_arn =
             state.db_subnet_group_arn(request.region.as_str(), &db_subnet_group_name);
@@ -205,12 +224,10 @@ impl RdsService {
             ));
         }
 
+        let (vpc_id, subnet_availability_zones) = self.place_subnet_group(request, &subnet_ids)?;
+
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
-
-        // Request-scope region for AZ names (matches the group's ARN), not the
-        // server's frozen startup region.
-        let region = request.region.clone();
 
         let subnet_group = state
             .subnet_groups
@@ -223,24 +240,21 @@ impl RdsService {
                 )
             })?;
 
-        let mut subnet_availability_zones: Vec<String> = Vec::with_capacity(subnet_ids.len());
-        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for sid in &subnet_ids {
-            let next = seen.len();
-            let idx = *seen.entry(sid.as_str()).or_insert(next);
-            let bucket = (idx % 26) as u8;
-            subnet_availability_zones.push(format!("{}{}", region, char::from(b'a' + bucket)));
+        if let Some(ec2) = &self.ec2_state {
+            if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                ec2,
+                &request.account_id,
+                &subnet_group.vpc_id,
+                &vpc_id,
+            ) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidSubnet",
+                    fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                ));
+            }
         }
-
-        let unique_azs: std::collections::HashSet<_> = subnet_availability_zones.iter().collect();
-        if unique_azs.len() < 2 {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "DBSubnetGroupDoesNotCoverEnoughAZs",
-                "DB Subnet Group must contain at least 2 subnets in different Availability Zones.",
-            ));
-        }
-
+        subnet_group.vpc_id = vpc_id;
         subnet_group.subnet_ids = subnet_ids;
         subnet_group.subnet_availability_zones = subnet_availability_zones;
         if let Some(description) = optional_query_param(request, "DBSubnetGroupDescription") {

@@ -375,6 +375,10 @@ impl RedshiftService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = param(req, "ClusterIdentifier").unwrap_or_default();
+        let vpc_id = self.cluster_vpc_id(
+            &req.account_id,
+            param(req, "ClusterSubnetGroupName").as_deref(),
+        );
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         if acct.clusters.contains_key(&id) {
@@ -417,7 +421,7 @@ impl RedshiftService {
                 "default.redshift-1.0",
             ),
             cluster_subnet_group_name: param(req, "ClusterSubnetGroupName"),
-            vpc_id: param(req, "ClusterSubnetGroupName").map(|_| "vpc-fakecloud".to_string()),
+            vpc_id,
             availability_zone: param_or(req, "AvailabilityZone", &format!("{}a", req.region)),
             preferred_maintenance_window: param_or(
                 req,

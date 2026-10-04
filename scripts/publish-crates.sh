@@ -76,11 +76,10 @@ CRATES=(
   fakecloud-resource-groups  # only core/persistence/aws deps
   fakecloud-resource-groups-tagging  # only core/persistence/aws deps
   fakecloud-elasticbeanstalk # only core/persistence/aws deps
-  fakecloud-memorydb         # only core/persistence/aws deps
+  fakecloud-memorydb         # depends on ec2 (subnet/VPC resolution)
   fakecloud-kinesisanalyticsv2 # only core/persistence/aws deps
-  fakecloud-eks              # depends on ec2 (cluster security group)
   fakecloud-efs              # depends on ec2 (subnet AZ/VPC resolution)
-  fakecloud-mq               # only core/persistence/aws deps
+  fakecloud-mq               # depends on ec2 (subnet/VPC resolution)
   fakecloud-kafka            # only core/persistence/aws deps
   fakecloud-mwaa             # only core/persistence deps
   fakecloud-fis              # only core/persistence deps
@@ -100,11 +99,11 @@ CRATES=(
   fakecloud-identitystore    # only core/persistence/aws deps
   fakecloud-ssoadmin         # only core/persistence/aws deps
   fakecloud-verifiedpermissions # core/persistence/aws + cedar-policy
-  fakecloud-redshift         # only core/persistence/aws deps
-  fakecloud-dms              # only core/persistence/aws deps
-  fakecloud-docdb            # only core/persistence/aws deps
-  fakecloud-neptune          # only core/persistence/aws deps
-  fakecloud-opensearch       # only core/persistence/aws deps (ES + OpenSearch)
+  fakecloud-redshift         # depends on ec2 (subnet/VPC resolution)
+  fakecloud-dms              # depends on ec2 (subnet/VPC resolution)
+  fakecloud-docdb            # depends on ec2 (subnet/VPC resolution)
+  fakecloud-neptune          # depends on ec2 (subnet/VPC resolution)
+  fakecloud-opensearch       # depends on ec2 (subnet/VPC resolution)
   fakecloud-backup           # only core/persistence/aws deps
   fakecloud-glacier          # only core/persistence/aws deps
   fakecloud-transfer         # only core/persistence/aws deps
@@ -136,6 +135,7 @@ CRATES=(
   fakecloud-acm
   fakecloud-application-autoscaling
   fakecloud-autoscaling
+  fakecloud-eks              # depends on ec2 (cluster security group), autoscaling (node group ASG)
   fakecloud-wafv2
   fakecloud-cloudwatch
   fakecloud-glue

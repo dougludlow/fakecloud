@@ -152,9 +152,80 @@ pub struct DmsService {
     /// KMS access, so a replication instance created
     /// without a `KmsKeyId` reports the account's real AWS-managed `aws/dms` key.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// EC2 state: replication subnet groups resolve their subnets (VPC and
+    /// Availability Zones) there. `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 impl DmsService {
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    /// Resolve a replication subnet group's VPC id and `Subnets` from EC2:
+    /// every subnet must exist in one VPC (`InvalidSubnet`) and they must
+    /// span two Availability Zones. Without EC2 state (memory-only unit
+    /// tests) zones are assigned in request order and the VPC is left empty.
+    fn place_subnets(
+        &self,
+        ctx: &Ctx,
+        subnet_ids: &[String],
+    ) -> Result<(String, Vec<Value>), AwsServiceError> {
+        let Some(ec2) = &self.ec2_state else {
+            let subnets = subnet_ids
+                .iter()
+                .enumerate()
+                .map(|(i, sid)| {
+                    json!({
+                        "SubnetIdentifier": sid,
+                        "SubnetStatus": "Active",
+                        "SubnetAvailabilityZone": { "Name": format!("{}{}", ctx.region, (b'a' + (i % 3) as u8) as char) }
+                    })
+                })
+                .collect();
+            return Ok((String::new(), subnets));
+        };
+        let placed = fakecloud_ec2::vpc_lookup::resolve_subnet_group(ec2, &ctx.account, subnet_ids)
+            .map_err(|e| {
+                AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidSubnet", e.message())
+            })?;
+        if placed.distinct_availability_zones() < 2 {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ReplicationSubnetGroupDoesNotCoverEnoughAZs",
+                "The replication subnet group does not cover enough Availability Zones (AZs). Edit replication subnet group and add more AZs.",
+            ));
+        }
+        Ok((placed.vpc_id.clone(), subnets_json(&placed.subnets)))
+    }
+
+    /// The `default` replication subnet group: the account's default VPC and
+    /// its default subnets.
+    fn default_subnet_group(&self, ctx: &Ctx) -> Value {
+        let (vpc_id, subnets) = match &self.ec2_state {
+            Some(ec2) => {
+                let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(ec2, &ctx.account);
+                (
+                    subnets
+                        .first()
+                        .map(|s| s.vpc_id.clone())
+                        .unwrap_or_default(),
+                    subnets_json(&subnets),
+                )
+            }
+            None => (String::new(), Vec::new()),
+        };
+        json!({
+            "ReplicationSubnetGroupIdentifier": "default",
+            "ReplicationSubnetGroupDescription": "default",
+            "VpcId": vpc_id,
+            "SubnetGroupStatus": "Complete",
+            "SupportedNetworkTypes": ["IPV4"],
+            "Subnets": subnets
+        })
+    }
+
     pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
         self.kms_hook = Some(hook);
         self
@@ -166,6 +237,7 @@ impl DmsService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             kms_hook: None,
+            ec2_state: None,
         }
     }
 
@@ -587,28 +659,18 @@ fn store_tags(data: &mut DmsData, resource_arn: &str, b: &Value) {
     }
 }
 
-// A default replication subnet group nested inside a replication instance
-// response (the model example always populates it).
-fn default_subnet_group(region: &str) -> Value {
-    json!({
-        "ReplicationSubnetGroupIdentifier": "default",
-        "ReplicationSubnetGroupDescription": "default",
-        "VpcId": "vpc-0a1b2c3d",
-        "SubnetGroupStatus": "Complete",
-        "SupportedNetworkTypes": ["IPV4"],
-        "Subnets": [
-            {
-                "SubnetIdentifier": "subnet-0a1b2c3d",
+/// A replication subnet group's `Subnets` member for EC2 subnets.
+fn subnets_json(subnets: &[fakecloud_ec2::vpc_lookup::SubnetInfo]) -> Vec<Value> {
+    subnets
+        .iter()
+        .map(|s| {
+            json!({
+                "SubnetIdentifier": s.subnet_id,
                 "SubnetStatus": "Active",
-                "SubnetAvailabilityZone": { "Name": format!("{region}a") }
-            },
-            {
-                "SubnetIdentifier": "subnet-1a2b3c4d",
-                "SubnetStatus": "Active",
-                "SubnetAvailabilityZone": { "Name": format!("{region}b") }
-            }
-        ]
-    })
+                "SubnetAvailabilityZone": { "Name": s.availability_zone }
+            })
+        })
+        .collect()
 }
 
 const ENDPOINT_SETTINGS_FIELDS: &[&str] = &[
@@ -663,6 +725,20 @@ impl DmsService {
         // Resolved (minted on first use) only for a valid request, with no DMS
         // lock held; the identifier is re-checked under the lock.
         let kms_key = self.kms_key_or_default(ctx, b);
+        // The instance reports the subnet group it was placed in: the named
+        // one, or the `default` group of the default VPC.
+        let named_group = opt_str(b, "ReplicationSubnetGroupIdentifier")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let subnet_group = match &named_group {
+            Some(name) => self
+                .state
+                .read()
+                .get(&ctx.account)
+                .and_then(|d| d.subnet_groups.get(name).cloned())
+                .ok_or_else(|| not_found(&format!("Replication subnet group {name} not found.")))?,
+            None => self.default_subnet_group(ctx),
+        };
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         if taken(data) {
@@ -687,10 +763,7 @@ impl DmsService {
             "AvailabilityZone".into(),
             json!(opt_str(b, "AvailabilityZone").unwrap_or(&format!("{}a", ctx.region))),
         );
-        inst.insert(
-            "ReplicationSubnetGroup".into(),
-            default_subnet_group(&ctx.region),
-        );
+        inst.insert("ReplicationSubnetGroup".into(), subnet_group);
         inst.insert(
             "PreferredMaintenanceWindow".into(),
             json!(opt_str(b, "PreferredMaintenanceWindow").unwrap_or("sun:06:00-sun:14:00")),
@@ -1676,6 +1749,7 @@ impl DmsService {
                     .collect()
             })
             .ok_or_else(|| validation("SubnetIds is required."))?;
+        let (vpc_id, subnets) = self.place_subnets(ctx, &subnet_ids)?;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         if !id.is_empty() && data.subnet_groups.contains_key(&id) {
@@ -1683,21 +1757,10 @@ impl DmsService {
                 "Subnet group {id} already exists."
             )));
         }
-        let subnets: Vec<Value> = subnet_ids
-            .iter()
-            .enumerate()
-            .map(|(i, sid)| {
-                json!({
-                    "SubnetIdentifier": sid,
-                    "SubnetStatus": "Active",
-                    "SubnetAvailabilityZone": { "Name": format!("{}{}", ctx.region, (b'a' + (i % 3) as u8) as char) }
-                })
-            })
-            .collect();
         let group = json!({
             "ReplicationSubnetGroupIdentifier": id,
             "ReplicationSubnetGroupDescription": desc,
-            "VpcId": "vpc-0a1b2c3d",
+            "VpcId": vpc_id,
             "SubnetGroupStatus": "Complete",
             "SupportedNetworkTypes": ["IPV4"],
             "Subnets": subnets
@@ -1727,32 +1790,39 @@ impl DmsService {
 
     fn modify_subnet_group(&self, ctx: &Ctx, b: &Value) -> Result<AwsResponse, AwsServiceError> {
         let id = req_str_allow_empty(b, "ReplicationSubnetGroupIdentifier")?.to_string();
-        if b.get("SubnetIds").and_then(Value::as_array).is_none() {
+        let Some(subnet_ids) = b.get("SubnetIds").and_then(Value::as_array) else {
             return Err(validation("SubnetIds is required."));
-        }
+        };
+        let subnet_ids: Vec<String> = subnet_ids
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let (vpc_id, subnets) = self.place_subnets(ctx, &subnet_ids)?;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         let Some(group) = data.subnet_groups.get_mut(&id) else {
             return Err(not_found(&format!("Subnet group {id} not found.")));
         };
         let obj = group.as_object_mut().unwrap();
+        if let Some(ec2) = &self.ec2_state {
+            let existing = obj.get("VpcId").and_then(Value::as_str).unwrap_or_default();
+            if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                ec2,
+                &ctx.account,
+                existing,
+                &vpc_id,
+            ) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidSubnet",
+                    fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                ));
+            }
+            obj.insert("VpcId".into(), json!(vpc_id));
+        }
+        obj.insert("Subnets".into(), json!(subnets));
         if let Some(desc) = opt_str(b, "ReplicationSubnetGroupDescription") {
             obj.insert("ReplicationSubnetGroupDescription".into(), json!(desc));
-        }
-        if let Some(ids) = b.get("SubnetIds").and_then(Value::as_array) {
-            let subnets: Vec<Value> = ids
-                .iter()
-                .filter_map(|v| v.as_str())
-                .enumerate()
-                .map(|(i, sid)| {
-                    json!({
-                        "SubnetIdentifier": sid,
-                        "SubnetStatus": "Active",
-                        "SubnetAvailabilityZone": { "Name": format!("{}{}", ctx.region, (b'a' + (i % 3) as u8) as char) }
-                    })
-                })
-                .collect();
-            obj.insert("Subnets".into(), json!(subnets));
         }
         let group = group.clone();
         ok(json!({ "ReplicationSubnetGroup": group }))

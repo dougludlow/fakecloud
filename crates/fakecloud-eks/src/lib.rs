@@ -1,7 +1,9 @@
 //! AWS EKS (`eks`) implementation for FakeCloud.
 
+pub mod addon_pod_identity;
 pub mod cluster_sg;
 pub(crate) mod eks_helpers;
+pub mod nodegroup_asg;
 pub mod persistence;
 pub(crate) mod service;
 pub(crate) mod state;

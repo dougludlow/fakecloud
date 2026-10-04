@@ -5,7 +5,10 @@ use super::*;
 impl LambdaService {
     pub(crate) fn create_function(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
-        let input = CreateFunctionInput::from_body(&body)?;
+        let mut input = CreateFunctionInput::from_body(&body)?;
+        if let Some(cfg) = input.vpc_config.take() {
+            input.vpc_config = Some(self.resolve_vpc_config(&req.account_id, cfg)?);
+        }
 
         // Enforce the Smithy length bounds on `FunctionName` (1..=140
         // characters; AWS accepts the bare name or any ARN form that

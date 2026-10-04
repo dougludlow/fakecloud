@@ -2118,7 +2118,8 @@ async fn main() {
     // export path can persist result objects through the S3 store.
     let dynamodb_state_for_register = dynamodb_state.clone();
     let delivery_for_dynamodb_register = delivery_for_dynamodb;
-    let mut lambda_service = LambdaService::new(lambda_state.clone());
+    let mut lambda_service =
+        LambdaService::new(lambda_state.clone()).with_ec2_state(ec2_state.clone());
     lambda_service = lambda_service.with_role_trust_validator(
         fakecloud_iam::pass_role::IamRoleTrustValidator::shared(iam_state.clone()),
     );
@@ -3162,8 +3163,9 @@ async fn main() {
         } else {
             None
         };
-    let mut rds_service =
-        RdsService::new(rds_state.clone()).with_kms_hook(kms_hook_for_services.clone());
+    let mut rds_service = RdsService::new(rds_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone())
+        .with_ec2_state(ec2_state.clone());
     if let Some(ref rt) = rds_runtime {
         rds_service = rds_service.with_runtime(rt.clone());
     }
@@ -3248,7 +3250,8 @@ async fn main() {
             None
         };
     let mut docdb_service = fakecloud_docdb::DocDbService::new(docdb_state.clone())
-        .with_kms_hook(kms_hook_for_services.clone());
+        .with_kms_hook(kms_hook_for_services.clone())
+        .with_ec2_state(ec2_state.clone());
     if let Some(store) = docdb_snapshot_store {
         docdb_service = docdb_service.with_snapshot_store(store);
     }
@@ -3307,7 +3310,8 @@ async fn main() {
             None
         };
     let mut neptune_service = fakecloud_neptune::NeptuneService::new(neptune_state.clone())
-        .with_kms_hook(kms_hook_for_services.clone());
+        .with_kms_hook(kms_hook_for_services.clone())
+        .with_ec2_state(ec2_state.clone());
     if let Some(store) = neptune_snapshot_store {
         neptune_service = neptune_service.with_snapshot_store(store);
     }
@@ -3373,8 +3377,9 @@ async fn main() {
         } else {
             None
         };
-    let mut elasticache_service =
-        ElastiCacheService::new(elasticache_state).with_s3(s3_state.clone());
+    let mut elasticache_service = ElastiCacheService::new(elasticache_state)
+        .with_s3(s3_state.clone())
+        .with_ec2_state(ec2_state.clone());
     if let Some(ref rt) = elasticache_runtime {
         elasticache_service = elasticache_service.with_runtime(rt.clone());
     }
@@ -3586,7 +3591,27 @@ async fn main() {
                                     fakecloud_elbv2::ELBV2_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            if let Some(accounts) = snapshot.accounts {
+                            if let Some(mut accounts) = snapshot.accounts {
+                                let fixed =
+                                    fakecloud_elbv2::network::restore_canonical_hosted_zone_ids(
+                                        &mut accounts,
+                                    );
+                                if fixed > 0 {
+                                    tracing::info!(
+                                        fixed,
+                                        "set the regional hosted zone id on restored load balancers"
+                                    );
+                                }
+                                let fixed = fakecloud_elbv2::network::restore_vpc_ids(
+                                    &mut accounts,
+                                    &ec2_state,
+                                );
+                                if fixed > 0 {
+                                    tracing::info!(
+                                        fixed,
+                                        "re-derived the vpc of restored load balancers from their subnets"
+                                    );
+                                }
                                 *elbv2_state.write() = accounts;
                                 tracing::info!("loaded elbv2 persistence snapshot");
                             }
@@ -3608,6 +3633,7 @@ async fn main() {
             None
         };
     let mut elbv2_inner = Elbv2Service::new_without_dataplane(elbv2_state.clone())
+        .with_ec2_state(ec2_state.clone())
         .with_waf_state(wafv2_state.clone())
         .with_delivery_bus(elbv2_delivery_bus);
     if let Some(store) = elbv2_snapshot_store.clone() {
@@ -4987,7 +5013,9 @@ async fn main() {
             None
         };
     let mut redshift_service = fakecloud_redshift::RedshiftService::new(redshift_state.clone())
-        .with_kms_hook(kms_hook_for_services.clone());
+        .with_kms_hook(kms_hook_for_services.clone())
+        .with_ec2_state(ec2_state.clone())
+        .with_ec2_snapshot_hook(cfn_snapshot_hooks.get("ec2").cloned());
     if let Some(store) = redshift_snapshot_store.clone() {
         redshift_service = redshift_service.with_snapshot_store(store);
     }
@@ -5671,7 +5699,8 @@ async fn main() {
             None
         };
     let mut dms_service = fakecloud_dms::DmsService::new(dms_state.clone())
-        .with_kms_hook(kms_hook_for_services.clone());
+        .with_kms_hook(kms_hook_for_services.clone())
+        .with_ec2_state(ec2_state.clone());
     if let Some(store) = dms_snapshot_store {
         dms_service = dms_service.with_snapshot_store(store);
     }
@@ -5825,7 +5854,8 @@ async fn main() {
         } else {
             None
         };
-    let mut memorydb_service = fakecloud_memorydb::MemoryDbService::new(memorydb_state.clone());
+    let mut memorydb_service = fakecloud_memorydb::MemoryDbService::new(memorydb_state.clone())
+        .with_ec2_state(ec2_state.clone());
     if let Some(store) = memorydb_snapshot_store {
         memorydb_service = memorydb_service.with_snapshot_store(store);
     }
@@ -5948,6 +5978,17 @@ async fn main() {
                             hook().await;
                         }
                     }
+                    let restored = fakecloud_eks::nodegroup_asg::restore_nodegroup_asgs(
+                        &eks_state,
+                        &autoscaling_state,
+                        Some(&ec2_state),
+                    );
+                    if restored > 0 {
+                        tracing::info!(restored, "created auto scaling groups for eks node groups");
+                        if let Some(hook) = cfn_snapshot_hooks.get("autoscaling") {
+                            hook().await;
+                        }
+                    }
                 }
                 Ok(fakecloud_eks::persistence::LoadOutcome::Empty) => {
                     tracing::info!("no eks persistence snapshot found; starting empty");
@@ -5960,7 +6001,9 @@ async fn main() {
         };
     let mut eks_service = fakecloud_eks::EksService::new(eks_state.clone())
         .with_ec2_state(ec2_state.clone())
-        .with_ec2_snapshot_hook(cfn_snapshot_hooks.get("ec2").cloned());
+        .with_ec2_snapshot_hook(cfn_snapshot_hooks.get("ec2").cloned())
+        .with_autoscaling_state(autoscaling_state.clone())
+        .with_autoscaling_snapshot_hook(cfn_snapshot_hooks.get("autoscaling").cloned());
     if let Some(store) = eks_snapshot_store {
         eks_service = eks_service.with_snapshot_store(store);
     }
@@ -6405,6 +6448,7 @@ async fn main() {
         };
     let mut efs_service = fakecloud_efs::EfsService::new(efs_state.clone())
         .with_ec2_state(ec2_state.clone())
+        .with_ec2_snapshot_hook(cfn_snapshot_hooks.get("ec2").cloned())
         .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = efs_snapshot_store {
         efs_service = efs_service.with_snapshot_store(store);
@@ -6437,7 +6481,8 @@ async fn main() {
         } else {
             None
         };
-    let mut mq_service = fakecloud_mq::MqService::new(mq_state.clone());
+    let mut mq_service =
+        fakecloud_mq::MqService::new(mq_state.clone()).with_ec2_state(ec2_state.clone());
     if let Some(store) = mq_snapshot_store {
         mq_service = mq_service.with_snapshot_store(store);
     }
@@ -6565,7 +6610,8 @@ async fn main() {
             None
         };
     let mut opensearch_service =
-        fakecloud_opensearch::OpenSearchService::new(opensearch_state.clone());
+        fakecloud_opensearch::OpenSearchService::new(opensearch_state.clone())
+            .with_ec2_state(ec2_state.clone());
     if let Some(store) = opensearch_snapshot_store {
         opensearch_service = opensearch_service.with_snapshot_store(store);
     }

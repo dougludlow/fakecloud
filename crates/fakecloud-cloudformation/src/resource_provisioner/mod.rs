@@ -257,9 +257,21 @@ fn parse_elb_actions(value: Option<&serde_json::Value>) -> Vec<ElbAction> {
                             .collect()
                     })
                     .unwrap_or_default();
+                let stickiness = f.get("TargetGroupStickinessConfig").map(|st| {
+                    fakecloud_elbv2::TargetGroupStickinessConfig {
+                        enabled: st
+                            .get("Enabled")
+                            .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true"))),
+                        duration_seconds: st.get("DurationSeconds").and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                .map(|n| n as i32)
+                        }),
+                    }
+                });
                 fakecloud_elbv2::ForwardConfig {
                     target_groups,
-                    stickiness: None,
+                    stickiness,
                 }
             });
             ElbAction {
@@ -269,8 +281,15 @@ fn parse_elb_actions(value: Option<&serde_json::Value>) -> Vec<ElbAction> {
                 redirect,
                 fixed_response,
                 forward,
-                authenticate_cognito: None,
-                authenticate_oidc: None,
+                authenticate_cognito: a
+                    .get("AuthenticateCognitoConfig")
+                    .map(fakecloud_elbv2::normalize_action_config),
+                authenticate_oidc: a
+                    .get("AuthenticateOidcConfig")
+                    .map(fakecloud_elbv2::normalize_action_config),
+                jwt_validation: a
+                    .get("JwtValidationConfig")
+                    .map(fakecloud_elbv2::normalize_action_config),
             }
         })
         .collect()
@@ -10380,9 +10399,115 @@ mod tests {
     }
 
     #[test]
-    fn cfn_mq_broker_synthesizes_subnets_matching_api_path() {
-        // Omitting SubnetIds must synthesize the same default-VPC subnet ids the
-        // direct CreateBroker path produces (no import drift).
+    fn cfn_vpc_resources_resolve_through_ec2_and_autoscaling() {
+        let prov = make_provisioner();
+        let subnets =
+            fakecloud_ec2::vpc_lookup::default_vpc_subnets(&prov.ec2_state, &prov.account_id);
+        let vpc = subnets[0].vpc_id.clone();
+        let default_sg = fakecloud_ec2::vpc_lookup::default_security_group_id(
+            &prov.ec2_state,
+            &prov.account_id,
+            &vpc,
+        )
+        .unwrap();
+
+        // Load balancer: VPC, zones and the default security group from EC2.
+        let lb = prov
+            .create_resource(&make_resource(
+                "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                "LB",
+                serde_json::json!({
+                    "Name": "cfn-placed",
+                    "Subnets": [subnets[0].subnet_id, subnets[1].subnet_id]
+                }),
+            ))
+            .expect("load balancer provisions");
+        {
+            let st = prov.elbv2_state.read();
+            let lb = &st.get(&prov.account_id).unwrap().load_balancers[&lb.physical_id];
+            assert_eq!(lb.vpc_id, vpc);
+            assert_eq!(lb.canonical_hosted_zone_id, "Z35SXDOTRQ7X7K");
+            assert_eq!(
+                lb.availability_zones[1].zone_name,
+                subnets[1].availability_zone
+            );
+            assert_eq!(lb.security_groups, vec![default_sg.clone()]);
+        }
+        assert!(prov
+            .create_resource(&make_resource(
+                "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                "Ghost",
+                serde_json::json!({ "Name": "cfn-ghost", "Subnets": ["subnet-0000dead"] }),
+            ))
+            .is_err());
+
+        // EKS node group: a real Auto Scaling group.
+        prov.create_resource(&make_resource(
+            "AWS::EKS::Cluster",
+            "C",
+            serde_json::json!({
+                "Name": "cfn-c",
+                "RoleArn": "arn:aws:iam::123456789012:role/eks",
+                "ResourcesVpcConfig": { "SubnetIds": [subnets[0].subnet_id] }
+            }),
+        ))
+        .expect("cluster provisions");
+        let ng = prov
+            .create_resource(&make_resource(
+                "AWS::EKS::Nodegroup",
+                "NG",
+                serde_json::json!({
+                    "ClusterName": "cfn-c",
+                    "NodegroupName": "cfn-ng",
+                    "NodeRole": "arn:aws:iam::123456789012:role/node",
+                    "Subnets": [subnets[0].subnet_id]
+                }),
+            ))
+            .expect("node group provisions");
+        let asg_name = prov
+            .eks_state
+            .read()
+            .get(&prov.account_id)
+            .unwrap()
+            .nodegroups["cfn-c"]["cfn-ng"]
+            .asg_name
+            .clone();
+        assert!(prov.autoscaling_state.read().accounts[&prov.account_id]
+            .groups
+            .contains_key(&asg_name));
+        prov.delete_resource(&ng).expect("node group deletes");
+        assert!(!prov.autoscaling_state.read().accounts[&prov.account_id]
+            .groups
+            .contains_key(&asg_name));
+
+        // EKS add-on: its pod identity associations are real records.
+        prov.create_resource(&make_resource(
+            "AWS::EKS::Addon",
+            "A",
+            serde_json::json!({
+                "ClusterName": "cfn-c",
+                "AddonName": "vpc-cni",
+                "PodIdentityAssociations": [
+                    { "ServiceAccount": "aws-node", "RoleArn": "arn:aws:iam::123456789012:role/cni" }
+                ]
+            }),
+        ))
+        .expect("add-on provisions");
+        let st = prov.eks_state.read();
+        let st = st.get(&prov.account_id).unwrap();
+        let addon = &st.addons["cfn-c"]["vpc-cni"];
+        let assoc = st.pod_identity_associations["cfn-c"]
+            .values()
+            .find(|a| a.association_arn == addon.pod_identity_associations[0])
+            .expect("association record");
+        assert_eq!(assoc.owner_arn.as_deref(), Some(addon.arn.as_str()));
+        assert_eq!(assoc.namespace, "kube-system");
+    }
+
+    #[test]
+    fn cfn_mq_broker_places_subnets_matching_api_path() {
+        // Omitting SubnetIds places the broker in the default VPC's subnets,
+        // exactly as the direct CreateBroker path does (no import drift).
         let prov = make_provisioner();
         let created = prov
             .create_resource(&make_resource(
@@ -10407,12 +10532,14 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
+        // Placed in one real default-VPC subnet, as the API path does.
         let expected: Vec<String> =
-            fakecloud_mq::shared::synthesize_subnets(&created.physical_id, "SINGLE_INSTANCE")
+            fakecloud_ec2::vpc_lookup::default_vpc_subnets(&prov.ec2_state, "123456789012")
                 .into_iter()
-                .map(|v| v.as_str().unwrap().to_string())
+                .take(1)
+                .map(|s| s.subnet_id)
                 .collect();
-        assert!(!subnets.is_empty(), "subnets are synthesized, not empty");
+        assert_eq!(subnets.len(), 1);
         assert_eq!(subnets, expected, "CFN subnets match the shared API path");
     }
 
@@ -11857,6 +11984,11 @@ mod tests {
     #[test]
     fn a_reprovisioned_unnamed_resource_keeps_its_name() {
         let prov = make_provisioner();
+        let subnets: Vec<String> =
+            fakecloud_ec2::vpc_lookup::default_vpc_subnets(&prov.ec2_state, &prov.account_id)
+                .into_iter()
+                .map(|s| s.subnet_id)
+                .collect();
         // No dedicated update arm: an update re-provisions the resource.
         let group = prov
             .create_resource(&make_resource(
@@ -11864,7 +11996,7 @@ mod tests {
                 "Subnets",
                 serde_json::json!({
                     "DBSubnetGroupDescription": "first",
-                    "SubnetIds": ["subnet-1", "subnet-2"]
+                    "SubnetIds": [subnets[0], subnets[1]]
                 }),
             ))
             .expect("create subnet group");
@@ -11881,7 +12013,7 @@ mod tests {
                     "Subnets",
                     serde_json::json!({
                         "DBSubnetGroupDescription": "second",
-                        "SubnetIds": ["subnet-1", "subnet-2"]
+                        "SubnetIds": [subnets[0], subnets[1]]
                     }),
                 ),
             )
@@ -11903,7 +12035,7 @@ mod tests {
                     "Subnets",
                     serde_json::json!({
                         "DBSubnetGroupDescription": "third",
-                        "SubnetIds": ["subnet-1", "subnet-2"]
+                        "SubnetIds": [subnets[0], subnets[1]]
                     }),
                 ),
             )

@@ -480,6 +480,78 @@ pub(crate) fn build_k8s_network_config(req: Option<&Value>) -> Value {
     })
 }
 
+/// Apply an `UpdateClusterConfig` `kubernetesNetworkConfig` to the stored
+/// config: only the members present in the request change, so toggling
+/// `elasticLoadBalancing` keeps the cluster's service CIDR and IP family.
+pub(crate) fn merge_k8s_network_config_update(existing: &mut Value, req: &Value) {
+    if !existing.is_object() {
+        *existing = build_k8s_network_config(None);
+    }
+    for key in ["serviceIpv4Cidr", "ipFamily"] {
+        if let Some(v) = req.get(key).filter(|v| v.is_string()) {
+            existing[key] = v.clone();
+        }
+    }
+    if let Some(enabled) = req
+        .get("elasticLoadBalancing")
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+    {
+        existing["elasticLoadBalancing"] = json!({ "enabled": enabled });
+    }
+}
+
+/// Apply an `UpdateNodegroupVersion` `launchTemplate` to a node group: the
+/// node group keeps its launch template (a given `id` / `name` must match it)
+/// and moves to the requested `version`.
+pub(crate) fn apply_launch_template_version(
+    ng: &mut crate::state::Nodegroup,
+    req: &Value,
+) -> Result<(), fakecloud_core::service::AwsServiceError> {
+    let Some(current) = ng.launch_template.as_mut().filter(|v| v.is_object()) else {
+        return Err(invalid_parameter(
+            "You cannot specify a launch template for a node group that was not created with one",
+        ));
+    };
+    for key in ["id", "name"] {
+        if let (Some(want), Some(have)) = (
+            req.get(key).and_then(Value::as_str),
+            current.get(key).and_then(Value::as_str),
+        ) {
+            if want != have {
+                return Err(invalid_parameter(format!(
+                    "Launch template {key} '{want}' does not match the node group's launch template {key} '{have}'"
+                )));
+            }
+        }
+    }
+    for key in ["id", "name", "version"] {
+        if let Some(v) = req.get(key).filter(|v| v.is_string()) {
+            current[key] = v.clone();
+        }
+    }
+    Ok(())
+}
+
+/// An add-on manages the pod identity associations it owns; they can only be
+/// changed or removed through the add-on (`UpdateAddon` / `DeleteAddon`), so
+/// a direct Update/DeletePodIdentityAssociation is refused, as on AWS.
+pub(crate) fn reject_addon_owned_association(
+    a: &PodIdentityAssociation,
+) -> Result<(), AwsServiceError> {
+    match &a.owner_arn {
+        Some(owner) => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequestException",
+            format!(
+                "Pod Identity association {} is owned by {owner}. Update or delete the add-on to change it.",
+                a.association_id
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Build an `AccessConfigResponse` object. The API only reports
 /// `authenticationMode` (bootstrap-creator permission is a create-only input),
 /// defaulting to `CONFIG_MAP` when the caller omits `accessConfig`.
@@ -715,26 +787,6 @@ pub(crate) fn default_addon_version(addon_name: &str, cluster_version: &str) -> 
         .find(|(_, is_default)| *is_default)
         .map(|(v, _)| v)
         .unwrap_or_else(|| "v1.0.0-eksbuild.1".to_string())
-}
-
-/// Turn the request's `podIdentityAssociations` (structs of
-/// `{serviceAccount, roleArn}`) into the association ARNs echoed back on the
-/// add-on as a StringList.
-pub(crate) fn build_pod_identity_association_arns(
-    region: &str,
-    account_id: &str,
-    cluster: &str,
-    req: Option<&Value>,
-) -> Vec<String> {
-    let Some(list) = req.and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    list.iter()
-        .map(|_| {
-            let id = uuid::Uuid::new_v4().to_string().replace('-', "");
-            pod_identity_association_arn(region, account_id, cluster, &id[..17.min(id.len())])
-        })
-        .collect()
 }
 
 pub(crate) fn addon_json(a: &Addon) -> Value {
@@ -1317,17 +1369,24 @@ pub(crate) fn pod_identity_association_json(a: &PodIdentityAssociation) -> Value
     if let Some(v) = &a.external_id {
         out["externalId"] = Value::String(v.clone());
     }
+    if let Some(v) = &a.owner_arn {
+        out["ownerArn"] = Value::String(v.clone());
+    }
     out
 }
 
 pub(crate) fn pod_identity_association_summary_json(a: &PodIdentityAssociation) -> Value {
-    json!({
+    let mut out = json!({
         "clusterName": a.cluster_name,
         "namespace": a.namespace,
         "serviceAccount": a.service_account,
         "associationArn": a.association_arn,
         "associationId": a.association_id,
-    })
+    });
+    if let Some(v) = &a.owner_arn {
+        out["ownerArn"] = Value::String(v.clone());
+    }
+    out
 }
 
 /// The real AWS EKS cluster access-policy catalogue returned by

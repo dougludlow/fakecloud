@@ -121,6 +121,11 @@ pub struct EksService {
     ec2_state: Option<fakecloud_ec2::SharedEc2State>,
     /// Persists EC2 after a cluster security group is created or deleted.
     ec2_snapshot_hook: Option<SnapshotHook>,
+    /// Auto Scaling state, where each managed node group's Auto Scaling group
+    /// lives. `None` (unit tests) leaves the group name unbacked.
+    autoscaling_state: Option<fakecloud_autoscaling::SharedAutoScalingState>,
+    /// Persists Auto Scaling after a node group's group changes.
+    autoscaling_snapshot_hook: Option<SnapshotHook>,
 }
 
 enum PathArgs {
@@ -155,7 +160,22 @@ impl EksService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             ec2_state: None,
             ec2_snapshot_hook: None,
+            autoscaling_state: None,
+            autoscaling_snapshot_hook: None,
         }
+    }
+
+    pub fn with_autoscaling_state(
+        mut self,
+        autoscaling_state: fakecloud_autoscaling::SharedAutoScalingState,
+    ) -> Self {
+        self.autoscaling_state = Some(autoscaling_state);
+        self
+    }
+
+    pub fn with_autoscaling_snapshot_hook(mut self, hook: Option<SnapshotHook>) -> Self {
+        self.autoscaling_snapshot_hook = hook;
+        self
     }
 
     pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
@@ -825,7 +845,7 @@ impl EksService {
             ));
         }
         if let Some(kn) = body.get("kubernetesNetworkConfig") {
-            cluster.kubernetes_network_config = build_k8s_network_config(Some(kn));
+            merge_k8s_network_config_update(&mut cluster.kubernetes_network_config, kn);
             mark!("VpcConfigUpdate");
             params.push(("KubernetesNetworkConfig".to_string(), kn.to_string()));
         }
@@ -1178,6 +1198,15 @@ impl EksService {
             warm_pool_config: body.get("warmPoolConfig").cloned(),
         };
 
+        if let Some(asg) = &self.autoscaling_state {
+            crate::nodegroup_asg::create_nodegroup_asg(
+                asg,
+                self.ec2_state.as_ref(),
+                &account_id,
+                &region,
+                &ng,
+            );
+        }
         let out = nodegroup_json(&ng);
         state
             .nodegroups
@@ -1260,6 +1289,9 @@ impl EksService {
             .and_then(|m| m.remove(name))
             .ok_or_else(not_found_nodegroup(name))?;
         ng.status = "DELETING".to_string();
+        if let Some(asg) = &self.autoscaling_state {
+            crate::nodegroup_asg::delete_nodegroup_asg(asg, &req.account_id, &ng);
+        }
         Ok(AwsResponse::json(
             StatusCode::OK,
             json!({ "nodegroup": nodegroup_json(&ng) }).to_string(),
@@ -1288,6 +1320,9 @@ impl EksService {
         if let Some(scaling) = body.get("scalingConfig") {
             ng.scaling_config = build_scaling_config(Some(scaling));
             params.push(("ScalingConfig".to_string(), scaling.to_string()));
+            if let Some(asg) = &self.autoscaling_state {
+                crate::nodegroup_asg::sync_nodegroup_asg_scaling(asg, &req.account_id, ng);
+            }
         }
         if let Some(labels) = body.get("labels") {
             if !ng.labels.is_object() {
@@ -1374,6 +1409,20 @@ impl EksService {
             .ok_or_else(not_found_nodegroup(name))?;
 
         let mut params = Vec::new();
+        // The launch template is validated (and applied) first so a rejected
+        // request leaves the node group untouched.
+        if let Some(lt) = body.get("launchTemplate").filter(|v| v.is_object()) {
+            apply_launch_template_version(ng, lt)?;
+            for (key, param) in [
+                ("name", "LaunchTemplateName"),
+                ("id", "LaunchTemplateId"),
+                ("version", "LaunchTemplateVersion"),
+            ] {
+                if let Some(v) = lt.get(key).and_then(|v| v.as_str()) {
+                    params.push((param.to_string(), v.to_string()));
+                }
+            }
+        }
         if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
             ng.version = version.to_string();
             params.push(("Version".to_string(), version.to_string()));
@@ -1591,12 +1640,25 @@ impl EksService {
             .and_then(|v| v.get("namespace"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let pod_identity_associations = build_pod_identity_association_arns(
-            &region,
-            &account_id,
-            cluster_name,
-            body.get("podIdentityAssociations"),
-        );
+        let pod_identity_associations = match body.get("podIdentityAssociations") {
+            Some(requested) => {
+                crate::addon_pod_identity::reconcile_addon_pod_identity_associations(
+                    state,
+                    &crate::addon_pod_identity::AddonOwner {
+                        region: &region,
+                        account_id: &account_id,
+                        cluster: cluster_name,
+                        addon_arn: &arn,
+                        namespace: namespace
+                            .as_deref()
+                            .unwrap_or(crate::addon_pod_identity::DEFAULT_ADDON_NAMESPACE),
+                    },
+                    requested,
+                )
+                .map_err(invalid_parameter)?
+            }
+            None => Vec::new(),
+        };
 
         let addon = Addon {
             name: name.clone(),
@@ -1703,6 +1765,11 @@ impl EksService {
             .and_then(|m| m.remove(name))
             .ok_or_else(not_found_addon(name))?;
         addon.status = "DELETING".to_string();
+        crate::addon_pod_identity::delete_addon_pod_identity_associations(
+            state,
+            cluster_name,
+            &addon.arn,
+        );
         Ok(AwsResponse::json(
             StatusCode::OK,
             json!({ "addon": addon_json(&addon) }).to_string(),
@@ -1723,6 +1790,33 @@ impl EksService {
         if !state.clusters.contains_key(cluster_name) {
             return Err(not_found_cluster(cluster_name)());
         }
+        let (addon_arn, namespace) = state
+            .addons
+            .get(cluster_name)
+            .and_then(|m| m.get(name))
+            .map(|a| (a.arn.clone(), a.namespace.clone()))
+            .ok_or_else(not_found_addon(name))?;
+        // The add-on's associations are reconciled in place: a service
+        // account that stays keeps its association and ARN.
+        let pod_identity_associations = match body.get("podIdentityAssociations") {
+            Some(requested) => Some(
+                crate::addon_pod_identity::reconcile_addon_pod_identity_associations(
+                    state,
+                    &crate::addon_pod_identity::AddonOwner {
+                        region: &region,
+                        account_id: &account_id,
+                        cluster: cluster_name,
+                        addon_arn: &addon_arn,
+                        namespace: namespace
+                            .as_deref()
+                            .unwrap_or(crate::addon_pod_identity::DEFAULT_ADDON_NAMESPACE),
+                    },
+                    requested,
+                )
+                .map_err(invalid_parameter)?,
+            ),
+            None => None,
+        };
         let addon = state
             .addons
             .get_mut(cluster_name)
@@ -1745,13 +1839,12 @@ impl EksService {
         if let Some(resolve) = body.get("resolveConflicts").and_then(|v| v.as_str()) {
             params.push(("ResolveConflicts".to_string(), resolve.to_string()));
         }
-        if let Some(assocs) = body.get("podIdentityAssociations") {
-            addon.pod_identity_associations = build_pod_identity_association_arns(
-                &region,
-                &account_id,
-                cluster_name,
-                Some(assocs),
-            );
+        if let Some(arns) = pod_identity_associations {
+            addon.pod_identity_associations = arns;
+            params.push((
+                "PodIdentityAssociations".to_string(),
+                body["podIdentityAssociations"].to_string(),
+            ));
         }
         addon.modified_at = Utc::now();
 
@@ -2434,6 +2527,7 @@ impl EksService {
             target_role_arn,
             external_id,
             tags: parse_tag_map(body.get("tags")),
+            owner_arn: None,
         };
         let out = pod_identity_association_json(&assoc);
         state
@@ -2522,6 +2616,12 @@ impl EksService {
         if !state.clusters.contains_key(cluster_name) {
             return Err(not_found_cluster(cluster_name)());
         }
+        let existing = state
+            .pod_identity_associations
+            .get(cluster_name)
+            .and_then(|m| m.get(association_id))
+            .ok_or_else(not_found_pod_identity_association(association_id))?;
+        reject_addon_owned_association(existing)?;
         let assoc = state
             .pod_identity_associations
             .get_mut(cluster_name)
@@ -2550,6 +2650,7 @@ impl EksService {
             .get_mut(cluster_name)
             .and_then(|m| m.get_mut(association_id))
             .ok_or_else(not_found_pod_identity_association(association_id))?;
+        reject_addon_owned_association(assoc)?;
 
         if let Some(role) = body.get("roleArn").and_then(|v| v.as_str()) {
             assoc.role_arn = role.to_string();
@@ -3835,6 +3936,15 @@ impl AwsService for EksService {
             // security group in EC2.
             if matches!(action, "CreateCluster" | "DeleteCluster") {
                 if let Some(hook) = &self.ec2_snapshot_hook {
+                    hook().await;
+                }
+            }
+            // Node groups create, resize and delete their Auto Scaling group.
+            if matches!(
+                action,
+                "CreateNodegroup" | "DeleteNodegroup" | "UpdateNodegroupConfig"
+            ) {
+                if let Some(hook) = &self.autoscaling_snapshot_hook {
                     hook().await;
                 }
             }

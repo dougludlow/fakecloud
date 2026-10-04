@@ -421,14 +421,32 @@ pub struct OpenSearchService {
     state: SharedOpenSearchState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// EC2 state: `VPCOptions` subnets and security groups resolve there
+    /// (`VPCId`, `AvailabilityZones`). `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 impl OpenSearchService {
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    /// Resolve requested `VPCOptions` into `VPCDerivedInfo` (see
+    /// [`crate::vpc::derive_vpc_options`]); kept as given without EC2.
+    fn derive_vpc_options(&self, account_id: &str, opts: &Value) -> Result<Value, AwsServiceError> {
+        match &self.ec2_state {
+            Some(ec2) => crate::vpc::derive_vpc_options(ec2, account_id, opts).map_err(validation),
+            None => Ok(opts.clone()),
+        }
+    }
+
     pub fn new(state: SharedOpenSearchState) -> Self {
         Self {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            ec2_state: None,
         }
     }
 
@@ -1139,6 +1157,10 @@ impl OpenSearchService {
         let b = body(req);
         let name = req_str(&b, "DomainName")?;
         validate_domain_name(&name)?;
+        let vpc_options = match b.get("VPCOptions").filter(|v| v.is_object()) {
+            Some(v) => Some(self.derive_vpc_options(&req.account_id, v)?),
+            None => None,
+        };
 
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
@@ -1161,6 +1183,9 @@ impl OpenSearchService {
                 }
                 cfg.insert(k.clone(), v.clone());
             }
+        }
+        if let Some(v) = vpc_options {
+            cfg.insert("VPCOptions".into(), v);
         }
         // Store the engine version in the canonical prefixed form
         // (`OpenSearch_x.y` / `Elasticsearch_x.y`) so both APIs render it
@@ -1320,6 +1345,10 @@ impl OpenSearchService {
         let name = label(l.domain.as_deref())?;
         let b = body(req);
         let dry_run = b.get("DryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+        let vpc_options = match b.get("VPCOptions").filter(|v| v.is_object()) {
+            Some(v) => Some(self.derive_vpc_options(&req.account_id, v)?),
+            None => None,
+        };
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let d = st
@@ -1339,6 +1368,9 @@ impl OpenSearchService {
                     }
                     d.config.insert(k.clone(), v.clone());
                 }
+            }
+            if let Some(v) = vpc_options {
+                d.config.insert("VPCOptions".into(), v);
             }
         }
         let cfg = domain_config(d, api);
@@ -1677,6 +1709,8 @@ impl OpenSearchService {
     fn create_vpc_endpoint(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = body(req);
         let domain_arn = req_str(&b, "DomainArn")?;
+        let vpc_options =
+            self.derive_vpc_options(&req.account_id, b.get("VpcOptions").unwrap_or(&json!({})))?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let id = format!("aos-{}", short_id());
@@ -1684,7 +1718,7 @@ impl OpenSearchService {
             id: id.clone(),
             domain_arn,
             status: "ACTIVE".to_string(),
-            vpc_options: b.get("VpcOptions").cloned().unwrap_or(json!({})),
+            vpc_options,
             endpoint: format!("vpc-{id}.{}.es.amazonaws.com", req.region),
             account_id: req.account_id.clone(),
             authorized_principals: Default::default(),
@@ -1697,14 +1731,18 @@ impl OpenSearchService {
     fn update_vpc_endpoint(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = body(req);
         let id = req_str(&b, "VpcEndpointId")?;
+        let vpc_options = match b.get("VpcOptions") {
+            Some(vo) => Some(self.derive_vpc_options(&req.account_id, vo)?),
+            None => None,
+        };
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let ep = st
             .vpc_endpoints
             .get_mut(&id)
             .ok_or_else(|| not_found_generic(&format!("VpcEndpoint {id} not found.")))?;
-        if let Some(vo) = b.get("VpcOptions") {
-            ep.vpc_options = vo.clone();
+        if let Some(vo) = vpc_options {
+            ep.vpc_options = vo;
         }
         Ok(ok(json!({ "VpcEndpoint": vpc_endpoint_json(ep) })))
     }

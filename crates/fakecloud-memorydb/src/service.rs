@@ -80,6 +80,9 @@ pub struct MemoryDbService {
     state: SharedMemoryDbState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// EC2 state: subnet groups resolve their subnets (VPC and Availability
+    /// Zones) there. `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 impl MemoryDbService {
@@ -88,7 +91,32 @@ impl MemoryDbService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            ec2_state: None,
         }
+    }
+
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    /// Resolve a subnet group's VPC and per-subnet Availability Zones from
+    /// EC2: every subnet must exist in one VPC (`InvalidSubnet`). Without EC2
+    /// state (memory-only unit tests) the group gets the all-zero VPC id and
+    /// no zones.
+    fn place_subnets(
+        &self,
+        req: &AwsRequest,
+        subnet_ids: &[String],
+    ) -> Result<(String, Vec<String>), AwsServiceError> {
+        let Some(ec2) = &self.ec2_state else {
+            return Ok(("vpc-00000000".to_string(), Vec::new()));
+        };
+        let placed =
+            fakecloud_ec2::vpc_lookup::resolve_subnet_group(ec2, &req.account_id, subnet_ids)
+                .map_err(|e| fault("InvalidSubnet", &e.message()))?;
+        let zones = placed.availability_zones();
+        Ok((placed.vpc_id, zones))
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -485,9 +513,11 @@ fn sg_json(g: &SubnetGroup) -> Value {
         "Name": g.name,
         "Description": g.description,
         "VpcId": g.vpc_id,
-        "Subnets": g.subnet_ids.iter().map(|id| json!({
+        "Subnets": g.subnet_ids.iter().enumerate().map(|(i, id)| json!({
             "Identifier": id,
-            "AvailabilityZone": { "Name": "us-east-1a" },
+            "AvailabilityZone": {
+                "Name": g.subnet_availability_zones.get(i).map(String::as_str).unwrap_or("us-east-1a")
+            },
             "SupportedNetworkTypes": ["ipv4"],
         })).collect::<Vec<_>>(),
         "ARN": g.arn,
@@ -1291,6 +1321,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "SubnetGroupName")?.to_string();
         let subnet_ids = str_list(&b, "SubnetIds");
+        let (vpc_id, zones) = self.place_subnets(req, &subnet_ids)?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.subnet_groups.contains_key(&name) {
@@ -1303,10 +1334,11 @@ impl MemoryDbService {
         let sg = SubnetGroup {
             name: name.clone(),
             description: opt_str(&b, "Description").unwrap_or_default(),
-            vpc_id: "vpc-00000000".to_string(),
+            vpc_id,
             subnet_ids,
             arn: sg_arn.clone(),
             supported_network_types: vec!["ipv4".to_string()],
+            subnet_availability_zones: zones,
         };
         let tags = parse_tags(&b);
         if !tags.is_empty() {
@@ -1340,6 +1372,12 @@ impl MemoryDbService {
     fn update_subnet_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let name = req_str(&b, "SubnetGroupName")?.to_string();
+        let ids = str_list(&b, "SubnetIds");
+        let placed = if ids.is_empty() {
+            None
+        } else {
+            Some(self.place_subnets(req, &ids)?)
+        };
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let Some(g) = st.subnet_groups.get_mut(&name) else {
@@ -1348,12 +1386,26 @@ impl MemoryDbService {
                 &format!("Subnet group {name} not found."),
             ));
         };
+        if let Some((vpc_id, zones)) = placed {
+            if let Some(ec2) = &self.ec2_state {
+                if !fakecloud_ec2::vpc_lookup::subnet_group_vpc_change_allowed(
+                    ec2,
+                    &req.account_id,
+                    &g.vpc_id,
+                    &vpc_id,
+                ) {
+                    return Err(fault(
+                        "InvalidSubnet",
+                        fakecloud_ec2::vpc_lookup::SUBNET_GROUP_VPC_CHANGE_MESSAGE,
+                    ));
+                }
+                g.vpc_id = vpc_id;
+            }
+            g.subnet_ids = ids;
+            g.subnet_availability_zones = zones;
+        }
         if let Some(d) = opt_str(&b, "Description") {
             g.description = d;
-        }
-        let ids = str_list(&b, "SubnetIds");
-        if !ids.is_empty() {
-            g.subnet_ids = ids;
         }
         let out = sg_json(g);
         ok(json!({ "SubnetGroup": out }))
@@ -1378,6 +1430,11 @@ impl MemoryDbService {
         let b = parse(req)?;
         let cluster_name = req_str(&b, "ClusterName")?.to_string();
         let snap_name = req_str(&b, "SnapshotName")?.to_string();
+        // A cluster without its own subnet group lives in the default VPC.
+        let default_vpc = self
+            .ec2_state
+            .as_ref()
+            .and_then(|ec2| fakecloud_ec2::vpc_lookup::default_vpc_id(ec2, &req.account_id));
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.snapshots.contains_key(&snap_name) {
@@ -1396,7 +1453,12 @@ impl MemoryDbService {
             "Name": c.name, "Description": c.description, "NodeType": c.node_type,
             "Engine": c.engine, "EngineVersion": c.engine_version, "MaintenanceWindow": c.maintenance_window,
             "TopicArn": c.sns_topic_arn, "Port": c.port, "ParameterGroupName": c.parameter_group_name,
-            "SubnetGroupName": c.subnet_group_name, "VpcId": "vpc-00000000",
+            "SubnetGroupName": c.subnet_group_name, "VpcId": st
+                .subnet_groups
+                .get(&c.subnet_group_name)
+                .map(|g| g.vpc_id.clone())
+                .or(default_vpc)
+                .unwrap_or_default(),
             "SnapshotRetentionLimit": c.snapshot_retention_limit, "SnapshotWindow": c.snapshot_window,
             "NumShards": c.number_of_shards,
         });

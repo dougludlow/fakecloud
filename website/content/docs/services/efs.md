@@ -27,13 +27,17 @@ resource lifecycle is modelled - not faked. No real NFS file system is served
   (`ReplicationOverwriteProtection`, toggled by `UpdateFileSystemProtection`).
   `DeleteFileSystem` returns `FileSystemInUse` while mount targets remain.
 - **Mount targets** - one per Availability Zone per file system
-  (`MountTargetConflict` otherwise). The AZ, AZ id, VPC, and - when the
-  referenced subnet was created through fakecloud's EC2 service - the IP address
-  are resolved from the real subnet; the network interface (`eni-...`) and
-  security groups are synthesized. `fsmt-` ids, `LifeCycleState`
-  (`creating` -> `available`), and `OwnerId` match AWS.
+  (`MountTargetConflict` otherwise). The subnet must exist in EC2
+  (`SubnetNotFound`), and the AZ, AZ id and VPC come from it. Like EFS, the
+  mount target creates a requester-managed network interface in the subnet
+  (`EFS mount target for fs-... (fsmt-...)`) whose IP is taken from the subnet's
+  CIDR (or the requested `IpAddress`, `IpAddressInUse` when taken), visible
+  through EC2 `DescribeNetworkInterfaces` and deleted with the mount target.
+  Security groups must exist in the subnet's VPC (`SecurityGroupNotFound`, at
+  most five); without any, the VPC's `default` group is used. `fsmt-` ids,
+  `LifeCycleState` (`creating` -> `available`), and `OwnerId` match AWS.
   `ModifyMountTargetSecurityGroups` / `DescribeMountTargetSecurityGroups`
-  round-trip the security-group list.
+  round-trip the security-group list onto the network interface.
 - **Access points** - `fsap-` ids, `PosixUser`, and `RootDirectory` (defaulting
   to `/`), with `ClientToken` idempotency (`AccessPointAlreadyExists`).
 - **Lifecycle configuration**, **backup policy**, and **file-system resource

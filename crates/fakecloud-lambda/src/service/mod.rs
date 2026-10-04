@@ -1155,6 +1155,10 @@ pub struct LambdaService {
     /// invoke entry, decremented when the invocation completes (or
     /// when the spawned async task finishes for `Event` invokes).
     pub(crate) inflight_invocations: Arc<parking_lot::RwLock<BTreeMap<String, i64>>>,
+    /// EC2 state: a function's `VpcConfig` subnets and security groups are
+    /// validated there and its `VpcId` resolved. `None` in memory-only unit
+    /// tests, where the config is stored as given.
+    pub(crate) ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 mod functions;
@@ -1174,6 +1178,31 @@ impl LambdaService {
             iam_mode: fakecloud_core::auth::IamMode::Off,
             s3_delivery: None,
             inflight_invocations: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            ec2_state: None,
+        }
+    }
+
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    /// Resolve a requested `VpcConfig` against EC2 (see
+    /// [`crate::vpc::resolve_vpc_config`]); stored as given without EC2.
+    pub(crate) fn resolve_vpc_config(
+        &self,
+        account_id: &str,
+        cfg: Value,
+    ) -> Result<Value, AwsServiceError> {
+        match &self.ec2_state {
+            Some(ec2) => crate::vpc::resolve_vpc_config(ec2, account_id, &cfg).map_err(|m| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterValueException",
+                    m,
+                )
+            }),
+            None => Ok(cfg),
         }
     }
 
