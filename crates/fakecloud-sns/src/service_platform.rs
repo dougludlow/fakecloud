@@ -20,7 +20,7 @@ impl SnsService {
         let attributes = parse_entries(req, "Attributes");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let arn = Arn::regional(
             "sns",
             &req.region,
@@ -63,7 +63,7 @@ impl SnsService {
         let arn = required(req, "PlatformApplicationArn")?;
         self.state
             .write()
-            .get_or_create(&req.account_id)
+            .regional_mut(&req.account_id, &req.region)
             .platform_applications
             .remove(&arn);
 
@@ -87,7 +87,9 @@ impl SnsService {
         let arn = required(req, "PlatformApplicationArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let app = state
             .platform_applications
             .get(&arn)
@@ -126,7 +128,7 @@ impl SnsService {
         let new_attrs = parse_entries(req, "Attributes");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let app = state
             .platform_applications
             .get_mut(&arn)
@@ -155,7 +157,9 @@ impl SnsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
 
         let items: Vec<(String, String)> = state
             .platform_applications
@@ -212,7 +216,7 @@ impl SnsService {
         let attrs = parse_entries(req, "Attributes");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let account_id = state.account_id.clone();
         let app = state
             .platform_applications
@@ -322,7 +326,7 @@ impl SnsService {
         let endpoint_arn = required(req, "EndpointArn")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         for app in state.platform_applications.values_mut() {
             app.endpoints.remove(&endpoint_arn);
         }
@@ -348,7 +352,9 @@ impl SnsService {
 
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         for app in state.platform_applications.values() {
             if let Some(ep) = app.endpoints.get(&endpoint_arn) {
                 let attrs: String = ep
@@ -388,7 +394,7 @@ impl SnsService {
         let new_attrs = parse_entries(req, "Attributes");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         for app in state.platform_applications.values_mut() {
             if let Some(ep) = app.endpoints.get_mut(&endpoint_arn) {
                 for (k, v) in new_attrs {
@@ -423,7 +429,9 @@ impl SnsService {
 
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let app = state
             .platform_applications
             .get(&app_arn)

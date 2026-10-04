@@ -234,7 +234,7 @@ impl ResetState {
             "sns" => {
                 let mut s = self.sns.write();
                 s.reset();
-                s.default_mut().seed_default_opted_out();
+                s.default_regional_mut().seed_default_opted_out();
             }
             "events" | "eventbridge" => {
                 let mut eb_accounts = self.eb.write();
@@ -410,9 +410,13 @@ impl ResetState {
             }
             "sns" => {
                 let mut mas = self.sns.write();
+                let default_account = mas.default_account_id() == account_id;
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
-                    state.seed_default_opted_out();
+                    // Every region of the account.
+                    state.clear();
+                }
+                if default_account {
+                    mas.default_regional_mut().seed_default_opted_out();
                 }
             }
             "events" | "eventbridge" => {
@@ -650,7 +654,7 @@ impl ResetState {
         {
             let mut sns = self.sns.write();
             sns.reset();
-            sns.default_mut().seed_default_opted_out();
+            sns.default_regional_mut().seed_default_opted_out();
         }
         {
             let mut eb_accounts = self.eb.write();

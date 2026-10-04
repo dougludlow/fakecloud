@@ -17,7 +17,7 @@ impl SnsService {
         let attrs = parse_entries(req, "attributes");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         for (k, v) in attrs {
             state.sms_attributes.insert(k, v);
         }
@@ -53,7 +53,9 @@ impl SnsService {
 
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
 
         let attrs: String = state
             .sms_attributes
@@ -103,7 +105,9 @@ impl SnsService {
 
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         // Numbers ending in 99 are considered opted out by convention
         let is_opted_out =
             state.opted_out_numbers.contains(&phone_number) || phone_number.ends_with("99");
@@ -130,7 +134,9 @@ impl SnsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let members: String = state
             .opted_out_numbers
             .iter()
@@ -162,7 +168,7 @@ impl SnsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let phone_number = required(req, "phoneNumber")?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.opted_out_numbers.retain(|n| n != &phone_number);
 
         Ok(xml_resp(
@@ -195,7 +201,7 @@ impl SnsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.sms_sandbox_phone_numbers.contains_key(&phone_number) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -235,7 +241,7 @@ impl SnsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let phone_number = required(req, "PhoneNumber")?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state
             .sms_sandbox_phone_numbers
             .remove(&phone_number)
@@ -268,7 +274,7 @@ impl SnsService {
         let phone_number = required(req, "PhoneNumber")?;
         let one_time_password = required(req, "OneTimePassword")?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let entry = state
             .sms_sandbox_phone_numbers
             .get_mut(&phone_number)
@@ -308,7 +314,9 @@ impl SnsService {
         validate_max_results(req, 1, 100)?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let members: String = state
             .sms_sandbox_phone_numbers
             .values()
@@ -345,7 +353,9 @@ impl SnsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let in_sandbox = state.is_sms_sandboxed();
         Ok(xml_resp(
             &format!(
@@ -369,7 +379,7 @@ impl SnsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         validate_max_results(req, 1, 30)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.seed_default_origination_numbers();
         let members: String = state
             .origination_numbers

@@ -327,13 +327,13 @@ async fn main() {
         ),
     ));
     let sns_state = Arc::new(parking_lot::RwLock::new({
-        let mut mas: fakecloud_core::multi_account::MultiAccountState<fakecloud_sns::SnsState> =
+        let mut mas: fakecloud_core::multi_account::MultiRegionState<fakecloud_sns::SnsState> =
             fakecloud_core::multi_account::MultiAccountState::new(
                 &cli.account_id,
                 &cli.region,
                 &endpoint_url,
             );
-        mas.default_mut().seed_default_opted_out();
+        mas.default_regional_mut().seed_default_opted_out();
         mas
     }));
     let eb_state = Arc::new(parking_lot::RwLock::new(
@@ -1835,40 +1835,38 @@ async fn main() {
             let path = data_path.join("sns").join("snapshot.json");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
-                Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_sns::SnsSnapshot>(&bytes) {
-                        Ok(snapshot) => {
-                            if snapshot.schema_version > fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION
-                            {
-                                fatal_exit(format_args!(
-                                    "sns persistence schema too new: on-disk={}, max supported={}",
-                                    snapshot.schema_version,
-                                    fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION,
-                                ));
-                            }
-                            if let Some(accounts) = snapshot.accounts {
-                                let account_count = accounts.account_count();
-                                *sns_state.write() = accounts;
-                                tracing::info!(
-                                    accounts = account_count,
-                                    "loaded sns persistence snapshot (multi-account)"
-                                );
-                            } else if let Some(single_state) = snapshot.state {
-                                let topic_count = single_state.topics.len();
-                                let account_id = single_state.account_id.clone();
-                                let mut mas = sns_state.write();
-                                *mas.get_or_create(&account_id) = single_state;
-                                tracing::info!(
-                                    topics = topic_count,
-                                    "loaded sns persistence snapshot (migrated from v1)"
-                                );
-                            }
+                Ok(Some(bytes)) => match fakecloud_sns::parse_sns_snapshot(&bytes) {
+                    Ok(snapshot) => {
+                        if snapshot.schema_version > fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION {
+                            fatal_exit(format_args!(
+                                "sns persistence schema too new: on-disk={}, max supported={}",
+                                snapshot.schema_version,
+                                fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION,
+                            ));
                         }
-                        Err(err) => fatal_exit(format_args!(
-                            "failed to parse sns persistence snapshot: {err}"
-                        )),
+                        if let Some(accounts) = snapshot.accounts {
+                            let account_count = accounts.account_count();
+                            *sns_state.write() = accounts;
+                            tracing::info!(
+                                accounts = account_count,
+                                "loaded sns persistence snapshot (multi-account)"
+                            );
+                        } else if let Some(single_state) = snapshot.state {
+                            let topic_count: usize =
+                                single_state.regions().map(|(_, s)| s.topics.len()).sum();
+                            let account_id = single_state.account_id().to_string();
+                            let mut mas = sns_state.write();
+                            *mas.get_or_create(&account_id) = single_state;
+                            tracing::info!(
+                                topics = topic_count,
+                                "loaded sns persistence snapshot (migrated from v1)"
+                            );
+                        }
                     }
-                }
+                    Err(err) => fatal_exit(format_args!(
+                        "failed to parse sns persistence snapshot: {err}"
+                    )),
+                },
                 Ok(None) => {
                     tracing::info!("no sns persistence snapshot found; starting empty");
                 }
@@ -8409,8 +8407,8 @@ async fn main() {
                 move || async move {
                     let mas = ss.read();
                     let messages = mas
-                        .iter()
-                        .flat_map(|(_, state)| state.published.iter())
+                        .iter_regional()
+                        .flat_map(|(_, _, state)| state.published.iter())
                         .map(|msg| types::SnsMessage {
                             message_id: msg.message_id.clone(),
                             topic_arn: msg.topic_arn.clone(),
@@ -8430,8 +8428,8 @@ async fn main() {
                 move || async move {
                     let mas = ss.read();
                     let messages = mas
-                        .iter()
-                        .flat_map(|(_, state)| state.sms_messages.iter())
+                        .iter_regional()
+                        .flat_map(|(_, _, state)| state.sms_messages.iter())
                         .map(|(phone_number, message)| types::SnsSmsMessage {
                             phone_number: phone_number.clone(),
                             message: message.clone(),

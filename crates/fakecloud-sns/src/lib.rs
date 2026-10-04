@@ -7,5 +7,6 @@ pub(crate) mod state;
 
 pub use service::{topic_arn, SnsService};
 pub use state::{
-    SharedSnsState, SnsSnapshot, SnsState, SnsSubscription, SnsTopic, SNS_SNAPSHOT_SCHEMA_VERSION,
+    parse_sns_snapshot, SharedSnsState, SnsSnapshot, SnsState, SnsSubscription, SnsTopic,
+    SNS_SNAPSHOT_SCHEMA_VERSION,
 };

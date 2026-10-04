@@ -418,7 +418,9 @@ pub trait EmailDispatcher: Send + Sync {
 /// Outbound SMS dispatch used by services that emulate AWS flows that route
 /// through SNS phone-number publish (Cognito SMS MFA, etc.).
 pub trait SmsDispatcher: Send + Sync {
-    fn send_sms(&self, account_id: &str, phone_number: &str, message: &str);
+    /// `region` is the region the SMS is sent from (the SNS account settings
+    /// and recorded messages are per region).
+    fn send_sms(&self, account_id: &str, region: &str, phone_number: &str, message: &str);
 }
 
 /// Cross-service KMS hook: services that accept a `KmsKeyId` (Secrets

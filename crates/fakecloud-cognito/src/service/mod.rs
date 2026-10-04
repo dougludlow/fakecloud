@@ -244,9 +244,11 @@ impl CognitoService {
             crate::triggers::render_verification_sms(sms_template.as_deref(), username, code);
         let dispatcher = dispatcher.clone();
         let acct = account_id.to_string();
+        // A user pool id is `<region>_<suffix>`: the pool sends from its region.
+        let region = pool_id.split('_').next().unwrap_or_default().to_string();
         let phone = phone_number.to_string();
         tokio::spawn(async move {
-            dispatcher.send_sms(&acct, &phone, &message);
+            dispatcher.send_sms(&acct, &region, &phone, &message);
         });
     }
 

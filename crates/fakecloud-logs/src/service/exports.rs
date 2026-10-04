@@ -335,7 +335,11 @@ impl LogsService {
                     if task.status_code == "PENDING" || task.status_code == "RUNNING" {
                         task.status_code = "PENDING".to_string();
                         task.status_message = "Task is pending".to_string();
-                        out.push((account_id.to_string(), region.to_string(), task.task_id.clone()));
+                        out.push((
+                            account_id.to_string(),
+                            region.to_string(),
+                            task.task_id.clone(),
+                        ));
                     }
                 }
             }
@@ -1213,7 +1217,13 @@ mod tests {
         }
         let req = make_request("CancelExportTask", json!({ "taskId": "t-1" }));
         svc.cancel_export_task(&req).unwrap();
-        super::run_export_task(&svc.state, &svc.delivery_bus, "123456789012", "us-east-1", "t-1");
+        super::run_export_task(
+            &svc.state,
+            &svc.delivery_bus,
+            "123456789012",
+            "us-east-1",
+            "t-1",
+        );
         assert_eq!(task_status(&svc, "t-1")["status"]["code"], "CANCELLED");
         assert!(
             recorder.objects.lock().is_empty(),

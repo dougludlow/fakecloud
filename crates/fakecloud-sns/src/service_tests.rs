@@ -124,12 +124,11 @@ fn build_sns_lambda_event_uses_configured_endpoint() {
 #[test]
 fn add_permission_with_invalid_policy_returns_error_not_panic() {
     use fakecloud_core::delivery::DeliveryBus;
-    use fakecloud_core::multi_account::MultiAccountState;
     use parking_lot::RwLock;
     use std::sync::Arc;
 
     let state = Arc::new(RwLock::new(
-        MultiAccountState::<crate::state::SnsState>::new(
+        fakecloud_core::multi_account::MultiRegionState::<crate::state::SnsState>::new(
             "123456789012",
             "us-east-1",
             "http://localhost:4566",
@@ -142,7 +141,7 @@ fn add_permission_with_invalid_policy_returns_error_not_panic() {
     let topic_arn = "arn:aws:sns:us-east-1:123456789012:test-topic";
     {
         let mut s = state.write();
-        s.default_mut().topics.insert(
+        s.default_regional_mut().topics.insert(
             topic_arn.to_string(),
             crate::state::SnsTopic {
                 topic_arn: topic_arn.to_string(),
@@ -199,12 +198,11 @@ fn add_permission_with_invalid_policy_returns_error_not_panic() {
 
 fn make_sns() -> (SnsService, crate::state::SharedSnsState) {
     use fakecloud_core::delivery::DeliveryBus;
-    use fakecloud_core::multi_account::MultiAccountState;
     use parking_lot::RwLock;
     use std::sync::Arc;
 
     let state = Arc::new(RwLock::new(
-        MultiAccountState::<crate::state::SnsState>::new(
+        fakecloud_core::multi_account::MultiRegionState::<crate::state::SnsState>::new(
             "123456789012",
             "us-east-1",
             "http://localhost:4566",
@@ -291,7 +289,7 @@ fn json_structure_delivers_per_protocol_body_to_each_subscriber() {
     )));
 
     let guard = state.read();
-    let s = guard.default_ref();
+    let s = guard.default_regional().unwrap();
     let plain = s
         .sent_emails
         .iter()
@@ -337,7 +335,7 @@ fn json_structure_falls_back_to_default_when_protocol_key_absent() {
     )));
 
     let guard = state.read();
-    let s = guard.default_ref();
+    let s = guard.default_regional().unwrap();
     let email = s
         .sent_emails
         .iter()
@@ -385,7 +383,7 @@ fn fifo_publish_deduplicates_within_window() {
     );
 
     let guard = state.read();
-    let s = guard.default_ref();
+    let s = guard.default_regional().unwrap();
     let count = s
         .published
         .iter()
@@ -425,7 +423,7 @@ fn fifo_content_based_dedup_suppresses_identical_body() {
     assert_eq!(id1, id2);
 
     let guard = state.read();
-    let s = guard.default_ref();
+    let s = guard.default_regional().unwrap();
     let count = s
         .published
         .iter()
@@ -566,7 +564,13 @@ fn unsubscribe_removes_subscription() {
     // Get subscription ARN from state
     let sub_arn = {
         let s = state.read();
-        s.default_ref().subscriptions.keys().next().unwrap().clone()
+        s.default_regional()
+            .unwrap()
+            .subscriptions
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
     };
 
     let req = sns_request("Unsubscribe", vec![("SubscriptionArn", &sub_arn)]);
@@ -574,13 +578,14 @@ fn unsubscribe_removes_subscription() {
 
     let s = state.read();
     assert!(
-        s.default_ref().subscriptions.is_empty(),
+        s.default_regional().unwrap().subscriptions.is_empty(),
         "Subscription should be removed"
     );
     // SubscriptionsDeleted on the parent topic must reflect the
     // unsubscribe so GetTopicAttributes returns a real cumulative count.
     assert_eq!(
-        s.default_ref()
+        s.default_regional()
+            .unwrap()
             .topics
             .get(topic_arn)
             .map(|t| t.subscriptions_deleted),
@@ -610,7 +615,8 @@ fn get_topic_attributes_emits_subscriptions_deleted() {
     let sub_arns: Vec<String> = svc
         .state
         .read()
-        .default_ref()
+        .default_regional()
+        .unwrap()
         .subscriptions
         .keys()
         .cloned()
@@ -812,10 +818,15 @@ fn publish_to_topic_stores_message() {
     );
 
     let s = state.read();
-    assert_eq!(s.default_ref().published.len(), 1);
-    assert_eq!(s.default_ref().published[0].message, "Hello world");
+    assert_eq!(s.default_regional().unwrap().published.len(), 1);
     assert_eq!(
-        s.default_ref().published[0].subject.as_deref(),
+        s.default_regional().unwrap().published[0].message,
+        "Hello world"
+    );
+    assert_eq!(
+        s.default_regional().unwrap().published[0]
+            .subject
+            .as_deref(),
         Some("Test subject")
     );
 }
@@ -908,9 +919,12 @@ fn publish_to_sms_phone_number() {
     assert_ok(&result);
 
     let s = state.read();
-    assert_eq!(s.default_ref().sms_messages.len(), 1);
-    assert_eq!(s.default_ref().sms_messages[0].0, "+15551234567");
-    assert_eq!(s.default_ref().sms_messages[0].1, "SMS test");
+    assert_eq!(s.default_regional().unwrap().sms_messages.len(), 1);
+    assert_eq!(
+        s.default_regional().unwrap().sms_messages[0].0,
+        "+15551234567"
+    );
+    assert_eq!(s.default_regional().unwrap().sms_messages[0].1, "SMS test");
 }
 
 #[test]
@@ -949,7 +963,7 @@ fn publish_batch_stores_multiple_messages() {
     );
 
     let s = state.read();
-    assert_eq!(s.default_ref().published.len(), 2);
+    assert_eq!(s.default_regional().unwrap().published.len(), 2);
 }
 
 #[test]
@@ -1056,7 +1070,13 @@ fn get_subscription_attributes_returns_defaults() {
 
     let sub_arn = {
         let s = state.read();
-        s.default_ref().subscriptions.keys().next().unwrap().clone()
+        s.default_regional()
+            .unwrap()
+            .subscriptions
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
     };
 
     let req = sns_request(
@@ -1113,7 +1133,7 @@ fn get_subscription_attributes_reflects_pending_confirmation() {
 
     let (http_arn, email_arn) = {
         let s = state.read();
-        let subs = &s.default_ref().subscriptions;
+        let subs = &s.default_regional().unwrap().subscriptions;
         let http = subs
             .values()
             .find(|sub| sub.protocol == "http")
@@ -1172,7 +1192,13 @@ fn set_subscription_attributes_updates_value() {
 
     let sub_arn = {
         let s = state.read();
-        s.default_ref().subscriptions.keys().next().unwrap().clone()
+        s.default_regional()
+            .unwrap()
+            .subscriptions
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
     };
 
     // Set RawMessageDelivery to true
@@ -1188,7 +1214,12 @@ fn set_subscription_attributes_updates_value() {
 
     // Verify in state
     let s = state.read();
-    let sub = s.default_ref().subscriptions.get(&sub_arn).unwrap();
+    let sub = s
+        .default_regional()
+        .unwrap()
+        .subscriptions
+        .get(&sub_arn)
+        .unwrap();
     assert_eq!(sub.attributes.get("RawMessageDelivery").unwrap(), "true");
 }
 
@@ -1209,7 +1240,13 @@ fn set_subscription_attributes_rejects_invalid_attr() {
 
     let sub_arn = {
         let s = state.read();
-        s.default_ref().subscriptions.keys().next().unwrap().clone()
+        s.default_regional()
+            .unwrap()
+            .subscriptions
+            .keys()
+            .next()
+            .unwrap()
+            .clone()
     };
 
     let req = sns_request(
@@ -1442,7 +1479,8 @@ fn confirm_subscription_returns_arn() {
     // Get the token from the pending subscription
     let token = {
         let s = state.read();
-        s.default_ref()
+        s.default_regional()
+            .unwrap()
             .subscriptions
             .values()
             .find(|sub| sub.topic_arn == topic_arn && !sub.confirmed)
@@ -1467,7 +1505,8 @@ fn confirm_subscription_returns_arn() {
     // Verify the subscription is now confirmed
     let s = state.read();
     let sub = s
-        .default_ref()
+        .default_regional()
+        .unwrap()
         .subscriptions
         .values()
         .find(|sub| sub.topic_arn == topic_arn)
@@ -1530,7 +1569,8 @@ fn confirm_subscription_matches_correct_pending_sub() {
     let (second_arn, second_token) = {
         let s = state.read();
         let sub = s
-            .default_ref()
+            .default_regional()
+            .unwrap()
             .subscriptions
             .values()
             .find(|sub| sub.endpoint == "http://second.example.com/hook")
@@ -1556,7 +1596,7 @@ fn confirm_subscription_matches_correct_pending_sub() {
 
     // Verify only the second subscription is confirmed
     let s = state.read();
-    for sub in s.default_ref().subscriptions.values() {
+    for sub in s.default_regional().unwrap().subscriptions.values() {
         if sub.endpoint == "http://second.example.com/hook" {
             assert!(sub.confirmed, "second subscription should be confirmed");
         } else {
@@ -1585,7 +1625,8 @@ fn confirm_subscription_accepts_sub_arn_as_token() {
     // Get the subscription ARN
     let sub_arn = {
         let s = state.read();
-        s.default_ref()
+        s.default_regional()
+            .unwrap()
             .subscriptions
             .values()
             .find(|sub| sub.topic_arn == topic_arn)
@@ -1605,7 +1646,8 @@ fn confirm_subscription_accepts_sub_arn_as_token() {
     // Verify the subscription is now confirmed
     let s = state.read();
     let sub = s
-        .default_ref()
+        .default_regional()
+        .unwrap()
         .subscriptions
         .values()
         .find(|sub| sub.topic_arn == topic_arn)
@@ -1679,7 +1721,8 @@ fn add_and_remove_permission() {
     {
         let s = state.read();
         let policy_str = s
-            .default_ref()
+            .default_regional()
+            .unwrap()
             .topics
             .get(topic_arn)
             .unwrap()
@@ -1707,7 +1750,8 @@ fn add_and_remove_permission() {
     {
         let s = state.read();
         let policy_str = s
-            .default_ref()
+            .default_regional()
+            .unwrap()
             .topics
             .get(topic_arn)
             .unwrap()
@@ -1784,7 +1828,10 @@ fn set_and_get_sms_attributes() {
 #[test]
 fn check_phone_opted_out() {
     let (svc, state) = make_sns();
-    state.write().default_mut().seed_default_opted_out();
+    state
+        .write()
+        .default_regional_mut()
+        .seed_default_opted_out();
 
     let req = sns_request(
         "CheckIfPhoneNumberIsOptedOut",
@@ -1802,7 +1849,10 @@ fn check_phone_opted_out() {
 #[test]
 fn list_phone_numbers_opted_out() {
     let (svc, state) = make_sns();
-    state.write().default_mut().seed_default_opted_out();
+    state
+        .write()
+        .default_regional_mut()
+        .seed_default_opted_out();
 
     let req = sns_request("ListPhoneNumbersOptedOut", vec![]);
     let result = svc.list_phone_numbers_opted_out(&req);
@@ -1817,7 +1867,10 @@ fn list_phone_numbers_opted_out() {
 #[test]
 fn opt_in_phone_number() {
     let (svc, state) = make_sns();
-    state.write().default_mut().seed_default_opted_out();
+    state
+        .write()
+        .default_regional_mut()
+        .seed_default_opted_out();
 
     let req = sns_request("OptInPhoneNumber", vec![("phoneNumber", "+15005550099")]);
     assert_ok(&svc.opt_in_phone_number(&req));
@@ -1825,7 +1878,8 @@ fn opt_in_phone_number() {
     // Verify removed from opted-out list
     let s = state.read();
     assert!(
-        !s.default_ref()
+        !s.default_regional()
+            .unwrap()
             .opted_out_numbers
             .contains(&"+15005550099".to_string()),
         "Phone should no longer be opted out"
@@ -1848,11 +1902,14 @@ fn delete_topic_removes_subscriptions() {
         ],
     )));
 
-    assert_eq!(state.read().default_ref().subscriptions.len(), 1);
+    assert_eq!(
+        state.read().default_regional().unwrap().subscriptions.len(),
+        1
+    );
 
     assert_ok(&svc.delete_topic(&sns_request("DeleteTopic", vec![("TopicArn", topic_arn)])));
     assert_eq!(
-        state.read().default_ref().subscriptions.len(),
+        state.read().default_regional().unwrap().subscriptions.len(),
         0,
         "Subscriptions should be removed with topic"
     );
@@ -1906,7 +1963,12 @@ fn create_platform_application_persists_arn_and_attrs() {
     let (svc, state) = make_sns();
     let arn = create_app(&svc, "MyApp", "GCM");
     let s = state.read();
-    let app = s.default_ref().platform_applications.get(&arn).unwrap();
+    let app = s
+        .default_regional()
+        .unwrap()
+        .platform_applications
+        .get(&arn)
+        .unwrap();
     assert_eq!(app.name, "MyApp");
     assert_eq!(app.platform, "GCM");
     assert_eq!(
@@ -1954,7 +2016,8 @@ fn set_platform_application_attributes_updates_attrs() {
     svc.set_platform_application_attributes(&req).unwrap();
     let s = state.read();
     assert_eq!(
-        s.default_ref()
+        s.default_regional()
+            .unwrap()
             .platform_applications
             .get(&arn)
             .unwrap()
@@ -1974,7 +2037,12 @@ fn delete_platform_application_removes_entry() {
         vec![("PlatformApplicationArn", arn.as_str())],
     );
     svc.delete_platform_application(&req).unwrap();
-    assert!(state.read().default_ref().platform_applications.is_empty());
+    assert!(state
+        .read()
+        .default_regional()
+        .unwrap()
+        .platform_applications
+        .is_empty());
 }
 
 fn create_endpoint(svc: &SnsService, app_arn: &str, token: &str) -> String {
@@ -2069,7 +2137,12 @@ fn delete_endpoint_removes_endpoint() {
     );
     svc.delete_endpoint(&del).unwrap();
     let s = state.read();
-    let app = s.default_ref().platform_applications.get(&app_arn).unwrap();
+    let app = s
+        .default_regional()
+        .unwrap()
+        .platform_applications
+        .get(&app_arn)
+        .unwrap();
     assert!(app.endpoints.is_empty());
 }
 
@@ -3431,7 +3504,8 @@ fn china_region_sns_arns_use_the_aws_cn_partition() {
             ("ActionName.member.1", "Publish"),
         ],
     )));
-    let policy_str = state.read().default_ref().topics[topic_arn].attributes["Policy"].clone();
+    let policy_str =
+        state.read().by_arn(topic_arn).unwrap().topics[topic_arn].attributes["Policy"].clone();
     let policy: Value = serde_json::from_str(&policy_str).unwrap();
     let single = policy["Statement"]
         .as_array()
@@ -3588,7 +3662,7 @@ fn subscription_recorded_in_the_callers_account_is_still_found() {
     let sub_arn = "arn:aws:sns:us-east-1:111111111111:other:legacy";
     state
         .write()
-        .get_or_create("123456789012")
+        .regional_mut("123456789012", "us-east-1")
         .subscriptions
         .insert(
             sub_arn.to_string(),
@@ -3621,8 +3695,86 @@ fn subscription_recorded_in_the_callers_account_is_still_found() {
     assert_ok(&svc.unsubscribe(&unsub));
     assert!(state
         .read()
-        .get("123456789012")
+        .regional("123456789012", "us-east-1")
         .unwrap()
         .subscriptions
         .is_empty());
+}
+
+#[test]
+fn topics_subscriptions_and_platform_apps_are_region_scoped() {
+    let (svc, _) = make_sns();
+    let in_region = |action: &str, params: Vec<(&str, &str)>, region: &str| {
+        let mut req = sns_request(action, params);
+        req.region = region.to_string();
+        req
+    };
+    let body_of = |resp: fakecloud_core::service::AwsResponse| {
+        std::str::from_utf8(resp.body.expect_bytes())
+            .unwrap()
+            .to_string()
+    };
+    let mut arns = Vec::new();
+    for region in ["us-east-1", "eu-west-1"] {
+        let body = body_of(
+            svc.create_topic(&in_region("CreateTopic", vec![("Name", "events")], region))
+                .unwrap(),
+        );
+        let start = body.find("<TopicArn>").unwrap() + 10;
+        let end = body.find("</TopicArn>").unwrap();
+        let arn = body[start..end].to_string();
+        assert_eq!(arn, format!("arn:aws:sns:{region}:123456789012:events"));
+        svc.subscribe(&in_region(
+            "Subscribe",
+            vec![
+                ("TopicArn", &arn),
+                ("Protocol", "email"),
+                ("Endpoint", &format!("{region}@example.com")),
+            ],
+            region,
+        ))
+        .unwrap();
+        arns.push(arn);
+    }
+    svc.create_platform_application(&in_region(
+        "CreatePlatformApplication",
+        vec![
+            ("Name", "west-app"),
+            ("Platform", "GCM"),
+            ("Attributes.entry.1.key", "PlatformCredential"),
+            ("Attributes.entry.1.value", "key"),
+        ],
+        "eu-west-1",
+    ))
+    .unwrap();
+
+    let east_subs = body_of(
+        svc.list_subscriptions(&in_region("ListSubscriptions", vec![], "us-east-1"))
+            .unwrap(),
+    );
+    assert!(east_subs.contains("us-east-1@example.com"));
+    assert!(!east_subs.contains("eu-west-1@example.com"));
+    let east_apps = body_of(
+        svc.list_platform_applications(&in_region("ListPlatformApplications", vec![], "us-east-1"))
+            .unwrap(),
+    );
+    assert!(!east_apps.contains("west-app"));
+    let west_apps = body_of(
+        svc.list_platform_applications(&in_region("ListPlatformApplications", vec![], "eu-west-1"))
+            .unwrap(),
+    );
+    assert!(west_apps.contains("west-app"));
+
+    // Deleting one region's topic leaves the other's.
+    svc.delete_topic(&in_region(
+        "DeleteTopic",
+        vec![("TopicArn", &arns[1])],
+        "eu-west-1",
+    ))
+    .unwrap();
+    let east_topics = body_of(
+        svc.list_topics(&in_region("ListTopics", vec![], "us-east-1"))
+            .unwrap(),
+    );
+    assert!(east_topics.contains(&arns[0]));
 }

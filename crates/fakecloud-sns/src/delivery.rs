@@ -38,9 +38,11 @@ impl SnsDeliveryImpl {
         // blocking I/O (HTTP retries, lambda invocations, SQS push).
         let (subscribers, msg_id, endpoint) = {
             let mut accounts = self.state.write();
-            let default_id = accounts.default_account_id().to_string();
-            let target_account = topic_arn.split(':').nth(4).unwrap_or(&default_id);
-            let state = accounts.get_or_create(target_account);
+            // The topic lives in the account and region its ARN names.
+            let Some(state) = accounts.by_arn_mut(topic_arn) else {
+                tracing::warn!(topic_arn, "SNS delivery target topic not found");
+                return;
+            };
 
             if !state.topics.contains_key(topic_arn) {
                 tracing::warn!(topic_arn, "SNS delivery target topic not found");
@@ -164,9 +166,9 @@ mod tests {
     }
 
     fn make_state(topics: Vec<SnsTopic>, subs: Vec<SnsSubscription>) -> SharedSnsState {
-        let mut multi: MultiAccountState<SnsState> =
+        let mut multi: fakecloud_core::multi_account::MultiRegionState<SnsState> =
             MultiAccountState::new(ACCOUNT, REGION, ENDPOINT);
-        let state = multi.default_mut();
+        let state = multi.default_regional_mut();
         for t in topics {
             state.topics.insert(t.topic_arn.clone(), t);
         }
@@ -186,7 +188,7 @@ mod tests {
         let delivery = SnsDeliveryImpl::new(state.clone(), bus);
         delivery.publish_to_topic(&arn, "hello", Some("hi"));
         let guard = state.read();
-        let s = guard.default_ref();
+        let s = guard.default_regional().unwrap();
         assert_eq!(s.published.len(), 1);
         let msg = &s.published[0];
         assert_eq!(msg.message, "hello");
@@ -206,7 +208,7 @@ mod tests {
             None,
         );
         let guard = state.read();
-        assert!(guard.default_ref().published.is_empty());
+        assert!(guard.default_regional().unwrap().published.is_empty());
     }
 
     #[test]
@@ -218,7 +220,7 @@ mod tests {
         let delivery = SnsDeliveryImpl::new(state.clone(), bus);
         delivery.publish_to_topic(&arn, "greetings", Some("subj"));
         let guard = state.read();
-        let s = guard.default_ref();
+        let s = guard.default_regional().unwrap();
         assert_eq!(s.sent_emails.len(), 1);
         assert_eq!(s.sent_emails[0].email_address, "user@example.com");
         assert_eq!(s.sent_emails[0].message, "greetings");
@@ -303,7 +305,7 @@ mod tests {
         let delivery = SnsDeliveryImpl::new(state.clone(), bus);
         delivery.publish_to_topic(&arn, "text-body", None);
         let guard = state.read();
-        let s = guard.default_ref();
+        let s = guard.default_regional().unwrap();
         assert_eq!(s.sms_messages.len(), 1);
         assert_eq!(s.sms_messages[0].0, "+14155550199");
         assert_eq!(s.sms_messages[0].1, "text-body");
@@ -318,7 +320,7 @@ mod tests {
         let delivery = SnsDeliveryImpl::new(state.clone(), bus);
         delivery.publish_to_topic(&arn, "msg", None);
         let guard = state.read();
-        let s = guard.default_ref();
+        let s = guard.default_regional().unwrap();
         assert!(s.sent_emails.is_empty());
         assert_eq!(s.published.len(), 1);
     }
@@ -333,7 +335,7 @@ mod tests {
         let delivery = SnsDeliveryImpl::new(state.clone(), bus);
         delivery.publish_to_topic(&arn, "payload", Some("s"));
         let guard = state.read();
-        let s = guard.default_ref();
+        let s = guard.default_regional().unwrap();
         assert_eq!(s.lambda_invocations.len(), 1);
         assert_eq!(s.lambda_invocations[0].function_arn, fn_arn);
         assert_eq!(s.lambda_invocations[0].message, "payload");

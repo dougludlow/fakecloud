@@ -6258,7 +6258,7 @@ mod tests {
             .expect("SNS::Topic is an updatable type");
         assert_eq!(updated.physical_id, created.physical_id);
         let sns = prov.sns_state.read();
-        let acct = sns.get("123456789012").unwrap();
+        let acct = sns.regional("123456789012", "us-east-1").unwrap();
         let topic = acct.topics.get(&created.physical_id).unwrap();
         assert_eq!(
             topic.attributes.get("DisplayName").map(String::as_str),
@@ -6704,7 +6704,7 @@ mod tests {
             .unwrap();
         let sns = prov.sns_state.read();
         let s = sns
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .subscriptions
             .get(&sub.physical_id)
@@ -7056,7 +7056,7 @@ mod tests {
 
         {
             let mut accounts = prov.sns_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             let stored = state.topics[&topic.physical_id]
                 .attributes
                 .get("Policy")
@@ -7067,7 +7067,7 @@ mod tests {
         prov.delete_resource(&sr).unwrap();
         {
             let mut accounts = prov.sns_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             assert!(!state.topics[&topic.physical_id]
                 .attributes
                 .contains_key("Policy"));
@@ -11174,7 +11174,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::SNS::Subscription is updatable");
         let sns = prov.sns_state.read();
-        let acct = sns.get("123456789012").unwrap();
+        let acct = sns.regional("123456789012", "us-east-1").unwrap();
         let sub = acct.subscriptions.get(&created.physical_id).unwrap();
         assert_eq!(
             sub.attributes.get("RawMessageDelivery").map(String::as_str),

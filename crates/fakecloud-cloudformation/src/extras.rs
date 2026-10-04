@@ -622,7 +622,7 @@ impl CloudFormationService {
                 .deps
                 .sns
                 .read()
-                .get(aid)
+                .regional(aid, region)
                 .map(|s| s.topics.contains_key(&resource.physical_id))
                 .unwrap_or(false),
             "AWS::S3::Bucket" => self
@@ -3028,7 +3028,7 @@ pub(crate) mod tests {
         }
         CloudFormationDeps {
             sqs: shared::<fakecloud_core::multi_account::RegionalState<SqsState>>(),
-            sns: shared::<SnsState>(),
+            sns: shared::<fakecloud_core::multi_account::RegionalState<SnsState>>(),
             ssm: shared::<SsmState>(),
             iam: shared::<IamState>(),
             s3: shared::<S3State>(),

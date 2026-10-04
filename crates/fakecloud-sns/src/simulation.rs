@@ -14,7 +14,7 @@ pub struct PendingConfirmation {
 pub fn list_pending_confirmations(state: &SharedSnsState) -> Vec<PendingConfirmation> {
     let accts = state.read();
     let mut result = Vec::new();
-    for (_, acct_state) in accts.iter() {
+    for (_, _, acct_state) in accts.iter_regional() {
         for sub in acct_state.subscriptions.values() {
             if !sub.confirmed {
                 result.push(PendingConfirmation {
@@ -34,7 +34,7 @@ pub fn list_pending_confirmations(state: &SharedSnsState) -> Vec<PendingConfirma
 /// subscription was found and confirmed (or was already confirmed).
 pub fn confirm_subscription(state: &SharedSnsState, subscription_arn: &str) -> bool {
     let mut accts = state.write();
-    for (_, acct_state) in accts.iter_mut() {
+    for (_, _, acct_state) in accts.iter_regional_mut() {
         if let Some(sub) = acct_state.subscriptions.get_mut(subscription_arn) {
             sub.confirmed = true;
             return true;
@@ -68,7 +68,7 @@ mod tests {
     ) -> String {
         let sub_arn = format!("{}:{}", topic_arn, uuid::Uuid::new_v4());
         let mut accts = state.write();
-        let s = accts.default_mut();
+        let s = accts.default_regional_mut();
         s.subscriptions.insert(
             sub_arn.clone(),
             crate::state::SnsSubscription {
@@ -130,11 +130,11 @@ mod tests {
         let topic_arn = "arn:aws:sns:us-east-1:123456789012:my-topic";
         let sub_arn = add_subscription(&state, topic_arn, "http", "http://example.com/hook", false);
 
-        assert!(!state.read().default_ref().subscriptions[&sub_arn].confirmed);
+        assert!(!state.read().default_regional().unwrap().subscriptions[&sub_arn].confirmed);
 
         let result = confirm_subscription(&state, &sub_arn);
         assert!(result);
-        assert!(state.read().default_ref().subscriptions[&sub_arn].confirmed);
+        assert!(state.read().default_regional().unwrap().subscriptions[&sub_arn].confirmed);
     }
 
     #[test]
