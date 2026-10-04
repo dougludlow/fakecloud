@@ -234,7 +234,7 @@ impl ResetState {
             "sns" => {
                 let mut s = self.sns.write();
                 s.reset();
-                s.default_mut().seed_default_opted_out();
+                s.default_regional_mut().seed_default_opted_out();
             }
             "events" | "eventbridge" => {
                 let mut eb_accounts = self.eb.write();
@@ -410,9 +410,13 @@ impl ResetState {
             }
             "sns" => {
                 let mut mas = self.sns.write();
+                let default_account = mas.default_account_id() == account_id;
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
-                    state.seed_default_opted_out();
+                    // Every region of the account.
+                    state.clear();
+                }
+                if default_account {
+                    mas.default_regional_mut().seed_default_opted_out();
                 }
             }
             "events" | "eventbridge" => {
@@ -422,9 +426,10 @@ impl ResetState {
                 }
             }
             "ssm" => {
+                // Every region of the account.
                 let mut mas = self.ssm.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "dynamodb" => {
@@ -440,9 +445,10 @@ impl ResetState {
                 }
             }
             "secretsmanager" => {
+                // Every region of the account.
                 let mut mas = self.secretsmanager.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "s3" => {
@@ -454,7 +460,7 @@ impl ResetState {
             "logs" => {
                 let mut mas = self.logs.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "kms" => {
@@ -482,9 +488,10 @@ impl ResetState {
                 }
             }
             "kinesis" => {
+                // Every region of the account.
                 let mut mas = self.kinesis.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "rds" => {
@@ -538,13 +545,13 @@ impl ResetState {
             "states" | "stepfunctions" => {
                 let mut mas = self.stepfunctions.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "scheduler" => {
                 let mut mas = self.scheduler.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "apigateway" => {
@@ -650,7 +657,7 @@ impl ResetState {
         {
             let mut sns = self.sns.write();
             sns.reset();
-            sns.default_mut().seed_default_opted_out();
+            sns.default_regional_mut().seed_default_opted_out();
         }
         {
             let mut eb_accounts = self.eb.write();
@@ -676,7 +683,7 @@ impl ResetState {
         }
         self.secretsmanager.write().reset();
         self.s3.write().reset();
-        self.logs.write().default_mut().reset();
+        self.logs.write().reset();
         self.kms.write().reset();
         self.cloudformation.write().reset();
         self.ses.write().reset();

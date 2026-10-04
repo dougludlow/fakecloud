@@ -239,24 +239,86 @@ impl SnsState {
     }
 }
 
-pub type SharedSnsState = Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<SnsState>>>;
+pub type SharedSnsState = Arc<RwLock<fakecloud_core::multi_account::MultiRegionState<SnsState>>>;
 
-/// On-disk snapshot envelope for SNS state. Versioned so format
-/// changes fail loudly on upgrade.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SnsSnapshot {
-    pub schema_version: u32,
-    #[serde(default)]
-    pub accounts: Option<fakecloud_core::multi_account::MultiAccountState<SnsState>>,
-    #[serde(default)]
-    pub state: Option<SnsState>,
+/// On-disk snapshot envelope for SNS state, per (account, region).
+/// Versioned so format changes fail loudly on upgrade.
+pub type SnsSnapshot = fakecloud_core::multi_account::RegionalSnapshot<SnsState>;
+
+/// v3: state partitioned by (account, region). v2 kept one state per
+/// account; v1 a single account's.
+pub const SNS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+
+/// Parse a persisted SNS snapshot, splitting pre-regional state by region.
+pub fn parse_sns_snapshot(bytes: &[u8]) -> Result<SnsSnapshot, serde_json::Error> {
+    fakecloud_core::multi_account::parse_regional_snapshot(
+        bytes,
+        SNS_SNAPSHOT_SCHEMA_VERSION,
+        |s: SnsState| {
+            let (account, region, endpoint) =
+                (s.account_id.clone(), s.region.clone(), s.endpoint.clone());
+            fakecloud_core::multi_account::RegionalState::from_legacy(
+                &account, &region, &endpoint, s,
+            )
+        },
+    )
 }
-
-pub const SNS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 impl fakecloud_core::multi_account::AccountState for SnsState {
     fn new_for_account(account_id: &str, region: &str, endpoint: &str) -> Self {
         Self::new(account_id, region, endpoint)
+    }
+}
+
+impl fakecloud_core::multi_account::SplitByRegion for SnsState {
+    /// Topics, platform applications and data protection policies go to the
+    /// region of their ARN; subscriptions, published messages and recorded
+    /// email deliveries follow their topic. SMS settings, sandbox and
+    /// origination numbers, opted-out numbers and recorded SMS/Lambda
+    /// deliveries name no region and stay in the server's region.
+    fn split_by_region(self, into: &mut fakecloud_core::multi_account::RegionalState<Self>) {
+        use fakecloud_aws::arn::region_of;
+        for (arn, topic) in self.topics {
+            into.region_or_default_mut(region_of(&arn))
+                .topics
+                .insert(arn, topic);
+        }
+        for (arn, sub) in self.subscriptions {
+            let region = region_of(&sub.topic_arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .subscriptions
+                .insert(arn, sub);
+        }
+        for msg in self.published {
+            let region = region_of(&msg.topic_arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .published
+                .push(msg);
+        }
+        for (arn, app) in self.platform_applications {
+            into.region_or_default_mut(region_of(&arn))
+                .platform_applications
+                .insert(arn, app);
+        }
+        for (arn, policy) in self.data_protection_policies {
+            into.region_or_default_mut(region_of(&arn))
+                .data_protection_policies
+                .insert(arn, policy);
+        }
+        for email in self.sent_emails {
+            let region = region_of(&email.topic_arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .sent_emails
+                .push(email);
+        }
+        let home = into.region_or_default_mut(None);
+        home.sms_attributes.extend(self.sms_attributes);
+        home.opted_out_numbers.extend(self.opted_out_numbers);
+        home.sms_messages.extend(self.sms_messages);
+        home.lambda_invocations.extend(self.lambda_invocations);
+        home.sms_sandbox_phone_numbers
+            .extend(self.sms_sandbox_phone_numbers);
+        home.origination_numbers.extend(self.origination_numbers);
     }
 }
 

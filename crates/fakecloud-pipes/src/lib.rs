@@ -17,5 +17,6 @@ pub use service::{
     validate_pipe_name, validate_resource_arn_len, PipesService,
 };
 pub use state::{
-    PipesAccounts, PipesSnapshot, PipesState, SharedPipesState, PIPES_SNAPSHOT_SCHEMA_VERSION,
+    parse_pipes_snapshot, PipesAccounts, PipesSnapshot, PipesState, SharedPipesState,
+    PIPES_SNAPSHOT_SCHEMA_VERSION,
 };

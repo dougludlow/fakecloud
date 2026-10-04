@@ -275,7 +275,7 @@ Called as a method on the main client: `fc.organizations()`.
 | Method | Description |
 |---|---|
 | `get_schedules()` | List scheduler schedules |
-| `fire_schedule(group, name)` | Manually fire a schedule by group/name |
+| `fire_schedule(group, name, account_id=None, region=None)` | Manually fire a schedule by group/name (default account/region: the server's) |
 
 ### `fc.glue`
 

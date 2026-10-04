@@ -380,9 +380,9 @@ pub(crate) struct SnsSmsDispatcher {
 }
 
 impl fakecloud_core::delivery::SmsDispatcher for SnsSmsDispatcher {
-    fn send_sms(&self, account_id: &str, phone_number: &str, message: &str) {
+    fn send_sms(&self, account_id: &str, region: &str, phone_number: &str, message: &str) {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         state
             .sms_messages
             .push((phone_number.to_string(), message.to_string()));

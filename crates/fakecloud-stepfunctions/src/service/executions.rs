@@ -36,7 +36,7 @@ impl StepFunctionsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let sm = state
             .state_machines
             .get(sm_arn)
@@ -143,7 +143,7 @@ impl StepFunctionsService {
         let cause = body["cause"].as_str().map(|s| s.to_string());
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let exec = state
             .executions
             .get_mut(exec_arn)
@@ -180,7 +180,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let exec = state
             .executions
             .get(exec_arn)
@@ -204,7 +206,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
 
         // Verify state machine exists
         if !state.state_machines.contains_key(sm_arn) {
@@ -275,7 +279,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let exec = state
             .executions
             .get(exec_arn)
@@ -326,7 +332,7 @@ impl StepFunctionsService {
         // driver the execution would hang RUNNING forever (bug-audit 4.6).
         let (definition, input, logging_config) = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             let exec = state.executions.get(&arn).ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -420,7 +426,7 @@ impl StepFunctionsService {
         }
         let (exec_arn, definition, logging_config) = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             let sm = state
                 .state_machines
                 .get(&sm_arn)
@@ -493,7 +499,7 @@ impl StepFunctionsService {
         // endpoints can replay the same numbers later.
         {
             let mut accounts = self.state.write();
-            if let Some(state) = accounts.get_mut(&req.account_id) {
+            if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
                 if let Some(exec) = state.executions.get_mut(&exec_arn) {
                     let duration_ms = exec
                         .stop_date
@@ -506,7 +512,7 @@ impl StepFunctionsService {
         }
 
         let accounts = self.state.read();
-        let state = accounts.get(&req.account_id).unwrap();
+        let state = accounts.regional(&req.account_id, &req.region).unwrap();
         let exec = state
             .executions
             .get(&exec_arn)

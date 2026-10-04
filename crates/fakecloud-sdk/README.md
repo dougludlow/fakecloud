@@ -251,7 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Method                              | Description                          |
 | ----------------------------------- | ------------------------------------ |
 | `get_schedules().await`             | List EventBridge Scheduler schedules |
-| `fire_schedule(name, group).await`  | Fire a schedule immediately          |
+| `fire_schedule(group, name).await` / `fire_schedule_in(group, name, account, region).await` | Fire a schedule immediately (default account/region: the server's) |
 
 ### `fc.secretsmanager()`
 

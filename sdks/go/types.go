@@ -523,7 +523,9 @@ type FireRuleResponse struct {
 // SchedulerSchedule describes one schedule managed by EventBridge
 // Scheduler. Returned by the /_fakecloud/scheduler/schedules endpoint.
 type SchedulerSchedule struct {
-	AccountID          string  `json:"accountId"`
+	AccountID string `json:"accountId"`
+	// Region is the schedule's region (schedules are regional).
+	Region             string  `json:"region"`
 	GroupName          string  `json:"groupName"`
 	Name               string  `json:"name"`
 	Arn                string  `json:"arn"`

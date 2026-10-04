@@ -243,7 +243,7 @@ const fc = new FakeCloud("http://localhost:5000");
 | Method                       | Description                                                  |
 | ---------------------------- | ------------------------------------------------------------ |
 | `getSchedules()`             | List every EventBridge Scheduler schedule                    |
-| `fireSchedule(group, name)`  | Fire a schedule manually, bypassing the cron tick            |
+| `fireSchedule(group, name, { accountId?, region? })` | Fire a schedule manually, bypassing the cron tick (default account/region: the server's) |
 
 ## `fc.secretsmanager`
 

@@ -41,7 +41,7 @@ impl StepFunctionsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let arn = state.state_machine_arn(&req.region, name);
 
         // Check if name already exists
@@ -117,7 +117,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let sm = state
             .state_machines
             .get(arn)
@@ -147,7 +149,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut machines: Vec<&StateMachine> = state.state_machines.values().collect();
         machines.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -185,7 +189,7 @@ impl StepFunctionsService {
         validate_arn(arn)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // AWS returns success even if it doesn't exist
         state.state_machines.remove(arn);
 
@@ -204,7 +208,7 @@ impl StepFunctionsService {
         validate_arn(arn)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let sm = state
             .state_machines
             .get_mut(arn)
@@ -271,7 +275,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let exec = state
             .executions
             .get(exec_arn)
@@ -298,7 +304,7 @@ impl StepFunctionsService {
             .to_string();
         let description = body["description"].as_str().unwrap_or("");
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if !state.state_machines.contains_key(&arn) {
             return Err(state_machine_not_found(&arn));
         }
@@ -320,7 +326,7 @@ impl StepFunctionsService {
             .to_string();
         validate_arn_length("stateMachineVersionArn", &arn, 2000)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.state_machine_versions.remove(&arn);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -349,7 +355,9 @@ impl StepFunctionsService {
         };
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut versions: Vec<&crate::state::StateMachineVersion> = state
             .state_machine_versions
             .values()
@@ -421,7 +429,7 @@ impl StepFunctionsService {
             update_date: now,
         };
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.state_machine_aliases.insert(alias_arn.clone(), alias);
         Ok(AwsResponse::ok_json(json!({
             "stateMachineAliasArn": alias_arn,
@@ -440,7 +448,7 @@ impl StepFunctionsService {
             .to_string();
         validate_arn_length("stateMachineAliasArn", &arn, 256)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.state_machine_aliases.remove(&arn);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -456,7 +464,9 @@ impl StepFunctionsService {
             .to_string();
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let alias = state
             .state_machine_aliases
             .get(&arn)
@@ -488,7 +498,9 @@ impl StepFunctionsService {
         };
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         // Anchor the prefix on the alias separator so a state machine
         // named `foo` doesn't pull in aliases for `foobar`.
         let parent_prefix = format!("{parent}:");
@@ -526,7 +538,7 @@ impl StepFunctionsService {
             .ok_or_else(|| missing("stateMachineAliasArn"))?
             .to_string();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let alias = state
             .state_machine_aliases
             .get_mut(&arn)

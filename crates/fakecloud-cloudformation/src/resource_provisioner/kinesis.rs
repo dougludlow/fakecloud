@@ -40,7 +40,7 @@ impl ResourceProvisioner {
         let (encryption_type, key_id) = cfn_kinesis_encryption(props)?;
 
         let mut accounts = self.kinesis_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if state.streams.contains_key(&stream_name) {
             return Err(format!("Stream {stream_name} already exists"));
         }
@@ -87,7 +87,7 @@ impl ResourceProvisioner {
         let stream_name = &existing.physical_id;
 
         let mut accounts = self.kinesis_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let stream = state
             .streams
             .get_mut(stream_name)
@@ -125,7 +125,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_kinesis_stream(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.kinesis_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.streams.remove(physical_id);
         Ok(())
     }
@@ -147,7 +147,7 @@ impl ResourceProvisioner {
             .to_string();
 
         let mut accounts = self.kinesis_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if state
             .consumers
             .values()
@@ -184,7 +184,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_kinesis_stream_consumer(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.kinesis_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.consumers.remove(physical_id);
         Ok(())
     }

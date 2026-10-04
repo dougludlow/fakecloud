@@ -415,7 +415,11 @@ fn kinesis_tags_encryption_and_reshard_keep_records() {
     );
     {
         let mut k = prov.kinesis_state.write();
-        let stream = k.get_or_create(ACCT).streams.get_mut("events").unwrap();
+        let stream = k
+            .regional_mut(ACCT, "us-east-1")
+            .streams
+            .get_mut("events")
+            .unwrap();
         assert_eq!(stream.encryption_type, "KMS");
         assert_eq!(stream.key_id.as_deref(), Some("alias/aws/kinesis"));
         assert_eq!(stream.tags["env"], "dev");
@@ -430,7 +434,7 @@ fn kinesis_tags_encryption_and_reshard_keep_records() {
     }
     update(&prov, &s, json!({"Name": "events", "ShardCount": 2}));
     let k = prov.kinesis_state.read();
-    let stream = &k.get(ACCT).unwrap().streams["events"];
+    let stream = &k.regional(ACCT, "us-east-1").unwrap().streams["events"];
     assert_eq!(stream.open_shard_count, 2);
     // The record written before the reshard is still in the (closed) parent.
     let parent = &stream.shards[0];
@@ -465,7 +469,7 @@ fn sns_topic_update_applies_tags_and_diffs_inline_subscriptions() {
     let arn = topic.physical_id.clone();
     {
         let mut sns = prov.sns_state.write();
-        let st = sns.get_or_create(ACCT);
+        let st = sns.regional_mut(ACCT, "us-east-1");
         st.subscriptions.insert(
             format!("{arn}:manual"),
             SnsSubscription {
@@ -494,7 +498,7 @@ fn sns_topic_update_applies_tags_and_diffs_inline_subscriptions() {
     );
     assert_eq!(updated.attributes["TopicArn"], arn);
     let sns = prov.sns_state.read();
-    let st = sns.get(ACCT).unwrap();
+    let st = sns.regional(ACCT, "us-east-1").unwrap();
     assert_eq!(
         st.topics[&arn].tags,
         vec![("b".to_string(), "2".to_string())]
@@ -522,7 +526,7 @@ fn sns_subscription_to_another_accounts_topic_lands_with_the_topic() {
     let topic_arn = "arn:aws:sns:us-east-1:111111111111:shared";
     {
         let mut sns = prov.sns_state.write();
-        let st = sns.get_or_create("111111111111");
+        let st = sns.regional_mut("111111111111", "us-east-1");
         st.topics.insert(
             topic_arn.to_string(),
             SnsTopic {
@@ -550,14 +554,17 @@ fn sns_subscription_to_another_accounts_topic_lands_with_the_topic() {
     );
     {
         let sns = prov.sns_state.read();
-        let s = &sns.get("111111111111").unwrap().subscriptions[&sub.physical_id];
+        let s = &sns
+            .regional("111111111111", "us-east-1")
+            .unwrap()
+            .subscriptions[&sub.physical_id];
         assert_eq!(s.owner, ACCT);
     }
     prov.delete_resource(&sub).unwrap();
     assert!(prov
         .sns_state
         .read()
-        .get("111111111111")
+        .regional("111111111111", "us-east-1")
         .unwrap()
         .subscriptions
         .is_empty());
@@ -576,7 +583,7 @@ fn sns_subscription_to_another_accounts_topic_lands_with_the_topic() {
     assert!(err.contains("AuthorizationError"), "{err}");
     prov.sns_state
         .write()
-        .get_or_create("111111111111")
+        .regional_mut("111111111111", "us-east-1")
         .topics
         .get_mut(topic_arn)
         .unwrap()
@@ -955,7 +962,7 @@ fn scheduler_schedule_and_group_are_real() {
     );
     {
         let sch = prov.scheduler_state.read();
-        let st = sch.get(ACCT).unwrap();
+        let st = sch.regional(ACCT, "us-east-1").unwrap();
         let s = &st.schedules[&("jobs".to_string(), "nightly".to_string())];
         assert_eq!(s.schedule_expression, "rate(2 days)");
         assert_eq!(s.target.arn, "arn:aws:sqs:us-east-1:123456789012:q");
@@ -972,7 +979,7 @@ fn scheduler_schedule_and_group_are_real() {
     prov.delete_resource(&sched).unwrap();
     prov.delete_resource(&group).unwrap();
     let sch = prov.scheduler_state.read();
-    let st = sch.get(ACCT).unwrap();
+    let st = sch.regional(ACCT, "us-east-1").unwrap();
     assert!(st.schedules.is_empty());
     assert!(!st.groups.contains_key("jobs"));
 }

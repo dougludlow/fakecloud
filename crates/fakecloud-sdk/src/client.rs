@@ -2366,12 +2366,27 @@ impl SchedulerClient<'_> {
         group: &str,
         name: &str,
     ) -> Result<FireScheduleResponse, Error> {
+        self.fire_schedule_in(group, name, None, None).await
+    }
+
+    /// [`Self::fire_schedule`] for the schedule in `account_id` / `region`
+    /// (`None`: the server default). Schedules are regional.
+    pub async fn fire_schedule_in(
+        &self,
+        group: &str,
+        name: &str,
+        account_id: Option<&str>,
+        region: Option<&str>,
+    ) -> Result<FireScheduleResponse, Error> {
         let resp = self
             .fc
             .client
             .post(format!(
-                "{}/_fakecloud/scheduler/fire/{}/{}",
-                self.fc.base_url, group, name
+                "{}/_fakecloud/scheduler/fire/{}/{}{}",
+                self.fc.base_url,
+                group,
+                name,
+                scope_query(account_id, region)
             ))
             .send()
             .await?;

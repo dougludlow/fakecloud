@@ -43,7 +43,7 @@ impl LogsService {
         let now = Utc::now().timestamp_millis();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Check limit (10 per region) only if adding new
         if !state.resource_policies.contains_key(&policy_name)
@@ -91,7 +91,9 @@ impl LogsService {
         )?;
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
 
         let mut policies: Vec<Value> = state
             .resource_policies
@@ -131,7 +133,7 @@ impl LogsService {
         })?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.resource_policies.remove(policy_name).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -186,7 +188,7 @@ impl LogsService {
 
         let now = Utc::now().timestamp_millis();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let account_id = state.account_id.clone();
         let scope = body["scope"].as_str().map(|s| s.to_string());
         let selection_criteria = body["selectionCriteria"].as_str().map(|s| s.to_string());
@@ -254,7 +256,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let policies: Vec<Value> = state
             .account_policies
             .values()
@@ -307,7 +311,7 @@ impl LogsService {
 
         let key = (policy_name.to_string(), policy_type.to_string());
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.account_policies.remove(&key).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -361,7 +365,7 @@ impl LogsService {
 
         let now = Utc::now().timestamp_millis();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -420,7 +424,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state.log_groups.get(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -472,7 +478,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -537,7 +543,7 @@ impl LogsService {
 
         let now = Utc::now().timestamp_millis();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -598,7 +604,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut policies = Vec::new();
 
         for id_val in log_group_ids {
@@ -656,7 +664,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -722,7 +730,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut field_indexes = Vec::new();
 
         for id_val in log_group_ids {
@@ -800,7 +810,7 @@ impl LogsService {
 
         let now = Utc::now().timestamp_millis();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -845,7 +855,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state.log_groups.get(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -898,7 +910,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -978,7 +990,7 @@ impl LogsService {
         }
         let now = Utc::now().timestamp_millis();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.storage_tier = Some(tier.to_string());
         state.storage_tier_last_updated = Some(now);
         Ok(AwsResponse::json(
@@ -997,7 +1009,7 @@ impl LogsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
         let mut out = json!({});
-        if let Some(state) = accounts.get(&req.account_id) {
+        if let Some(state) = accounts.regional(&req.account_id, &req.region) {
             // Default to STANDARD when no policy has been set, matching AWS.
             let tier = state
                 .storage_tier

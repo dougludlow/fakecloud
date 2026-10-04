@@ -695,6 +695,9 @@ pub struct FireRuleResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerSchedule {
     pub account_id: String,
+    /// The schedule's region (schedules are regional).
+    #[serde(default)]
+    pub region: String,
     pub group_name: String,
     pub name: String,
     pub arn: String,

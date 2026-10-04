@@ -622,7 +622,7 @@ impl CloudFormationService {
                 .deps
                 .sns
                 .read()
-                .get(aid)
+                .regional(aid, region)
                 .map(|s| s.topics.contains_key(&resource.physical_id))
                 .unwrap_or(false),
             "AWS::S3::Bucket" => self
@@ -670,7 +670,7 @@ impl CloudFormationService {
                 .deps
                 .secretsmanager
                 .read()
-                .get(aid)
+                .regional(aid, region)
                 .map(|s| s.secret_key(&resource.physical_id).is_some())
                 .unwrap_or(false),
             _ => return None,
@@ -3028,16 +3028,18 @@ pub(crate) mod tests {
         }
         CloudFormationDeps {
             sqs: shared::<fakecloud_core::multi_account::RegionalState<SqsState>>(),
-            sns: shared::<SnsState>(),
-            ssm: shared::<SsmState>(),
+            sns: shared::<fakecloud_core::multi_account::RegionalState<SnsState>>(),
+            ssm: shared::<fakecloud_core::multi_account::RegionalState<SsmState>>(),
             iam: shared::<IamState>(),
             s3: shared::<S3State>(),
             eventbridge: shared::<EventBridgeState>(),
             dynamodb: shared::<fakecloud_core::multi_account::RegionalState<DynamoDbState>>(),
-            logs: shared::<LogsState>(),
+            logs: shared::<fakecloud_core::multi_account::RegionalState<LogsState>>(),
             lambda: shared::<LambdaState>(),
-            secretsmanager: shared::<SecretsManagerState>(),
-            kinesis: shared::<KinesisState>(),
+            secretsmanager: shared::<
+                fakecloud_core::multi_account::RegionalState<SecretsManagerState>,
+            >(),
+            kinesis: shared::<fakecloud_core::multi_account::RegionalState<KinesisState>>(),
             kms: shared::<KmsState>(),
             ecr: shared::<EcrState>(),
             cloudwatch: Arc::new(RwLock::new(fakecloud_cloudwatch::CloudWatchAccounts::new())),
@@ -3067,7 +3069,11 @@ pub(crate) mod tests {
             elasticache: shared::<fakecloud_elasticache::ElastiCacheState>(),
             route53: Arc::new(RwLock::new(fakecloud_route53::Route53Accounts::new())),
             cloudfront: Arc::new(RwLock::new(fakecloud_cloudfront::CloudFrontAccounts::new())),
-            stepfunctions: shared::<fakecloud_stepfunctions::StepFunctionsState>(),
+            stepfunctions: shared::<
+                fakecloud_core::multi_account::RegionalState<
+                    fakecloud_stepfunctions::StepFunctionsState,
+                >,
+            >(),
             wafv2: Arc::new(RwLock::new(fakecloud_wafv2::Wafv2Accounts::default())),
             apigateway: shared::<fakecloud_apigateway::ApiGatewayState>(),
             apigatewayv2: shared::<fakecloud_apigatewayv2::ApiGatewayV2State>(),
@@ -3109,7 +3115,9 @@ pub(crate) mod tests {
             amplify: shared::<fakecloud_amplify::state::AmplifyData>(),
             iot: shared::<fakecloud_iot::IotData>(),
             appconfig: shared::<fakecloud_appconfig::AppConfigState>(),
-            scheduler: shared::<fakecloud_scheduler::SchedulerState>(),
+            scheduler: shared::<
+                fakecloud_core::multi_account::RegionalState<fakecloud_scheduler::SchedulerState>,
+            >(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
             iam_mode: Default::default(),
@@ -4255,7 +4263,9 @@ pub(crate) mod tests {
         .expect("execute change set");
 
         let accounts = sfn.read();
-        let st = accounts.get("000000000000").expect("sfn account exists");
+        let st = accounts
+            .regional("000000000000", "us-east-1")
+            .expect("sfn account exists");
         let machine = st
             .state_machines
             .values()

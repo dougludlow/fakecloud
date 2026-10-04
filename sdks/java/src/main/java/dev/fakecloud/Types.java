@@ -525,6 +525,7 @@ public final class Types {
 
     // ── Scheduler (EventBridge Scheduler) ──────────────────────────
     @JsonIgnoreProperties(ignoreUnknown = true)
+    /** A schedule; {@code region} is its region (schedules are regional). */
     public record SchedulerSchedule(
             String accountId,
             String groupName,
@@ -533,7 +534,8 @@ public final class Types {
             String state,
             String scheduleExpression,
             String targetArn,
-            String lastFired) {}
+            String lastFired,
+            String region) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record SchedulerSchedulesResponse(List<SchedulerSchedule> schedules) {}

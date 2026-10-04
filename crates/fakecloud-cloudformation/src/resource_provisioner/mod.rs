@@ -5592,7 +5592,7 @@ mod tests {
         );
 
         let mut st = prov.route53resolver_state.write();
-        let acc = st.account_mut("123456789012");
+        let acc = st.region_mut("123456789012", &prov.region);
         let r = acc.rules.get(&rule_id).expect("rule preserved");
         assert_eq!(
             r.name.as_deref(),
@@ -5656,7 +5656,7 @@ mod tests {
         let qlc_id = qlc.physical_id.clone();
         {
             let mut st = prov.route53resolver_state.write();
-            let acc = st.account_mut("123456789012");
+            let acc = st.region_mut("123456789012", &prov.region);
             acc.query_log_configs
                 .get_mut(&qlc_id)
                 .unwrap()
@@ -5677,7 +5677,7 @@ mod tests {
         assert_eq!(qlc_up.physical_id, qlc_id, "query log config id preserved");
 
         let mut st = prov.route53resolver_state.write();
-        let acc = st.account_mut("123456789012");
+        let acc = st.region_mut("123456789012", &prov.region);
         assert_eq!(
             acc.firewall_rules.get(&frg_id).map(|r| r.len()),
             Some(2),
@@ -5934,7 +5934,7 @@ mod tests {
         assert_eq!(ep_up.physical_id, ep_id, "resolver endpoint id preserved");
 
         let st = prov.route53resolver_state.read();
-        let acc = st.accounts.get(&prov.account_id).unwrap();
+        let acc = st.region(&prov.account_id, &prov.region).unwrap();
         let rec = acc.endpoints.get(&ep_id).unwrap();
         assert_eq!(rec.endpoint.name.as_deref(), Some("ep2"), "name updated");
         assert_eq!(
@@ -6077,7 +6077,7 @@ mod tests {
         // The change is actually applied to the pipes service state.
         let pipes = prov.pipes_state.read();
         let pipe = pipes
-            .get("123456789012")
+            .get("123456789012", "us-east-1")
             .unwrap()
             .pipes
             .get("my-pipe")
@@ -6122,7 +6122,7 @@ mod tests {
         .expect("update succeeds")
         .expect("Pipes::Pipe is updatable");
         let pipes = prov.pipes_state.read();
-        let acct = pipes.get("123456789012").unwrap();
+        let acct = pipes.get("123456789012", "us-east-1").unwrap();
         // Exactly one pipe (the recreate reused the same Name after deleting).
         assert_eq!(acct.pipes.len(), 1);
         let pipe = acct.pipes.get("src-pipe").unwrap();
@@ -6157,7 +6157,12 @@ mod tests {
         .expect("update succeeds")
         .expect("updatable");
         let pipes = prov.pipes_state.read();
-        let pipe = pipes.get("123456789012").unwrap().pipes.get("p2").unwrap();
+        let pipe = pipes
+            .get("123456789012", "us-east-1")
+            .unwrap()
+            .pipes
+            .get("p2")
+            .unwrap();
         assert!(
             pipe.get("Description").is_none(),
             "an omitted updatable field is cleared (full-replace semantics)"
@@ -6253,7 +6258,7 @@ mod tests {
             .expect("SNS::Topic is an updatable type");
         assert_eq!(updated.physical_id, created.physical_id);
         let sns = prov.sns_state.read();
-        let acct = sns.get("123456789012").unwrap();
+        let acct = sns.regional("123456789012", "us-east-1").unwrap();
         let topic = acct.topics.get(&created.physical_id).unwrap();
         assert_eq!(
             topic.attributes.get("DisplayName").map(String::as_str),
@@ -6699,7 +6704,7 @@ mod tests {
             .unwrap();
         let sns = prov.sns_state.read();
         let s = sns
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .subscriptions
             .get(&sub.physical_id)
@@ -7051,7 +7056,7 @@ mod tests {
 
         {
             let mut accounts = prov.sns_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             let stored = state.topics[&topic.physical_id]
                 .attributes
                 .get("Policy")
@@ -7062,7 +7067,7 @@ mod tests {
         prov.delete_resource(&sr).unwrap();
         {
             let mut accounts = prov.sns_state.write();
-            let state = accounts.get_or_create(&prov.account_id);
+            let state = accounts.regional_mut(&prov.account_id, &prov.region);
             assert!(!state.topics[&topic.physical_id]
                 .attributes
                 .contains_key("Policy"));
@@ -7579,7 +7584,7 @@ mod tests {
         assert!(prov
             .logs_state
             .read()
-            .get("222222222222")
+            .regional("222222222222", &prov.region)
             .is_some_and(|s| s.log_groups.contains_key("/app/logs")));
         assert!(prov
             .lambda_state
@@ -7599,7 +7604,7 @@ mod tests {
         assert!(!prov
             .logs_state
             .read()
-            .get("222222222222")
+            .regional("222222222222", &prov.region)
             .unwrap()
             .log_groups
             .contains_key("/app/logs"));
@@ -8492,7 +8497,7 @@ mod tests {
             "P",
             serde_json::json!({"Name": "/cn/param", "Value": "v", "Type": "String"}),
         );
-        let param_arn = prov.ssm_state.read().get(ACCT).unwrap().parameters["/cn/param"]
+        let param_arn = prov.ssm_state.read().regional(ACCT, CN).unwrap().parameters["/cn/param"]
             .arn
             .clone();
         assert_eq!(param_arn, fakecloud_ssm::param_arn(CN, ACCT, "/cn/param"));
@@ -9869,7 +9874,7 @@ mod tests {
         let prov = make_provisioner();
         let seed = |name: &str, deletion_date: chrono::DateTime<Utc>| {
             let mut sm = prov.secretsmanager_state.write();
-            let st = sm.get_or_create("123456789012");
+            let st = sm.regional_mut("123456789012", "us-east-1");
             let now = Utc::now();
             st.secrets.insert(
                 name.to_string(),
@@ -9895,6 +9900,8 @@ mod tests {
                     last_rotated_at: None,
                     resource_policy: None,
                     replica_regions: Vec::new(),
+                    replica_settings: Default::default(),
+                    primary_region: None,
                 },
             );
         };
@@ -9920,7 +9927,7 @@ mod tests {
             .expect("an expired recovery window frees the name");
         assert!(!created.physical_id.ends_with("-OldOld"));
         let sm = prov.secretsmanager_state.read();
-        let secret = &sm.get("123456789012").unwrap().secrets["expired"];
+        let secret = &sm.regional("123456789012", "us-east-1").unwrap().secrets["expired"];
         assert!(!secret.deleted);
         assert_eq!(secret.arn, created.physical_id);
 
@@ -9957,7 +9964,7 @@ mod tests {
         assert_eq!(sr.physical_id, arn);
         // Keyed by name like API-created secrets, so name lookups resolve it.
         let sm = prov.secretsmanager_state.read();
-        let acct = sm.get("123456789012").unwrap();
+        let acct = sm.regional("123456789012", "us-east-1").unwrap();
         assert_eq!(
             acct.secrets.get("my-secret").map(|s| s.arn.as_str()),
             Some(arn.as_str())
@@ -10879,7 +10886,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::SSM::Parameter is updatable");
         let ssm = prov.ssm_state.read();
-        let acct = ssm.get("123456789012").unwrap();
+        let acct = ssm.regional("123456789012", "us-east-1").unwrap();
         let param = acct.parameters.get("/app/db").unwrap();
         assert_eq!(param.value, "v2", "GetParameter must return the new value");
         assert_eq!(param.version, 2, "overwrite bumps the version");
@@ -10954,7 +10961,7 @@ mod tests {
             .expect("delete returns ok");
         {
             let ssm = prov.ssm_state.read();
-            let acct = ssm.get("123456789012").unwrap();
+            let acct = ssm.regional("123456789012", "us-east-1").unwrap();
             assert!(
                 acct.parameters.contains_key("/keep/me"),
                 "DeletionPolicy: Retain must preserve the parameter"
@@ -10964,7 +10971,7 @@ mod tests {
         // The unconditional delete still tears it down (control).
         prov.delete_resource(&created).expect("hard delete ok");
         let ssm = prov.ssm_state.read();
-        let acct = ssm.get("123456789012").unwrap();
+        let acct = ssm.regional("123456789012", "us-east-1").unwrap();
         assert!(
             !acct.parameters.contains_key("/keep/me"),
             "an explicit delete removes the parameter"
@@ -10985,7 +10992,7 @@ mod tests {
         prov.delete_resource_respecting_policy(&created)
             .expect("delete ok");
         let ssm = prov.ssm_state.read();
-        let acct = ssm.get("123456789012").unwrap();
+        let acct = ssm.regional("123456789012", "us-east-1").unwrap();
         assert!(
             !acct.parameters.contains_key("/gone"),
             "default (None) policy deletes the parameter"
@@ -11013,7 +11020,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::Logs::LogGroup is updatable");
         let logs = prov.logs_state.read();
-        let acct = logs.get("123456789012").unwrap();
+        let acct = logs.regional("123456789012", "us-east-1").unwrap();
         let group = acct.log_groups.get("/svc/logs").unwrap();
         assert_eq!(group.retention_in_days, Some(30));
     }
@@ -11039,7 +11046,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::Kinesis::Stream is updatable");
         let kinesis = prov.kinesis_state.read();
-        let acct = kinesis.get("123456789012").unwrap();
+        let acct = kinesis.regional("123456789012", "us-east-1").unwrap();
         let stream = acct.streams.get("events").unwrap();
         assert_eq!(stream.retention_period_hours, 48);
         assert_eq!(stream.open_shard_count, 2);
@@ -11169,7 +11176,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::SNS::Subscription is updatable");
         let sns = prov.sns_state.read();
-        let acct = sns.get("123456789012").unwrap();
+        let acct = sns.regional("123456789012", "us-east-1").unwrap();
         let sub = acct.subscriptions.get(&created.physical_id).unwrap();
         assert_eq!(
             sub.attributes.get("RawMessageDelivery").map(String::as_str),
@@ -11202,7 +11209,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::SecretsManager::Secret is updatable");
         let sm = prov.secretsmanager_state.read();
-        let acct = sm.get("123456789012").unwrap();
+        let acct = sm.regional("123456789012", "us-east-1").unwrap();
         let key = acct.secret_key(&created.physical_id).unwrap();
         let secret = acct.secrets.get(&key).unwrap();
         let current = secret

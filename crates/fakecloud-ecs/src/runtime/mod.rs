@@ -550,6 +550,18 @@ pub(crate) fn task_desired_stopped(
     }
 }
 
+/// The region a task runs in: the region its ARN names, else the ECS state's
+/// region.
+pub(super) fn task_region(state: &SharedEcsState, account_id: &str, task_id: &str) -> String {
+    let accounts = state.read();
+    let account = accounts.get(account_id);
+    account
+        .and_then(|s| s.tasks.get(task_id))
+        .and_then(|t| fakecloud_aws::arn::region_of(&t.task_arn).map(str::to_string))
+        .or_else(|| account.map(|s| s.region.clone()))
+        .unwrap_or_else(|| accounts.region().to_string())
+}
+
 fn build_container_plans(
     state: &SharedEcsState,
     account_id: &str,
@@ -2163,6 +2175,41 @@ mod tests {
             volume_configurations: Vec::new(),
             task_set_arn: None,
         }
+    }
+
+    #[test]
+    fn awslogs_forwarding_writes_to_the_awslogs_region() {
+        let mut accounts: MultiAccountState<EcsState> =
+            MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+        let mut task = make_task("t1");
+        task.awslogs = Some(crate::state::AwsLogsConfig {
+            group: "/ecs/app".into(),
+            stream_prefix: None,
+            region: "eu-west-1".into(),
+            container_name: "app".into(),
+        });
+        accounts
+            .get_or_create("000000000000")
+            .tasks
+            .insert("t1".into(), task);
+        let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+        let logs: fakecloud_logs::SharedLogsState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiRegionState::new(
+                "000000000000",
+                "us-east-1",
+                "http://localhost:4566",
+            ),
+        ));
+        let runtime = EcsRuntime::bare_for_tests().with_logs(logs.clone());
+        runtime.forward_awslogs_if_configured(&state, "000000000000", "t1", "hello\nworld");
+
+        let guard = logs.read();
+        let west = guard
+            .regional("000000000000", "eu-west-1")
+            .expect("awslogs-region holds the group");
+        let events = &west.log_groups["/ecs/app"].log_streams["app/t1"].events;
+        assert_eq!(events.len(), 2);
+        assert!(guard.regional("000000000000", "us-east-1").is_none());
     }
 
     #[test]

@@ -437,7 +437,8 @@ public sealed record SchedulerSchedule(
     string? State,
     string? ScheduleExpression,
     string? TargetArn,
-    string? LastFired);
+    string? LastFired,
+    string? Region = null);
 
 public sealed record SchedulerSchedulesResponse(IReadOnlyList<SchedulerSchedule>? Schedules);
 

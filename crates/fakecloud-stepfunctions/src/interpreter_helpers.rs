@@ -180,7 +180,7 @@ pub(crate) fn context_object(
     let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let accounts = shared_state.read();
     let exec = accounts
-        .get(account_id_from_arn(execution_arn))
+        .by_arn(execution_arn)
         .and_then(|s| s.executions.get(execution_arn));
     let (input, name, role_arn, start, sm_arn, sm_name, redrive_count) = match exec {
         Some(e) => (
@@ -1267,10 +1267,11 @@ pub(crate) fn md5_hex(data: &str) -> String {
 pub(crate) fn cleanup_token(
     shared_state: &SharedStepFunctionsState,
     account_id: &str,
+    region: &str,
     token: &str,
 ) {
     let mut accounts = shared_state.write();
-    if let Some(state) = accounts.get_mut(account_id) {
+    if let Some(state) = accounts.regional_get_mut(account_id, region) {
         state.task_tokens.remove(token);
     }
 }
@@ -1290,6 +1291,7 @@ pub(crate) fn deadline_after_secs(secs: u64) -> Option<std::time::Instant> {
 pub(crate) async fn poll_task_token(
     shared_state: &SharedStepFunctionsState,
     account_id: &str,
+    region: &str,
     token: &str,
     timeout_seconds: Option<u64>,
     heartbeat_seconds: Option<u64>,
@@ -1300,7 +1302,7 @@ pub(crate) async fn poll_task_token(
         let snapshot = {
             let accounts = shared_state.read();
             accounts
-                .get(account_id)
+                .regional(account_id, region)
                 .and_then(|s| s.task_tokens.get(token).cloned())
         };
         let Some(entry) = snapshot else {
@@ -1311,13 +1313,13 @@ pub(crate) async fn poll_task_token(
         };
         match entry.status.as_str() {
             "SUCCEEDED" => {
-                cleanup_token(shared_state, account_id, token);
+                cleanup_token(shared_state, account_id, region, token);
                 let output = entry.output.unwrap_or_else(|| "{}".to_string());
                 let value: Value = serde_json::from_str(&output).unwrap_or(Value::String(output));
                 return Ok(value);
             }
             "FAILED" => {
-                cleanup_token(shared_state, account_id, token);
+                cleanup_token(shared_state, account_id, region, token);
                 return Err((
                     entry
                         .error
@@ -1333,7 +1335,7 @@ pub(crate) async fn poll_task_token(
             if let Some(hb) = heartbeat_seconds {
                 let last = entry.last_heartbeat_at.unwrap_or(entry.created_at);
                 if (now_ts - last).num_seconds() > i64::try_from(hb).unwrap_or(i64::MAX) {
-                    cleanup_token(shared_state, account_id, token);
+                    cleanup_token(shared_state, account_id, region, token);
                     return Err((
                         "States.HeartbeatTimeout".to_string(),
                         format!("Worker missed heartbeat ({hb}s window)"),
@@ -1342,7 +1344,7 @@ pub(crate) async fn poll_task_token(
             }
         }
         if absolute_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            cleanup_token(shared_state, account_id, token);
+            cleanup_token(shared_state, account_id, region, token);
             let secs = timeout_seconds.unwrap_or(3600);
             return Err((
                 "States.Timeout".to_string(),
@@ -1460,10 +1462,11 @@ pub(crate) fn add_event(
     previous_event_id: i64,
     details: Value,
 ) -> i64 {
-    let account_id = account_id_from_arn(execution_arn).to_string();
     let mut accounts = state.write();
-    let s = accounts.get_or_create(&account_id);
-    if let Some(exec) = s.executions.get_mut(execution_arn) {
+    if let Some(exec) = accounts
+        .by_arn_mut(execution_arn)
+        .and_then(|s| s.executions.get_mut(execution_arn))
+    {
         let id = exec.history_events.len() as i64 + 1;
         exec.history_events.push(HistoryEvent {
             id,
@@ -1506,11 +1509,10 @@ pub(crate) fn succeed_execution(
     execution_arn: &str,
     output: &Value,
 ) {
-    let account_id = account_id_from_arn(execution_arn).to_string();
     // Check terminal status before recording events to avoid inconsistent history
     {
         let accounts = state.read();
-        if let Some(s) = accounts.get(&account_id) {
+        if let Some(s) = accounts.by_arn(execution_arn) {
             if let Some(exec) = s.executions.get(execution_arn) {
                 if exec.status != ExecutionStatus::Running {
                     return;
@@ -1531,8 +1533,10 @@ pub(crate) fn succeed_execution(
     );
 
     let mut accounts = state.write();
-    let s = accounts.get_or_create(&account_id);
-    if let Some(exec) = s.executions.get_mut(execution_arn) {
+    if let Some(exec) = accounts
+        .by_arn_mut(execution_arn)
+        .and_then(|s| s.executions.get_mut(execution_arn))
+    {
         apply_terminal_transition_if_running(exec, |exec| {
             exec.status = ExecutionStatus::Succeeded;
             exec.output = Some(output_str);
@@ -1547,11 +1551,10 @@ pub(crate) fn fail_execution(
     error: &str,
     cause: &str,
 ) {
-    let account_id = account_id_from_arn(execution_arn).to_string();
     // Check terminal status before recording events to avoid inconsistent history
     {
         let accounts = state.read();
-        if let Some(s) = accounts.get(&account_id) {
+        if let Some(s) = accounts.by_arn(execution_arn) {
             if let Some(exec) = s.executions.get(execution_arn) {
                 if exec.status != ExecutionStatus::Running {
                     return;
@@ -1569,8 +1572,10 @@ pub(crate) fn fail_execution(
     );
 
     let mut accounts = state.write();
-    let s = accounts.get_or_create(&account_id);
-    if let Some(exec) = s.executions.get_mut(execution_arn) {
+    if let Some(exec) = accounts
+        .by_arn_mut(execution_arn)
+        .and_then(|s| s.executions.get_mut(execution_arn))
+    {
         apply_terminal_transition_if_running(exec, |exec| {
             exec.status = ExecutionStatus::Failed;
             exec.error = Some(error.to_string());
@@ -1622,9 +1627,8 @@ pub(crate) fn deliver_execution_logs(
         .to_string();
     let log_group_name = log_group_name.trim_end_matches(":*");
 
-    let account_id = account_id_from_arn(execution_arn).to_string();
     let accounts = state.read();
-    let s = match accounts.get(&account_id) {
+    let s = match accounts.by_arn(execution_arn) {
         Some(st) => st,
         None => return,
     };
@@ -1667,7 +1671,13 @@ pub(crate) fn deliver_execution_logs(
     drop(accounts);
 
     if let Some(d) = delivery {
-        d.put_log_events(log_account_id, log_group_name, &stream_name, &events);
+        d.put_log_events(
+            log_account_id,
+            parts[3],
+            log_group_name,
+            &stream_name,
+            &events,
+        );
     }
 }
 

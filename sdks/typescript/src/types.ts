@@ -1041,6 +1041,8 @@ export interface FirehoseDeliveryStreamsResponse {
 
 export interface SchedulerSchedule {
   accountId: string;
+  /** The schedule's region (schedules are regional). */
+  region: string;
   groupName: string;
   name: string;
   arn: string;

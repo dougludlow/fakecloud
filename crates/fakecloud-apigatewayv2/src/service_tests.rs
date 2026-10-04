@@ -2509,6 +2509,7 @@ impl fakecloud_core::delivery::CloudwatchLogsDelivery for MockCloudwatchLogsDeli
     fn put_log_events(
         &self,
         account_id: &str,
+        _region: &str,
         log_group_name: &str,
         log_stream_name: &str,
         events: &[(i64, String)],

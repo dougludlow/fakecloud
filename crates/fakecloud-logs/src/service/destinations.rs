@@ -59,7 +59,7 @@ impl LogsService {
             .unwrap_or_default();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let arn = format!(
             "arn:{}:logs:{}:{}:destination:{}",
             fakecloud_aws::arn::partition_for(&req.region),
@@ -119,7 +119,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let destinations: Vec<Value> = state
             .destinations
             .values()
@@ -161,7 +163,7 @@ impl LogsService {
         validate_string_length("destinationName", name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.destinations.remove(name).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -199,7 +201,7 @@ impl LogsService {
         validate_string_length("accessPolicy", policy, 1, 5120)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // `PutDestinationPolicy` does not declare `ResourceNotFoundException`
         // in its Smithy error union — AWS surfaces unknown-destination errors
         // as `InvalidParameterException`.

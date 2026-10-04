@@ -146,7 +146,7 @@ FakeCloud fc2 = new FakeCloud("http://localhost:5000"); // explicit base URL
 | Method                          | Description                                  |
 | ------------------------------- | -------------------------------------------- |
 | `getSchedules()`                | List EventBridge Scheduler schedules         |
-| `fireSchedule(group, name)`     | Fire a single schedule immediately           |
+| `fireSchedule(group, name[, accountId, region])` | Fire a single schedule immediately (default account/region: the server's) |
 
 ## `fc.glue()`
 

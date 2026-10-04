@@ -501,6 +501,7 @@ impl ApiGatewayV2Service {
 
         delivery.put_log_events(
             &req.account_id,
+            &req.region,
             &log_group_name,
             &log_stream_name,
             &[(timestamp, log_line)],

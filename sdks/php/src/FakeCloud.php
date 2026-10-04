@@ -680,11 +680,22 @@ final class SchedulerClient
         );
     }
 
-    public function fireSchedule(string $group, string $name): FireScheduleResponse
-    {
-        return FireScheduleResponse::fromArray(
-            $this->http->postEmpty("/_fakecloud/scheduler/fire/{$group}/{$name}")
-        );
+    /**
+     * Fire a schedule now. It is looked up in $accountId / $region (null: the
+     * server's default).
+     */
+    public function fireSchedule(
+        string $group,
+        string $name,
+        ?string $accountId = null,
+        ?string $region = null,
+    ): FireScheduleResponse {
+        $query = array_filter(['accountId' => $accountId, 'region' => $region], fn ($v) => $v !== null && $v !== '');
+        $path = '/_fakecloud/scheduler/fire/' . HttpTransport::encodePath($group) . '/' . HttpTransport::encodePath($name);
+        if ($query !== []) {
+            $path .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+        }
+        return FireScheduleResponse::fromArray($this->http->postEmpty($path));
     }
 }
 

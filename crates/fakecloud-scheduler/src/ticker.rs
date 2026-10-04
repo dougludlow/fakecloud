@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The (account, region) a schedule lives in: schedules are regional, so
+/// the same group and name can exist in two regions of one account.
+type Scope = (String, String);
+
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
 use fakecloud_core::delivery::DeliveryBus;
@@ -75,9 +79,9 @@ impl Ticker {
         // (hour, minute) pair of the last cron fire, keyed by schedule
         // identity — keeps cron schedules from firing multiple times
         // inside the same minute when the 1s tick runs 60+ times.
-        let mut cron_last_minute: HashMap<(String, ScheduleKey), CronFireStamp> = HashMap::new();
-        let mut pending_fires: HashMap<(String, ScheduleKey), PendingFire> = HashMap::new();
-        let mut retries: HashMap<(String, ScheduleKey), RetryState> = HashMap::new();
+        let mut cron_last_minute: HashMap<(Scope, ScheduleKey), CronFireStamp> = HashMap::new();
+        let mut pending_fires: HashMap<(Scope, ScheduleKey), PendingFire> = HashMap::new();
+        let mut retries: HashMap<(Scope, ScheduleKey), RetryState> = HashMap::new();
         loop {
             interval.tick().await;
             self.tick_and_persist(&mut cron_last_minute, &mut pending_fires, &mut retries)
@@ -91,9 +95,9 @@ impl Ticker {
     /// mutating tick, to avoid a snapshot every idle second.
     async fn tick_and_persist(
         &self,
-        cron_last_minute: &mut HashMap<(String, ScheduleKey), CronFireStamp>,
-        pending_fires: &mut HashMap<(String, ScheduleKey), PendingFire>,
-        retries: &mut HashMap<(String, ScheduleKey), RetryState>,
+        cron_last_minute: &mut HashMap<(Scope, ScheduleKey), CronFireStamp>,
+        pending_fires: &mut HashMap<(Scope, ScheduleKey), PendingFire>,
+        retries: &mut HashMap<(Scope, ScheduleKey), RetryState>,
     ) {
         let mutated = self.tick(cron_last_minute, pending_fires, retries);
         if mutated {
@@ -111,21 +115,18 @@ impl Ticker {
     /// one-shot), so the caller knows to write the snapshot through.
     fn tick(
         &self,
-        cron_last_minute: &mut HashMap<(String, ScheduleKey), CronFireStamp>,
-        pending_fires: &mut HashMap<(String, ScheduleKey), PendingFire>,
-        retries: &mut HashMap<(String, ScheduleKey), RetryState>,
+        cron_last_minute: &mut HashMap<(Scope, ScheduleKey), CronFireStamp>,
+        pending_fires: &mut HashMap<(Scope, ScheduleKey), PendingFire>,
+        retries: &mut HashMap<(Scope, ScheduleKey), RetryState>,
     ) -> bool {
         let now = Utc::now();
         // Phase 1: collect due schedules while holding a short write lock.
-        let mut due: Vec<(String, ScheduleKey)> = Vec::new();
-        let mut post_fire_actions: Vec<(String, ScheduleKey, PostFire)> = Vec::new();
+        let mut due: Vec<(Scope, ScheduleKey)> = Vec::new();
+        let mut post_fire_actions: Vec<(Scope, ScheduleKey, PostFire)> = Vec::new();
         {
             let mut accounts = self.state.write();
-            let account_ids: Vec<String> = accounts.iter().map(|(id, _)| id.to_string()).collect();
-            for account_id in account_ids {
-                let Some(state) = accounts.get_mut(&account_id) else {
-                    continue;
-                };
+            for (account, region, state) in accounts.iter_regional_mut() {
+                let account_id: Scope = (account.to_string(), region.to_string());
                 let keys: Vec<ScheduleKey> = state.schedules.keys().cloned().collect();
                 for key in keys {
                     let Some(sched) = state.schedules.get(&key) else {
@@ -216,7 +217,7 @@ impl Ticker {
             let snapshot = {
                 let accounts = self.state.read();
                 accounts
-                    .get(account_id)
+                    .regional(&account_id.0, &account_id.1)
                     .and_then(|s| s.schedules.get(key).cloned())
             };
             let Some(sched) = snapshot else {
@@ -282,7 +283,7 @@ impl Ticker {
         if !post_fire_actions.is_empty() {
             let mut accounts = self.state.write();
             for (account_id, key, post) in post_fire_actions {
-                let Some(state) = accounts.get_mut(&account_id) else {
+                let Some(state) = accounts.regional_get_mut(&account_id.0, &account_id.1) else {
                     continue;
                 };
                 match post {
@@ -391,8 +392,8 @@ fn is_due_with_dedup(
     last_fired: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     tz: Option<&str>,
-    key: &(String, ScheduleKey),
-    cron_last_minute: &mut HashMap<(String, ScheduleKey), CronFireStamp>,
+    key: &(Scope, ScheduleKey),
+    cron_last_minute: &mut HashMap<(Scope, ScheduleKey), CronFireStamp>,
 ) -> bool {
     match expr {
         Expr::Cron(c) => {
@@ -433,14 +434,14 @@ mod tests {
 
     fn make_state() -> SharedSchedulerState {
         Arc::new(RwLock::new(
-            fakecloud_core::multi_account::MultiAccountState::new(ACCOUNT, "us-east-1", ""),
+            fakecloud_core::multi_account::MultiRegionState::new(ACCOUNT, "us-east-1", ""),
         ))
     }
 
     fn seed_schedule(state: &SharedSchedulerState, name: &str, expr: &str, target_arn: &str) {
         let now = Utc::now();
         let mut accounts = state.write();
-        let s = accounts.get_or_create(ACCOUNT);
+        let s = accounts.regional_mut(ACCOUNT, "us-east-1");
         s.schedules.insert(
             ("default".to_string(), name.to_string()),
             Schedule {
@@ -537,7 +538,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             s.schedules
                 .get_mut(&("default".to_string(), "r".to_string()))
                 .unwrap()
@@ -565,7 +566,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             s.schedules
                 .get_mut(&("default".to_string(), "once".to_string()))
                 .unwrap()
@@ -580,7 +581,7 @@ mod tests {
         ticker.tick(&mut cron, &mut pending, &mut retries);
         assert_eq!(rec.calls.lock().unwrap().len(), 1);
         let accounts = state.read();
-        let s = accounts.get(ACCOUNT).unwrap();
+        let s = accounts.regional(ACCOUNT, "us-east-1").unwrap();
         assert!(!s
             .schedules
             .contains_key(&("default".to_string(), "once".to_string())));
@@ -597,7 +598,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             s.schedules
                 .get_mut(&("default".to_string(), "dlqtest".to_string()))
                 .unwrap()
@@ -660,7 +661,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             let sched = s
                 .schedules
                 .get_mut(&("default".to_string(), "retried".to_string()))
@@ -747,7 +748,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             let sched = s
                 .schedules
                 .get_mut(&("default".to_string(), "flex".to_string()))
@@ -798,7 +799,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             s.schedules
                 .get_mut(&("default".to_string(), "ended".to_string()))
                 .unwrap()
@@ -871,7 +872,7 @@ mod tests {
         );
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create(ACCOUNT);
+            let s = accounts.regional_mut(ACCOUNT, "us-east-1");
             let sched = s
                 .schedules
                 .get_mut(&("default".to_string(), "retry-then-ok".to_string()))

@@ -186,13 +186,13 @@ impl EcsRuntime {
                 message: line.to_string(),
             })
             .collect();
-        append_events(
-            logs,
-            account_id,
-            &task_region,
-            &cfg.group,
-            &stream_name,
-            &events,
-        );
+        // The awslogs driver writes to `awslogs-region` (already defaulted to
+        // the RunTask region when the option is absent).
+        let region = if cfg.region.is_empty() {
+            task_region.as_str()
+        } else {
+            cfg.region.as_str()
+        };
+        append_events(logs, account_id, region, &cfg.group, &stream_name, &events);
     }
 }

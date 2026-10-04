@@ -436,7 +436,8 @@ async fn execute_task_state(
         context["Task"] = json!({ "Token": token.clone() });
         {
             let mut accounts = shared_state.write();
-            let state = accounts.get_or_create(account_id);
+            let region = arn_region(execution_arn, accounts.region());
+            let state = accounts.regional_mut(account_id, &region);
             state.task_tokens.insert(
                 token.clone(),
                 crate::state::TaskTokenState {
@@ -478,7 +479,7 @@ async fn execute_task_state(
             entered_event_id,
             json!({
                 "resource": resource,
-                "region": "us-east-1",
+                "region": region_from_execution_arn(execution_arn),
                 "parameters": serde_json::to_string(&task_input).expect("serde_json::Value serialization is infallible"),
             }),
         );
@@ -508,9 +509,11 @@ async fn execute_task_state(
             Ok(result) => {
                 if let Some((token, _)) = &task_token {
                     let account_id = account_id_from_arn(execution_arn);
+                    let region = arn_region(execution_arn, shared_state.read().region());
                     match poll_task_token(
                         shared_state,
                         account_id,
+                        &region,
                         token,
                         timeout_seconds,
                         heartbeat_seconds,
@@ -1010,7 +1013,8 @@ fn start_map_run(
 ) {
     let account = account_id_from_arn(execution_arn).to_string();
     let mut accounts = shared_state.write();
-    let s = accounts.get_or_create(&account);
+    let region = arn_region(execution_arn, accounts.region());
+    let s = accounts.regional_mut(&account, &region);
     s.map_runs.insert(
         map_run_arn.to_string(),
         MapRun {
@@ -1041,7 +1045,8 @@ fn finish_map_run(
 ) {
     let account = account_id_from_arn(execution_arn).to_string();
     let mut accounts = shared_state.write();
-    let s = accounts.get_or_create(&account);
+    let region = arn_region(execution_arn, accounts.region());
+    let s = accounts.regional_mut(&account, &region);
     if let Some(mr) = s.map_runs.get_mut(map_run_arn) {
         mr.status = status.to_string();
         mr.succeeded_count = succeeded;
@@ -1085,6 +1090,7 @@ async fn read_items_from_s3(
 
     let registry_arc = resolve_registry(registry)?;
     let account_id = account_from_execution_arn(execution_arn);
+    let region = &region_from_execution_arn(execution_arn);
 
     let body = call_sdk_action_raw_bytes(
         &registry_arc,
@@ -1092,6 +1098,7 @@ async fn read_items_from_s3(
         "GetObject",
         &json!({ "Bucket": bucket, "Key": key }),
         &account_id,
+        region,
     )
     .await?;
 
@@ -1161,7 +1168,7 @@ async fn write_map_results_to_s3(
     let req = AwsRequest {
         service: "s3".to_string(),
         action: "PutObject".to_string(),
-        region: "us-east-1".to_string(),
+        region: region_from_execution_arn(execution_arn),
         account_id: account_id.to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         headers: HeaderMap::new(),
@@ -1332,7 +1339,7 @@ async fn invoke_resource(
         {
             let account = account_from_execution_arn(execution_arn);
             let region = fakecloud_aws::arn::region_of(execution_arn).unwrap_or("us-east-1");
-            return call_sdk_action_in(&registry_arc, "dynamodb", action, input, &account, region)
+            return call_sdk_action(&registry_arc, "dynamodb", action, input, &account, region)
                 .await
                 .map_err(optimized_dynamodb_error);
         }
@@ -1354,9 +1361,16 @@ async fn invoke_resource(
     if let Some(tail) = integration {
         if tail.starts_with("states:startExecution") {
             let account_id = account_from_execution_arn(execution_arn);
-            let result =
-                invoke_aws_sdk_integration(tail, input, registry, &account_id, timeout_seconds)
-                    .await;
+            let region = &region_from_execution_arn(execution_arn);
+            let result = invoke_aws_sdk_integration(
+                tail,
+                input,
+                registry,
+                &account_id,
+                region,
+                timeout_seconds,
+            )
+            .await;
             // Patch the inner execution's parent_execution_arn so the
             // `/execution-tree` introspection can walk back-references.
             // For `.sync`, the result is the DescribeExecution shape
@@ -1369,7 +1383,7 @@ async fn invoke_resource(
                     .and_then(Value::as_str)
                 {
                     let mut accounts = shared_state.write();
-                    if let Some(state) = accounts.get_mut(&account_id) {
+                    if let Some(state) = accounts.by_arn_mut(inner_arn) {
                         if let Some(exec) = state.executions.get_mut(inner_arn) {
                             exec.parent_execution_arn = Some(execution_arn.to_string());
                         }
@@ -1387,8 +1401,16 @@ async fn invoke_resource(
     // real Step Functions.
     if let Some(rest) = integration.and_then(|t| t.strip_prefix("aws-sdk:")) {
         let account_id = account_from_execution_arn(execution_arn);
-        return invoke_aws_sdk_integration(rest, input, registry, &account_id, timeout_seconds)
-            .await;
+        let region = &region_from_execution_arn(execution_arn);
+        return invoke_aws_sdk_integration(
+            rest,
+            input,
+            registry,
+            &account_id,
+            region,
+            timeout_seconds,
+        )
+        .await;
     }
 
     // Optimized service integrations expose `.sync` variants for ECS,
@@ -1397,8 +1419,16 @@ async fn invoke_resource(
     if let Some(tail) = integration {
         if tail.contains(".sync") {
             let account_id = account_from_execution_arn(execution_arn);
-            return invoke_aws_sdk_integration(tail, input, registry, &account_id, timeout_seconds)
-                .await;
+            let region = &region_from_execution_arn(execution_arn);
+            return invoke_aws_sdk_integration(
+                tail,
+                input,
+                registry,
+                &account_id,
+                region,
+                timeout_seconds,
+            )
+            .await;
         }
     }
 
@@ -1437,10 +1467,28 @@ fn map_sdk_service_id(service_id: &str) -> &str {
 fn execution_role_arn(state: &SharedStepFunctionsState, execution_arn: &str) -> String {
     let accounts = state.read();
     accounts
-        .get(account_id_from_arn(execution_arn))
+        .by_arn(execution_arn)
         .and_then(|s| s.executions.get(execution_arn))
         .map(|exec| exec.role_arn.clone())
         .unwrap_or_default()
+}
+
+/// The region a Step Functions ARN names, or `fallback` (the server region)
+/// for a malformed one. An execution's map runs, task tokens and child
+/// executions live in its own region.
+fn arn_region(arn: &str, fallback: &str) -> String {
+    fakecloud_aws::arn::region_of(arn)
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// The region of a Step Functions execution ARN: an execution's
+/// `aws-sdk:` and optimized integrations call services in its own region.
+/// Falls back to the AWS-conventional default for a malformed ARN.
+fn region_from_execution_arn(execution_arn: &str) -> String {
+    fakecloud_aws::arn::region_of(execution_arn)
+        .unwrap_or("us-east-1")
+        .to_string()
 }
 
 /// Extract the AWS account id from a Step Functions execution ARN
@@ -1464,6 +1512,7 @@ async fn invoke_aws_sdk_integration(
     input: &Value,
     registry: &Option<SharedServiceRegistry>,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let registry_arc = resolve_registry(registry)?;
@@ -1517,6 +1566,7 @@ async fn invoke_aws_sdk_integration(
         &action_pascal,
         &translated_input,
         account_id,
+        region,
     )
     .await?;
 
@@ -1535,6 +1585,7 @@ async fn invoke_aws_sdk_integration(
         &initial,
         &translated_input,
         account_id,
+        region,
         timeout_seconds,
     )
     .await
@@ -1604,27 +1655,9 @@ fn optimized_dynamodb_error((error, cause): (String, String)) -> (String, String
     }
 }
 
-/// Call a single AWS SDK action against the registered service handler.
+/// Call a single AWS SDK action against the registered service handler, as
+/// the execution's account in the execution's region.
 async fn call_sdk_action(
-    registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
-    service_name: &str,
-    action_pascal: &str,
-    input: &Value,
-    account_id: &str,
-) -> Result<Value, (String, String)> {
-    call_sdk_action_in(
-        registry,
-        service_name,
-        action_pascal,
-        input,
-        account_id,
-        "us-east-1",
-    )
-    .await
-}
-
-/// [`call_sdk_action`] in a given region.
-async fn call_sdk_action_in(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     service_name: &str,
     action_pascal: &str,
@@ -1709,6 +1742,7 @@ async fn call_sdk_action_raw_bytes(
     action_pascal: &str,
     input: &Value,
     account_id: &str,
+    region: &str,
 ) -> Result<bytes::Bytes, (String, String)> {
     use bytes::Bytes;
     use fakecloud_core::service::AwsRequest;
@@ -1728,7 +1762,7 @@ async fn call_sdk_action_raw_bytes(
     let req = AwsRequest {
         service: service_name.to_string(),
         action: action_pascal.to_string(),
-        region: "us-east-1".to_string(),
+        region: region.to_string(),
         account_id: account_id.to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         headers: HeaderMap::new(),
@@ -1778,6 +1812,7 @@ const SYNC_POLL_INTERVAL_MS: u64 = 200;
 /// Dispatch `.sync` waiters by service+action. Each waiter polls the
 /// matching describe-style API until the downstream operation reaches a
 /// terminal state, then returns the full describe response.
+#[allow(clippy::too_many_arguments)]
 async fn sync_wait(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     service_name: &str,
@@ -1785,17 +1820,18 @@ async fn sync_wait(
     initial: &Value,
     input: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     match (service_name, action_pascal) {
         ("ecs", "RunTask") => {
-            sync_wait_ecs_run_task(registry, initial, input, account_id, timeout_seconds).await
+            sync_wait_ecs_run_task(registry, initial, input, account_id, region, timeout_seconds).await
         }
         ("athena", "StartQueryExecution") => {
-            sync_wait_athena_query(registry, initial, account_id, timeout_seconds).await
+            sync_wait_athena_query(registry, initial, account_id, region, timeout_seconds).await
         }
         ("states", "StartExecution") => {
-            sync_wait_states_start_execution(registry, initial, account_id, timeout_seconds).await
+            sync_wait_states_start_execution(registry, initial, account_id, region, timeout_seconds).await
         }
         ("glue", "StartJobRun") => {
             // Poll the real Glue `GetJobRun` (the job run was created by the
@@ -1820,7 +1856,7 @@ async fn sync_wait(
                     "glue",
                     "GetJobRun",
                     &json!({ "JobName": job_name, "RunId": job_run_id }),
-                    account_id,
+                    account_id, region,
                 )
                 .await?;
                 let state = described
@@ -1865,6 +1901,7 @@ async fn sync_wait_ecs_run_task(
     initial: &Value,
     input: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let tasks = initial
@@ -1904,6 +1941,7 @@ async fn sync_wait_ecs_run_task(
             "DescribeTasks",
             &describe_input,
             account_id,
+            region,
         )
         .await?;
         let described_tasks = described
@@ -1975,6 +2013,7 @@ async fn sync_wait_athena_query(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     initial: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let qid = initial
@@ -1996,6 +2035,7 @@ async fn sync_wait_athena_query(
             "GetQueryExecution",
             &json!({ "QueryExecutionId": qid }),
             account_id,
+            region,
         )
         .await?;
         let state = described
@@ -2040,6 +2080,7 @@ async fn sync_wait_states_start_execution(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     initial: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let exec_arn = initial
@@ -2062,6 +2103,7 @@ async fn sync_wait_states_start_execution(
             "DescribeExecution",
             &json!({ "executionArn": exec_arn }),
             account_id,
+            region,
         )
         .await?;
         let status = described
@@ -2219,7 +2261,7 @@ async fn invoke_activity(
     {
         let accounts = shared_state.read();
         let exists = accounts
-            .get(&activity_account)
+            .by_arn(activity_arn)
             .map(|s| s.activities.contains_key(activity_arn))
             .unwrap_or(false);
         if !exists {
@@ -2240,7 +2282,8 @@ async fn invoke_activity(
         serde_json::to_string(input).expect("serde_json::Value serialization is infallible");
     {
         let mut accounts = shared_state.write();
-        let state = accounts.get_or_create(&activity_account);
+        let region = arn_region(activity_arn, accounts.region());
+        let state = accounts.regional_mut(&activity_account, &region);
         state.task_tokens.insert(
             token.clone(),
             TaskTokenState {
@@ -2258,9 +2301,11 @@ async fn invoke_activity(
         );
     }
 
+    let activity_region = arn_region(activity_arn, shared_state.read().region());
     poll_task_token(
         shared_state,
         &activity_account,
+        &activity_region,
         &token,
         timeout_seconds,
         heartbeat_seconds,

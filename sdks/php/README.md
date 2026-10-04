@@ -172,7 +172,7 @@ $fc = new FakeCloud('http://localhost:4566'); // explicit base URL
 | Method                          | Description                                  |
 | ------------------------------- | -------------------------------------------- |
 | `getSchedules()`                | List EventBridge Scheduler schedules         |
-| `fireSchedule($group, $name)`   | Fire a scheduled invocation immediately      |
+| `fireSchedule($group, $name, ?$accountId, ?$region)` | Fire a scheduled invocation immediately (default account/region: the server's) |
 
 ### `$fc->glue()`
 

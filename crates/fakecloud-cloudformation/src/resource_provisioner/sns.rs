@@ -174,7 +174,7 @@ fn sns_policy_allows_subscribe(
 impl ResourceProvisioner {
     pub(super) fn get_att_sns_topic(&self, physical_id: &str, attribute: &str) -> Option<String> {
         let mut accounts = self.sns_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let topic = state.topics.get(physical_id)?;
         match attribute {
             "TopicArn" => Some(topic.topic_arn.clone()),
@@ -200,7 +200,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let arn = &existing.physical_id;
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.regional_mut(&self.account_id, &self.region);
         let topic = state
             .topics
             .get_mut(arn)
@@ -296,7 +296,7 @@ impl ResourceProvisioner {
             .unwrap_or(&generated_name);
 
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.regional_mut(&self.account_id, &self.region);
         let topic_arn = fakecloud_sns::topic_arn(&self.region, &self.account_id, topic_name);
         if state.topics.contains_key(&topic_arn) {
             return Err(resource_already_exists("AWS::SNS::Topic", &topic_arn));
@@ -351,7 +351,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sns_topic(&self, physical_id: &str) -> Result<(), String> {
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.regional_mut(&self.account_id, &self.region);
         state.topics.remove(physical_id);
         // Also remove subscriptions for this topic
         state
@@ -386,7 +386,10 @@ impl ResourceProvisioner {
         // it, as Subscribe is.
         let topic_account = sns_owning_account(topic_arn, &self.account_id).to_string();
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&topic_account);
+        let state = __sns_mas.regional_mut(
+            &topic_account,
+            fakecloud_aws::arn::region_of(topic_arn).unwrap_or(&self.region),
+        );
 
         let topic = state
             .topics
@@ -451,7 +454,10 @@ impl ResourceProvisioner {
         let sub_arn = &existing.physical_id;
 
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(sns_owning_account(sub_arn, &self.account_id));
+        let state = __sns_mas.regional_mut(
+            sns_owning_account(sub_arn, &self.account_id),
+            fakecloud_aws::arn::region_of(sub_arn).unwrap_or(&self.region),
+        );
         let subscription = state
             .subscriptions
             .get_mut(sub_arn)
@@ -466,7 +472,10 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sns_subscription(&self, physical_id: &str) -> Result<(), String> {
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(sns_owning_account(physical_id, &self.account_id));
+        let state = __sns_mas.regional_mut(
+            sns_owning_account(physical_id, &self.account_id),
+            fakecloud_aws::arn::region_of(physical_id).unwrap_or(&self.region),
+        );
         state.subscriptions.remove(physical_id);
         Ok(())
     }
@@ -487,7 +496,7 @@ impl ResourceProvisioner {
         let policy = policy_document_string(&resource.properties)?;
 
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.regional_mut(&self.account_id, &self.region);
         for arn in &topic_arns {
             let topic = state
                 .topics
@@ -515,7 +524,7 @@ impl ResourceProvisioner {
         let policy = policy_document_string(&resource.properties)?;
 
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.regional_mut(&self.account_id, &self.region);
         for arn in &old_arns {
             if !new_arns.contains(arn) {
                 if let Some(topic) = state.topics.get_mut(arn) {
@@ -537,7 +546,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sns_topic_policy(&self, physical_id: &str) -> Result<(), String> {
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.regional_mut(&self.account_id, &self.region);
         for arn in physical_id.split('\n').filter(|s| !s.is_empty()) {
             if let Some(topic) = state.topics.get_mut(arn) {
                 topic.attributes.remove("Policy");

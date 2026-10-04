@@ -19,8 +19,8 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
     group_arn, schedule_arn, DeadLetterConfig, FlexibleTimeWindow, RetryPolicy, Schedule,
-    ScheduleGroup, SchedulerSnapshot, SharedSchedulerState, SqsParameters, Target, DEFAULT_GROUP,
-    SCHEDULER_SNAPSHOT_SCHEMA_VERSION,
+    ScheduleGroup, SchedulerSnapshot, SchedulerState, SharedSchedulerState, SqsParameters, Target,
+    DEFAULT_GROUP, SCHEDULER_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const NAME_MAX: usize = 64;
@@ -98,11 +98,12 @@ impl SchedulerService {
     pub fn replace_schedule_group_tags(
         &self,
         account_id: &str,
+        region: &str,
         name: &str,
         tags: BTreeMap<String, String>,
     ) -> Result<(), AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         let group = state
             .groups
             .get_mut(name)
@@ -203,7 +204,7 @@ impl SchedulerService {
         let target = parse_target(body.get("Target"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         if !state.groups.contains_key(&group_name) {
             return Err(AwsServiceError::aws_error(
@@ -278,9 +279,10 @@ impl SchedulerService {
             .unwrap_or_else(|| DEFAULT_GROUP.to_string());
 
         let accounts = self.state.read();
+        let untouched = SchedulerState::new(&req.account_id, &req.region);
         let state = accounts
-            .get(&req.account_id)
-            .ok_or_else(not_found_schedule(name, &group_name))?;
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&untouched);
         let sched = state
             .schedules
             .get(&(group_name.clone(), name.to_string()))
@@ -319,7 +321,7 @@ impl SchedulerService {
         let target = parse_target(body.get("Target"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let key = (group_name.clone(), name.to_string());
         let sched = state
             .schedules
@@ -377,7 +379,7 @@ impl SchedulerService {
             .unwrap_or_else(|| DEFAULT_GROUP.to_string());
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .schedules
             .remove(&(group_name.clone(), name.to_string()))
@@ -409,12 +411,11 @@ impl SchedulerService {
         let next_token = req.query_params.get("NextToken").cloned();
 
         let accounts = self.state.read();
-        let Some(state) = accounts.get(&req.account_id) else {
-            return Ok(AwsResponse::json(
-                StatusCode::OK,
-                json!({ "Schedules": [] }).to_string(),
-            ));
-        };
+        // A region nothing has touched still has its `default` group.
+        let untouched = SchedulerState::new(&req.account_id, &req.region);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&untouched);
 
         let mut schedules: Vec<&Schedule> = state
             .schedules
@@ -451,7 +452,7 @@ impl SchedulerService {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         if state.groups.contains_key(name) {
             return Err(AwsServiceError::aws_error(
@@ -497,9 +498,10 @@ impl SchedulerService {
     ) -> Result<AwsResponse, AwsServiceError> {
         validate_name("Name", name)?;
         let accounts = self.state.read();
+        let untouched = SchedulerState::new(&req.account_id, &req.region);
         let state = accounts
-            .get(&req.account_id)
-            .ok_or_else(not_found_group(name))?;
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&untouched);
         let group = state.groups.get(name).ok_or_else(not_found_group(name))?;
         Ok(AwsResponse::json(
             StatusCode::OK,
@@ -521,7 +523,7 @@ impl SchedulerService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .groups
             .remove(name)
@@ -547,12 +549,11 @@ impl SchedulerService {
         let next_token = req.query_params.get("NextToken").cloned();
 
         let accounts = self.state.read();
-        let Some(state) = accounts.get(&req.account_id) else {
-            return Ok(AwsResponse::json(
-                StatusCode::OK,
-                json!({ "ScheduleGroups": [] }).to_string(),
-            ));
-        };
+        // A region nothing has touched still has its `default` group.
+        let untouched = SchedulerState::new(&req.account_id, &req.region);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&untouched);
 
         let mut groups: Vec<&ScheduleGroup> = state
             .groups
@@ -590,7 +591,7 @@ impl SchedulerService {
             return Err(validation("Tags must contain at least one entry"));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group_name = group_name_from_tag_arn(resource_arn)?;
         let group = state
             .groups
@@ -620,7 +621,7 @@ impl SchedulerService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state
             .groups
             .get_mut(&group_name)
@@ -639,9 +640,10 @@ impl SchedulerService {
         validate_resource_arn(resource_arn)?;
         let group_name = group_name_from_tag_arn(resource_arn)?;
         let accounts = self.state.read();
+        let untouched = SchedulerState::new(&req.account_id, &req.region);
         let state = accounts
-            .get(&req.account_id)
-            .ok_or_else(not_found_arn(resource_arn))?;
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&untouched);
         let group = state
             .groups
             .get(&group_name)
@@ -668,10 +670,7 @@ pub async fn save_scheduler_snapshot(
         return;
     };
     let _guard = lock.lock().await;
-    let snapshot = SchedulerSnapshot {
-        schema_version: SCHEDULER_SNAPSHOT_SCHEMA_VERSION,
-        accounts: state.read().clone(),
-    };
+    let snapshot = SchedulerSnapshot::of(SCHEDULER_SNAPSHOT_SCHEMA_VERSION, state.read().clone());
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -859,8 +858,7 @@ impl AwsService for SchedulerService {
     fn resource_tags_for(&self, resource_arn: &str) -> Option<HashMap<String, String>> {
         let group_name = group_name_from_tag_arn(resource_arn).ok()?;
         let accounts = self.state.read();
-        let account_id = arn_account_id(resource_arn)?;
-        let state = accounts.get(&account_id)?;
+        let state = accounts.by_arn(resource_arn)?;
         state
             .groups
             .get(&group_name)
@@ -914,10 +912,6 @@ fn arn_group_name(arn: &str) -> Option<String> {
     arn.split(':')
         .nth(5)
         .and_then(|r| r.strip_prefix("schedule-group/").map(str::to_string))
-}
-
-fn arn_account_id(arn: &str) -> Option<String> {
-    arn.split(':').nth(4).map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1336,7 @@ mod tests {
 
     fn make_state() -> SharedSchedulerState {
         Arc::new(RwLock::new(
-            fakecloud_core::multi_account::MultiAccountState::new("111122223333", "us-east-1", ""),
+            fakecloud_core::multi_account::MultiRegionState::new("111122223333", "us-east-1", ""),
         ))
     }
 
@@ -1378,6 +1372,81 @@ mod tests {
             access_key_id: None,
             principal: None,
         }
+    }
+
+    fn in_region(mut req: AwsRequest, region: &str) -> AwsRequest {
+        req.region = region.to_string();
+        req
+    }
+
+    #[tokio::test]
+    async fn same_schedule_name_coexists_in_two_regions() {
+        let svc = SchedulerService::new(make_state());
+        let body = create_body("r");
+        for region in ["us-east-1", "eu-west-1"] {
+            svc.handle(in_region(
+                make_request(Method::POST, "/schedules/nightly", &body),
+                region,
+            ))
+            .await
+            .unwrap();
+        }
+        for region in ["us-east-1", "eu-west-1"] {
+            let resp = svc
+                .handle(in_region(
+                    make_request(Method::GET, "/schedules/nightly", ""),
+                    region,
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            assert_eq!(
+                v["Arn"],
+                format!("arn:aws:scheduler:{region}:111122223333:schedule/default/nightly")
+            );
+        }
+        // Deleting one region's schedule leaves the other's; a region nothing
+        // touched still lists its own default group and no schedules.
+        svc.handle(in_region(
+            make_request(Method::DELETE, "/schedules/nightly", ""),
+            "eu-west-1",
+        ))
+        .await
+        .unwrap();
+        assert!(svc
+            .handle(in_region(
+                make_request(Method::GET, "/schedules/nightly", ""),
+                "eu-west-1"
+            ))
+            .await
+            .is_err());
+        assert!(svc
+            .handle(make_request(Method::GET, "/schedules/nightly", ""))
+            .await
+            .is_ok());
+        let resp = svc
+            .handle(in_region(
+                make_request(Method::GET, "/schedule-groups", ""),
+                "ap-south-1",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let groups = v["ScheduleGroups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]["Arn"],
+            "arn:aws:scheduler:ap-south-1:111122223333:schedule-group/default"
+        );
+        let resp = svc
+            .handle(in_region(
+                make_request(Method::GET, "/schedules", ""),
+                "ap-south-1",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(v["Schedules"].as_array().unwrap().is_empty());
     }
 
     fn create_body(name_hint: &str) -> String {
@@ -1988,7 +2057,7 @@ mod tests {
     #[tokio::test]
     async fn china_region_schedule_arns_use_the_aws_cn_partition() {
         let svc = SchedulerService::new(Arc::new(RwLock::new(
-            fakecloud_core::multi_account::MultiAccountState::new("111122223333", "cn-north-1", ""),
+            fakecloud_core::multi_account::MultiRegionState::new("111122223333", "cn-north-1", ""),
         )));
         let in_china = |method: Method, path: &str, body: &str| {
             let mut req = make_request(method, path, body);

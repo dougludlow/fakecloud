@@ -6,7 +6,7 @@
 
 use fakecloud_persistence::SnapshotStore;
 
-use crate::state::{SchedulerSnapshot, SharedSchedulerState, SCHEDULER_SNAPSHOT_SCHEMA_VERSION};
+use crate::state::{SharedSchedulerState, SCHEDULER_SNAPSHOT_SCHEMA_VERSION};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoadOutcome {
@@ -36,30 +36,33 @@ pub fn load_into(
     let Some(bytes) = store.load().map_err(|e| LoadError::Io(e.to_string()))? else {
         return Ok(LoadOutcome::Empty);
     };
-    let snapshot: SchedulerSnapshot =
-        serde_json::from_slice(&bytes).map_err(|e| LoadError::Parse(e.to_string()))?;
+    let snapshot = crate::state::parse_scheduler_snapshot(&bytes)
+        .map_err(|e| LoadError::Parse(e.to_string()))?;
     if snapshot.schema_version > SCHEDULER_SNAPSHOT_SCHEMA_VERSION {
         return Err(LoadError::SchemaTooNew {
             on_disk: snapshot.schema_version,
             supported: SCHEDULER_SNAPSHOT_SCHEMA_VERSION,
         });
     }
-    let accounts = snapshot.accounts.account_count();
-    *state.write() = snapshot.accounts;
-    Ok(LoadOutcome::Loaded(accounts))
+    let Some(accounts) = snapshot.accounts else {
+        return Ok(LoadOutcome::Empty);
+    };
+    let count = accounts.account_count();
+    *state.write() = accounts;
+    Ok(LoadOutcome::Loaded(count))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{SchedulerSnapshot, SchedulerState};
-    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::multi_account::{MultiAccountState, MultiRegionState};
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::sync::Mutex;
 
     fn make_state() -> SharedSchedulerState {
-        Arc::new(RwLock::new(MultiAccountState::new(
+        Arc::new(RwLock::new(MultiRegionState::new(
             "000000000000",
             "us-east-1",
             "",
@@ -97,30 +100,59 @@ mod tests {
     #[test]
     fn load_into_valid_snapshot_restores_accounts() {
         let state = make_state();
-        let mut mas: MultiAccountState<SchedulerState> =
-            MultiAccountState::new("999999999999", "us-east-1", "");
-        mas.get_or_create("999999999999");
-        let snap = SchedulerSnapshot {
-            schema_version: SCHEDULER_SNAPSHOT_SCHEMA_VERSION,
-            accounts: mas,
-        };
+        let mut mas: MultiRegionState<SchedulerState> =
+            MultiRegionState::new("999999999999", "us-east-1", "");
+        mas.regional_mut("999999999999", "eu-west-1");
+        let snap = SchedulerSnapshot::of(SCHEDULER_SNAPSHOT_SCHEMA_VERSION, mas);
         let bytes = serde_json::to_vec(&snap).unwrap();
         let store = MemStore::new(Some(bytes));
         let outcome = load_into(&store, &state).unwrap();
         assert_eq!(outcome, LoadOutcome::Loaded(1));
         let accounts = state.read();
-        assert!(accounts.get("999999999999").is_some());
+        assert!(accounts.regional("999999999999", "eu-west-1").is_some());
+    }
+
+    #[test]
+    fn load_into_migrates_v1_snapshot_by_arn_region() {
+        let state = make_state();
+        let mut legacy: MultiAccountState<SchedulerState> =
+            MultiAccountState::new("000000000000", "us-east-1", "");
+        let west_group = crate::state::ScheduleGroup {
+            arn: crate::state::group_arn("eu-west-1", "000000000000", "jobs"),
+            name: "jobs".into(),
+            state: "ACTIVE".into(),
+            creation_date: chrono::Utc::now(),
+            last_modification_date: chrono::Utc::now(),
+            tags: Default::default(),
+        };
+        legacy
+            .default_mut()
+            .groups
+            .insert("jobs".into(), west_group);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "accounts": legacy,
+        }))
+        .unwrap();
+        let store = MemStore::new(Some(bytes));
+        assert_eq!(load_into(&store, &state).unwrap(), LoadOutcome::Loaded(1));
+        let accounts = state.read();
+        let west = accounts.regional("000000000000", "eu-west-1").unwrap();
+        assert!(west.groups.contains_key("jobs"));
+        // The migrated region gets its own default group, in its own region.
+        assert!(west.groups[crate::state::DEFAULT_GROUP]
+            .arn
+            .contains(":eu-west-1:"));
+        let east = accounts.regional("000000000000", "us-east-1").unwrap();
+        assert!(!east.groups.contains_key("jobs"));
     }
 
     #[test]
     fn load_into_rejects_future_schema() {
         let state = make_state();
-        let mas: MultiAccountState<SchedulerState> =
-            MultiAccountState::new("000000000000", "us-east-1", "");
-        let snap = SchedulerSnapshot {
-            schema_version: SCHEDULER_SNAPSHOT_SCHEMA_VERSION + 1,
-            accounts: mas,
-        };
+        let mas: MultiRegionState<SchedulerState> =
+            MultiRegionState::new("000000000000", "us-east-1", "");
+        let snap = SchedulerSnapshot::of(SCHEDULER_SNAPSHOT_SCHEMA_VERSION + 1, mas);
         let bytes = serde_json::to_vec(&snap).unwrap();
         let store = MemStore::new(Some(bytes));
         let err = load_into(&store, &state).err().unwrap();

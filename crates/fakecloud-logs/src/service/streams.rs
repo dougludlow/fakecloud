@@ -46,7 +46,7 @@ impl LogsService {
         validate_string_length("logStreamName", &stream_name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let region = req.region.clone();
         let account_id = state.account_id.clone();
 
@@ -115,7 +115,7 @@ impl LogsService {
         validate_string_length("logStreamName", stream_name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -224,7 +224,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state.log_groups.get(group_name.as_str()).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -433,7 +435,7 @@ impl LogsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -886,7 +888,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state.log_groups.get(group_name.as_str()).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -1056,7 +1060,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state
             .log_groups
             .get(resolved_group_name.as_str())
@@ -1227,13 +1233,15 @@ impl LogsService {
                 )
             })?;
         let accounts = self.state.read();
-        let state = accounts.get(&req.account_id).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                "log record not found",
-            )
-        })?;
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceNotFoundException",
+                    "log record not found",
+                )
+            })?;
         let group = state.log_groups.get(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -2679,7 +2687,7 @@ mod tests {
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         assert_eq!(body["rejectedLogEventsInfo"]["expiredLogEventEndIndex"], 1);
         let accounts = svc.state.read();
-        let events = &accounts.default_ref().log_groups["g"].log_streams["s"].events;
+        let events = &accounts.default_regional().unwrap().log_groups["g"].log_streams["s"].events;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message, "kept");
     }

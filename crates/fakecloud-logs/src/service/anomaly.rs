@@ -75,7 +75,7 @@ impl LogsService {
 
         let now = Utc::now().timestamp_millis();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let detector_id = uuid::Uuid::new_v4().to_string();
         let arn = format!(
             "arn:{}:logs:{}:{}:anomaly-detector:{}",
@@ -121,7 +121,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let detector = state.anomaly_detectors.get(arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -168,7 +170,7 @@ impl LogsService {
         })?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.anomaly_detectors.remove(arn).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -198,7 +200,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let detectors: Vec<Value> = state
             .anomaly_detectors
             .values()
@@ -260,7 +264,7 @@ impl LogsService {
         let enabled = body["enabled"].as_bool().unwrap_or(true);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let detector = state.anomaly_detectors.get_mut(arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -304,7 +308,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let anomalies: Vec<Value> = state
             .anomalies
             .values()
@@ -359,7 +365,7 @@ impl LogsService {
         let suppress = !body["suppressionType"].is_null();
         if let Some(id) = anomaly_id {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if let Some(a) = state.anomalies.get_mut(id) {
                 a.suppressed = suppress;
             }
@@ -375,7 +381,7 @@ impl LogsService {
     pub fn inject_anomaly(
         &self,
         account_id: &str,
-        _region: &str,
+        region: &str,
         anomaly_detector_arn: String,
         log_group_arns: Vec<String>,
         pattern_string: String,
@@ -385,7 +391,11 @@ impl LogsService {
         let anomaly_id = uuid::Uuid::new_v4().to_string();
         let pattern_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        // The anomaly belongs to its detector's region.
+        let region = fakecloud_aws::arn::region_of(&anomaly_detector_arn)
+            .unwrap_or(region)
+            .to_string();
+        let state = accounts.regional_mut(account_id, &region);
         state.anomalies.insert(
             anomaly_id.clone(),
             LogAnomaly {

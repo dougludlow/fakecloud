@@ -283,7 +283,7 @@ impl KinesisService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         if state.streams.contains_key(stream_name) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -341,7 +341,9 @@ impl KinesisService {
         validate_optional_json_range("Limit", &body["Limit"], 1, 10000)?;
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let stream = state.lookup_stream(&body)?;
 
         let enhanced_monitoring = if stream.enhanced_metrics.is_empty() {
@@ -395,7 +397,9 @@ impl KinesisService {
         let body = request.json_body();
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let stream = state.lookup_stream(&body)?;
         let consumer_count = state
             .consumers
@@ -473,7 +477,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let mut names: Vec<String> = state.streams.keys().cloned().collect();
         names.sort();
 
@@ -533,7 +539,7 @@ impl KinesisService {
         let body = request.json_body();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         // A stream cannot be deleted while a channel still draws from it; AWS
         // requires the attached channels to be deleted first. The guard keys
@@ -564,7 +570,7 @@ impl KinesisService {
     fn add_tags_to_stream(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -587,7 +593,7 @@ impl KinesisService {
     fn get_shard_iterator(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let shard_id = require_shard_id(&body)?;
         let iterator_type = body["ShardIteratorType"]
@@ -615,7 +621,7 @@ impl KinesisService {
     fn get_records(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let iterator = body["ShardIterator"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -773,7 +779,7 @@ impl KinesisService {
     fn put_record(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         // Drop records past retention on write so they don't accumulate in
         // memory (and in every snapshot) unbounded.
         state.trim_expired_records();
@@ -811,7 +817,7 @@ impl KinesisService {
     fn put_records(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         // Drop records past retention on write so they don't accumulate in
         // memory (and in every snapshot) unbounded.
         state.trim_expired_records();
@@ -881,7 +887,9 @@ impl KinesisService {
         let body = request.json_body();
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let stream = state.lookup_stream(&body)?;
 
         let tags: Vec<Value> = stream
@@ -902,7 +910,7 @@ impl KinesisService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -950,7 +958,7 @@ impl KinesisService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -992,7 +1000,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("Tags must be a map"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stored = resource_tags_mut(state, resource_arn)?;
         for (key, value) in tags {
             if let Some(value) = value.as_str() {
@@ -1011,7 +1019,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("TagKeys must be a list"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stored = resource_tags_mut(state, resource_arn)?;
         for key in tag_keys.iter().filter_map(|v| v.as_str()) {
             stored.remove(key);
@@ -1026,7 +1034,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let tags: Vec<Value> = resource_tags(state, resource_arn)?
             .iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
@@ -1042,7 +1052,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         state
             .stream_name_from_arn(resource_arn)
             .ok_or_else(|| resource_not_found_arn(resource_arn))?;
@@ -1064,7 +1076,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("Policy is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         state
             .stream_name_from_arn(resource_arn)
             .ok_or_else(|| resource_not_found_arn(resource_arn))?;
@@ -1081,7 +1093,7 @@ impl KinesisService {
         let resource_arn = require_resource_arn(&body)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         state
             .stream_name_from_arn(resource_arn)
             .ok_or_else(|| resource_not_found_arn(resource_arn))?;
@@ -1113,7 +1125,7 @@ impl KinesisService {
         validate_optional_string_length("KeyId", Some(key_id), 1, 2048)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -1139,7 +1151,7 @@ impl KinesisService {
         validate_optional_string_length("KeyId", body["KeyId"].as_str(), 1, 2048)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -1163,7 +1175,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("ShardLevelMetrics is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream_arn = state.stream_arn(request.region.as_str(), &stream_name);
@@ -1218,7 +1230,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("ShardLevelMetrics is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream_arn = state.stream_arn(request.region.as_str(), &stream_name);
@@ -1262,7 +1274,9 @@ impl KinesisService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         Ok(AwsResponse::ok_json(json!({
             "MinimumThroughputBillingCommitment": {
                 "Status": state.billing_commitment_status,
@@ -1286,7 +1300,7 @@ impl KinesisService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         state.billing_commitment_status = status.to_string();
 
         Ok(AwsResponse::ok_json(json!({
@@ -1299,7 +1313,9 @@ impl KinesisService {
     fn describe_limits(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let open_shard_count: i32 = state.streams.values().map(|s| s.open_shard_count).sum();
         let on_demand_count = state
             .streams
@@ -1334,7 +1350,7 @@ impl KinesisService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = state
             .stream_name_from_arn(stream_arn)
             .ok_or_else(|| resource_not_found_arn(stream_arn))?;
@@ -1366,7 +1382,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("RecordDistributionStrategy is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = state
             .stream_name_from_arn(stream_arn)
             .ok_or_else(|| resource_not_found_arn(stream_arn))?;
@@ -1406,7 +1422,7 @@ impl KinesisService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream_arn = state.stream_arn(request.region.as_str(), &stream_name);
@@ -1440,7 +1456,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("MaxRecordSizeInKiB is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_arn = body["StreamARN"]
             .as_str()
             .filter(|v| !v.is_empty())
@@ -1474,7 +1490,7 @@ impl KinesisService {
         validate_string_length("ConsumerName", consumer_name, 1, 128)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let _stream_name = state
             .stream_name_from_arn(stream_arn)
             .ok_or_else(|| resource_not_found_arn(stream_arn))?;
@@ -1534,7 +1550,7 @@ impl KinesisService {
         let body = request.json_body();
         validate_stream_id(&body)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
 
         let consumer_arn = if let Some(arn) = body["ConsumerARN"].as_str().filter(|v| !v.is_empty())
         {
@@ -1581,7 +1597,9 @@ impl KinesisService {
         validate_stream_id(&body)?;
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
 
         let consumer = if let Some(arn) = body["ConsumerARN"].as_str().filter(|v| !v.is_empty()) {
             validate_string_length("ConsumerARN", arn, 1, 2048)?;
@@ -1638,7 +1656,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let mut consumers: Vec<Value> = state
             .consumers
             .values()
@@ -1697,7 +1717,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let stream = state.lookup_stream(&body)?;
 
         // Resume position: a NextToken (opaque cursor) takes precedence over
@@ -1762,7 +1784,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("AdjacentShardToMerge is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -1825,7 +1847,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("NewStartingHashKey is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream = state
@@ -1894,7 +1916,7 @@ impl KinesisService {
             .ok_or_else(|| invalid_argument("ScalingType is required"))?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let stream_name = resolve_stream_name(state, &body)?;
         let account_id = state.account_id.clone();
         let stream_arn = state.stream_arn(request.region.as_str(), &stream_name);
@@ -1960,7 +1982,9 @@ impl KinesisService {
         // expects.
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let consumer = state.consumers.get(consumer_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -2064,7 +2088,7 @@ impl KinesisService {
             .unwrap_or_default();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         if state.channels.contains_key(channel_name) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -2107,7 +2131,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let channel_name = state
             .channel_name_from_arn(channel_arn)
             .ok_or_else(|| resource_not_found_arn(channel_arn))?;
@@ -2138,7 +2164,9 @@ impl KinesisService {
 
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         // Filters resolve source ARNs against the account's streams, so they
         // are parsed once the state is in hand rather than off the raw body.
         let filters = parse_channel_stream_filters(state, &body["StreamFilter"])?;
@@ -2193,7 +2221,7 @@ impl KinesisService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let channel_name = state
             .channel_name_from_arn(channel_arn)
             .ok_or_else(|| resource_not_found_arn(channel_arn))?;
@@ -2245,7 +2273,7 @@ impl KinesisService {
         let channel_arn = require_channel_arn(&body)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request.account_id);
+        let state = accounts.regional_mut(&request.account_id, &request.region);
         let channel_name = state
             .channel_name_from_arn(channel_arn)
             .ok_or_else(|| resource_not_found_arn(channel_arn))?;

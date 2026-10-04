@@ -502,8 +502,27 @@ public sealed class FakeCloudClient : IDisposable
 
         public Task<FireScheduleResponse> FireScheduleAsync(
             string group, string name, CancellationToken ct = default) =>
-            _http.PostEmptyAsync<FireScheduleResponse>(
-                "/_fakecloud/scheduler/fire/" + group + "/" + name, ct);
+            FireScheduleAsync(group, name, null, null, ct);
+
+        /// <summary>Fire the schedule of that group and name in <paramref name="accountId"/> /
+        /// <paramref name="region"/> (null: the server default).</summary>
+        public Task<FireScheduleResponse> FireScheduleAsync(
+            string group, string name, string? accountId, string? region, CancellationToken ct = default)
+        {
+            var path = "/_fakecloud/scheduler/fire/" + HttpTransport.EncodePath(group) + "/"
+                + HttpTransport.EncodePath(name);
+            var sep = "?";
+            if (!string.IsNullOrEmpty(accountId))
+            {
+                path += sep + "accountId=" + HttpTransport.EncodePath(accountId);
+                sep = "&";
+            }
+            if (!string.IsNullOrEmpty(region))
+            {
+                path += sep + "region=" + HttpTransport.EncodePath(region);
+            }
+            return _http.PostEmptyAsync<FireScheduleResponse>(path, ct);
+        }
     }
 
     public sealed class GlueClient

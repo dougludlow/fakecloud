@@ -165,11 +165,8 @@ pub async fn save_stepfunctions_snapshot(
         return;
     };
     let _guard = lock.lock().await;
-    let snapshot = StepFunctionsSnapshot {
-        schema_version: STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION,
-        state: None,
-        accounts: Some(state.read().clone()),
-    };
+    let snapshot =
+        StepFunctionsSnapshot::of(STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION, state.read().clone());
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -196,11 +193,7 @@ pub fn reconcile_interrupted_executions(state: &SharedStepFunctionsState) -> usi
     let now = Utc::now();
     let mut count = 0;
     let mut accounts = state.write();
-    let account_ids: Vec<String> = accounts.iter().map(|(id, _)| id.to_string()).collect();
-    for account_id in account_ids {
-        let Some(s) = accounts.get_mut(&account_id) else {
-            continue;
-        };
+    for (_, _, s) in accounts.iter_regional_mut() {
         for exec in s.executions.values_mut() {
             if matches!(
                 exec.status,
@@ -329,7 +322,9 @@ impl StepFunctionsService {
         };
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut activities: Vec<&crate::state::Activity> = state.activities.values().collect();
         activities.sort_by(|a, b| a.name.cmp(&b.name));
         let items: Vec<Value> = activities
@@ -1032,15 +1027,15 @@ pub fn start_execution_from_delivery(
 
     let execution_name = uuid::Uuid::new_v4().to_string();
 
-    // Extract account_id from the state machine ARN
-    let account_id = state_machine_arn
-        .split(':')
-        .nth(4)
-        .unwrap_or("000000000000")
-        .to_string();
-
     let mut accounts = state.write();
-    let st = accounts.get_or_create(&account_id);
+    // The state machine lives in the account and region its ARN names.
+    let Some(st) = accounts.by_arn_mut(state_machine_arn) else {
+        tracing::warn!(
+            state_machine_arn,
+            "Step Functions delivery: state machine not found"
+        );
+        return;
+    };
     let sm = match st.state_machines.get(state_machine_arn) {
         Some(sm) => sm,
         None => {
@@ -1169,6 +1164,106 @@ mod tests {
         let resp = svc.create_state_machine(&req).unwrap();
         let b = body_json(&resp);
         b["stateMachineArn"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn same_state_machine_name_coexists_in_two_regions() {
+        let svc = StepFunctionsService::new(make_state());
+        let in_region = |action: &str, body: Value, region: &str| {
+            let mut req = make_request(action, &body.to_string());
+            req.region = region.to_string();
+            req
+        };
+        let create = |region: &str| {
+            let body = json!({
+                "name": "orders",
+                "definition": VALID_DEF,
+                "roleArn": "arn:aws:iam::123456789012:role/test",
+            });
+            let resp = svc
+                .create_state_machine(&in_region("CreateStateMachine", body, region))
+                .unwrap();
+            body_json(&resp)["stateMachineArn"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let east = create("us-east-1");
+        let west = create("eu-west-1");
+        assert_eq!(
+            east,
+            "arn:aws:states:us-east-1:123456789012:stateMachine:orders"
+        );
+        assert_eq!(
+            west,
+            "arn:aws:states:eu-west-1:123456789012:stateMachine:orders"
+        );
+
+        // Each region lists only its own state machine.
+        for (region, arn) in [("us-east-1", &east), ("eu-west-1", &west)] {
+            let resp = svc
+                .list_state_machines(&in_region("ListStateMachines", json!({}), region))
+                .unwrap();
+            let listed: Vec<String> = body_json(&resp)["stateMachines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["stateMachineArn"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(listed, vec![arn.clone()]);
+        }
+
+        // A state machine ARN of another region is not found here.
+        let err = svc
+            .describe_state_machine(&in_region(
+                "DescribeStateMachine",
+                json!({ "stateMachineArn": west }),
+                "us-east-1",
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "StateMachineDoesNotExist");
+
+        // Deleting one region's state machine leaves the other's.
+        svc.delete_state_machine(&in_region(
+            "DeleteStateMachine",
+            json!({ "stateMachineArn": west }),
+            "eu-west-1",
+        ))
+        .unwrap();
+        assert!(svc
+            .describe_state_machine(&in_region(
+                "DescribeStateMachine",
+                json!({ "stateMachineArn": east }),
+                "us-east-1",
+            ))
+            .is_ok());
+    }
+
+    #[test]
+    fn v2_snapshot_migrates_resources_into_their_arn_region() {
+        let mut legacy: fakecloud_core::multi_account::MultiAccountState<StepFunctionsState> =
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", "");
+        {
+            let s = legacy.default_mut();
+            s.activities.insert(
+                "arn:aws:states:eu-west-1:123456789012:activity:work".into(),
+                crate::state::Activity {
+                    name: "work".into(),
+                    arn: "arn:aws:states:eu-west-1:123456789012:activity:work".into(),
+                    creation_date: Utc::now(),
+                    tags: Default::default(),
+                },
+            );
+        }
+        let bytes = serde_json::to_vec(&json!({"schema_version": 2, "accounts": legacy})).unwrap();
+        let snap = crate::state::parse_stepfunctions_snapshot(&bytes).unwrap();
+        assert_eq!(snap.schema_version, STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = snap.accounts.unwrap();
+        let west = accounts.regional("123456789012", "eu-west-1").unwrap();
+        assert_eq!(west.region, "eu-west-1");
+        assert_eq!(west.activities.len(), 1);
+        assert!(accounts.regional("123456789012", "us-east-1").is_none());
     }
 
     #[test]
@@ -2320,7 +2415,7 @@ mod tests {
         let exec_arn = b["executionArn"].as_str().unwrap().to_string();
 
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").unwrap();
+        let state = accounts.regional("123456789012", "us-east-1").unwrap();
         let stored = state
             .executions
             .get(&exec_arn)
@@ -2403,7 +2498,7 @@ mod tests {
         let state = make_state();
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create("123456789012");
+            let s = accounts.regional_mut("123456789012", "us-east-1");
             s.executions.insert(
                 "running".into(),
                 make_execution("running", ExecutionStatus::Running),
@@ -2418,7 +2513,7 @@ mod tests {
         assert_eq!(n, 1, "only the RUNNING execution is reconciled");
 
         let accounts = state.read();
-        let s = accounts.get("123456789012").unwrap();
+        let s = accounts.regional("123456789012", "us-east-1").unwrap();
         let running = &s.executions["running"];
         assert_eq!(running.status, ExecutionStatus::Aborted);
         assert!(running.stop_date.is_some());

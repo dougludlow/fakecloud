@@ -327,13 +327,13 @@ async fn main() {
         ),
     ));
     let sns_state = Arc::new(parking_lot::RwLock::new({
-        let mut mas: fakecloud_core::multi_account::MultiAccountState<fakecloud_sns::SnsState> =
+        let mut mas: fakecloud_core::multi_account::MultiRegionState<fakecloud_sns::SnsState> =
             fakecloud_core::multi_account::MultiAccountState::new(
                 &cli.account_id,
                 &cli.region,
                 &endpoint_url,
             );
-        mas.default_mut().seed_default_opted_out();
+        mas.default_regional_mut().seed_default_opted_out();
         mas
     }));
     let eb_state = Arc::new(parking_lot::RwLock::new(
@@ -1186,7 +1186,7 @@ async fn main() {
                     if let Some(accounts) = snapshot.accounts {
                         *logs_state.write() = accounts;
                     } else if let Some(single) = snapshot.state {
-                        let account_id = single.account_id.clone();
+                        let account_id = single.account_id().to_string();
                         *logs_state.write().get_or_create(&account_id) = single;
                     } else {
                         tracing::warn!(
@@ -1835,40 +1835,38 @@ async fn main() {
             let path = data_path.join("sns").join("snapshot.json");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
-                Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_sns::SnsSnapshot>(&bytes) {
-                        Ok(snapshot) => {
-                            if snapshot.schema_version > fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION
-                            {
-                                fatal_exit(format_args!(
-                                    "sns persistence schema too new: on-disk={}, max supported={}",
-                                    snapshot.schema_version,
-                                    fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION,
-                                ));
-                            }
-                            if let Some(accounts) = snapshot.accounts {
-                                let account_count = accounts.account_count();
-                                *sns_state.write() = accounts;
-                                tracing::info!(
-                                    accounts = account_count,
-                                    "loaded sns persistence snapshot (multi-account)"
-                                );
-                            } else if let Some(single_state) = snapshot.state {
-                                let topic_count = single_state.topics.len();
-                                let account_id = single_state.account_id.clone();
-                                let mut mas = sns_state.write();
-                                *mas.get_or_create(&account_id) = single_state;
-                                tracing::info!(
-                                    topics = topic_count,
-                                    "loaded sns persistence snapshot (migrated from v1)"
-                                );
-                            }
+                Ok(Some(bytes)) => match fakecloud_sns::parse_sns_snapshot(&bytes) {
+                    Ok(snapshot) => {
+                        if snapshot.schema_version > fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION {
+                            fatal_exit(format_args!(
+                                "sns persistence schema too new: on-disk={}, max supported={}",
+                                snapshot.schema_version,
+                                fakecloud_sns::SNS_SNAPSHOT_SCHEMA_VERSION,
+                            ));
                         }
-                        Err(err) => fatal_exit(format_args!(
-                            "failed to parse sns persistence snapshot: {err}"
-                        )),
+                        if let Some(accounts) = snapshot.accounts {
+                            let account_count = accounts.account_count();
+                            *sns_state.write() = accounts;
+                            tracing::info!(
+                                accounts = account_count,
+                                "loaded sns persistence snapshot (multi-account)"
+                            );
+                        } else if let Some(single_state) = snapshot.state {
+                            let topic_count: usize =
+                                single_state.regions().map(|(_, s)| s.topics.len()).sum();
+                            let account_id = single_state.account_id().to_string();
+                            let mut mas = sns_state.write();
+                            *mas.get_or_create(&account_id) = single_state;
+                            tracing::info!(
+                                topics = topic_count,
+                                "loaded sns persistence snapshot (migrated from v1)"
+                            );
+                        }
                     }
-                }
+                    Err(err) => fatal_exit(format_args!(
+                        "failed to parse sns persistence snapshot: {err}"
+                    )),
+                },
                 Ok(None) => {
                     tracing::info!("no sns persistence snapshot found; starting empty");
                 }
@@ -2063,7 +2061,10 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_ssm::SsmSnapshot>(&bytes) {
+                    // Older schemas are migrated on parse: v2 kept one
+                    // state per account, split into regions by each
+                    // parameter's ARN.
+                    match fakecloud_ssm::parse_ssm_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version > fakecloud_ssm::SSM_SNAPSHOT_SCHEMA_VERSION
                             {
@@ -2081,8 +2082,11 @@ async fn main() {
                                     "loaded ssm persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let param_count = single_state.parameters.len();
-                                let account_id = single_state.account_id.clone();
+                                let param_count: usize = single_state
+                                    .regions()
+                                    .map(|(_, s)| s.parameters.len())
+                                    .sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = ssm_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
                                 tracing::info!(
@@ -2236,9 +2240,10 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_secretsmanager::SecretsManagerSnapshot>(
-                        &bytes,
-                    ) {
+                    // Older schemas are migrated on parse: v2 kept one
+                    // state per account, split into regions by each secret's
+                    // ARN.
+                    match fakecloud_secretsmanager::parse_secretsmanager_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_secretsmanager::SECRETSMANAGER_SNAPSHOT_SCHEMA_VERSION
@@ -2249,18 +2254,29 @@ async fn main() {
                                     fakecloud_secretsmanager::SECRETSMANAGER_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            if let Some(accounts) = snapshot.accounts {
+                            if let Some(mut accounts) = snapshot.accounts {
                                 let account_count = accounts.account_count();
+                                // A migrated pre-regional snapshot names replica
+                                // regions with no replica secret in them yet.
+                                fakecloud_secretsmanager::sync_all_replicas(
+                                    &mut accounts,
+                                    Some(kms_hook_for_services.as_ref()),
+                                );
                                 *secretsmanager_state.write() = accounts;
                                 tracing::info!(
                                     accounts = account_count,
                                     "loaded secretsmanager persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let secret_count = single_state.secrets.len();
-                                let account_id = single_state.account_id.clone();
+                                let secret_count: usize =
+                                    single_state.regions().map(|(_, s)| s.secrets.len()).sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = secretsmanager_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
+                                fakecloud_secretsmanager::sync_all_replicas(
+                                    &mut mas,
+                                    Some(kms_hook_for_services.as_ref()),
+                                );
                                 tracing::info!(
                                     secrets = secret_count,
                                     "loaded secretsmanager persistence snapshot (migrated from v1)"
@@ -3032,7 +3048,10 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_kinesis::KinesisSnapshot>(&bytes) {
+                    // Older schemas are migrated on parse: v2 kept one
+                    // state per account, split into regions by each
+                    // resource's ARN.
+                    match fakecloud_kinesis::parse_kinesis_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_kinesis::KINESIS_SNAPSHOT_SCHEMA_VERSION
@@ -3051,8 +3070,9 @@ async fn main() {
                                     "loaded kinesis persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let stream_count = single_state.streams.len();
-                                let account_id = single_state.account_id.clone();
+                                let stream_count: usize =
+                                    single_state.regions().map(|(_, s)| s.streams.len()).sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = kinesis_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
                                 tracing::info!(
@@ -3960,8 +3980,11 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_route53resolver::Route53ResolverSnapshot>(
+                    // Older schemas are migrated on parse: v1 kept one state
+                    // per account, split into regions by each resource's ARN.
+                    match fakecloud_route53resolver::parse_route53resolver_snapshot(
                         &bytes,
+                        &cli.region,
                     ) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
@@ -4823,7 +4846,7 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_pipes::PipesSnapshot>(&bytes) {
+                    match fakecloud_pipes::parse_pipes_snapshot(&bytes, &cli.region) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_pipes::PIPES_SNAPSHOT_SCHEMA_VERSION
@@ -5076,9 +5099,7 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_stepfunctions::StepFunctionsSnapshot>(
-                        &bytes,
-                    ) {
+                    match fakecloud_stepfunctions::parse_stepfunctions_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_stepfunctions::STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION
@@ -5097,8 +5118,11 @@ async fn main() {
                                     "loaded stepfunctions persistence snapshot (multi-account)",
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let sm_count = single_state.state_machines.len();
-                                let account_id = single_state.account_id.clone();
+                                let sm_count: usize = single_state
+                                    .regions()
+                                    .map(|(_, s)| s.state_machines.len())
+                                    .sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = stepfunctions_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
                                 tracing::info!(
@@ -8408,8 +8432,8 @@ async fn main() {
                 move || async move {
                     let mas = ss.read();
                     let messages = mas
-                        .iter()
-                        .flat_map(|(_, state)| state.published.iter())
+                        .iter_regional()
+                        .flat_map(|(_, _, state)| state.published.iter())
                         .map(|msg| types::SnsMessage {
                             message_id: msg.message_id.clone(),
                             topic_arn: msg.topic_arn.clone(),
@@ -8429,8 +8453,8 @@ async fn main() {
                 move || async move {
                     let mas = ss.read();
                     let messages = mas
-                        .iter()
-                        .flat_map(|(_, state)| state.sms_messages.iter())
+                        .iter_regional()
+                        .flat_map(|(_, _, state)| state.sms_messages.iter())
                         .map(|(phone_number, message)| types::SnsSmsMessage {
                             phone_number: phone_number.clone(),
                             message: message.clone(),
@@ -8449,7 +8473,13 @@ async fn main() {
                     let anomaly_id = uuid::Uuid::new_v4().to_string();
                     let pattern_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
                     let mut accounts = ls.write();
-                    let state = accounts.default_mut();
+                    // The anomaly belongs to its detector's region (default
+                    // account, as before).
+                    let account = accounts.default_account_id().to_string();
+                    let region = fakecloud_aws::arn::region_of(&body.anomaly_detector_arn)
+                        .unwrap_or(accounts.region())
+                        .to_string();
+                    let state = accounts.regional_mut(&account, &region);
                     state.anomalies.insert(
                         anomaly_id.clone(),
                         fakecloud_logs::LogAnomaly {
@@ -8481,7 +8511,7 @@ async fn main() {
                     async move {
                         let accounts = ls.read();
                         let mut configurations: Vec<types::LogsDeliveryConfiguration> = Vec::new();
-                        for (_account, state) in accounts.iter() {
+                        for (_account, _region, state) in accounts.iter_regional() {
                             for delivery in state.deliveries.values() {
                                 let log_type = state
                                     .delivery_sources
@@ -8520,7 +8550,7 @@ async fn main() {
                         let accounts = ls.read();
                         let mut indexes: Vec<types::LogsFieldIndex> = Vec::new();
                         let mut found = false;
-                        for (_account, state) in accounts.iter() {
+                        for (_account, _region, state) in accounts.iter_regional() {
                             let Some(group) = state.log_groups.get(&log_group_name) else {
                                 continue;
                             };
@@ -8967,6 +8997,7 @@ async fn main() {
                         .into_iter()
                         .map(|r| types::SchedulerSchedule {
                             account_id: r.account_id,
+                            region: r.region,
                             group_name: r.group_name,
                             name: r.name,
                             arn: r.arn,
@@ -9170,17 +9201,29 @@ async fn main() {
                 let delivery = delivery_for_scheduler_fire;
                 let default_account = default_account_for_scheduler_fire;
                 let default_region = default_region_for_scheduler_fire;
-                move |axum::extract::Path((group, name)): axum::extract::Path<(String, String)>| {
+                move |axum::extract::Path((group, name)): axum::extract::Path<(String, String)>,
+                      axum::extract::Query(scope): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
                     let state = state.clone();
                     let delivery = delivery.clone();
-                    let default_account = default_account.clone();
-                    let default_region = default_region.clone();
+                    // The schedule of that group and name in one account and
+                    // region: `accountId` / `region` query parameters,
+                    // defaulting to the server's.
+                    let account = scope
+                        .get("accountId")
+                        .cloned()
+                        .unwrap_or_else(|| default_account.clone());
+                    let region = scope
+                        .get("region")
+                        .cloned()
+                        .unwrap_or_else(|| default_region.clone());
                     async move {
                         match fakecloud_scheduler::simulation::fire_schedule_response(
                             &state,
                             &delivery,
-                            &default_region,
-                            &default_account,
+                            &region,
+                            &account,
                             &group,
                             &name,
                         ) {
@@ -9280,10 +9323,12 @@ async fn main() {
                 let ss = secretsmanager_rotation_state;
                 let bus = delivery_for_rotation_scheduler;
                 let store = secretsmanager_rotation_snapshot_store;
+                let kms = kms_hook_for_services.clone();
                 move || async move {
                     let rotated = fakecloud_secretsmanager::rotation::check_and_rotate(
                         &ss,
                         Some(&bus),
+                        Some(kms.as_ref()),
                         store.clone(),
                     )
                     .await;
@@ -10980,10 +11025,11 @@ async fn main() {
                     let ss = ss.clone();
                     async move {
                         let accounts = ss.read();
-                        let state = accounts.default_ref();
-                        let mut executions: Vec<types::StepFunctionsExecution> = state
-                            .executions
-                            .values()
+                        // The default account's executions in every region.
+                        let mut executions: Vec<types::StepFunctionsExecution> = accounts
+                            .default_ref()
+                            .regions()
+                            .flat_map(|(_, state)| state.executions.values())
                             .map(|exec| types::StepFunctionsExecution {
                                 execution_arn: exec.execution_arn.clone(),
                                 state_machine_arn: exec.state_machine_arn.clone(),
@@ -11009,10 +11055,11 @@ async fn main() {
                     let ss = ss.clone();
                     async move {
                         let accounts = ss.read();
-                        let state = accounts.default_ref();
-                        let mut executions: Vec<types::StepFunctionsSyncExecution> = state
-                            .executions
-                            .values()
+                        // The default account's executions in every region.
+                        let mut executions: Vec<types::StepFunctionsSyncExecution> = accounts
+                            .default_ref()
+                            .regions()
+                            .flat_map(|(_, state)| state.executions.values())
                             .filter(|exec| exec.is_sync)
                             .map(|exec| {
                                 let duration_ms = exec.billed_duration_ms.unwrap_or_else(|| {
@@ -11053,7 +11100,15 @@ async fn main() {
                     let ss = ss.clone();
                     async move {
                         let accounts = ss.read();
-                        let state = accounts.default_ref();
+                        // The execution lives in the region its ARN names
+                        // (default account, as before); so do its children.
+                        let empty = fakecloud_stepfunctions::StepFunctionsState::new(
+                            accounts.default_account_id(),
+                            accounts.region(),
+                        );
+                        let state = fakecloud_aws::arn::region_of(&arn)
+                            .and_then(|r| accounts.default_ref().region(r))
+                            .unwrap_or(&empty);
                         // Index children by parent arn for O(N) tree build.
                         let mut children_by_parent: std::collections::HashMap<
                             String,
@@ -11373,16 +11428,20 @@ async fn main() {
                         // Default-account namespace keeps the introspection
                         // endpoint simple. Multi-account callers can switch
                         // FAKECLOUD's default account before calling, or
-                        // create the activity in the default account.
-                        let state = accounts.default_mut();
-                        if !state.activities.contains_key(&activity_arn) {
+                        // create the activity in the default account. The
+                        // activity lives in the region its ARN names.
+                        let Some(state) = fakecloud_aws::arn::region_of(&activity_arn)
+                            .map(str::to_string)
+                            .and_then(|r| accounts.default_mut().get_region_mut(&r))
+                            .filter(|s| s.activities.contains_key(&activity_arn))
+                        else {
                             return (
                                 axum::http::StatusCode::NOT_FOUND,
                                 axum::Json(serde_json::json!({
                                     "error": "ActivityDoesNotExist"
                                 })),
                             );
-                        }
+                        };
                         state.task_tokens.insert(
                             token.clone(),
                             fakecloud_stepfunctions::TaskTokenState {

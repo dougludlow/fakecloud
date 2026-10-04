@@ -15,7 +15,7 @@ impl StepFunctionsService {
         validate_required("tags", &body["tags"])?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let tags_map = resource_tags_mut(state, arn).ok_or_else(|| resource_not_found(arn))?;
 
         fakecloud_core::tags::apply_tags(tags_map, &body, "tags", "key", "value").map_err(|f| {
@@ -39,7 +39,7 @@ impl StepFunctionsService {
         validate_required("tagKeys", &body["tagKeys"])?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let tags_map = resource_tags_mut(state, arn).ok_or_else(|| resource_not_found(arn))?;
 
         fakecloud_core::tags::remove_tags(tags_map, &body, "tagKeys").map_err(|f| {
@@ -66,7 +66,9 @@ impl StepFunctionsService {
 
         let accounts = self.state.read();
         let empty = StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let tags_map = resource_tags(state, arn).ok_or_else(|| resource_not_found(arn))?;
 
         let tags = fakecloud_core::tags::tags_to_json(tags_map, "key", "value");

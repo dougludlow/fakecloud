@@ -436,7 +436,7 @@ impl AwsService for SnsService {
                 // policy evaluation and the actual ARN can't diverge even
                 // if the two sources ever drift (identified by cubic on
                 // PR #399).
-                let _accts = self.state.read(); let _empty = crate::state::SnsState::new(&request.account_id, &request.region, ""); let state = _accts.get(&request.account_id).unwrap_or(&_empty);
+                let _accts = self.state.read(); let _empty = crate::state::SnsState::new(&request.account_id, &request.region, ""); let state = _accts.regional(&request.account_id, &request.region).unwrap_or(&_empty);
                 param(request, "Name")
                     .map(|n| topic_arn(&request.region, &state.account_id, &n))
                     .unwrap_or_else(|| "*".to_string())
@@ -535,9 +535,8 @@ impl AwsService for SnsService {
         if resource_arn == "*" {
             return Some(std::collections::HashMap::new());
         }
-        let account_id = resource_arn.split(':').nth(4).unwrap_or("");
         let _accts = self.state.read();
-        let state = _accts.get(account_id)?;
+        let state = _accts.by_arn(resource_arn)?;
         let topic = state.topics.get(resource_arn)?;
         Some(topic.tags.iter().cloned().collect())
     }
@@ -623,7 +622,7 @@ impl SnsService {
         let tags = parse_tags(req);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let topic_arn = topic_arn(&req.region, &state.account_id, &name);
 
         if !state.topics.contains_key(&topic_arn) {
@@ -694,7 +693,7 @@ impl SnsService {
     fn delete_topic(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let topic_arn = required(req, "TopicArn")?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.topics.remove(&topic_arn);
         state
             .subscriptions
@@ -716,7 +715,9 @@ impl SnsService {
     fn list_topics(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
 
         // Filter topics by region
         let all_topics: Vec<&SnsTopic> = state
@@ -792,7 +793,9 @@ impl SnsService {
 
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let topic = state
             .topics
             .get(&topic_arn)
@@ -857,7 +860,7 @@ impl SnsService {
         let attr_value = param(req, "AttributeValue").unwrap_or_default();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let topic = state
             .topics
             .get_mut(&topic_arn)
@@ -945,7 +948,7 @@ impl SnsService {
         // topic policy at dispatch.
         let topic_account = owning_account(&topic_arn, &req.account_id).to_string();
         let accts = self.state.read();
-        let state_r = match accts.get(&topic_account) {
+        let state_r = match accts.regional(&topic_account, &req.region) {
             Some(s) => s,
             None => return Err(not_found("Topic")),
         };
@@ -1027,7 +1030,7 @@ impl SnsService {
 
         // Check for duplicate subscription (same topic, protocol, endpoint)
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&topic_account);
+        let state = accounts.regional_mut(&topic_account, &req.region);
         for sub in state.subscriptions.values() {
             if sub.topic_arn == topic_arn && sub.protocol == protocol && sub.endpoint == endpoint {
                 return Ok(xml_resp(
@@ -1155,7 +1158,17 @@ impl SnsService {
         let token = required(req, "Token")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(owning_account(&topic_arn, &req.account_id));
+        // The subscription lives with its topic: in the account and region
+        // the topic ARN names (the confirmation link the subscriber follows
+        // may be opened from anywhere).
+        let invalid_token = || {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameter",
+                format!("Invalid token: {token}"),
+            )
+        };
+        let state = accounts.by_arn_mut(&topic_arn).ok_or_else(invalid_token)?;
         // AWS accepts both the confirmation token and the subscription ARN as the Token parameter.
         // Confirming an already-confirmed subscription is a no-op (idempotent).
         let sub_arn = state
@@ -1167,16 +1180,10 @@ impl SnsService {
                         || s.subscription_arn == token)
             })
             .map(|s| s.subscription_arn.clone())
-            .ok_or_else(|| {
-                // AWS returns InvalidParameterException for unknown or
-                // expired confirmation tokens; matching the wire format
-                // lets client SDKs surface the right error type.
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidParameter",
-                    format!("Invalid token: {token}"),
-                )
-            })?;
+            // AWS returns InvalidParameterException for unknown or expired
+            // confirmation tokens; matching the wire format lets client SDKs
+            // surface the right error type.
+            .ok_or_else(invalid_token)?;
 
         // Mark the subscription as confirmed
         if let Some(sub) = state.subscriptions.get_mut(&sub_arn) {
@@ -1202,8 +1209,28 @@ impl SnsService {
     fn unsubscribe(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let sub_arn = required(req, "SubscriptionArn")?;
         let mut accts = self.state.write();
-        let account = subscription_account(&accts, &sub_arn, &req.account_id);
-        let state = accts.get_or_create(&account);
+        // A subscription ARN (`<topic ARN>:<id>`) names the region it lives
+        // in and its topic owner's account, where it is stored (an older
+        // build may have stored it under the caller's account instead). An
+        // unsubscribe link may be opened from anywhere; unknown subscriptions
+        // are a no-op, as on AWS.
+        let region = fakecloud_aws::arn::region_of(&sub_arn)
+            .unwrap_or(&req.region)
+            .to_string();
+        let account = subscription_account(&accts, &sub_arn, &req.account_id, &region);
+        let Some(state) = accts.regional_get_mut(&account, &region) else {
+            return Ok(xml_resp(
+                &format!(
+                    r#"<UnsubscribeResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">
+  <ResponseMetadata>
+    <RequestId>{}</RequestId>
+  </ResponseMetadata>
+</UnsubscribeResponse>"#,
+                    req.request_id
+                ),
+                &req.request_id,
+            ));
+        };
         // Snapshot the parent topic ARN before removing the subscription
         // so we can bump SubscriptionsDeleted on the right topic. Real
         // SNS exposes this counter on GetTopicAttributes.
@@ -1234,14 +1261,15 @@ impl SnsService {
 
     fn list_subscriptions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let _accts = self.state.read();
-        // ListSubscriptions returns the requester's subscriptions: the ones it
-        // owns, wherever the topic lives (a subscription to another
-        // account's topic is stored with that topic). Subscriptions other
-        // accounts own on the requester's topics are listed by
-        // ListSubscriptionsByTopic instead.
+        // ListSubscriptions returns the requester's subscriptions in the
+        // request region: the ones it owns, wherever the topic's account is
+        // (a subscription to another account's topic is stored with that
+        // topic). Subscriptions other accounts own on the requester's topics
+        // are listed by ListSubscriptionsByTopic instead.
         let mut all_subs: Vec<&SnsSubscription> = _accts
-            .iter()
-            .flat_map(|(_, st)| st.subscriptions.values())
+            .iter_regional()
+            .filter(|(_, region, _)| *region == req.region)
+            .flat_map(|(_, _, st)| st.subscriptions.values())
             .filter(|s| s.owner == req.account_id)
             .collect();
         all_subs.sort_by(|a, b| a.subscription_arn.cmp(&b.subscription_arn));
@@ -1298,9 +1326,10 @@ impl SnsService {
         let topic_arn = required(req, "TopicArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        // A topic's subscriptions live with the topic, in its owner's account.
+        // A topic's subscriptions live with the topic, in its owner's account
+        // (in the request region).
         let state = _accts
-            .get(owning_account(&topic_arn, &req.account_id))
+            .regional(owning_account(&topic_arn, &req.account_id), &req.region)
             .unwrap_or(&_empty);
 
         let all_subs: Vec<&SnsSubscription> = state
@@ -1362,8 +1391,8 @@ impl SnsService {
         let sub_arn = required(req, "SubscriptionArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let account = subscription_account(&_accts, &sub_arn, &req.account_id);
-        let state = _accts.get(&account).unwrap_or(&_empty);
+        let account = subscription_account(&_accts, &sub_arn, &req.account_id, &req.region);
+        let state = _accts.regional(&account, &req.region).unwrap_or(&_empty);
         let sub = state
             .subscriptions
             .get(&sub_arn)
@@ -1471,8 +1500,8 @@ impl SnsService {
         }
 
         let mut accounts = self.state.write();
-        let account = subscription_account(&accounts, &sub_arn, &req.account_id);
-        let state = accounts.get_or_create(&account);
+        let account = subscription_account(&accounts, &sub_arn, &req.account_id, &req.region);
+        let state = accounts.regional_mut(&account, &req.region);
         let sub = state
             .subscriptions
             .get_mut(&sub_arn)
@@ -1505,7 +1534,7 @@ impl SnsService {
         let new_tags = parse_tags(req);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let topic = state.topics.get_mut(&resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -1553,7 +1582,7 @@ impl SnsService {
         let tag_keys = parse_tag_keys(req);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let topic = state.topics.get_mut(&resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -1581,7 +1610,9 @@ impl SnsService {
         let resource_arn = required(req, "ResourceArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let topic = state.topics.get(&resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -1658,7 +1689,7 @@ impl SnsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let account_id = state.account_id.clone();
         let topic = state
             .topics
@@ -1761,7 +1792,7 @@ impl SnsService {
         let label = required(req, "Label")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let topic = state
             .topics
             .get_mut(&topic_arn)
@@ -1797,7 +1828,9 @@ impl SnsService {
         let resource_arn = required(req, "ResourceArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         if !state.topics.contains_key(&resource_arn) {
             return Err(not_found("Topic"));
         }
@@ -1838,7 +1871,7 @@ impl SnsService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if !state.topics.contains_key(&resource_arn) {
             return Err(not_found("Topic"));
         }
@@ -1993,18 +2026,19 @@ fn owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
         .unwrap_or(caller)
 }
 
-/// The account whose state holds subscription `sub_arn`: its topic owner's
-/// (where subscriptions are stored), falling back to the caller's for a
-/// subscription recorded there by an older build.
+/// The account whose state (in `region`) holds subscription `sub_arn`: its
+/// topic owner's (where subscriptions are stored), falling back to the
+/// caller's for a subscription recorded there by an older build.
 fn subscription_account(
-    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::SnsState>,
+    accounts: &fakecloud_core::multi_account::MultiRegionState<crate::state::SnsState>,
     sub_arn: &str,
     caller: &str,
+    region: &str,
 ) -> String {
     let owner = owning_account(sub_arn, caller);
     let held_by = |acct: &str| {
         accounts
-            .get(acct)
+            .regional(acct, region)
             .is_some_and(|s| s.subscriptions.contains_key(sub_arn))
     };
     if !held_by(owner) && held_by(caller) {

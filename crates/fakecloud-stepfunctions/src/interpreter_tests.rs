@@ -11,7 +11,9 @@ fn make_state() -> SharedStepFunctionsState {
 
 fn create_execution(state: &SharedStepFunctionsState, arn: &str, input: Option<String>) {
     let mut accounts = state.write();
-    let s = accounts.get_or_create("123456789012");
+    // The execution lives in the region its ARN names.
+    let region = fakecloud_aws::arn::region_of(arn).unwrap_or("us-east-1");
+    let s = accounts.regional_mut("123456789012", region);
     s.executions.insert(
         arn.to_string(),
         Execution {
@@ -69,7 +71,7 @@ async fn test_simple_pass_state() {
     .await;
 
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Succeeded);
     assert!(exec.output.is_some());
@@ -115,7 +117,7 @@ async fn test_pass_chain() {
     .await;
 
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Succeeded);
     let output: Value = serde_json::from_str(exec.output.as_ref().unwrap()).unwrap();
@@ -152,7 +154,7 @@ async fn test_succeed_state() {
     .await;
 
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Succeeded);
 }
@@ -188,7 +190,7 @@ async fn test_fail_state() {
     .await;
 
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Failed);
     assert_eq!(exec.error.as_deref(), Some("CustomError"));
@@ -225,7 +227,7 @@ async fn test_history_events_recorded() {
     .await;
 
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     let event_types: Vec<&str> = exec
         .history_events
@@ -264,7 +266,7 @@ fn drive(state: &SharedStepFunctionsState, arn: &str, def: Value, input: Option<
 
 fn read_exec<R>(state: &SharedStepFunctionsState, arn: &str, f: impl FnOnce(&Execution) -> R) -> R {
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.by_arn(arn).expect("execution region");
     f(s.executions.get(arn).expect("execution missing"))
 }
 
@@ -1171,12 +1173,12 @@ fn succeed_execution_is_noop_when_already_terminal() {
     create_execution(&state, arn, None);
     {
         let mut __a = state.write();
-        let s = __a.default_mut();
+        let s = __a.default_regional_mut();
         s.executions.get_mut(arn).unwrap().status = ExecutionStatus::Failed;
     }
     succeed_execution(&state, arn, &json!({"x":1}));
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Failed);
     assert!(exec.output.is_none());
@@ -1189,12 +1191,12 @@ fn fail_execution_is_noop_when_already_terminal() {
     create_execution(&state, arn, None);
     {
         let mut __a = state.write();
-        let s = __a.default_mut();
+        let s = __a.default_regional_mut();
         s.executions.get_mut(arn).unwrap().status = ExecutionStatus::Succeeded;
     }
     fail_execution(&state, arn, "Oops", "nope");
     let __a = state.read();
-    let s = __a.default_ref();
+    let s = __a.default_regional().unwrap();
     let exec = s.executions.get(arn).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Succeeded);
     assert!(exec.error.is_none());
@@ -2008,7 +2010,7 @@ fn execution_started_event_carries_the_role_recorded_at_start() {
 
 fn insert_token(state: &SharedStepFunctionsState, token: &str, status: &str) {
     let mut accounts = state.write();
-    let s = accounts.get_or_create("123456789012");
+    let s = accounts.regional_mut("123456789012", "us-east-1");
     s.task_tokens.insert(
         token.to_string(),
         crate::state::TaskTokenState {
@@ -2036,6 +2038,7 @@ async fn poll_task_token_huge_timeouts_do_not_panic() {
     let out = poll_task_token(
         &state,
         "123456789012",
+        "us-east-1",
         "done",
         Some(u64::MAX),
         Some(u64::MAX),
@@ -2052,6 +2055,7 @@ async fn poll_task_token_huge_timeouts_do_not_panic() {
         poll_task_token(
             &state,
             "123456789012",
+            "us-east-1",
             "busy",
             Some(u64::MAX),
             Some(u64::MAX),
@@ -2171,7 +2175,12 @@ fn item_selector_failure_finishes_distributed_map_run_as_failed() {
             .any(|e| e.event_type == "MapIterationStarted"));
     });
     let accounts = state.read();
-    let runs: Vec<_> = accounts.default_ref().map_runs.values().collect();
+    let runs: Vec<_> = accounts
+        .default_regional()
+        .unwrap()
+        .map_runs
+        .values()
+        .collect();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, "FAILED");
 }
@@ -2183,7 +2192,7 @@ fn context_redrive_count_reflects_execution() {
     create_execution(&state, &arn, None);
     {
         let mut accounts = state.write();
-        let s = accounts.get_or_create("123456789012");
+        let s = accounts.regional_mut("123456789012", "us-east-1");
         s.executions.get_mut(&arn).unwrap().redrive_count = 2;
     }
     let ctx = context_object(&state, &arn, "S", Utc::now(), 0);
@@ -2229,4 +2238,81 @@ fn task_parameters_reevaluated_per_retry_attempt() {
             .collect();
         assert_eq!(retries, vec![0, 1, 2]);
     });
+}
+
+/// Records the region and account of every request it receives.
+struct RegionRecorder {
+    seen: parking_lot::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl fakecloud_core::service::AwsService for RegionRecorder {
+    fn service_name(&self) -> &str {
+        "sqs"
+    }
+
+    async fn handle(
+        &self,
+        request: fakecloud_core::service::AwsRequest,
+    ) -> Result<fakecloud_core::service::AwsResponse, fakecloud_core::service::AwsServiceError>
+    {
+        self.seen
+            .lock()
+            .push((request.region.clone(), request.account_id.clone()));
+        Ok(fakecloud_core::service::AwsResponse::json(
+            http::StatusCode::OK,
+            "{}".to_string(),
+        ))
+    }
+
+    fn supported_actions(&self) -> &[&str] {
+        &["ListQueues"]
+    }
+}
+
+#[test]
+fn aws_sdk_integration_calls_the_service_in_the_execution_region() {
+    let recorder = Arc::new(RegionRecorder {
+        seen: parking_lot::Mutex::new(Vec::new()),
+    });
+    let mut registry = fakecloud_core::registry::ServiceRegistry::new();
+    registry.register(recorder.clone());
+    let handle: crate::service::SharedServiceRegistry = Arc::new(std::sync::OnceLock::new());
+    let _ = handle.set(Arc::new(registry));
+
+    let state = make_state();
+    let arn = "arn:aws:states:eu-west-1:123456789012:execution:test:sdk-region";
+    create_execution(&state, arn, Some("{}".to_string()));
+    let def = json!({
+        "StartAt": "T",
+        "States": {
+            "T": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sqs:listQueues",
+                "End": true
+            }
+        }
+    });
+    let fut = execute_state_machine(
+        state.clone(),
+        arn.to_string(),
+        def.to_string(),
+        Some("{}".to_string()),
+        None,
+        None,
+        Some(handle),
+        None,
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(fut);
+    read_exec(&state, arn, |exec| {
+        assert_eq!(exec.status, ExecutionStatus::Succeeded, "{:?}", exec.cause);
+    });
+    assert_eq!(
+        *recorder.seen.lock(),
+        vec![("eu-west-1".to_string(), "123456789012".to_string())]
+    );
 }

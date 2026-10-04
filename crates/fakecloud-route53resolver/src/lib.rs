@@ -21,6 +21,7 @@ mod service;
 
 pub use persistence::save_route53resolver_snapshot;
 pub use service::Route53ResolverService;
+pub use state::parse_route53resolver_snapshot;
 pub use state::{
     AccountState, EndpointRecord, FirewallConfig, FirewallDomainList, FirewallRule,
     FirewallRuleGroup, FirewallRuleGroupAssociation, IpAddressResponse, OutpostResolver,

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fakecloud_aws::arn::Arn;
-use fakecloud_core::multi_account::{AccountState, MultiAccountState};
+use fakecloud_core::multi_account::{AccountState, MultiRegionState};
 
 /// Default schedule group name, auto-created for every account and
 /// never deletable (matches AWS behavior).
@@ -189,16 +189,45 @@ impl AccountState for SchedulerState {
     }
 }
 
-pub type SharedSchedulerState = Arc<RwLock<MultiAccountState<SchedulerState>>>;
+/// Scheduler state partitioned by account and region: schedule groups and
+/// schedules are regional, and every region has its own `default` group.
+pub type SharedSchedulerState = Arc<RwLock<MultiRegionState<SchedulerState>>>;
 
 /// Bumped whenever the on-disk shape of `SchedulerSnapshot` changes.
-/// Schema version 1 is the initial format introduced by Batch 3.
-pub const SCHEDULER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// v2: state partitioned by (account, region); v1 kept one state per account.
+pub const SCHEDULER_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SchedulerSnapshot {
-    pub schema_version: u32,
-    pub accounts: MultiAccountState<SchedulerState>,
+pub type SchedulerSnapshot = fakecloud_core::multi_account::RegionalSnapshot<SchedulerState>;
+
+/// Parse a persisted scheduler snapshot, migrating a v1 snapshot by moving
+/// every group and schedule into the region its ARN names.
+pub fn parse_scheduler_snapshot(bytes: &[u8]) -> Result<SchedulerSnapshot, serde_json::Error> {
+    fakecloud_core::multi_account::parse_regional_snapshot(
+        bytes,
+        SCHEDULER_SNAPSHOT_SCHEMA_VERSION,
+        |s: SchedulerState| {
+            let (account, region) = (s.account_id.clone(), s.region.clone());
+            fakecloud_core::multi_account::RegionalState::from_legacy(&account, &region, "", s)
+        },
+    )
+}
+
+impl fakecloud_core::multi_account::SplitByRegion for SchedulerState {
+    fn split_by_region(self, into: &mut fakecloud_core::multi_account::RegionalState<Self>) {
+        use fakecloud_aws::arn::region_of;
+        for (name, group) in self.groups {
+            let region = region_of(&group.arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .groups
+                .insert(name, group);
+        }
+        for (key, sched) in self.schedules {
+            let region = region_of(&sched.arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .schedules
+                .insert(key, sched);
+        }
+    }
 }
 
 /// Build an EventBridge Scheduler schedule ARN.

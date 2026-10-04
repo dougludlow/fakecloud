@@ -45,7 +45,7 @@ impl ResourceProvisioner {
         };
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.destinations.insert(destination_name.clone(), dest);
 
         Ok(ProvisionResult::new(destination_name).with("Arn", arn))
@@ -53,7 +53,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_logs_destination(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.destinations.remove(physical_id);
         Ok(())
     }
@@ -86,7 +86,7 @@ impl ResourceProvisioner {
         };
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.resource_policies.insert(policy_name.clone(), policy);
 
         Ok(ProvisionResult::new(policy_name))
@@ -94,7 +94,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_logs_resource_policy(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.resource_policies.remove(physical_id);
         Ok(())
     }
@@ -141,7 +141,7 @@ impl ResourceProvisioner {
         };
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.query_definitions.insert(id.clone(), qd);
 
         Ok(ProvisionResult::new(id.clone()).with("QueryDefinitionId", id))
@@ -149,7 +149,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_logs_query_definition(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.query_definitions.remove(physical_id);
         Ok(())
     }
@@ -211,7 +211,7 @@ impl ResourceProvisioner {
         };
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.delivery_destinations.insert(name.clone(), dd);
 
         Ok(ProvisionResult::new(name).with("Arn", arn))
@@ -219,7 +219,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_logs_delivery_destination(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.delivery_destinations.remove(physical_id);
         Ok(())
     }
@@ -272,7 +272,7 @@ impl ResourceProvisioner {
         };
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.delivery_sources.insert(name.clone(), ds);
 
         Ok(ProvisionResult::new(name).with("Arn", arn))
@@ -280,7 +280,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_logs_delivery_source(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.delivery_sources.remove(physical_id);
         Ok(())
     }
@@ -325,7 +325,7 @@ impl ResourceProvisioner {
         };
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.deliveries.insert(id.clone(), delivery);
 
         Ok(ProvisionResult::new(id.clone())
@@ -335,7 +335,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_logs_delivery(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         state.deliveries.remove(physical_id);
         Ok(())
     }

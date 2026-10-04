@@ -867,14 +867,13 @@ pub(crate) fn deliver_to_logs(
     let ts_millis = timestamp.timestamp_millis();
 
     let mut accounts = logs_state.write();
-    let state = match target_account {
-        Some(acct) => accounts.get_or_create(acct),
-        None => accounts.default_mut(),
-    };
+    let account_id = target_account
+        .map(str::to_string)
+        .unwrap_or_else(|| accounts.default_account_id().to_string());
     let region = target_region
         .map(str::to_string)
-        .unwrap_or_else(|| state.region.clone());
-    let account_id = state.account_id.clone();
+        .unwrap_or_else(|| accounts.region().to_string());
+    let state = accounts.regional_mut(&account_id, &region);
 
     // Auto-create log group and stream if they don't exist
     let group = state
@@ -1287,7 +1286,9 @@ mod logs_persist_tests {
             .unwrap()
             .expect("manifest committed");
         let accounts = snapshot.accounts.expect("multi-account snapshot");
-        let logs = accounts.get("123456789012").expect("account present");
+        let logs = accounts
+            .regional("123456789012", "us-east-1")
+            .expect("account present");
         let group = logs
             .log_groups
             .get("/eb/target")
@@ -1309,7 +1310,7 @@ mod logs_persist_tests {
         deliver_to_logs_and_persist(&logs_state, None, arn, "payload", chrono::Utc::now());
 
         let accounts = logs_state.read();
-        let logs = accounts.get("123456789012").unwrap();
+        let logs = accounts.regional("123456789012", "us-east-1").unwrap();
         assert!(logs.log_groups.contains_key("/eb/nohook"));
     }
 
@@ -1324,8 +1325,8 @@ mod logs_persist_tests {
 
         let accounts = logs_state.read();
         let logs = accounts
-            .get("999999999999")
-            .expect("group must land in the target account, not the default");
+            .regional("999999999999", "eu-central-1")
+            .expect("group must land in the target account and region, not the default");
         let group = logs
             .log_groups
             .get("/eb/xacct")

@@ -6971,7 +6971,7 @@ mod tests {
                 .sns
                 .read()
                 .get(ACCT_D)
-                .map_or(0, |s| s.topics.len())
+                .map_or(0, |s| s.regions().map(|(_, r)| r.topics.len()).sum())
         };
         assert_eq!(topics(), 1);
 

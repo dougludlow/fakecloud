@@ -112,7 +112,7 @@ impl SnsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // Read topic fields in a tight scope so the immutable borrow ends
         // before the mutable counter re-borrow below (bug-audit 2026-05-28, 1.6).
         let (is_fifo, content_dedup, kms_key_id) = {
@@ -321,7 +321,9 @@ impl SnsService {
 
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&_empty);
         let topic = state
             .topics
             .get(&topic_arn)
@@ -503,7 +505,7 @@ impl SnsService {
             };
             let (msg_id, sequence_number, deduped) = {
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&req.account_id);
+                let state = accounts.regional_mut(&req.account_id, &req.region);
                 let now = Utc::now();
                 let replayed = effective_dedup_id.as_ref().and_then(|dedup_id| {
                     let topic = state.topics.get_mut(&topic_arn)?;
@@ -579,7 +581,9 @@ impl SnsService {
                 let subscribers = {
                     let accts = self.state.read();
                     let empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-                    let state = accts.get(&req.account_id).unwrap_or(&empty);
+                    let state = accts
+                        .regional(&req.account_id, &req.region)
+                        .unwrap_or(&empty);
                     collect_topic_subscribers(state, &topic_arn, &batch_attrs, message)
                 };
                 let envelope_attrs = build_envelope_attrs(&batch_attrs);
@@ -682,7 +686,7 @@ impl SnsService {
 
         let msg_id = uuid::Uuid::new_v4().to_string();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .sms_messages
             .push((phone.to_string(), message.clone()));
@@ -721,8 +725,11 @@ impl SnsService {
         request_id: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let acct = endpoint_arn.split(':').nth(4).unwrap_or("");
+        let region = fakecloud_aws::arn::region_of(endpoint_arn).unwrap_or("");
         let _accts = self.state.read();
-        let state = _accts.get(acct).unwrap_or_else(|| _accts.default_ref());
+        // The endpoint lives in the account and region its ARN names.
+        let empty = crate::state::SnsState::new(acct, region, "");
+        let state = _accts.by_arn(endpoint_arn).unwrap_or(&empty);
 
         // Find the platform endpoint
         let mut found_endpoint: Option<&PlatformEndpoint> = None;
@@ -748,8 +755,9 @@ impl SnsService {
 
         let msg_id = uuid::Uuid::new_v4().to_string();
         let acct = endpoint_arn.split(':').nth(4).unwrap_or("");
+        let region = fakecloud_aws::arn::region_of(endpoint_arn).unwrap_or("");
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(acct);
+        let state = accounts.regional_mut(acct, region);
         // Store message on the endpoint
         for app in state.platform_applications.values_mut() {
             if let Some(ep) = app.endpoints.get_mut(endpoint_arn) {
@@ -957,8 +965,9 @@ pub(crate) fn deliver_to_lambda_subscribers(
 
     {
         let acct = ctx.topic_arn.split(':').nth(4).unwrap_or("");
+        let region = fakecloud_aws::arn::region_of(ctx.topic_arn).unwrap_or("");
         let mut accounts = state.write();
-        let state = accounts.get_or_create(acct);
+        let state = accounts.regional_mut(acct, region);
         for (function_arn, ..) in &lambda_payloads {
             state
                 .lambda_invocations
@@ -1030,9 +1039,10 @@ pub(crate) fn deliver_to_email_subscribers(
         }
     };
     let acct = ctx.topic_arn.split(':').nth(4).unwrap_or("");
+    let region = fakecloud_aws::arn::region_of(ctx.topic_arn).unwrap_or("");
     {
         let mut accounts = state.write();
-        let state = accounts.get_or_create(acct);
+        let state = accounts.regional_mut(acct, region);
         for (email_address, protocol) in subs {
             tracing::info!(
                 email = %email_address,
@@ -1101,8 +1111,9 @@ pub(crate) fn deliver_to_sms_subscribers(
     }
     let sms_message = ctx.body_for_protocol("sms");
     let acct = ctx.topic_arn.split(':').nth(4).unwrap_or("");
+    let region = fakecloud_aws::arn::region_of(ctx.topic_arn).unwrap_or("");
     let mut accounts = state.write();
-    let state = accounts.get_or_create(acct);
+    let state = accounts.regional_mut(acct, region);
     for phone_number in subs {
         tracing::info!(
             phone_number = %phone_number,

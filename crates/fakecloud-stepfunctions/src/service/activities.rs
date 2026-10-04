@@ -10,7 +10,7 @@ impl StepFunctionsService {
         let name = body["name"].as_str().ok_or_else(|| missing("name"))?;
         validate_name(name)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let arn = crate::state::activity_arn(&req.region, &state.account_id, name);
         if state.activities.contains_key(&arn) {
             return Err(AwsServiceError::aws_error(
@@ -44,7 +44,7 @@ impl StepFunctionsService {
             .to_string();
         validate_arn_length("activityArn", &arn, 256)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.activities.remove(&arn);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -60,7 +60,9 @@ impl StepFunctionsService {
             .to_string();
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let a = state.activities.get(&arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -88,7 +90,7 @@ impl StepFunctionsService {
         {
             let accounts = self.state.read();
             let state = accounts
-                .get(&req.account_id)
+                .regional(&req.account_id, &req.region)
                 .ok_or_else(|| activity_not_found(&arn))?;
             if !state.activities.contains_key(&arn) {
                 return Err(activity_not_found(&arn));
@@ -107,7 +109,7 @@ impl StepFunctionsService {
             // Try to dequeue oldest PENDING token for this activity.
             {
                 let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&req.account_id);
+                let state = accounts.regional_mut(&req.account_id, &req.region);
                 let mut candidates: Vec<(String, chrono::DateTime<chrono::Utc>)> = state
                     .task_tokens
                     .iter()

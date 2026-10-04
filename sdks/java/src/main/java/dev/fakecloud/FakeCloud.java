@@ -716,10 +716,29 @@ public final class FakeCloud {
                     Types.SchedulerSchedulesResponse.class);
         }
 
+        /** Fire a schedule now, in the server's default account and region. */
         public Types.FireScheduleResponse fireSchedule(String group, String name) {
-            return http.postEmpty(
-                    "/_fakecloud/scheduler/fire/" + group + "/" + name,
-                    Types.FireScheduleResponse.class);
+            return fireSchedule(group, name, null, null);
+        }
+
+        /**
+         * Fire the schedule of that group and name in {@code accountId} / {@code region} (null:
+         * the server default).
+         */
+        public Types.FireScheduleResponse fireSchedule(
+                String group, String name, String accountId, String region) {
+            StringBuilder path =
+                    new StringBuilder(
+                            "/_fakecloud/scheduler/fire/" + encodePath(group) + "/" + encodePath(name));
+            String sep = "?";
+            if (accountId != null && !accountId.isEmpty()) {
+                path.append(sep).append("accountId=").append(encodePath(accountId));
+                sep = "&";
+            }
+            if (region != null && !region.isEmpty()) {
+                path.append(sep).append("region=").append(encodePath(region));
+            }
+            return http.postEmpty(path.toString(), Types.FireScheduleResponse.class);
         }
     }
 

@@ -79,7 +79,7 @@ impl ResourceProvisioner {
         if self
             .pipes_state
             .read()
-            .get(&self.account_id)
+            .get(&self.account_id, &self.region)
             .is_some_and(|st| st.pipes.contains_key(&name))
         {
             return Err(format!("Pipe with Name {name} already exists."));
@@ -119,7 +119,7 @@ impl ResourceProvisioner {
                 pipe.insert("Tags".into(), Value::Object(owned.clone()));
                 let mut state = self.pipes_state.write();
                 let entry = state
-                    .get_or_create(&self.account_id)
+                    .get_or_create(&self.account_id, &self.region)
                     .tags
                     .entry(arn.clone())
                     .or_default();
@@ -133,7 +133,7 @@ impl ResourceProvisioner {
 
         self.pipes_state
             .write()
-            .get_or_create(&self.account_id)
+            .get_or_create(&self.account_id, &self.region)
             .pipes
             .insert(name.clone(), Value::Object(pipe));
 
@@ -173,7 +173,7 @@ impl ResourceProvisioner {
         let old_source = self
             .pipes_state
             .read()
-            .get(&self.account_id)
+            .get(&self.account_id, &self.region)
             .and_then(|st| st.pipes.get(&name))
             .and_then(|p| p.get("Source").and_then(Value::as_str).map(String::from));
         let new_source = props.get("Source").and_then(Value::as_str);
@@ -198,7 +198,7 @@ impl ResourceProvisioner {
         };
 
         let mut state = self.pipes_state.write();
-        let acct = state.get_or_create(&self.account_id);
+        let acct = state.get_or_create(&self.account_id, &self.region);
         let pipe = acct
             .pipes
             .get_mut(&name)
@@ -247,7 +247,10 @@ impl ResourceProvisioner {
     /// overlay used when reading back a persisted stack).
     pub(super) fn get_att_pipes_pipe(&self, physical_id: &str, attribute: &str) -> Option<String> {
         let state = self.pipes_state.read();
-        let pipe = state.get(&self.account_id)?.pipes.get(physical_id)?;
+        let pipe = state
+            .get(&self.account_id, &self.region)?
+            .pipes
+            .get(physical_id)?;
         match attribute {
             "Arn" => pipe.get("Arn").and_then(Value::as_str).map(String::from),
             _ => None,
@@ -258,7 +261,7 @@ impl ResourceProvisioner {
     /// keyed by the pipe's ARN.
     pub(super) fn delete_pipes_pipe(&self, physical_id: &str) {
         let mut state = self.pipes_state.write();
-        let acct = state.get_or_create(&self.account_id);
+        let acct = state.get_or_create(&self.account_id, &self.region);
         if let Some(removed) = acct.pipes.remove(physical_id) {
             if let Some(arn) = removed.get("Arn").and_then(Value::as_str) {
                 acct.tags.remove(arn);
