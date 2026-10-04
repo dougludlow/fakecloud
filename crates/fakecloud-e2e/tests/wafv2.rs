@@ -1140,7 +1140,7 @@ async fn regional_scope_resources_are_scoped_to_their_region() {
             .iter()
             .map(|s| s.arn().unwrap().to_string())
             .collect();
-        assert_eq!(listed, [own.clone()]);
+        assert_eq!(listed, std::slice::from_ref(own));
     }
 
     // The other region's ARN does not exist here.

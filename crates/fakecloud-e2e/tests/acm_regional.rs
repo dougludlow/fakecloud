@@ -35,10 +35,8 @@ async fn list_arns(acm: &aws_sdk_acm::Client) -> Vec<String> {
 fn not_found<E: aws_sdk_acm::error::ProvideErrorMetadata, R>(
     err: aws_sdk_acm::error::SdkError<E, R>,
 ) -> String {
-    err.into_service_error()
-        .code()
-        .unwrap_or_default()
-        .to_string()
+    use aws_sdk_acm::error::ProvideErrorMetadata;
+    err.code().unwrap_or_default().to_string()
 }
 
 #[tokio::test]
