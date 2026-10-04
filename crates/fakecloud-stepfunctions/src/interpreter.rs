@@ -153,7 +153,10 @@ async fn run_wait_state(
         }),
     );
 
-    execute_wait_state(state_def, &input).await;
+    let ctx = context_object(shared_state, execution_arn, name, Utc::now(), 0);
+    if let Err((error, cause)) = execute_wait_state(state_def, &input, &ctx).await {
+        return Advance::Fail(error, cause);
+    }
 
     add_event(
         shared_state,
@@ -245,8 +248,10 @@ async fn run_parallel_state(
         }),
     );
 
+    let ctx = context_object(shared_state, execution_arn, name, Utc::now(), 0);
     let result = execute_parallel_state(
         state_def,
+        &ctx,
         &input,
         delivery,
         dynamodb_state,
@@ -298,8 +303,10 @@ async fn run_map_state(
         }),
     );
 
+    let ctx = context_object(shared_state, execution_arn, name, Utc::now(), 0);
     let result = execute_map_state(
         state_def,
+        &ctx,
         &input,
         delivery,
         dynamodb_state,
@@ -330,50 +337,58 @@ async fn run_map_state(
 }
 
 /// Execute a Wait state: pause execution for a specified duration or until a timestamp.
-async fn execute_wait_state(state_def: &Value, input: &Value) {
+/// A `SecondsPath` / `TimestampPath` that matches nothing, or selects a value
+/// of the wrong type, fails the state with `States.Runtime`, as on AWS.
+async fn execute_wait_state(
+    state_def: &Value,
+    input: &Value,
+    ctx: &Value,
+) -> Result<(), (String, String)> {
     if let Some(seconds) = state_def["Seconds"].as_u64() {
         tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
-        return;
+        return Ok(());
     }
 
     if let Some(path) = state_def["SecondsPath"].as_str() {
-        let val = crate::io_processing::resolve_path(input, path);
-        if let Some(seconds) = val.as_u64() {
-            tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
-        }
-        return;
+        let val = crate::io_processing::resolve_reference_with_context(input, Some(ctx), path)?;
+        let seconds = val.as_u64().ok_or_else(|| {
+            crate::io_processing::runtime_error(format!(
+                "The SecondsPath parameter does not reference a valid integer value: '{path}'"
+            ))
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
+        return Ok(());
     }
 
-    if let Some(ts_str) = state_def["Timestamp"].as_str() {
-        if let Ok(target) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-            let now = Utc::now();
-            let target_utc = target.with_timezone(&chrono::Utc);
-            if target_utc > now {
-                let duration = (target_utc - now).to_std().unwrap_or_default();
-                tokio::time::sleep(duration).await;
-            }
+    let target = if let Some(ts_str) = state_def["Timestamp"].as_str() {
+        chrono::DateTime::parse_from_rfc3339(ts_str).ok()
+    } else if let Some(path) = state_def["TimestampPath"].as_str() {
+        let val = crate::io_processing::resolve_reference_with_context(input, Some(ctx), path)?;
+        let parsed = val
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        if parsed.is_none() {
+            return Err(crate::io_processing::runtime_error(format!(
+                "The TimestampPath parameter does not reference a valid ISO-8601 extended offset date-time format string: '{path}'"
+            )));
         }
-        return;
-    }
+        parsed
+    } else {
+        warn!(
+            "Wait state has no valid Seconds, SecondsPath, Timestamp, or TimestampPath — skipping wait"
+        );
+        return Ok(());
+    };
 
-    if let Some(path) = state_def["TimestampPath"].as_str() {
-        let val = crate::io_processing::resolve_path(input, path);
-        if let Some(ts_str) = val.as_str() {
-            if let Ok(target) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-                let now = Utc::now();
-                let target_utc = target.with_timezone(&chrono::Utc);
-                if target_utc > now {
-                    let duration = (target_utc - now).to_std().unwrap_or_default();
-                    tokio::time::sleep(duration).await;
-                }
-            }
+    if let Some(target) = target {
+        let now = Utc::now();
+        let target_utc = target.with_timezone(&chrono::Utc);
+        if target_utc > now {
+            let duration = (target_utc - now).to_std().unwrap_or_default();
+            tokio::time::sleep(duration).await;
         }
-        return;
     }
-
-    warn!(
-        "Wait state has no valid Seconds, SecondsPath, Timestamp, or TimestampPath — skipping wait"
-    );
+    Ok(())
 }
 
 /// Execute a Task state: invoke the resource (Lambda, SQS, SNS, EventBridge, DynamoDB),
@@ -391,6 +406,8 @@ async fn execute_task_state(
     entered_event_id: i64,
 ) -> Result<Value, (String, String)> {
     let resource = state_def["Resource"].as_str().unwrap_or("").to_string();
+    let entered = Utc::now();
+    let base_ctx = context_object(shared_state, execution_arn, name, entered, 0);
 
     let input_path = state_def["InputPath"].as_str();
     let result_path = state_def["ResultPath"].as_str();
@@ -399,7 +416,7 @@ async fn execute_task_state(
     let effective_input = if input_path == Some("null") {
         json!({})
     } else {
-        apply_input_path(input, input_path)
+        apply_input_path(input, input_path)?
     };
 
     let retriers = state_def["Retry"].as_array().cloned().unwrap_or_default();
@@ -415,11 +432,8 @@ async fn execute_task_state(
             uuid::Uuid::new_v4().simple(),
         );
         let account_id = account_id_from_arn(execution_arn);
-        let context = json!({
-            "Task": { "Token": token.clone() },
-            "Execution": { "Id": execution_arn },
-            "State": { "Name": name },
-        });
+        let mut context = base_ctx.clone();
+        context["Task"] = json!({ "Token": token.clone() });
         {
             let mut accounts = shared_state.write();
             let state = accounts.get_or_create(account_id);
@@ -445,14 +459,18 @@ async fn execute_task_state(
         None
     };
 
-    let task_input = if let Some(params) = state_def.get("Parameters") {
-        let ctx = task_token.as_ref().map(|(_, ctx)| ctx);
-        try_apply_parameters(params, &effective_input, ctx)?
-    } else {
-        effective_input
-    };
-
     loop {
+        // Parameters are re-evaluated for every attempt, so
+        // `$$.State.RetryCount` reflects the current retry as on AWS.
+        let task_input = if let Some(params) = state_def.get("Parameters") {
+            let mut ctx = context_object(shared_state, execution_arn, name, entered, attempt);
+            if let Some((_, token_ctx)) = &task_token {
+                ctx["Task"] = token_ctx["Task"].clone();
+            }
+            apply_parameters(params, &effective_input, Some(&ctx))?
+        } else {
+            effective_input.clone()
+        };
         add_event(
             shared_state,
             execution_arn,
@@ -512,7 +530,14 @@ async fn execute_task_state(
                             );
 
                             let selected = if let Some(selector) = state_def.get("ResultSelector") {
-                                apply_parameters(selector, &output, None)
+                                let ctx = context_object(
+                                    shared_state,
+                                    execution_arn,
+                                    name,
+                                    entered,
+                                    attempt,
+                                );
+                                apply_parameters(selector, &output, Some(&ctx))?
                             } else {
                                 output
                             };
@@ -526,7 +551,7 @@ async fn execute_task_state(
                             let output = if output_path == Some("null") {
                                 json!({})
                             } else {
-                                apply_output_path(&after_result, output_path)
+                                apply_output_path(&after_result, output_path)?
                             };
 
                             return Ok(output);
@@ -566,7 +591,8 @@ async fn execute_task_state(
                 );
 
                 let selected = if let Some(selector) = state_def.get("ResultSelector") {
-                    apply_parameters(selector, &result, None)
+                    let ctx = context_object(shared_state, execution_arn, name, entered, attempt);
+                    apply_parameters(selector, &result, Some(&ctx))?
                 } else {
                     result
                 };
@@ -580,7 +606,7 @@ async fn execute_task_state(
                 let output = if output_path == Some("null") {
                     json!({})
                 } else {
-                    apply_output_path(&after_result, output_path)
+                    apply_output_path(&after_result, output_path)?
                 };
 
                 return Ok(output);
@@ -609,8 +635,10 @@ async fn execute_task_state(
 }
 
 /// Execute a Parallel state: run all branches concurrently, collect results into an array.
+#[allow(clippy::too_many_arguments)]
 async fn execute_parallel_state(
     state_def: &Value,
+    ctx: &Value,
     input: &Value,
     delivery: &Option<Arc<DeliveryBus>>,
     dynamodb_state: &Option<SharedDynamoDbState>,
@@ -625,7 +653,7 @@ async fn execute_parallel_state(
     let effective_input = if input_path == Some("null") {
         json!({})
     } else {
-        apply_input_path(input, input_path)
+        apply_input_path(input, input_path)?
     };
 
     let branches = state_def["Branches"]
@@ -672,7 +700,7 @@ async fn execute_parallel_state(
 
     // Apply ResultSelector if present
     let selected = if let Some(selector) = state_def.get("ResultSelector") {
-        apply_parameters(selector, &branch_output, None)
+        apply_parameters(selector, &branch_output, Some(ctx))?
     } else {
         branch_output
     };
@@ -688,7 +716,7 @@ async fn execute_parallel_state(
     let output = if output_path == Some("null") {
         json!({})
     } else {
-        apply_output_path(&after_result, output_path)
+        apply_output_path(&after_result, output_path)?
     };
 
     Ok(output)
@@ -700,6 +728,7 @@ async fn execute_parallel_state(
 #[allow(clippy::too_many_arguments)]
 async fn execute_map_state(
     state_def: &Value,
+    ctx: &Value,
     input: &Value,
     delivery: &Option<Arc<DeliveryBus>>,
     dynamodb_state: &Option<SharedDynamoDbState>,
@@ -714,12 +743,12 @@ async fn execute_map_state(
     let effective_input = if input_path == Some("null") {
         json!({})
     } else {
-        apply_input_path(input, input_path)
+        apply_input_path(input, input_path)?
     };
 
     // Resolve MaxConcurrencyPath if present
     let max_concurrency = if let Some(path) = state_def["MaxConcurrencyPath"].as_str() {
-        crate::io_processing::resolve_path(&effective_input, path)
+        crate::io_processing::resolve_reference_with_context(&effective_input, Some(ctx), path)?
             .as_u64()
             .unwrap_or(0)
     } else {
@@ -736,8 +765,20 @@ async fn execute_map_state(
         read_items_from_s3(item_reader, registry, execution_arn).await?
     } else {
         let items_path = state_def["ItemsPath"].as_str().unwrap_or("$");
-        let items_value = crate::io_processing::resolve_path(&effective_input, items_path);
-        items_value.as_array().cloned().unwrap_or_default()
+        let items_value = crate::io_processing::resolve_reference_with_context(
+            &effective_input,
+            Some(ctx),
+            items_path,
+        )?;
+        match items_value {
+            Value::Array(items) => items,
+            other => {
+                return Err(crate::io_processing::runtime_error(format!(
+                    "Map state input must be an array but was: {}",
+                    json_type_name(&other)
+                )))
+            }
+        }
     };
 
     // Apply ItemBatcher if present
@@ -794,11 +835,37 @@ async fn execute_map_state(
         None
     };
 
+    // Apply ItemSelector to every item before any iteration starts, so a
+    // failing selector fails the state without leaving earlier iterations
+    // running in the background. `$` paths read the Map state's effective
+    // input; the current item is exposed through the context object as
+    // `$$.Map.Item.Value` / `$$.Map.Item.Index`, as on AWS.
+    let item_inputs: Vec<Value> = match state_def.get("ItemSelector") {
+        Some(selector) => {
+            let mut out = Vec::with_capacity(batched_items.len());
+            for (index, batch_item) in batched_items.into_iter().enumerate() {
+                let mut item_ctx = ctx.clone();
+                item_ctx["Map"] = json!({"Item": {"Value": batch_item, "Index": index}});
+                match apply_parameters(selector, &effective_input, Some(&item_ctx)) {
+                    Ok(v) => out.push(v),
+                    Err(err) => {
+                        if let Some(arn) = &map_run_arn {
+                            finish_map_run(shared_state, arn, execution_arn, 0, 0, "FAILED");
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            out
+        }
+        None => batched_items,
+    };
+
     let semaphore = Arc::new(tokio::sync::Semaphore::new(effective_concurrency));
 
     // Process all items
     let mut handles = Vec::new();
-    for (index, batch_item) in batched_items.into_iter().enumerate() {
+    for (index, item_input) in item_inputs.into_iter().enumerate() {
         let iter_def = iterator_def.clone();
         let delivery = delivery.clone();
         let ddb = dynamodb_state.clone();
@@ -806,16 +873,6 @@ async fn execute_map_state(
         let state = shared_state.clone();
         let arn = execution_arn.to_string();
         let sem = semaphore.clone();
-
-        // Apply ItemSelector if present
-        let item_input = if let Some(selector) = state_def.get("ItemSelector") {
-            let mut ctx = serde_json::Map::new();
-            ctx.insert("value".to_string(), batch_item.clone());
-            ctx.insert("index".to_string(), json!(index));
-            apply_parameters(selector, &Value::Object(ctx), None)
-        } else {
-            batch_item
-        };
 
         add_event(
             shared_state,
@@ -908,7 +965,7 @@ async fn execute_map_state(
 
     // Apply ResultSelector if present
     let selected = if let Some(selector) = state_def.get("ResultSelector") {
-        apply_parameters(selector, &map_output, None)
+        apply_parameters(selector, &map_output, Some(ctx))?
     } else {
         map_output
     };
@@ -924,7 +981,7 @@ async fn execute_map_state(
     let output = if output_path == Some("null") {
         json!({})
     } else {
-        apply_output_path(&after_result, output_path)
+        apply_output_path(&after_result, output_path)?
     };
 
     Ok(output)
@@ -2172,6 +2229,18 @@ pub(crate) enum NextState {
 #[path = "interpreter_helpers.rs"]
 mod interpreter_helpers;
 pub(crate) use interpreter_helpers::*;
+
+/// JSON type name as Step Functions reports it in Map input errors.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
 
 #[cfg(test)]
 #[path = "interpreter_tests.rs"]
