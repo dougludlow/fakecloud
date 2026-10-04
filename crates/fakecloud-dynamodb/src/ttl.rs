@@ -37,6 +37,9 @@ pub fn process_ttl_expirations_with(
     process_ttl_expirations_at_with(state, now, delivery)
 }
 
+/// (account, region, table name, keys of the expired rows).
+type SweptTable = (String, String, String, Vec<HashMap<String, AttributeValue>>);
+
 /// Same as [`process_ttl_expirations`] but accepts an explicit "now" timestamp,
 /// making it easy to test without time manipulation.
 pub fn process_ttl_expirations_at(state: &SharedDynamoDbState, now_epoch: i64) -> usize {
@@ -56,9 +59,12 @@ pub fn process_ttl_expirations_at_with(
     let mut pending_kinesis: Vec<PendingTtlKinesis> = Vec::new();
     {
         let mut mas = state.write();
+        // Tables that lost rows, for replicating the deletes to their other
+        // replicas once the sweep is done.
+        let mut swept: Vec<SweptTable> = Vec::new();
 
-        // Process TTL across all accounts
-        for (_, acct_state) in mas.iter_mut() {
+        // Process TTL across every account and region.
+        for (account, _, acct_state) in mas.iter_regional_mut() {
             let region = acct_state.region.clone();
             for table in acct_state.tables.values_mut() {
                 if !table.ttl_enabled {
@@ -79,6 +85,13 @@ pub fn process_ttl_expirations_at_with(
                     continue;
                 }
                 total_expired += expired.len();
+                let expired_keys = expired.iter().map(|i| table.primary_key_of(i)).collect();
+                swept.push((
+                    account.to_string(),
+                    region.clone(),
+                    table.name.clone(),
+                    expired_keys,
+                ));
 
                 let kinesis_target = crate::service::kinesis_target_for(table);
                 for item in expired {
@@ -105,6 +118,9 @@ pub fn process_ttl_expirations_at_with(
                 }
             }
         } // end per-account loop
+        for (account, region, name, keys) in swept {
+            crate::service::replicas::replicate_keys(&mut mas, &account, &region, &name, &keys);
+        }
     } // write lock released here
 
     if let Some(delivery) = delivery {
@@ -228,6 +244,8 @@ mod tests {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         }
     }
 
@@ -253,13 +271,22 @@ mod tests {
         table.put_item_at_key(make_item("a", Some(json!({"N": "999999"}))));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         let count = process_ttl_expirations_at(&state, now);
         assert_eq!(count, 1);
-        assert_eq!(state.read().default_ref().tables["t1"].items.len(), 0);
+        assert_eq!(
+            state
+                .read()
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t1"]
+                .items
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -272,13 +299,22 @@ mod tests {
         table.put_item_at_key(make_item("a", Some(json!({"N": "2000000"}))));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         let count = process_ttl_expirations_at(&state, now);
         assert_eq!(count, 0);
-        assert_eq!(state.read().default_ref().tables["t1"].items.len(), 1);
+        assert_eq!(
+            state
+                .read()
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t1"]
+                .items
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -290,13 +326,22 @@ mod tests {
         table.put_item_at_key(make_item("a", Some(json!({"N": "999999"}))));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         let count = process_ttl_expirations_at(&state, now);
         assert_eq!(count, 0);
-        assert_eq!(state.read().default_ref().tables["t1"].items.len(), 1);
+        assert_eq!(
+            state
+                .read()
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t1"]
+                .items
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -309,13 +354,22 @@ mod tests {
         table.put_item_at_key(make_item("a", None));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         let count = process_ttl_expirations_at(&state, now);
         assert_eq!(count, 0);
-        assert_eq!(state.read().default_ref().tables["t1"].items.len(), 1);
+        assert_eq!(
+            state
+                .read()
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t1"]
+                .items
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -328,13 +382,22 @@ mod tests {
         table.put_item_at_key(make_item("a", Some(json!({"S": "not-a-number"}))));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         let count = process_ttl_expirations_at(&state, now);
         assert_eq!(count, 0);
-        assert_eq!(state.read().default_ref().tables["t1"].items.len(), 1);
+        assert_eq!(
+            state
+                .read()
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t1"]
+                .items
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -350,13 +413,22 @@ mod tests {
         table.put_item_at_key(make_item("string-ttl", Some(json!({"S": "oops"}))));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         let count = process_ttl_expirations_at(&state, now);
         assert_eq!(count, 2);
-        assert_eq!(state.read().default_ref().tables["t1"].items.len(), 3);
+        assert_eq!(
+            state
+                .read()
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t1"]
+                .items
+                .len(),
+            3
+        );
     }
 
     // bug-audit 2026-06-28: a TTL expiry must publish a REMOVE stream record
@@ -374,7 +446,7 @@ mod tests {
         table.put_item_at_key(make_item("a", Some(json!({"N": "999999"}))));
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
@@ -382,7 +454,9 @@ mod tests {
         assert_eq!(count, 1);
 
         let s = state.read();
-        let records = s.default_ref().tables["t1"].stream_records.read();
+        let records = s.regional("123456789012", "us-east-1").unwrap().tables["t1"]
+            .stream_records
+            .read();
         assert_eq!(records.len(), 1, "one REMOVE stream record emitted");
         let rec = &records[0];
         assert_eq!(rec.event_name, "REMOVE");
@@ -412,12 +486,15 @@ mod tests {
         table.size_bytes = 100;
         state
             .write()
-            .default_mut()
+            .default_regional_mut()
             .tables
             .insert("t1".to_string(), table);
 
         process_ttl_expirations_at(&state, now);
         let s = state.read();
-        assert_eq!(s.default_ref().tables["t1"].item_count, 1);
+        assert_eq!(
+            s.regional("123456789012", "us-east-1").unwrap().tables["t1"].item_count,
+            1
+        );
     }
 }

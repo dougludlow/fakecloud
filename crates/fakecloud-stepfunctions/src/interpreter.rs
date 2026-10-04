@@ -1312,20 +1312,36 @@ async fn invoke_resource(
         );
     }
 
-    if is_integration("dynamodb:getItem") {
-        return invoke_dynamodb_get_item(input, dynamodb_state);
-    }
-
-    if is_integration("dynamodb:putItem") {
-        return invoke_dynamodb_put_item(input, dynamodb_state);
-    }
-
-    if is_integration("dynamodb:deleteItem") {
-        return invoke_dynamodb_delete_item(input, dynamodb_state);
-    }
-
-    if is_integration("dynamodb:updateItem") {
-        return invoke_dynamodb_update_item(input, dynamodb_state);
+    // Optimized DynamoDB integrations call DynamoDB itself, in the
+    // execution's account and region, so a task's write goes through the
+    // same path as any client's: validation, streams, Kinesis destinations,
+    // global-table replication and persistence. The direct state access
+    // below is only for an interpreter run without a service registry.
+    for (task, action) in [
+        ("dynamodb:getItem", "GetItem"),
+        ("dynamodb:putItem", "PutItem"),
+        ("dynamodb:deleteItem", "DeleteItem"),
+        ("dynamodb:updateItem", "UpdateItem"),
+    ] {
+        if !is_integration(task) {
+            continue;
+        }
+        if let Some(registry_arc) = resolve_registry(registry)
+            .ok()
+            .filter(|r| r.get("dynamodb").is_some())
+        {
+            let account = account_from_execution_arn(execution_arn);
+            let region = fakecloud_aws::arn::region_of(execution_arn).unwrap_or("us-east-1");
+            return call_sdk_action_in(&registry_arc, "dynamodb", action, input, &account, region)
+                .await
+                .map_err(optimized_dynamodb_error);
+        }
+        return match action {
+            "GetItem" => invoke_dynamodb_get_item(input, dynamodb_state, execution_arn),
+            "PutItem" => invoke_dynamodb_put_item(input, dynamodb_state, execution_arn),
+            "DeleteItem" => invoke_dynamodb_delete_item(input, dynamodb_state, execution_arn),
+            _ => invoke_dynamodb_update_item(input, dynamodb_state, execution_arn),
+        };
     }
 
     // Nested Step Functions execution:
@@ -1577,6 +1593,17 @@ fn resolve_registry(
     })
 }
 
+/// The error name an optimized DynamoDB task fails with: `DynamoDB.<code>`,
+/// with request validation failures reported as
+/// `DynamoDB.AmazonDynamoDBException`, as Step Functions names them.
+fn optimized_dynamodb_error((error, cause): (String, String)) -> (String, String) {
+    match error.strip_prefix("DynamoDb.") {
+        Some("ValidationException") => ("DynamoDB.AmazonDynamoDBException".to_string(), cause),
+        Some(code) => (format!("DynamoDB.{code}"), cause),
+        None => (error, cause),
+    }
+}
+
 /// Call a single AWS SDK action against the registered service handler.
 async fn call_sdk_action(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
@@ -1584,6 +1611,26 @@ async fn call_sdk_action(
     action_pascal: &str,
     input: &Value,
     account_id: &str,
+) -> Result<Value, (String, String)> {
+    call_sdk_action_in(
+        registry,
+        service_name,
+        action_pascal,
+        input,
+        account_id,
+        "us-east-1",
+    )
+    .await
+}
+
+/// [`call_sdk_action`] in a given region.
+async fn call_sdk_action_in(
+    registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
+    service_name: &str,
+    action_pascal: &str,
+    input: &Value,
+    account_id: &str,
+    region: &str,
 ) -> Result<Value, (String, String)> {
     use bytes::Bytes;
     use fakecloud_core::service::AwsRequest;
@@ -1603,7 +1650,7 @@ async fn call_sdk_action(
     let req = AwsRequest {
         service: service_name.to_string(),
         action: action_pascal.to_string(),
-        region: "us-east-1".to_string(),
+        region: region.to_string(),
         account_id: account_id.to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         headers: HeaderMap::new(),

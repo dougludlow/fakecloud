@@ -118,6 +118,7 @@ On load, such a snapshot is split once: every resource moves to the region its A
 
 - **SQS** - each queue goes to the region of its queue ARN; message move tasks follow their source queue. Queue URLs (`<endpoint>/<account>/<name>`) carry no region, so they stay byte-identical, and the request region selects which region's queue a URL addresses.
 - **CloudFormation** - each stack goes to the region of its stack ID; change sets, events, policies, exports and stack sets follow it.
+- **DynamoDB** - each table goes to the region of its table ARN, and backups, exports, imports and stream policies to the region of their own ARNs. Legacy (2017.11.29) global tables, whose ARNs carry no region, stay in the server's region and remain visible from every region of their replication group. Stream-to-Lambda checkpoints are keyed by mapping UUID, so every migrated region keeps a copy.
 
 ## S3 object body handling
 

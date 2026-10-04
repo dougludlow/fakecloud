@@ -45,7 +45,7 @@ const RESTORE_TARGET_ACTIONS: [&str; 7] = [
 struct Scope<'a> {
     account: &'a str,
     region: &'a str,
-    accounts: &'a fakecloud_core::multi_account::MultiAccountState<crate::state::DynamoDbState>,
+    accounts: &'a fakecloud_core::multi_account::MultiRegionState<crate::state::DynamoDbState>,
     /// Whether the operation may act on another account's table.
     cross_account: bool,
 }
@@ -68,6 +68,14 @@ impl Scope<'_> {
     fn table(&self, name_or_arn: &str) -> String {
         let (name, owner) = match table_arn_of(name_or_arn) {
             Some(arn) => {
+                // A table in another region is never served by this request
+                // (the handler answers not-found), so its ARN is authorized
+                // as written -- never redirected to the same-named table of
+                // the request's region.
+                let region = arn.split(':').nth(3).filter(|r| !r.is_empty());
+                if region.is_some_and(|r| r != self.region) {
+                    return arn;
+                }
                 let owner = arn.split(':').nth(4).filter(|a| !a.is_empty());
                 let name = arn
                     .rsplit("table/")
@@ -84,7 +92,7 @@ impl Scope<'_> {
         };
         if let Some(table) = self
             .accounts
-            .get(&owner)
+            .regional(&owner, self.region)
             .and_then(|state| state.tables.get(&name))
         {
             return table.arn.clone();
@@ -476,10 +484,11 @@ pub(crate) fn resource_tags(
         return Some(HashMap::new());
     }
     let table_arn = table_arn_of(resource_arn)?;
+    let region = table_arn.split(':').nth(3)?;
     let account = table_arn.split(':').nth(4)?;
     let name = table_arn.rsplit("table/").next()?;
     let accounts = state.read();
-    let table = accounts.get(account)?.tables.get(name)?;
+    let table = accounts.regional(account, region)?.tables.get(name)?;
     Some(
         table
             .tags

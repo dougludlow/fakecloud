@@ -382,6 +382,10 @@ async fn unsupported_operations_and_other_regions_find_no_table() {
     );
     assert!(partiql.contains("ResourceNotFoundException"), "{partiql}");
 
+    // Another region's table of the same name is a different table, which
+    // has no resource policy: the cross-account caller is refused there, as
+    // for any table that grants it nothing, and the owner itself does not
+    // find it from this region.
     let other_region = format!("arn:aws:dynamodb:us-west-2:{ACCOUNT_A}:table/Shared");
     let region = err_text(
         caller
@@ -391,7 +395,19 @@ async fn unsupported_operations_and_other_regions_find_no_table() {
             .send()
             .await,
     );
-    assert!(region.contains("ResourceNotFoundException"), "{region}");
+    assert!(region.contains("AccessDenied"), "{region}");
+    let own_region = err_text(
+        owner
+            .get_item()
+            .table_name(&other_region)
+            .key("pk", pk("x"))
+            .send()
+            .await,
+    );
+    assert!(
+        own_region.contains("ResourceNotFoundException"),
+        "{own_region}"
+    );
 
     // B does not see A's table in its own listing.
     let tables = caller.list_tables().send().await.unwrap();

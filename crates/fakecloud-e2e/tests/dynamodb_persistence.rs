@@ -93,7 +93,7 @@ fn assert_snapshot_file_contains_item(
         serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
     assert_eq!(
         snapshot.get("schema_version").and_then(|v| v.as_u64()),
-        Some(2),
+        Some(3),
     );
 
     let table = snapshot
@@ -102,8 +102,14 @@ fn assert_snapshot_file_contains_item(
         .and_then(|accounts| {
             accounts.values().find_map(|account| {
                 account
-                    .get("tables")
-                    .and_then(|tables| tables.get(table_name))
+                    .get("regions")
+                    .and_then(|v| v.as_object())?
+                    .values()
+                    .find_map(|region| {
+                        region
+                            .get("tables")
+                            .and_then(|tables| tables.get(table_name))
+                    })
             })
         })
         .unwrap_or_else(|| panic!("snapshot should contain table {table_name}: {snapshot}"));

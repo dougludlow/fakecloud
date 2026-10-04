@@ -128,8 +128,8 @@ impl DynamoDbStreamsLambdaPoller {
                 continue;
             };
             // The DynamoDB state holding the table lives in the stream ARN's
-            // own account, which is not necessarily the default account.
-            let ddb_account = stream_arn.split(':').nth(4).unwrap_or("").to_string();
+            // own account and region, which are not necessarily the
+            // default account or the server's region.
 
             // AT_TIMESTAMP isn't valid for DDB streams in real AWS;
             // suppress the field if the user supplied it.
@@ -147,7 +147,7 @@ impl DynamoDbStreamsLambdaPoller {
             // with the whole retained backlog (duplicate side effects).
             let checkpoint = {
                 let mut ddb_accounts = self.dynamodb_state.write();
-                let dynamodb = match ddb_accounts.get_mut(&ddb_account) {
+                let dynamodb = match ddb_accounts.by_arn_mut(&stream_arn) {
                     Some(d) => d,
                     None => continue,
                 };
@@ -172,7 +172,7 @@ impl DynamoDbStreamsLambdaPoller {
             // Read stream records from DynamoDB
             let records = {
                 let ddb_accounts = self.dynamodb_state.read();
-                let dynamodb = match ddb_accounts.get(&ddb_account) {
+                let dynamodb = match ddb_accounts.by_arn(&stream_arn) {
                     Some(d) => d,
                     None => continue,
                 };
@@ -256,7 +256,7 @@ impl DynamoDbStreamsLambdaPoller {
             // successful invoke so failures retry on the next poll.
             if event_records.is_empty() {
                 if let Some(seq) = last_seq.clone() {
-                    self.advance_checkpoint(&ddb_account, &mapping_id, seq);
+                    self.advance_checkpoint(&stream_arn, &mapping_id, seq);
                 }
                 continue;
             }
@@ -293,7 +293,7 @@ impl DynamoDbStreamsLambdaPoller {
             // Successful invoke — advance the checkpoint and record
             // the invocation when no real Lambda runtime is wired.
             if let Some(seq) = last_seq.clone() {
-                self.advance_checkpoint(&ddb_account, &mapping_id, seq);
+                self.advance_checkpoint(&stream_arn, &mapping_id, seq);
                 // Persist the advanced checkpoint so a restart resumes past the
                 // records this batch already delivered.
                 self.persist().await;
@@ -317,9 +317,9 @@ impl DynamoDbStreamsLambdaPoller {
     /// DynamoDB state. The value rides along with the next DynamoDB
     /// snapshot save, so it survives a restart (mirrors how Kinesis lambda
     /// checkpoints persist through their snapshot).
-    fn advance_checkpoint(&self, ddb_account: &str, mapping_id: &str, sequence_number: String) {
+    fn advance_checkpoint(&self, stream_arn: &str, mapping_id: &str, sequence_number: String) {
         let mut ddb_accounts = self.dynamodb_state.write();
-        if let Some(dynamodb) = ddb_accounts.get_mut(ddb_account) {
+        if let Some(dynamodb) = ddb_accounts.by_arn_mut(stream_arn) {
             dynamodb.set_lambda_stream_checkpoint(mapping_id, sequence_number);
         }
     }
@@ -329,7 +329,7 @@ impl DynamoDbStreamsLambdaPoller {
 mod tests {
     use super::*;
 
-    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::multi_account::{MultiAccountState, MultiRegionState};
     use fakecloud_core::service::{AwsRequest, AwsService};
     use fakecloud_dynamodb::{DynamoDbService, DynamoDbState};
     use fakecloud_lambda::{EventSourceMapping, LambdaState};
@@ -396,7 +396,7 @@ mod tests {
     fn stream_arn(state: &SharedDynamoDbState, account: &str, table: &str) -> String {
         state
             .read()
-            .get(account)
+            .regional(account, REGION)
             .expect("account exists")
             .tables
             .get(table)
@@ -491,13 +491,13 @@ mod tests {
 
         // "Restart": persist + reload the DynamoDB state, fresh Lambda state.
         let serialized = serde_json::to_string(&*dynamodb_state.read()).unwrap();
-        let restored: MultiAccountState<DynamoDbState> = serde_json::from_str(&serialized).unwrap();
+        let restored: MultiRegionState<DynamoDbState> = serde_json::from_str(&serialized).unwrap();
         let restored_state: SharedDynamoDbState = Arc::new(RwLock::new(restored));
         // The checkpoint must have survived the round-trip.
         assert!(
             restored_state
                 .read()
-                .get(DEFAULT_ACCOUNT)
+                .regional(DEFAULT_ACCOUNT, REGION)
                 .unwrap()
                 .lambda_stream_checkpoint("esm-1")
                 .is_some(),

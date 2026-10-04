@@ -583,7 +583,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_table(&state.tables, table_name)?;
         let not_served = || {
             validation(format!(

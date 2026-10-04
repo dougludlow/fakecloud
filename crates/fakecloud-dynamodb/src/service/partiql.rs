@@ -182,7 +182,7 @@ impl DynamoDbService {
         let mut pending = Vec::new();
         let response = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             let outcome = execute(&mut state.tables, &stmt, &opts).map_err(|e| *e.error)?;
             let mut response = json!({});
             if outcome.returns_items {
@@ -226,7 +226,7 @@ impl DynamoDbService {
         let mut capacity = CapacityByTable::default();
         let responses: Vec<Value> = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             statements
                 .iter()
                 .map(|member| {
@@ -350,7 +350,7 @@ impl DynamoDbService {
                 return Self::ok_json(replay);
             }
         }
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Run every statement against copies of the tables it touches; only a
         // transaction whose every statement succeeded is committed.

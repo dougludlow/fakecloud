@@ -96,7 +96,7 @@ impl DynamoDbStreamsService {
     fn list_streams(&self, req: &AwsRequest, body: &Value) -> Result<AwsResponse, AwsServiceError> {
         let table_filter = body["TableName"].as_str();
         let accounts = self.state.read();
-        let state = match accounts.get(&req.account_id) {
+        let state = match accounts.regional(&req.account_id, &req.region) {
             Some(s) => s,
             None => return Ok(AwsResponse::ok_json(json!({ "Streams": [] }))),
         };
@@ -131,7 +131,7 @@ impl DynamoDbStreamsService {
         let stream_arn = require_string(body, "StreamArn")?;
         let accounts = self.state.read();
         let state = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .ok_or_else(|| not_found("Stream", &stream_arn))?;
         let table = state
             .tables
@@ -186,7 +186,7 @@ impl DynamoDbStreamsService {
 
         let accounts = self.state.read();
         let state = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .ok_or_else(|| not_found("Stream", &stream_arn))?;
         let table = state
             .tables
@@ -261,7 +261,7 @@ impl DynamoDbStreamsService {
 
         let accounts = self.state.read();
         let state = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .ok_or_else(|| not_found("Stream", &stream_arn))?;
         let table = state
             .tables
@@ -443,7 +443,7 @@ mod tests {
 
     fn seed_table(state: &SharedDynamoDbState) -> String {
         let mut accts = state.write();
-        let s = accts.get_or_create("123456789012");
+        let s = accts.regional_mut("123456789012", "us-east-1");
         let arn =
             "arn:aws:dynamodb:us-east-1:123456789012:table/widgets/stream/2026-05-03T00:00:00.000"
                 .to_string();
@@ -485,6 +485,8 @@ mod tests {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         };
         let rec = StreamRecord {
             event_id: "e1".into(),
@@ -566,7 +568,7 @@ mod tests {
 
     fn push_record(state: &SharedDynamoDbState, seq: &str, age_hours: i64, event_id: &str) {
         let mut accts = state.write();
-        let s = accts.get_or_create("123456789012");
+        let s = accts.regional_mut("123456789012", "us-east-1");
         let table = s.tables.get_mut("widgets").unwrap();
         let rec = StreamRecord {
             event_id: event_id.into(),
@@ -591,7 +593,7 @@ mod tests {
 
     fn trim_front(state: &SharedDynamoDbState, n: usize) {
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("widgets").unwrap();
         let mut recs = table.stream_records.write();
         for _ in 0..n {
@@ -612,7 +614,7 @@ mod tests {
                                       // Replace the seeded record set with a clean, ordered set seq 1..=5.
         {
             let accts = state.read();
-            let s = accts.get("123456789012").unwrap();
+            let s = accts.regional("123456789012", "us-east-1").unwrap();
             s.tables
                 .get("widgets")
                 .unwrap()

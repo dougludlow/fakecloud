@@ -50,17 +50,21 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_table(&state.tables, table_name)?;
 
         // Replicas come from the global-table replication group (created via
         // CreateGlobalTable / UpdateTable ReplicaUpdates). The global-table
         // name equals the table name in AWS.
-        let replicas = state
-            .global_tables
-            .get(super::resolve_table_name(table_name))
-            .map(|gt| replica_auto_scaling_list(&gt.replication_group))
-            .unwrap_or_default();
+        let name = super::resolve_table_name(table_name);
+        let replicas =
+            super::replicas::global_table_region(&accounts, &req.account_id, &req.region, name)
+                .and_then(|region| accounts.regional(&req.account_id, &region))
+                .and_then(|s| s.global_tables.get(name))
+                .map(|gt| replica_auto_scaling_list(&gt.replication_group))
+                .unwrap_or_default();
 
         Self::ok_json(json!({
             "TableAutoScalingDescription": {
@@ -79,11 +83,29 @@ impl DynamoDbService {
         let table_name = require_str(&body, "TableName")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
         // Validate the table exists (returns ResourceNotFound otherwise).
         let (name, status) = {
+            let empty = crate::state::DynamoDbState::new(&req.account_id, &req.region);
+            let state = accounts
+                .regional(&req.account_id, &req.region)
+                .unwrap_or(&empty);
             let table = get_table(&state.tables, table_name)?;
             (table.name.clone(), table.status.clone())
+        };
+        // The global table may have been created in another of its replica
+        // regions; its settings live there.
+        let holder = super::replicas::global_table_region(
+            &accounts,
+            &req.account_id,
+            &req.region,
+            super::resolve_table_name(table_name),
+        )
+        .unwrap_or_else(|| req.region.clone());
+        let empty = crate::state::DynamoDbState::new(&req.account_id, &holder);
+        let mut scratch = None;
+        let state = match accounts.regional_get_mut(&req.account_id, &holder) {
+            Some(state) => state,
+            None => scratch.insert(empty),
         };
 
         // Persist the supplied autoscaling settings onto the matching replicas
@@ -157,7 +179,7 @@ impl DynamoDbService {
             .unwrap_or("");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = get_table_mut(&mut state.tables, table_name)?;
 
         table.kinesis_destinations.push(KinesisDestination {
@@ -187,7 +209,7 @@ impl DynamoDbService {
         let stream_arn = require_str(&body, "StreamArn")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = get_table_mut(&mut state.tables, table_name)?;
 
         if let Some(dest) = table
@@ -214,7 +236,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_table(&state.tables, table_name)?;
 
         let destinations: Vec<Value> = table
@@ -254,7 +278,7 @@ impl DynamoDbService {
             .unwrap_or("");
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = get_table_mut(&mut state.tables, table_name)?;
 
         if let Some(dest) = table
@@ -289,7 +313,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_table(&state.tables, table_name)?;
 
         let top = table.top_contributors(10);
@@ -326,7 +352,7 @@ impl DynamoDbService {
         let index_name = body["IndexName"].as_str();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = get_table_mut(&mut state.tables, table_name)?;
 
         let status = match action {
@@ -367,7 +393,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let summaries: Vec<Value> = state
             .tables
             .values()

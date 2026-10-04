@@ -264,19 +264,38 @@ async fn cfn_refs_and_previously_unbacked_types_reach_their_services() {
         .unwrap();
     assert_eq!(sched.schedule_expression(), Some("rate(5 minutes)"));
 
+    // The GlobalTable's replicas are real tables: the stack-region table
+    // lists the eu-west-1 replica, which a client there can describe.
     let ddb = aws_sdk_dynamodb::Client::new(&server.aws_config().await);
-    let gt = ddb
-        .describe_global_table()
-        .global_table_name("fid-global")
+    let west = aws_sdk_dynamodb::Client::new(&server.aws_config_in("eu-west-1").await);
+    let table = ddb
+        .describe_table()
+        .table_name("fid-global")
         .send()
         .await
+        .unwrap()
+        .table
+        .unwrap();
+    assert_eq!(table.global_table_version(), Some("2019.11.21"));
+    assert_eq!(
+        table
+            .replicas()
+            .iter()
+            .filter_map(|r| r.region_name())
+            .collect::<Vec<_>>(),
+        vec!["eu-west-1"]
+    );
+    let replica = west
+        .describe_table()
+        .table_name("fid-global")
+        .send()
+        .await
+        .unwrap()
+        .table
         .unwrap();
     assert_eq!(
-        gt.global_table_description()
-            .unwrap()
-            .replication_group()
-            .len(),
-        2
+        replica.table_arn(),
+        Some("arn:aws:dynamodb:eu-west-1:123456789012:table/fid-global")
     );
 
     // Deleting the stack removes the backing state too.
@@ -299,6 +318,13 @@ async fn cfn_refs_and_previously_unbacked_types_reach_their_services() {
     .expect("schedule removed with the stack");
     let inline = iam.list_role_policies().role_name("fid-role").send().await;
     assert!(inline.is_err() || inline.unwrap().policy_names().is_empty());
+    // The replica goes with the GlobalTable.
+    assert!(west
+        .describe_table()
+        .table_name("fid-global")
+        .send()
+        .await
+        .is_err());
 }
 
 const SQS_V1: &str = r#"{

@@ -147,19 +147,21 @@ struct Target {
 }
 
 fn target(
-    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::DynamoDbState>,
+    accounts: &fakecloud_core::multi_account::MultiRegionState<crate::state::DynamoDbState>,
     resource: &str,
 ) -> Option<Target> {
     let rest = fakecloud_aws::arn::arn_resource(resource, "dynamodb")?;
     let (scope, path) = rest.split_once(":table/")?;
-    let account = scope.split(':').nth(1)?;
+    let mut scope = scope.split(':');
+    let region = scope.next()?;
+    let account = scope.next()?;
     let mut segments = path.split('/');
     let name = segments.next()?;
     let index = match (segments.next(), segments.next()) {
         (Some("index"), Some(index)) => Some(index.to_string()),
         _ => None,
     };
-    let table = accounts.get(account)?.tables.get(name)?;
+    let table = accounts.regional(account, region)?.tables.get(name)?;
     let partition_key = match &index {
         Some(index) => table
             .gsi
@@ -1130,26 +1132,31 @@ mod tests {
         );
     }
 
-    /// The resource authorized for an existing table is its own stored ARN,
-    /// whatever region the request was signed for or the caller wrote into a
-    /// table ARN: that table is what the handler serves.
+    /// The resource authorized for a table is the table of the request's own
+    /// region: a request signed for another region names that region's
+    /// table (which the handler then serves or reports missing), and an ARN
+    /// naming another region is authorized as written, never redirected to
+    /// the same-named table of the request's region.
     #[test]
-    fn authorization_uses_the_stored_table_arn() {
+    fn authorization_uses_the_request_region_table() {
         let (_svc, state) = service_with_table();
         let stored = "arn:aws:dynamodb:us-east-1:123456789012:table/Games";
+        let req = request("GetItem", serde_json::json!({"TableName": "Games"}));
+        assert_eq!(
+            super::super::iam::actions_for(&state, &req)[0].resource,
+            stored
+        );
         let mut req = request("GetItem", serde_json::json!({"TableName": "Games"}));
         req.region = "eu-west-1".to_string();
         assert_eq!(
             super::super::iam::actions_for(&state, &req)[0].resource,
-            stored
+            "arn:aws:dynamodb:eu-west-1:123456789012:table/Games"
         );
-        let req = request(
-            "GetItem",
-            serde_json::json!({"TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/Games"}),
-        );
+        let foreign = "arn:aws:dynamodb:eu-west-1:123456789012:table/Games";
+        let req = request("GetItem", serde_json::json!({ "TableName": foreign }));
         assert_eq!(
             super::super::iam::actions_for(&state, &req)[0].resource,
-            stored
+            foreign
         );
     }
 
@@ -1349,8 +1356,12 @@ mod tests {
         let (_svc, state) = service_with_table();
         {
             let mut accounts = state.write();
-            let src = accounts.get("123456789012").unwrap().tables["Games"].clone();
-            let foreign = accounts.get_or_create("444455556666");
+            let src = accounts
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["Games"]
+                .clone();
+            let foreign = accounts.regional_mut("444455556666", "us-east-1");
             let mut table = src;
             table.arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games".to_string();
             foreign.tables.insert("Games".to_string(), table);
@@ -1383,10 +1394,14 @@ mod tests {
         let arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games";
         {
             let mut accounts = state.write();
-            let mut table = accounts.get("123456789012").unwrap().tables["Games"].clone();
+            let mut table = accounts
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["Games"]
+                .clone();
             table.arn = arn.to_string();
             accounts
-                .get_or_create("444455556666")
+                .regional_mut("444455556666", "us-east-1")
                 .tables
                 .insert("Games".to_string(), table);
         }

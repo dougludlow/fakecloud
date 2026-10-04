@@ -1304,7 +1304,7 @@ impl DynamoDbService {
             // with `ValidationError` and leaves siblings as `None`.
             for ((account, table_name), (items, change_marker)) in snapshots {
                 if let Some(table) = accounts
-                    .get_mut(&account)
+                    .regional_get_mut(&account, &req.region)
                     .and_then(|state| state.tables.get_mut(&table_name))
                 {
                     table.replace_items(items);
@@ -1447,7 +1447,7 @@ mod tests {
 
     fn seed_table_with_stream(state: &SharedDynamoDbState, name: &str) {
         let mut accts = state.write();
-        let s = accts.get_or_create("123456789012");
+        let s = accts.regional_mut("123456789012", "us-east-1");
         let table = DynamoTable {
             name: name.to_string(),
             arn: format!("arn:aws:dynamodb:us-east-1:123456789012:table/{name}"),
@@ -1491,6 +1491,8 @@ mod tests {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         };
         s.tables.insert(name.to_string(), table);
     }
@@ -1516,7 +1518,7 @@ mod tests {
         {
             let mut accts = state.write();
             let table = accts
-                .get_or_create("123456789012")
+                .regional_mut("123456789012", "us-east-1")
                 .tables
                 .get_mut("Widgets")
                 .unwrap();
@@ -1556,7 +1558,7 @@ mod tests {
             }
             let mut accts = state.write();
             let table = accts
-                .get_or_create("123456789012")
+                .regional_mut("123456789012", "us-east-1")
                 .tables
                 .get_mut("Widgets")
                 .unwrap();
@@ -1704,7 +1706,11 @@ mod tests {
             .expect("missing-key Put rejected");
         assert!(format!("{err:?}").contains("ValidationException"));
         // No orphan row was stored.
-        assert!(state.read().get("123456789012").unwrap().tables["Widgets"]
+        assert!(state
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables["Widgets"]
             .items
             .is_empty());
     }
@@ -1767,7 +1773,7 @@ mod tests {
         // Nothing should have been written.
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -1796,7 +1802,7 @@ mod tests {
         // All-or-nothing up front: nothing persisted.
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -1821,7 +1827,7 @@ mod tests {
         .unwrap();
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -1848,7 +1854,7 @@ mod tests {
         assert!(format!("{err:?}").contains("ValidationException"));
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -1955,7 +1961,7 @@ mod tests {
         svc.transact_write_items(&req).unwrap();
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         let records = table.stream_records.read();
         assert_eq!(records.len(), 2, "one stream record per Put");
@@ -1994,7 +2000,7 @@ mod tests {
         assert_eq!(resp.status, http::StatusCode::OK);
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         let item = table
             .items
@@ -2034,7 +2040,7 @@ mod tests {
         }
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         let item = table
             .items
@@ -2071,7 +2077,7 @@ mod tests {
         assert_eq!(resp.status, http::StatusCode::OK);
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         assert_eq!(
             table.items.len(),
@@ -2098,7 +2104,7 @@ mod tests {
         let _ = svc.transact_write_items(&req);
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         assert_eq!(
             table.items.len(),
@@ -2245,7 +2251,7 @@ mod tests {
 
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -2300,7 +2306,7 @@ mod tests {
         assert_eq!(
             state
                 .read()
-                .get("123456789012")
+                .regional("123456789012", "us-east-1")
                 .unwrap()
                 .tables
                 .get("Widgets")
@@ -2317,7 +2323,7 @@ mod tests {
         seed_table_with_stream(&state, "Widgets");
         state
             .write()
-            .get_or_create("123456789012")
+            .regional_mut("123456789012", "us-east-1")
             .tables
             .get_mut("Widgets")
             .unwrap()
@@ -2338,7 +2344,7 @@ mod tests {
         ))
         .unwrap();
         let accts = state.read();
-        let table = &accts.get("123456789012").unwrap().tables["Widgets"];
+        let table = &accts.regional("123456789012", "us-east-1").unwrap().tables["Widgets"];
         assert_eq!(table.items.len(), 0);
         assert_eq!(
             table.change_count(),
@@ -2385,7 +2391,7 @@ mod tests {
         // Confirm revert: the Put on index 0 must NOT have committed.
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -2418,7 +2424,7 @@ mod tests {
         assert_eq!(resp.status, http::StatusCode::OK);
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         assert_eq!(table.items.len(), 2);
         assert_eq!(
@@ -2445,7 +2451,7 @@ mod tests {
 
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -2488,7 +2494,7 @@ mod tests {
         .unwrap();
 
         let accts = state.read();
-        let table = &accts.get("123456789012").unwrap().tables["Widgets"];
+        let table = &accts.regional("123456789012", "us-east-1").unwrap().tables["Widgets"];
         assert_eq!(table.items.len(), 3);
         assert_eq!(table.stream_records.read().len(), 3);
     }
@@ -2514,7 +2520,7 @@ mod tests {
 
         let accts = state.read();
         let table = accts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Widgets")
@@ -2843,7 +2849,7 @@ mod tests {
         assert_eq!(err.code(), "ResourceNotFoundException");
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         assert_eq!(
             table.items.len(),
@@ -2870,7 +2876,7 @@ mod tests {
         // Reset stream records so we only count what the txn emits.
         {
             let accts = state.read();
-            let s = accts.get("123456789012").unwrap();
+            let s = accts.regional("123456789012", "us-east-1").unwrap();
             let table = s.tables.get("Widgets").unwrap();
             table.stream_records.write().clear();
         }
@@ -2899,7 +2905,7 @@ mod tests {
         assert_eq!(reasons[2]["Code"].as_str().unwrap(), "None");
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         // Only the pre-seed should remain — neither 'a' nor 'c' from
         // the rolled-back txn must persist.
@@ -3067,7 +3073,7 @@ mod tests {
         assert_eq!(body["Responses"].as_array().unwrap().len(), 3);
 
         let accts = state.read();
-        let s = accts.get("123456789012").unwrap();
+        let s = accts.regional("123456789012", "us-east-1").unwrap();
         let table = s.tables.get("Widgets").unwrap();
         assert_eq!(table.items.len(), 3);
         let records = table.stream_records.read();
@@ -3083,7 +3089,7 @@ mod tests {
         seed_table_with_stream(state, "Typed");
         let mut accts = state.write();
         let table = accts
-            .get_or_create("123456789012")
+            .regional_mut("123456789012", "us-east-1")
             .tables
             .get_mut("Typed")
             .unwrap();
@@ -3109,7 +3115,11 @@ mod tests {
     }
 
     fn typed_item_count(state: &SharedDynamoDbState) -> usize {
-        state.read().get("123456789012").unwrap().tables["Typed"]
+        state
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables["Typed"]
             .items
             .len()
     }
@@ -3347,7 +3357,11 @@ mod tests {
             .err()
             .expect("over 4 MB of updated items rejected");
         assert_eq!(err.code(), "ValidationException");
-        let count = state.read().get("123456789012").unwrap().tables["Widgets"]
+        let count = state
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables["Widgets"]
             .items
             .len();
         assert_eq!(count, 10, "the rejected transaction wrote nothing");

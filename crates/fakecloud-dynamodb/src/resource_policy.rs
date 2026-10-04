@@ -27,17 +27,19 @@ impl DynamoDbResourcePolicyProvider {
     }
 }
 
-/// The account, table name and sub-resource path of a DynamoDB table-scoped
-/// ARN: `arn:aws:dynamodb:REGION:ACCOUNT:table/NAME[/KIND/ID]`.
-fn parse(arn: &str) -> Option<(&str, &str, Option<&str>)> {
+/// The region, account, table name and sub-resource path of a DynamoDB
+/// table-scoped ARN: `arn:aws:dynamodb:REGION:ACCOUNT:table/NAME[/KIND/ID]`.
+fn parse(arn: &str) -> Option<(&str, &str, &str, Option<&str>)> {
     let rest = fakecloud_aws::arn::arn_resource(arn, "dynamodb")?;
     let (scope, path) = rest.split_once(":table/")?;
-    let account = scope.split(':').nth(1).filter(|a| !a.is_empty())?;
+    let mut scope = scope.split(':');
+    let region = scope.next().filter(|r| !r.is_empty())?;
+    let account = scope.next().filter(|a| !a.is_empty())?;
     let (name, sub) = match path.split_once('/') {
         Some((name, sub)) => (name, Some(sub)),
         None => (path, None),
     };
-    (!name.is_empty()).then_some((account, name, sub))
+    (!name.is_empty()).then_some((region, account, name, sub))
 }
 
 fn is_dynamodb(service: &str) -> bool {
@@ -49,9 +51,9 @@ impl ResourcePolicyProvider for DynamoDbResourcePolicyProvider {
         if !is_dynamodb(service) {
             return None;
         }
-        let (account, name, sub) = parse(resource_arn)?;
+        let (region, account, name, sub) = parse(resource_arn)?;
         let accounts = self.state.read();
-        let state = accounts.get(account)?;
+        let state = accounts.regional(account, region)?;
         let table = state.tables.get(name)?;
         match sub {
             None => table.resource_policy.clone(),
@@ -67,7 +69,7 @@ impl ResourcePolicyProvider for DynamoDbResourcePolicyProvider {
         if !is_dynamodb(service) {
             return None;
         }
-        parse(resource_arn).map(|(account, _, _)| account.to_string())
+        parse(resource_arn).map(|(_, account, _, _)| account.to_string())
     }
 }
 
@@ -75,13 +77,13 @@ impl ResourcePolicyProvider for DynamoDbResourcePolicyProvider {
 mod tests {
     use super::*;
     use crate::state::{DynamoDbState, DynamoTable, KeySchemaElement, ProvisionedThroughput};
-    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::multi_account::MultiRegionState;
 
     const ARN: &str = "arn:aws:dynamodb:us-east-1:111122223333:table/Orders";
 
     fn provider() -> DynamoDbResourcePolicyProvider {
-        let mut accounts = MultiAccountState::<DynamoDbState>::new("111122223333", "us-east-1", "");
-        let state = accounts.get_or_create("111122223333");
+        let mut accounts = MultiRegionState::<DynamoDbState>::new("111122223333", "us-east-1", "");
+        let state = accounts.regional_mut("111122223333", "us-east-1");
         let mut table = DynamoTable::new(
             "Orders".to_string(),
             ARN.to_string(),
@@ -132,6 +134,15 @@ mod tests {
             None
         );
         assert_eq!(p.resource_policy("sqs", ARN), None);
+        // The same table name in another region is another table, with no
+        // policy of its own.
+        assert_eq!(
+            p.resource_policy(
+                "dynamodb",
+                "arn:aws:dynamodb:eu-west-1:111122223333:table/Orders"
+            ),
+            None
+        );
         assert_eq!(
             p.resource_owner_account(
                 "dynamodb",

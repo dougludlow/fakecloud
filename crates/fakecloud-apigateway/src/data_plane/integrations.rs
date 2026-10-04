@@ -424,6 +424,13 @@ pub(super) async fn aws_direct_integration(
             "AWS integration uri not in expected ARN format: {uri}"
         )));
     }
+    // The URI's region is the region the target service is called in
+    // (normally the API's own); an empty one means the API's region.
+    let target_region = if parts[0].is_empty() {
+        req.region.clone()
+    } else {
+        parts[0].to_string()
+    };
     let target_service = parts[1];
     let action_or_path = parts[2];
 
@@ -449,7 +456,7 @@ pub(super) async fn aws_direct_integration(
     let mut dispatch_req = AwsRequest {
         service: target_service.to_string(),
         action: req.action.clone(),
-        region: req.region.clone(),
+        region: target_region,
         account_id: req.account_id.clone(),
         request_id: uuid::Uuid::new_v4().to_string(),
         headers: req.headers.clone(),

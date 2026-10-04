@@ -8,7 +8,7 @@
 //! reads. For any other operation, and for an ARN naming another region than
 //! the request's, the resource is simply not found.
 
-use fakecloud_core::multi_account::MultiAccountState;
+use fakecloud_core::multi_account::MultiRegionState;
 use fakecloud_core::service::AwsRequest;
 use http::StatusCode;
 use serde_json::Value;
@@ -60,28 +60,30 @@ pub(crate) fn owner_account<'a>(req: &'a AwsRequest, name_or_arn: &'a str) -> &'
     }
 }
 
-/// The tables of the account that owns `name_or_arn`, or none if that
-/// account holds no DynamoDB state.
+/// The tables, in the request's region, of the account that owns
+/// `name_or_arn`, or none if that account holds no DynamoDB state there. An
+/// ARN naming another region never gets here: [`check_references`] rejects it
+/// up front, so the request's region is always the table's.
 pub(crate) fn tables_of<'a>(
-    accounts: &'a MultiAccountState<DynamoDbState>,
+    accounts: &'a MultiRegionState<DynamoDbState>,
     req: &AwsRequest,
     name_or_arn: &str,
 ) -> &'a BTreeMap<String, DynamoTable> {
     static EMPTY: BTreeMap<String, DynamoTable> = BTreeMap::new();
     accounts
-        .get(owner_account(req, name_or_arn))
+        .regional(owner_account(req, name_or_arn), &req.region)
         .map_or(&EMPTY, |state| &state.tables)
 }
 
-/// Mutable [`tables_of`]. An account that has never held DynamoDB state gets
-/// an empty one, in which the table is then not found.
+/// Mutable [`tables_of`]. An account that has never held DynamoDB state in
+/// the region gets an empty one, in which the table is then not found.
 pub(crate) fn tables_of_mut<'a>(
-    accounts: &'a mut MultiAccountState<DynamoDbState>,
+    accounts: &'a mut MultiRegionState<DynamoDbState>,
     req: &AwsRequest,
     name_or_arn: &str,
 ) -> &'a mut BTreeMap<String, DynamoTable> {
     &mut accounts
-        .get_or_create(owner_account(req, name_or_arn))
+        .regional_mut(owner_account(req, name_or_arn), &req.region)
         .tables
 }
 
@@ -221,7 +223,7 @@ pub(crate) fn single_resource_owner(
 /// AccessDeniedException, never that the table is missing, since authorization
 /// is decided before existence is looked up.
 pub(crate) fn check_foreign_table_exists(
-    accounts: &MultiAccountState<DynamoDbState>,
+    accounts: &MultiRegionState<DynamoDbState>,
     req: &AwsRequest,
     body: &Value,
     owner: &str,
@@ -234,7 +236,7 @@ pub(crate) fn check_foreign_table_exists(
         return Ok(());
     };
     let exists = accounts
-        .get(owner)
+        .regional(owner, &req.region)
         .is_some_and(|s| s.tables.contains_key(super::resolve_table_name(reference)));
     if exists {
         return Ok(());

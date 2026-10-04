@@ -430,7 +430,7 @@ impl ResetState {
             "dynamodb" => {
                 let mut mas = self.dynamodb.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "lambda" => {

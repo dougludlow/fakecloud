@@ -252,6 +252,8 @@ mod tests {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         }
     }
 

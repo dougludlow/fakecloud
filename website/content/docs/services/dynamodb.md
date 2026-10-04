@@ -6,6 +6,17 @@ weight = 6
 
 fakecloud implements **57 of 57** DynamoDB operations at 100% Smithy conformance.
 
+## Regions
+
+Tables are regional. The same table name can exist independently in every region of an account, and `ListTables`, `DescribeTable` and every table-addressed call see only the tables of the region the request is signed for; a table, stream, backup, export or import ARN naming another region is not found. Backups, exports, imports, streams and resource policies live in the region of their table. DynamoDB Streams consumers (Lambda event source mappings, EventBridge Pipes), Step Functions DynamoDB tasks (real DynamoDB calls in the execution's account and region) and CloudFormation-provisioned tables resolve each table in the region its ARN, execution or stack names.
+
+Multi-region tables follow AWS's two global-table versions:
+
+- **Version 2019.11.21**: `UpdateTable` with `ReplicaUpdates` `Create` builds a replica table in the target region (same schema, indexes, billing, stream, TTL and encryption settings, and the current rows; its own ARN, stream ARN, tags and policy). It is an ordinary table of that region, `DescribeTable` on any member lists the others under `Replicas` with `GlobalTableVersion` `2019.11.21`, and `Delete` removes the replica table. Deleting a member table drops it from the set.
+- **Version 2017.11.29**: `CreateGlobalTable` over same-named tables in several regions; the global table is describable and updatable from any region of its replication group, and `ListGlobalTables` honors `RegionName`.
+
+Item writes (single-item, batch, transaction, PartiQL, Step Functions DynamoDB tasks and TTL expiry) to any member replicate synchronously to the others: exactly the rows a write touched are copied, the last write to a row wins, and each replicated change is recorded on the receiving replica's stream. For version 2019.11.21 tables, billing mode and capacity, attribute definitions, global secondary indexes, the stream specification and the TTL setting are kept in step across replicas (`UpdateTable` or `UpdateTimeToLive` on any member); table class, encryption key, deletion protection, tags and resource policy stay per replica. `CreateGlobalTable` does not verify that the member tables exist or are empty.
+
 ## Supported features
 
 - **Tables** — CRUD, attributes, indexes (GSI, LSI), billing modes, tags, resource-based policies on tables and streams (`PutResourcePolicy` / `GetResourcePolicy` / `DeleteResourcePolicy` with `ExpectedRevisionId`, `CreateTable` `ResourcePolicy`)

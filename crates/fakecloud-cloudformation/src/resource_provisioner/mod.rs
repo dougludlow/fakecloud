@@ -11125,7 +11125,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::DynamoDB::Table is updatable");
         let ddb = prov.dynamodb_state.read();
-        let acct = ddb.get("123456789012").unwrap();
+        let acct = ddb.regional("123456789012", "us-east-1").unwrap();
         let table = acct.tables.get("items").unwrap();
         assert_eq!(table.provisioned_throughput.read_capacity_units, 25);
         assert_eq!(table.provisioned_throughput.write_capacity_units, 40);
