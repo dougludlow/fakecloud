@@ -30,7 +30,10 @@ lifecycle, but no real broker container is spawned.
   `CREATION_IN_PROGRESS`, settling to `RUNNING` on the next `DescribeBroker` (an
   interrupted transition reconciles on restart). `creatorRequestId` is honoured
   as the idempotency token. `DescribeBroker` reports the engine, deployment
-  mode, security groups, auto-assigned subnets, encryption options,
+  mode, security groups and subnets (supplied ones must exist in EC2 in one
+  VPC; without any, the broker lands in the default VPC's subnets, one for
+  `SINGLE_INSTANCE` and two for the multi-AZ modes, with the VPC's `default`
+  security group), encryption options,
   maintenance window, logs, current/pending configuration, the derived per-user
   summary, and - once `RUNNING` - the `brokerInstances` list with the broker's
   REAL, connectable endpoints projected from the live backing container's host

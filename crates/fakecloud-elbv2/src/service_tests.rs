@@ -883,3 +883,218 @@ async fn china_region_arns_use_the_aws_cn_partition() {
     .await;
     assert!(body.contains(&tg_arn), "{body}");
 }
+
+// -----------------------------------------------------------------------
+// VPC placement (EC2-backed) and full action config round trip
+// -----------------------------------------------------------------------
+
+fn ec2_state() -> fakecloud_ec2::SharedEc2State {
+    Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ))
+}
+
+fn ec2_svc() -> (Elbv2Service, fakecloud_ec2::SharedEc2State) {
+    let ec2 = ec2_state();
+    (
+        Elbv2Service::new_without_dataplane(Arc::new(RwLock::new(
+            crate::state::Elbv2Accounts::new(),
+        )))
+        .with_ec2_state(ec2.clone()),
+        ec2,
+    )
+}
+
+fn xml_field(body: &str, tag: &str) -> String {
+    body.split(&format!("<{tag}>"))
+        .nth(1)
+        .and_then(|s| s.split(&format!("</{tag}>")).next())
+        .unwrap_or_else(|| panic!("<{tag}> in {body}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn create_lb_derives_vpc_azs_and_default_sg_from_ec2() {
+    let (svc, ec2) = ec2_svc();
+    let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012");
+    let vpc = subnets[0].vpc_id.clone();
+    let default_sg =
+        fakecloud_ec2::vpc_lookup::default_security_group_id(&ec2, "123456789012", &vpc).unwrap();
+    let resp = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "placed"),
+                ("Subnets.member.1", &subnets[0].subnet_id),
+                ("Subnets.member.2", &subnets[1].subnet_id),
+            ],
+        ))
+        .await
+        .unwrap();
+    let body = body_string(&resp);
+    assert_eq!(xml_field(&body, "VpcId"), vpc);
+    assert_eq!(xml_field(&body, "CanonicalHostedZoneId"), "Z35SXDOTRQ7X7K");
+    for s in &subnets[..2] {
+        assert!(body.contains(&format!(
+            "<ZoneName>{}</ZoneName><SubnetId>{}</SubnetId>",
+            s.availability_zone, s.subnet_id
+        )));
+    }
+    assert!(body.contains(&format!(
+        "<SecurityGroups><member>{default_sg}</member></SecurityGroups>"
+    )));
+
+    // An NLB uses its own hosted zone and gets no default security group.
+    let resp = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "net"),
+                ("Type", "network"),
+                ("SubnetMappings.member.1.SubnetId", &subnets[0].subnet_id),
+                ("SubnetMappings.member.1.PrivateIPv4Address", "172.31.0.10"),
+            ],
+        ))
+        .await
+        .unwrap();
+    let body = body_string(&resp);
+    assert_eq!(xml_field(&body, "CanonicalHostedZoneId"), "Z26RNL4JYFTOTI");
+    assert!(body.contains("<SecurityGroups></SecurityGroups>"));
+    assert!(body.contains("<PrivateIPv4Address>172.31.0.10</PrivateIPv4Address>"));
+}
+
+#[tokio::test]
+async fn create_lb_rejects_unknown_subnets_and_security_groups() {
+    let (svc, ec2) = ec2_svc();
+    let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012");
+    let err = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[("Name", "a"), ("Subnets.member.1", "subnet-0000000000dead")],
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "SubnetNotFound");
+    let err = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "b"),
+                ("Subnets.member.1", &subnets[0].subnet_id),
+                ("SecurityGroups.member.1", "sg-0000000000dead"),
+            ],
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidSecurityGroup");
+    let err = svc
+        .handle(req(
+            "CreateLoadBalancer",
+            &[
+                ("Name", "c"),
+                ("Type", "network"),
+                ("SubnetMappings.member.1.SubnetId", &subnets[0].subnet_id),
+                ("SubnetMappings.member.1.PrivateIPv4Address", "10.200.0.1"),
+            ],
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidConfigurationRequest");
+    // Nothing was created by the rejected calls.
+    let body = body_string(&svc.handle(req("DescribeLoadBalancers", &[])).await.unwrap());
+    assert!(!body.contains("<LoadBalancerName>"));
+}
+
+#[tokio::test]
+async fn listener_actions_round_trip_auth_and_stickiness() {
+    let svc = svc();
+    let (lb, tg) = create_lb_and_tg_for_listener_test(&svc).await;
+    let resp = svc
+        .handle(req(
+            "CreateListener",
+            &[
+                ("LoadBalancerArn", &lb),
+                ("Protocol", "HTTPS"),
+                ("Port", "443"),
+                ("Certificates.member.1.CertificateArn", "arn:aws:acm:us-east-1:123456789012:certificate/x"),
+                ("DefaultActions.member.1.Type", "authenticate-oidc"),
+                ("DefaultActions.member.1.Order", "1"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.Issuer", "https://idp.example.com"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.AuthorizationEndpoint", "https://idp.example.com/auth"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.TokenEndpoint", "https://idp.example.com/token"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.UserInfoEndpoint", "https://idp.example.com/userinfo"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.ClientId", "client-1"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.ClientSecret", "s3cret"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.SessionTimeout", "3600"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.AuthenticationRequestExtraParams.entry.1.key", "prompt"),
+                ("DefaultActions.member.1.AuthenticateOidcConfig.AuthenticationRequestExtraParams.entry.1.value", "login"),
+                ("DefaultActions.member.2.Type", "forward"),
+                ("DefaultActions.member.2.Order", "2"),
+                ("DefaultActions.member.2.ForwardConfig.TargetGroups.member.1.TargetGroupArn", &tg),
+                ("DefaultActions.member.2.ForwardConfig.TargetGroupStickinessConfig.Enabled", "true"),
+                ("DefaultActions.member.2.ForwardConfig.TargetGroupStickinessConfig.DurationSeconds", "600"),
+            ],
+        ))
+        .await
+        .unwrap();
+    let listener_arn = xml_field(&body_string(&resp), "ListenerArn");
+    let body = body_string(
+        &svc.handle(req(
+            "DescribeListeners",
+            &[("ListenerArns.member.1", &listener_arn)],
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(body.contains("<Issuer>https://idp.example.com</Issuer>"));
+    assert!(body.contains("<ClientId>client-1</ClientId>"));
+    assert!(body.contains("<SessionTimeout>3600</SessionTimeout>"));
+    assert!(body.contains("<entry><key>prompt</key><value>login</value></entry>"));
+    // AWS never returns the OIDC client secret.
+    assert!(!body.contains("s3cret"));
+    assert!(body.contains(
+        "<TargetGroupStickinessConfig><Enabled>true</Enabled><DurationSeconds>600</DurationSeconds></TargetGroupStickinessConfig>"
+    ));
+
+    // A rule with a Cognito action round-trips too.
+    let resp = svc
+        .handle(req(
+            "CreateRule",
+            &[
+                ("ListenerArn", &listener_arn),
+                ("Priority", "10"),
+                ("Conditions.member.1.Field", "path-pattern"),
+                ("Conditions.member.1.Values.member.1", "/app/*"),
+                ("Actions.member.1.Type", "authenticate-cognito"),
+                ("Actions.member.1.Order", "1"),
+                (
+                    "Actions.member.1.AuthenticateCognitoConfig.UserPoolArn",
+                    "arn:aws:cognito-idp:us-east-1:123456789012:userpool/us-east-1_abc",
+                ),
+                (
+                    "Actions.member.1.AuthenticateCognitoConfig.UserPoolClientId",
+                    "pool-client",
+                ),
+                (
+                    "Actions.member.1.AuthenticateCognitoConfig.UserPoolDomain",
+                    "auth-domain",
+                ),
+                (
+                    "Actions.member.1.AuthenticateCognitoConfig.OnUnauthenticatedRequest",
+                    "deny",
+                ),
+                ("Actions.member.2.Type", "forward"),
+                ("Actions.member.2.Order", "2"),
+                ("Actions.member.2.TargetGroupArn", &tg),
+            ],
+        ))
+        .await
+        .unwrap();
+    let body = body_string(&resp);
+    assert!(body.contains("<UserPoolClientId>pool-client</UserPoolClientId>"));
+    assert!(body.contains("<UserPoolDomain>auth-domain</UserPoolDomain>"));
+    assert!(body.contains("<OnUnauthenticatedRequest>deny</OnUnauthenticatedRequest>"));
+}

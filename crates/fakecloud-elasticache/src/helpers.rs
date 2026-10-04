@@ -728,7 +728,11 @@ pub(crate) fn cache_subnet_group_xml(g: &CacheSubnetGroup, region: &str) -> Stri
         .iter()
         .enumerate()
         .map(|(i, id)| {
-            let az = format!("{}{}", region, (b'a' + (i % 6) as u8) as char);
+            let az = g
+                .subnet_availability_zones
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{}{}", region, (b'a' + (i % 6) as u8) as char));
             format!(
                 "<Subnet>\
                  <SubnetIdentifier>{}</SubnetIdentifier>\

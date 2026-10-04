@@ -43,6 +43,10 @@ impl Elbv2Accounts {
             .or_insert_with(|| Elbv2State::new(account_id))
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut Elbv2State)> {
+        self.accounts.iter_mut()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Elbv2State)> {
         self.accounts.iter()
     }
@@ -243,8 +247,15 @@ pub struct Action {
     pub redirect: Option<RedirectConfig>,
     pub fixed_response: Option<FixedResponseConfig>,
     pub forward: Option<ForwardConfig>,
+    /// `AuthenticateCognitoConfig`, as a JSON object keyed by the API member
+    /// names (`UserPoolArn`, `UserPoolClientId`, ...).
     pub authenticate_cognito: Option<serde_json::Value>,
+    /// `AuthenticateOidcConfig`, as a JSON object keyed by the API member
+    /// names. `ClientSecret` is kept but never returned, as on AWS.
     pub authenticate_oidc: Option<serde_json::Value>,
+    /// `JwtValidationConfig`, as a JSON object keyed by the API member names.
+    #[serde(default)]
+    pub jwt_validation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

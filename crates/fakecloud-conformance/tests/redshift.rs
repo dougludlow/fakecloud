@@ -251,19 +251,23 @@ async fn redshift_parameter_group_crud() {
 #[tokio::test]
 async fn redshift_subnet_group_crud() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let (st, body) = rs_post(
         &server,
         "CreateClusterSubnetGroup",
         &[
             ("ClusterSubnetGroupName", "sg1"),
             ("Description", "d"),
-            ("SubnetIds.member.1", "subnet-1"),
-            ("SubnetIds.member.2", "subnet-2"),
+            ("SubnetIds.member.1", vpc_subnets[0].as_str()),
+            ("SubnetIds.member.2", vpc_subnets[1].as_str()),
         ],
     )
     .await;
     assert_eq!(st, 200, "{body}");
-    assert!(body.contains("<SubnetIdentifier>subnet-1</SubnetIdentifier>"));
+    assert!(body.contains(&format!(
+        "<SubnetIdentifier>{}</SubnetIdentifier>",
+        vpc_subnets[0]
+    )));
     let (_, body) = rs_post(&server, "DescribeClusterSubnetGroups", &[]).await;
     assert!(body.contains("sg1"));
     let (st, body) = rs_post(
@@ -271,12 +275,12 @@ async fn redshift_subnet_group_crud() {
         "ModifyClusterSubnetGroup",
         &[
             ("ClusterSubnetGroupName", "sg1"),
-            ("SubnetIds.member.1", "subnet-9"),
+            ("SubnetIds.member.1", vpc_subnets[2].as_str()),
         ],
     )
     .await;
     assert_eq!(st, 200);
-    assert!(body.contains("subnet-9"));
+    assert!(body.contains(vpc_subnets[2].as_str()));
     let (st, _) = rs_post(
         &server,
         "DeleteClusterSubnetGroup",

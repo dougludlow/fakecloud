@@ -195,6 +195,9 @@ pub struct ElastiCacheService {
     /// memory mode / unit tests, where the RDB falls back to the platform temp
     /// dir (nothing is persisted across a restart in that mode anyway).
     data_dir: Option<std::path::PathBuf>,
+    /// EC2 state: a cache subnet group's subnets resolve there (its `VpcId`
+    /// and per-subnet Availability Zones). `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 mod clusters;
@@ -216,6 +219,7 @@ impl ElastiCacheService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             s3: None,
             data_dir: None,
+            ec2_state: None,
         }
     }
 
@@ -235,6 +239,11 @@ impl ElastiCacheService {
 
     /// Wire the shared S3 state used by `ExportServerlessCacheSnapshot` to
     /// write the exported snapshot artifact into the target bucket.
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
     pub fn with_s3(mut self, s3: SharedS3State) -> Self {
         self.s3 = Some(s3);
         self

@@ -88,11 +88,13 @@ pub struct EfsService {
     state: SharedEfsState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
-    /// Optional handle to EC2 state so a mount target's Availability Zone, VPC,
-    /// and IP address resolve from the real subnet it references. `None` in
+    /// EC2 state: a mount target's subnet and security groups must exist
+    /// there, and its network interface is created there. `None` in
     /// memory-only contexts (unit tests), where the values are synthesized
     /// deterministically from the subnet id instead.
     ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// Persists EC2 after a mount target's network interface changes.
+    ec2_snapshot_hook: Option<fakecloud_persistence::SnapshotHook>,
     /// KMS access, so an encrypted file system created without a `KmsKeyId`
     /// reports the account's real AWS-managed `aws/elasticfilesystem` key.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
@@ -105,6 +107,7 @@ impl EfsService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             ec2_state: None,
+            ec2_snapshot_hook: None,
             kms_hook: None,
         }
     }
@@ -121,6 +124,14 @@ impl EfsService {
 
     pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
         self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    pub fn with_ec2_snapshot_hook(
+        mut self,
+        hook: Option<fakecloud_persistence::SnapshotHook>,
+    ) -> Self {
+        self.ec2_snapshot_hook = hook;
         self
     }
 
@@ -141,21 +152,6 @@ impl EfsService {
                 save_snapshot(&state, Some(store), &lock).await;
             })
         }))
-    }
-
-    /// Resolve a subnet's `(availability_zone, availability_zone_id, vpc_id)`
-    /// from EC2 state when the subnet is real. Returns `None` when EC2 state is
-    /// not wired or the subnet does not exist, so the caller falls back to
-    /// deterministic synthesis.
-    fn resolve_subnet(&self, account: &str, subnet_id: &str) -> Option<(String, String, String)> {
-        let ec2 = self.ec2_state.as_ref()?;
-        let guard = ec2.read();
-        let subnet = guard.get(account)?.subnets.get(subnet_id)?;
-        Some((
-            subnet.availability_zone.clone(),
-            subnet.availability_zone_id.clone(),
-            subnet.vpc_id.clone(),
-        ))
     }
 
     async fn save(&self) {
@@ -293,6 +289,16 @@ impl AwsService for EfsService {
             && matches!(result.as_ref(), Ok(resp) if resp.status.is_success())
         {
             self.save().await;
+            // Mount targets create, re-group and delete their network
+            // interface in EC2.
+            if matches!(
+                action,
+                "CreateMountTarget" | "DeleteMountTarget" | "ModifyMountTargetSecurityGroups"
+            ) {
+                if let Some(hook) = &self.ec2_snapshot_hook {
+                    hook().await;
+                }
+            }
         }
         result
     }
@@ -426,14 +432,6 @@ fn ap_not_found(id: &str) -> AwsServiceError {
         StatusCode::NOT_FOUND,
         "AccessPointNotFound",
         format!("Access point '{id}' does not exist."),
-    )
-}
-
-fn subnet_not_found(id: &str) -> AwsServiceError {
-    AwsServiceError::aws_error(
-        StatusCode::BAD_REQUEST,
-        "SubnetNotFound",
-        format!("The subnet ID '{id}' is invalid or does not exist."),
     )
 }
 
@@ -977,21 +975,42 @@ impl EfsService {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        // Resolve the subnet's real Availability Zone / VPC from EC2 state when
-        // available (so a mount target on a Terraform-created subnet reports the
-        // true AZ and the one-per-AZ rule is exact); otherwise synthesize
-        // deterministically from the subnet id.
+        let requested_groups: Vec<String> = b
+            .get("SecurityGroups")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let requested_ip = b.get("IpAddress").and_then(Value::as_str);
+        // With EC2 wired the subnet and security groups must be real (as on
+        // AWS) and the mount target's AZ / VPC come from the subnet. Only an
+        // EC2-less context (unit tests) synthesizes them from the subnet id.
         let h = hash_str(&subnet_id);
-        let (az_name, az_id, vpc_id) = match self.resolve_subnet(&ctx.account, &subnet_id) {
-            Some((az, azid, vpc)) => (az, azid, vpc),
+        let placement = match &self.ec2_state {
+            Some(ec2) => {
+                let subnet = crate::network::resolve_subnet(ec2, &ctx.account, &subnet_id)
+                    .map_err(|e| e.to_aws())?;
+                let groups = crate::network::resolve_security_groups(
+                    ec2,
+                    &ctx.account,
+                    &subnet.vpc_id,
+                    &requested_groups,
+                )
+                .map_err(|e| e.to_aws())?;
+                Some((subnet, groups))
+            }
+            None => None,
+        };
+        let (az_name, az_id, vpc_id) = match &placement {
+            Some((subnet, _)) => (
+                subnet.availability_zone.clone(),
+                subnet.availability_zone_id.clone(),
+                subnet.vpc_id.clone(),
+            ),
             None => {
-                // EC2 state wired but the subnet did not resolve -> the subnet
-                // genuinely does not exist, which real EFS rejects with
-                // `SubnetNotFound`. Only synthesize an AZ/VPC/IP when there is
-                // no EC2 subsystem to validate the subnet against at all.
-                if self.ec2_state.is_some() {
-                    return Err(subnet_not_found(&subnet_id));
-                }
                 let az_index = (h % 3) as u8;
                 (
                     format!("{}{}", ctx.region, (b'a' + az_index) as char),
@@ -1031,22 +1050,36 @@ impl EfsService {
         }
 
         let mtid = format!("fsmt-{}", hex17());
-        let ip = b
-            .get("IpAddress")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("10.0.{}.{}", (h >> 8) % 256, h % 254 + 1));
-        let eni_id = format!("eni-{}", hex17());
-        let security_groups: Vec<String> = b
-            .get("SecurityGroups")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .filter(|v: &Vec<String>| !v.is_empty())
-            .unwrap_or_else(|| vec![format!("sg-{:017x}", h & 0x000f_ffff_ffff_ffff)]);
+        let (ip, eni_id, security_groups) = match (&self.ec2_state, placement) {
+            (Some(ec2), Some((subnet, groups))) => {
+                let net = crate::network::create_mount_target_eni(
+                    ec2,
+                    &ctx.account,
+                    &fsid,
+                    &mtid,
+                    &subnet,
+                    groups,
+                    requested_ip,
+                )
+                .map_err(|e| e.to_aws())?;
+                (
+                    net.ip_address,
+                    net.network_interface_id,
+                    net.security_groups,
+                )
+            }
+            _ => (
+                requested_ip
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("10.0.{}.{}", (h >> 8) % 256, h % 254 + 1)),
+                format!("eni-{}", hex17()),
+                if requested_groups.is_empty() {
+                    vec![format!("sg-{:017x}", h & 0x000f_ffff_ffff_ffff)]
+                } else {
+                    requested_groups
+                },
+            ),
+        };
 
         let mut mt = Map::new();
         mt.insert("OwnerId".into(), json!(ctx.account));
@@ -1143,10 +1176,17 @@ impl EfsService {
     fn delete_mount_target(&self, ctx: &Ctx, label: &str) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = self.account(&mut guard, ctx);
-        if data.mount_targets.remove(label).is_none() {
+        let Some(mt) = data.mount_targets.remove(label) else {
             return Err(mt_not_found(label));
-        }
+        };
         data.mount_target_security_groups.remove(label);
+        drop(guard);
+        if let (Some(ec2), Some(eni)) = (
+            &self.ec2_state,
+            mt.get("NetworkInterfaceId").and_then(Value::as_str),
+        ) {
+            crate::network::delete_mount_target_eni(ec2, &ctx.account, eni);
+        }
         empty(StatusCode::NO_CONTENT)
     }
 
@@ -1177,10 +1217,14 @@ impl EfsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = self.account(&mut guard, ctx);
-        if !data.mount_targets.contains_key(label) {
+        let Some(mt) = data.mount_targets.get(label) else {
             return Err(mt_not_found(label));
-        }
-        let sgs: Vec<String> = b
+        };
+        let eni_id = mt
+            .get("NetworkInterfaceId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut sgs: Vec<String> = b
             .get("SecurityGroups")
             .and_then(Value::as_array)
             .map(|a| {
@@ -1189,6 +1233,13 @@ impl EfsService {
                     .collect()
             })
             .unwrap_or_default();
+        if let (Some(ec2), Some(eni)) = (&self.ec2_state, eni_id.as_deref()) {
+            if let Some(vpc_id) = crate::network::eni_vpc_id(ec2, &ctx.account, eni) {
+                sgs = crate::network::resolve_security_groups(ec2, &ctx.account, &vpc_id, &sgs)
+                    .map_err(|e| e.to_aws())?;
+            }
+            crate::network::set_mount_target_eni_groups(ec2, &ctx.account, eni, &sgs);
+        }
         data.mount_target_security_groups
             .insert(label.to_string(), sgs);
         empty(StatusCode::NO_CONTENT)
@@ -2206,6 +2257,111 @@ mod tests {
             .unwrap();
         assert_eq!(err.code(), "SubnetNotFound");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn body_json(resp: AwsResponse) -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    /// A default subnet of the account and its VPC's default security group.
+    fn default_subnet(ec2: &fakecloud_ec2::SharedEc2State) -> (String, String, String, String) {
+        let sub = fakecloud_ec2::vpc_lookup::default_vpc_subnets(ec2, "000000000000").remove(0);
+        let sg =
+            fakecloud_ec2::vpc_lookup::default_security_group_id(ec2, "000000000000", &sub.vpc_id)
+                .unwrap();
+        (sub.subnet_id, sub.vpc_id, sub.cidr_block, sg)
+    }
+
+    #[test]
+    fn create_mount_target_creates_requester_managed_eni_in_subnet() {
+        let ec2 = empty_ec2();
+        let (subnet, vpc, cidr, default_sg) = default_subnet(&ec2);
+        let s = svc().with_ec2_state(ec2.clone());
+        seed_fs(&s, "fs-1", "available");
+        let mt = body_json(
+            s.create_mount_target(
+                &ctx(),
+                &json!({ "FileSystemId": "fs-1", "SubnetId": subnet }),
+            )
+            .unwrap(),
+        );
+        let mtid = mt["MountTargetId"].as_str().unwrap().to_string();
+        let eni_id = mt["NetworkInterfaceId"].as_str().unwrap().to_string();
+        let ip = mt["IpAddress"].as_str().unwrap().to_string();
+        assert_eq!(mt["VpcId"], vpc.as_str());
+        assert!(
+            fakecloud_ec2::vpc_lookup::ip_in_cidr(&ip, &cidr),
+            "{ip} in {cidr}"
+        );
+        {
+            let g = ec2.read();
+            let eni = &g.get("000000000000").unwrap().network_interfaces[&eni_id];
+            assert!(eni.requester_managed);
+            assert_eq!(eni.subnet_id, subnet);
+            assert_eq!(eni.private_ip_address, ip);
+            assert_eq!(eni.group_ids, vec![default_sg.clone()]);
+            assert_eq!(
+                eni.description,
+                format!("EFS mount target for fs-1 ({mtid})")
+            );
+        }
+        // Security groups default to the VPC's default group.
+        let sgs = s
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .mount_target_security_groups[&mtid]
+            .clone();
+        assert_eq!(sgs, vec![default_sg]);
+
+        // Unknown replacement groups are rejected; real ones reach the ENI.
+        let err = s
+            .modify_mt_security_groups(&ctx(), &mtid, &json!({ "SecurityGroups": ["sg-nope"] }))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "SecurityGroupNotFound");
+
+        // Deleting the mount target deletes its ENI.
+        s.delete_mount_target(&ctx(), &mtid).unwrap();
+        assert!(!ec2
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .network_interfaces
+            .contains_key(&eni_id));
+    }
+
+    #[test]
+    fn create_mount_target_validates_security_groups_and_ip() {
+        let ec2 = empty_ec2();
+        let (subnet, _, _, _) = default_subnet(&ec2);
+        let s = svc().with_ec2_state(ec2.clone());
+        seed_fs(&s, "fs-1", "available");
+        let err = s
+            .create_mount_target(
+                &ctx(),
+                &json!({ "FileSystemId": "fs-1", "SubnetId": subnet, "SecurityGroups": ["sg-0bad"] }),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "SecurityGroupNotFound");
+        let err = s
+            .create_mount_target(
+                &ctx(),
+                &json!({ "FileSystemId": "fs-1", "SubnetId": subnet, "IpAddress": "10.99.0.5" }),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "BadRequest");
+        // Nothing leaked into EC2 from the rejected calls.
+        assert!(ec2
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .network_interfaces
+            .values()
+            .all(|e| !e.requester_managed));
     }
 
     // Without EC2 state wired, the deterministic-synthesis fallback still

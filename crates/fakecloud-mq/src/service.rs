@@ -89,6 +89,9 @@ pub struct MqService {
     /// present, the runtime owns the CREATION/REBOOT/DELETION transitions and
     /// a broker is only `RUNNING` once its container accepts connections.
     runtime: Option<Arc<MqRuntime>>,
+    /// EC2 state: a broker's subnets and security groups resolve there.
+    /// `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 impl MqService {
@@ -98,7 +101,13 @@ impl MqService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             runtime: None,
+            ec2_state: None,
         }
+    }
+
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -657,6 +666,15 @@ pub(crate) fn gather_spec(data: &MqData, id: &str) -> Option<BrokerSpec> {
 
 impl MqService {
     fn create_broker(&self, ctx: &Ctx, b: &Value) -> Result<AwsResponse, AwsServiceError> {
+        let resolved;
+        let b = match &self.ec2_state {
+            Some(ec2) => {
+                resolved = shared::resolve_broker_network(ec2, &ctx.account, b)
+                    .map_err(|m| bad_request(&m))?;
+                &resolved
+            }
+            None => b,
+        };
         let name = b
             .get("brokerName")
             .and_then(Value::as_str)

@@ -7,13 +7,14 @@ use helpers::TestServer;
 #[tokio::test]
 async fn elasticache_create_cache_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let response = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("test-subnet-group")
         .cache_subnet_group_description("Test subnet group")
-        .subnet_ids("subnet-abc123")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -30,13 +31,14 @@ async fn elasticache_create_cache_subnet_group() {
 #[tokio::test]
 async fn elasticache_delete_cache_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("to-delete")
         .cache_subnet_group_description("Will be deleted")
-        .subnet_ids("subnet-abc123")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -68,13 +70,14 @@ async fn elasticache_describe_cache_subnet_groups() {
 #[tokio::test]
 async fn elasticache_modify_cache_subnet_group() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("to-modify")
         .cache_subnet_group_description("Original description")
-        .subnet_ids("subnet-abc123")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -493,13 +496,14 @@ async fn elasticache_delete_cache_cluster() {
 #[tokio::test]
 async fn elasticache_add_tags_to_resource() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("tag-test-group")
         .cache_subnet_group_description("For tag test")
-        .subnet_ids("subnet-abc123")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -532,13 +536,14 @@ async fn elasticache_add_tags_to_resource() {
 #[tokio::test]
 async fn elasticache_list_tags_for_resource() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("list-tag-group")
         .cache_subnet_group_description("For list tag test")
-        .subnet_ids("subnet-abc123")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -584,13 +589,14 @@ async fn elasticache_list_tags_for_resource() {
 #[tokio::test]
 async fn elasticache_remove_tags_from_resource() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("remove-tag-group")
         .cache_subnet_group_description("For remove tag test")
-        .subnet_ids("subnet-abc123")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -1009,6 +1015,7 @@ async fn elasticache_test_failover() {
 #[tokio::test]
 async fn elasticache_create_serverless_cache() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let response = client
@@ -1017,7 +1024,7 @@ async fn elasticache_create_serverless_cache() {
         .engine("redis")
         .description("Serverless cache")
         .security_group_ids("sg-123")
-        .subnet_ids("subnet-123")
+        .subnet_ids(&vpc_subnets[0])
         .snapshot_retention_limit(7)
         .daily_snapshot_time("04:00")
         .send()

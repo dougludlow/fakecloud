@@ -177,6 +177,10 @@ pub struct PodIdentityAssociation {
     /// Generated for the target role's trust policy when `targetRoleArn` is set.
     pub external_id: Option<String>,
     pub tags: TagMap,
+    /// The add-on that manages this association (`ownerArn`), when an add-on's
+    /// `podIdentityAssociations` created it.
+    #[serde(default)]
+    pub owner_arn: Option<String>,
 }
 
 /// A Fargate profile, a sub-resource of a cluster.

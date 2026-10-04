@@ -40,7 +40,13 @@ impl ResourceProvisioner {
         // uses, so a CFN-created broker is byte-for-byte identical (users,
         // synthesized subnets, auto-configuration, logs, encryption, tags) --
         // the two paths cannot diverge (#1766).
-        let body = cfn_broker_body(props, &name);
+        // The broker's subnets and security groups resolve against EC2,
+        // exactly as the direct CreateBroker does.
+        let body = mq_shared::resolve_broker_network(
+            &self.ec2_state,
+            &self.account_id,
+            &cfn_broker_body(props, &name),
+        )?;
         let engine = body
             .get("engineType")
             .and_then(Value::as_str)

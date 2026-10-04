@@ -364,8 +364,28 @@ fn snapshot_schedule_association_visible_on_describe() {
 }
 
 #[test]
-fn endpoint_access_inherits_default_sg_and_vpc_endpoint() {
-    let svc = service();
+fn endpoint_access_creates_vpc_endpoint_in_subnet_group_subnets() {
+    let ec2: fakecloud_ec2::SharedEc2State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012");
+    let vpc = subnets[0].vpc_id.clone();
+    let default_sg =
+        fakecloud_ec2::vpc_lookup::default_security_group_id(&ec2, "123456789012", &vpc).unwrap();
+    let svc = service().with_ec2_state(ec2.clone());
+    let group = ok(
+        &svc,
+        "CreateClusterSubnetGroup",
+        &[
+            ("ClusterSubnetGroupName", "sg"),
+            ("Description", "d"),
+            ("SubnetIds.member.1", &subnets[0].subnet_id),
+            ("SubnetIds.member.2", &subnets[1].subnet_id),
+        ],
+    );
+    // The group reports the subnets' real VPC and zones.
+    assert!(group.contains(&format!("<VpcId>{vpc}</VpcId>")));
+    assert!(group.contains(&format!("<Name>{}</Name>", subnets[1].availability_zone)));
     ok(
         &svc,
         "CreateCluster",
@@ -374,6 +394,7 @@ fn endpoint_access_inherits_default_sg_and_vpc_endpoint() {
             ("NodeType", "ra3.xlplus"),
             ("MasterUsername", "admin"),
             ("MasterUserPassword", "Passw0rd123"),
+            ("ClusterSubnetGroupName", "sg"),
         ],
     );
     let created = ok(
@@ -386,15 +407,64 @@ fn endpoint_access_inherits_default_sg_and_vpc_endpoint() {
         ],
     );
     assert!(created.contains("<EndpointStatus>active</EndpointStatus>"));
-    // No SG supplied -> a default one is attached so the resource is non-empty.
-    assert!(created.contains("<VpcSecurityGroupId>"));
-    // A well-formed interface VPC endpoint is surfaced.
-    assert!(created.contains("<VpcEndpoint><VpcEndpointId>vpce-"));
+    // No SG supplied -> the VPC's default group is attached.
+    assert!(created.contains(&format!(
+        "<VpcSecurityGroupId>{default_sg}</VpcSecurityGroupId>"
+    )));
+    let vpce = created
+        .split("<VpcEndpointId>")
+        .nth(1)
+        .and_then(|s| s.split("</VpcEndpointId>").next())
+        .unwrap()
+        .to_string();
+    assert!(created.contains(&format!("<VpcId>{vpc}</VpcId>")));
+    {
+        let accounts = ec2.read();
+        let state = accounts.get("123456789012").unwrap();
+        assert!(state.vpc_endpoints.contains_key(&vpce));
+        let enis: Vec<_> = state
+            .network_interfaces
+            .values()
+            .filter(|e| e.description == format!("VPC Endpoint Interface {vpce}"))
+            .collect();
+        assert_eq!(enis.len(), 2);
+        assert!(enis.iter().all(|e| e.group_ids == vec![default_sg.clone()]));
+    }
     // DescribeEndpointAccess filters by EndpointName (provider asserts single).
     let one = ok(&svc, "DescribeEndpointAccess", &[("EndpointName", "ep")]);
     assert!(one.contains("<EndpointName>ep</EndpointName>"));
     let none = ok(&svc, "DescribeEndpointAccess", &[("EndpointName", "other")]);
     assert!(!none.contains("<EndpointName>ep</EndpointName>"));
+
+    // Deleting the endpoint removes its EC2 resources.
+    ok(&svc, "DeleteEndpointAccess", &[("EndpointName", "ep")]);
+    let accounts = ec2.read();
+    let state = accounts.get("123456789012").unwrap();
+    assert!(!state.vpc_endpoints.contains_key(&vpce));
+    assert!(state
+        .network_interfaces
+        .values()
+        .all(|e| !e.description.contains(&vpce)));
+}
+
+#[test]
+fn cluster_subnet_group_rejects_unknown_subnets() {
+    let ec2: fakecloud_ec2::SharedEc2State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let svc = service().with_ec2_state(ec2);
+    let err = svc
+        .dispatch(&req(
+            "CreateClusterSubnetGroup",
+            &[
+                ("ClusterSubnetGroupName", "bad"),
+                ("Description", "d"),
+                ("SubnetIds.member.1", "subnet-0000000000dead"),
+            ],
+        ))
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidSubnet");
 }
 
 #[test]

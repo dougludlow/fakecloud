@@ -548,14 +548,15 @@ async fn persistence_round_trip_parameter_group() {
 async fn persistence_round_trip_subnet_group() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("persist-subnet-grp")
         .db_subnet_group_description("Persistence test subnet group")
-        .subnet_ids("subnet-aaa")
-        .subnet_ids("subnet-bbb")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -583,8 +584,8 @@ async fn persistence_round_trip_subnet_group() {
         .iter()
         .filter_map(|s| s.subnet_identifier())
         .collect();
-    assert!(subnet_ids.contains(&"subnet-aaa"));
-    assert!(subnet_ids.contains(&"subnet-bbb"));
+    assert!(subnet_ids.contains(&vpc_subnets[0].as_str()));
+    assert!(subnet_ids.contains(&vpc_subnets[1].as_str()));
 }
 
 /// Deletion survives a restart: a deleted parameter group does not reappear.

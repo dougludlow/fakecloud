@@ -52,6 +52,10 @@ pub struct CacheSubnetGroup {
     pub vpc_id: String,
     pub subnet_ids: Vec<String>,
     pub arn: String,
+    /// Availability Zone of each subnet (parallel to `subnet_ids`), resolved
+    /// from EC2. Empty for groups persisted before zones were tracked.
+    #[serde(default)]
+    pub subnet_availability_zones: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1283,6 +1287,7 @@ fn default_subnet_groups(account_id: &str, region: &str) -> BTreeMap<String, Cac
         vpc_id: "vpc-00000000".to_string(),
         subnet_ids: vec!["subnet-00000000".to_string()],
         arn: elasticache_arn(region, account_id, "subnetgroup", "default"),
+        subnet_availability_zones: Vec::new(),
     };
     let mut map = BTreeMap::new();
     map.insert("default".to_string(), default_group);

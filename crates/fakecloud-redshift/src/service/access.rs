@@ -27,21 +27,35 @@ fn render_endpoint(e: &EndpointAccess) -> String {
             )
         })
         .collect();
-    // Redshift provisions an interface VPC endpoint (with an ENI per subnet)
-    // for every managed endpoint; surface a well-formed one so the Terraform
-    // resource's computed `vpc_endpoint` block is populated.
-    let token: String = e
-        .endpoint_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(12)
-        .collect();
-    let vpc_endpoint = format!(
-        "<VpcEndpoint><VpcEndpointId>vpce-{token}</VpcEndpointId><VpcId>vpc-fakecloud</VpcId>\
-         <NetworkInterfaces><NetworkInterface><NetworkInterfaceId>eni-{token}</NetworkInterfaceId>\
-         <SubnetId>subnet-fakecloud</SubnetId><PrivateIpAddress>10.0.0.10</PrivateIpAddress>\
-         <AvailabilityZone>us-east-1a</AvailabilityZone></NetworkInterface></NetworkInterfaces></VpcEndpoint>",
-    );
+    // Redshift provisions an interface VPC endpoint (with an ENI per subnet
+    // of the endpoint's subnet group); report the one created in EC2.
+    let vpc_endpoint = e
+        .vpc_endpoint
+        .as_ref()
+        .map(|v| {
+            let enis: String = v
+                .interfaces
+                .iter()
+                .map(|i| {
+                    format!(
+                        "<NetworkInterface><NetworkInterfaceId>{}</NetworkInterfaceId>\
+                         <SubnetId>{}</SubnetId><PrivateIpAddress>{}</PrivateIpAddress>\
+                         <AvailabilityZone>{}</AvailabilityZone></NetworkInterface>",
+                        xml_escape(&i.network_interface_id),
+                        xml_escape(&i.subnet_id),
+                        xml_escape(&i.private_ip_address),
+                        xml_escape(&i.availability_zone),
+                    )
+                })
+                .collect();
+            format!(
+                "<VpcEndpoint><VpcEndpointId>{}</VpcEndpointId><VpcId>{}</VpcId>\
+                 <NetworkInterfaces>{enis}</NetworkInterfaces></VpcEndpoint>",
+                xml_escape(&v.vpc_endpoint_id),
+                xml_escape(&v.vpc_id),
+            )
+        })
+        .unwrap_or_default();
     format!(
         "<EndpointName>{name}</EndpointName><ClusterIdentifier>{cluster}</ClusterIdentifier>\
          <SubnetGroupName>{subnet}</SubnetGroupName><EndpointStatus>{status}</EndpointStatus>\
@@ -347,39 +361,108 @@ impl RedshiftService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = param(req, "EndpointName").unwrap_or_default();
-        let mut guard = self.state.write();
-        let acct = guard.account(&req.account_id);
-        if acct.endpoint_access.contains_key(&name) {
-            return Err(endpoint_already_exists(&name));
-        }
-        let token = &fakecloud_core::ids::short_id(12);
         let cluster_id = param(req, "ClusterIdentifier").unwrap_or_default();
+        let subnet_group_name = param(req, "SubnetGroupName").unwrap_or_default();
         // When the caller supplies no security groups, Redshift attaches the
         // cluster's effective VPC security groups (the VPC default group when
         // the cluster itself has none), so the endpoint always reports at least
-        // one — mirror that so the resource's `vpc_security_group_ids` is set.
+        // one, as the resource's `vpc_security_group_ids` expects.
         let mut vpc_security_group_ids =
             member_list(req, "VpcSecurityGroupIds", "VpcSecurityGroupId");
-        if vpc_security_group_ids.is_empty() {
-            vpc_security_group_ids = acct
-                .clusters
-                .get(&cluster_id)
-                .map(|c| c.vpc_security_group_ids.clone())
-                .unwrap_or_default();
-            if vpc_security_group_ids.is_empty() {
-                vpc_security_group_ids = vec!["sg-fakecloud0default".to_string()];
+        let (subnet_ids, group_vpc, cluster_groups) = {
+            let guard = self.state.read();
+            let acct = guard.accounts.get(&req.account_id);
+            if acct.is_some_and(|a| a.endpoint_access.contains_key(&name)) {
+                return Err(endpoint_already_exists(&name));
             }
+            let group = acct.and_then(|a| a.subnet_groups.get(&subnet_group_name));
+            (
+                group
+                    .map(|g| {
+                        g.subnets
+                            .iter()
+                            .map(|s| s.subnet_identifier.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                group.map(|g| g.vpc_id.clone()).unwrap_or_default(),
+                acct.and_then(|a| a.clusters.get(&cluster_id))
+                    .map(|c| c.vpc_security_group_ids.clone())
+                    .unwrap_or_default(),
+            )
+        };
+        if vpc_security_group_ids.is_empty() {
+            vpc_security_group_ids = cluster_groups;
         }
+        // The endpoint's interface VPC endpoint and its network interfaces
+        // are real EC2 resources in the subnet group's subnets.
+        let vpc_endpoint = match &self.ec2_state {
+            Some(ec2) if !subnet_ids.is_empty() => {
+                let subnets = fakecloud_ec2::vpc_lookup::resolve_subnets(
+                    ec2,
+                    &req.account_id,
+                    &subnet_ids,
+                )
+                .map_err(|id| {
+                    AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        format!("The subnet '{id}' of subnet group '{subnet_group_name}' does not exist."),
+                    )
+                })?;
+                if vpc_security_group_ids.is_empty() {
+                    vpc_security_group_ids.extend(
+                        fakecloud_ec2::vpc_lookup::default_security_group_id(
+                            ec2,
+                            &req.account_id,
+                            &group_vpc,
+                        ),
+                    );
+                }
+                let mut accounts = ec2.write();
+                let state = accounts.get_or_create(&req.account_id);
+                let created = fakecloud_ec2::vpc_lookup::create_service_endpoint(
+                    state,
+                    &group_vpc,
+                    &format!("com.amazonaws.{}.redshift", req.region),
+                    &subnets,
+                    &vpc_security_group_ids,
+                )
+                .map_err(|e| {
+                    AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        format!("Could not place the endpoint in its subnets: {e:?}"),
+                    )
+                })?;
+                Some(created)
+            }
+            _ => None,
+        };
+        let mut guard = self.state.write();
+        let acct = guard.account(&req.account_id);
+        if acct.endpoint_access.contains_key(&name) {
+            if let (Some(ec2), Some(v)) = (&self.ec2_state, &vpc_endpoint) {
+                let mut accounts = ec2.write();
+                fakecloud_ec2::vpc_lookup::delete_service_endpoint(
+                    accounts.get_or_create(&req.account_id),
+                    v,
+                );
+            }
+            return Err(endpoint_already_exists(&name));
+        }
+        let token = &fakecloud_core::ids::short_id(12);
         let e = EndpointAccess {
             endpoint_name: name.clone(),
             cluster_identifier: cluster_id,
-            subnet_group_name: param(req, "SubnetGroupName").unwrap_or_default(),
+            subnet_group_name,
             endpoint_status: "active".to_string(),
             endpoint_create_time: Utc::now(),
             resource_owner: param(req, "ResourceOwner").unwrap_or_else(|| req.account_id.clone()),
             port: 5439,
             address: format!("{name}-{token}.{}.redshift.amazonaws.com", req.region),
             vpc_security_group_ids,
+            vpc_endpoint,
         };
         acct.endpoint_access.insert(name, e.clone());
         Ok(xml_resp(
@@ -464,6 +547,14 @@ impl RedshiftService {
             .endpoint_access
             .remove(&name)
             .ok_or_else(|| endpoint_not_found(&name))?;
+        drop(guard);
+        if let (Some(ec2), Some(v)) = (&self.ec2_state, &e.vpc_endpoint) {
+            let mut accounts = ec2.write();
+            fakecloud_ec2::vpc_lookup::delete_service_endpoint(
+                accounts.get_or_create(&req.account_id),
+                v,
+            );
+        }
         Ok(xml_resp(
             "DeleteEndpointAccess",
             render_endpoint(&e),

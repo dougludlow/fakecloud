@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod service;
 pub mod service_helpers;
 pub mod state;
+pub mod vpc_lookup;
 
 pub use runtime::Ec2Runtime;
 pub use service::quota::Ec2QuotaUsage;

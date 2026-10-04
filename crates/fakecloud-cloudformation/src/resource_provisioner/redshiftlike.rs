@@ -91,7 +91,8 @@ impl ResourceProvisioner {
     /// so an encrypted stack cluster reports the same AWS-managed key the
     /// direct API does.
     fn redshift_service(&self) -> fakecloud_redshift::RedshiftService {
-        let svc = fakecloud_redshift::RedshiftService::new(self.redshift_state.clone());
+        let svc = fakecloud_redshift::RedshiftService::new(self.redshift_state.clone())
+            .with_ec2_state(self.ec2_state.clone());
         match &self.kms_hook {
             Some(hook) => svc.with_kms_hook(hook.clone()),
             None => svc,
@@ -102,7 +103,8 @@ impl ResourceProvisioner {
     /// hook so an encrypted stack cluster reports the same key the direct API
     /// does.
     fn docdb_service(&self) -> fakecloud_docdb::DocDbService {
-        let svc = fakecloud_docdb::DocDbService::new(self.docdb_state.clone());
+        let svc = fakecloud_docdb::DocDbService::new(self.docdb_state.clone())
+            .with_ec2_state(self.ec2_state.clone());
         match &self.kms_hook {
             Some(hook) => svc.with_kms_hook(hook.clone()),
             None => svc,
@@ -112,7 +114,8 @@ impl ResourceProvisioner {
     /// The Neptune handlers over the shared state, with the server's KMS hook
     /// (see [`Self::docdb_service`]).
     fn neptune_service(&self) -> fakecloud_neptune::NeptuneService {
-        let svc = fakecloud_neptune::NeptuneService::new(self.neptune_state.clone());
+        let svc = fakecloud_neptune::NeptuneService::new(self.neptune_state.clone())
+            .with_ec2_state(self.ec2_state.clone());
         match &self.kms_hook {
             Some(hook) => svc.with_kms_hook(hook.clone()),
             None => svc,

@@ -38,7 +38,7 @@ fn eni_xml(n: &NetworkInterface, tags: &[Tag], owner: &str) -> String {
         .map(|a| format!("<attachment>{}</attachment>", attachment_inner(a)))
         .unwrap_or_default();
     format!(
-        "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
         ec2_elem("networkInterfaceId", &n.network_interface_id),
         ec2_elem("subnetId", &n.subnet_id),
         ec2_elem("vpcId", &n.vpc_id),
@@ -56,6 +56,10 @@ fn eni_xml(n: &NetworkInterface, tags: &[Tag], owner: &str) -> String {
         format_args!("<sourceDestCheck>{}</sourceDestCheck>", n.source_dest_check),
         ec2_elem("status", &n.status),
         ec2_elem("interfaceType", &n.interface_type),
+        format_args!(
+            "<requesterManaged>{}</requesterManaged>",
+            n.requester_managed
+        ),
         ec2_list("groupSet", &groups),
         ec2_list("privateIpAddressesSet", &priv_ips),
         format_args!("{}{}", ec2_list("ipv6AddressesSet", &ipv6), attachment),
@@ -150,6 +154,7 @@ pub(crate) fn create_network_interface(
         ipv6_addresses: Vec::new(),
         attachment: None,
         public_ip_dns_hostname_type: None,
+        requester_managed: false,
     };
     let owner = req.account_id.clone();
     let tags = {
@@ -185,9 +190,21 @@ pub(crate) fn delete_network_interface(
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if state.network_interfaces.remove(&id).is_none() {
-            return Err(eni_not_found(&id));
+        match state.network_interfaces.get(&id) {
+            None => return Err(eni_not_found(&id)),
+            // An interface another service placed in the subnet (an EFS
+            // mount target's, for example) stays until that service removes
+            // it; AWS refuses the delete as the interface is in use.
+            Some(eni) if eni.requester_managed => {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "InvalidParameterValue",
+                    format!("Network interface '{id}' is currently in use."),
+                ));
+            }
+            Some(_) => {}
         }
+        state.network_interfaces.remove(&id);
         state.tags.remove(&id);
     }
     Ok(Ec2Service::respond(
@@ -820,6 +837,7 @@ mod tests {
                     ipv6_addresses: vec![],
                     attachment: None,
                     public_ip_dns_hostname_type: None,
+                    requester_managed: false,
                 },
             );
         }
@@ -864,6 +882,7 @@ mod tests {
                 ipv6_addresses: vec![],
                 attachment: None,
                 public_ip_dns_hostname_type: None,
+                requester_managed: false,
             },
         );
     }
@@ -1057,6 +1076,7 @@ mod tests {
                         delete_on_termination: false,
                     }),
                     public_ip_dns_hostname_type: None,
+                    requester_managed: false,
                 },
             );
         }

@@ -3119,3 +3119,284 @@ async fn restore_recreates_security_group_for_clusters_saved_without_one() {
     let state = accounts.get("111122223333").unwrap();
     assert!(!state.security_groups.contains_key(&sg_id));
 }
+
+// -----------------------------------------------------------------------
+// Node group Auto Scaling groups, add-on pod identities, version/config merges
+// -----------------------------------------------------------------------
+
+fn body_of(resp: AwsResponse) -> Value {
+    serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn nodegroup_creates_resizes_and_deletes_its_auto_scaling_group() {
+    let ec2 = make_ec2_state();
+    let (subnet_id, _) = ec2_subnet(&ec2);
+    let asg: fakecloud_autoscaling::SharedAutoScalingState = Arc::new(RwLock::new(
+        fakecloud_autoscaling::AutoScalingAccounts::new(),
+    ));
+    let svc = EksService::new(make_state())
+        .with_ec2_state(ec2.clone())
+        .with_autoscaling_state(asg.clone());
+    create_cluster(&svc, "c1").await;
+    let mut body: Value = serde_json::from_str(&nodegroup_body("ng1")).unwrap();
+    body["subnets"] = json!([subnet_id]);
+    let v = body_of(
+        svc.handle(make_request(
+            Method::POST,
+            "/clusters/c1/node-groups",
+            &body.to_string(),
+        ))
+        .await
+        .unwrap(),
+    );
+    let asg_name = v["nodegroup"]["resources"]["autoScalingGroups"][0]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let g = asg.read();
+        let group = &g.accounts["111122223333"].groups[&asg_name];
+        assert_eq!(
+            (group.min_size, group.max_size, group.desired_capacity),
+            (1, 3, 2)
+        );
+        assert_eq!(
+            group.vpc_zone_identifier.as_deref(),
+            Some(subnet_id.as_str())
+        );
+        assert_eq!(group.availability_zones.len(), 1);
+        assert!(group
+            .tags
+            .iter()
+            .any(|t| t.key == "eks:nodegroup-name" && t.value == "ng1"));
+        assert!(group
+            .tags
+            .iter()
+            .any(|t| t.key == "k8s.io/cluster-autoscaler/c1" && t.value == "owned"));
+    }
+
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/node-groups/ng1/update-config",
+        &json!({ "scalingConfig": { "minSize": 2, "maxSize": 5, "desiredSize": 4 } }).to_string(),
+    ))
+    .await
+    .unwrap();
+    {
+        let g = asg.read();
+        let group = &g.accounts["111122223333"].groups[&asg_name];
+        assert_eq!(
+            (group.min_size, group.max_size, group.desired_capacity),
+            (2, 5, 4)
+        );
+    }
+
+    svc.handle(make_request(
+        Method::DELETE,
+        "/clusters/c1/node-groups/ng1",
+        "",
+    ))
+    .await
+    .unwrap();
+    assert!(!asg.read().accounts["111122223333"]
+        .groups
+        .contains_key(&asg_name));
+}
+
+#[tokio::test]
+async fn addon_pod_identity_associations_are_real_and_stable_on_update() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let v = body_of(
+        svc.handle(make_request(
+            Method::POST,
+            "/clusters/c1/addons",
+            &json!({
+                "addonName": "vpc-cni",
+                "podIdentityAssociations": [
+                    { "serviceAccount": "aws-node", "roleArn": "arn:aws:iam::111122223333:role/cni" }
+                ]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap(),
+    );
+    let addon_arn = v["addon"]["addonArn"].as_str().unwrap().to_string();
+    let assoc_arn = v["addon"]["podIdentityAssociations"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The association exists and is owned by the add-on.
+    let list = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            "/clusters/c1/pod-identity-associations",
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    let summary = &list["associations"][0];
+    assert_eq!(summary["associationArn"], assoc_arn.as_str());
+    assert_eq!(summary["namespace"], "kube-system");
+    assert_eq!(summary["serviceAccount"], "aws-node");
+    assert_eq!(summary["ownerArn"], addon_arn.as_str());
+    let assoc_id = summary["associationId"].as_str().unwrap().to_string();
+    let desc = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            &format!("/clusters/c1/pod-identity-associations/{assoc_id}"),
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        desc["association"]["roleArn"],
+        "arn:aws:iam::111122223333:role/cni"
+    );
+
+    // Updating the role keeps the association (and its ARN).
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/addons/vpc-cni/update",
+        &json!({
+            "podIdentityAssociations": [
+                { "serviceAccount": "aws-node", "roleArn": "arn:aws:iam::111122223333:role/cni2" }
+            ]
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let addon = body_of(
+        svc.handle(make_request(Method::GET, "/clusters/c1/addons/vpc-cni", ""))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        addon["addon"]["podIdentityAssociations"][0],
+        assoc_arn.as_str()
+    );
+    let desc = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            &format!("/clusters/c1/pod-identity-associations/{assoc_id}"),
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        desc["association"]["roleArn"],
+        "arn:aws:iam::111122223333:role/cni2"
+    );
+
+    // Deleting the add-on deletes its associations.
+    svc.handle(make_request(
+        Method::DELETE,
+        "/clusters/c1/addons/vpc-cni",
+        "",
+    ))
+    .await
+    .unwrap();
+    let list = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            "/clusters/c1/pod-identity-associations",
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(list["associations"], json!([]));
+}
+
+#[tokio::test]
+async fn update_nodegroup_version_applies_launch_template_version() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let mut body: Value = serde_json::from_str(&nodegroup_body("ng1")).unwrap();
+    body["launchTemplate"] = json!({ "id": "lt-0123456789abcdef0", "version": "1" });
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/node-groups",
+        &body.to_string(),
+    ))
+    .await
+    .unwrap();
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/node-groups/ng1/update-version",
+        &json!({ "launchTemplate": { "id": "lt-0123456789abcdef0", "version": "3" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let ng = body_of(
+        svc.handle(make_request(
+            Method::GET,
+            "/clusters/c1/node-groups/ng1",
+            "",
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(ng["nodegroup"]["launchTemplate"]["version"], "3");
+    assert_eq!(
+        ng["nodegroup"]["launchTemplate"]["id"],
+        "lt-0123456789abcdef0"
+    );
+
+    // A different launch template is rejected.
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c1/node-groups/ng1/update-version",
+            &json!({ "launchTemplate": { "id": "lt-0000000000000000f", "version": "4" } })
+                .to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+}
+
+#[tokio::test]
+async fn update_cluster_config_merges_network_config() {
+    let svc = EksService::new(make_state());
+    let mut body: Value = serde_json::from_str(&create_body("c1")).unwrap();
+    body["kubernetesNetworkConfig"] = json!({ "serviceIpv4Cidr": "10.100.0.0/16" });
+    svc.handle(make_request(Method::POST, "/clusters", &body.to_string()))
+        .await
+        .unwrap();
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/update-config",
+        &json!({ "kubernetesNetworkConfig": { "elasticLoadBalancing": { "enabled": true } } })
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    // An endpoint toggle keeps the subnets.
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/update-config",
+        &json!({ "resourcesVpcConfig": { "endpointPrivateAccess": true } }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let c = body_of(
+        svc.handle(make_request(Method::GET, "/clusters/c1", ""))
+            .await
+            .unwrap(),
+    );
+    let kn = &c["cluster"]["kubernetesNetworkConfig"];
+    assert_eq!(kn["serviceIpv4Cidr"], "10.100.0.0/16");
+    assert_eq!(kn["elasticLoadBalancing"]["enabled"], true);
+    let vpc = &c["cluster"]["resourcesVpcConfig"];
+    assert_eq!(vpc["subnetIds"], json!(["subnet-1", "subnet-2"]));
+    assert_eq!(vpc["endpointPrivateAccess"], true);
+}

@@ -37,7 +37,11 @@ traffic against the cluster itself).
 
 **Domains (shared across both APIs):** create, describe, delete, list domain
 names, batch describe, describe/update domain config (including `DryRun`), change
-progress, auto-tunes, cancel config change.
+progress, auto-tunes, cancel config change. `VPCOptions` (on domains and VPC
+endpoints) resolve their subnets and security groups in EC2 and are returned as
+`VPCDerivedInfo` with the subnets' `VPCId` and `AvailabilityZones`; without
+security groups the VPC's `default` group is used (`ValidationException` for
+unknown subnets or groups).
 
 **Elasticsearch Service (2015-01-01):** `CreateElasticsearchDomain`,
 `DescribeElasticsearchDomain(s)`, `DescribeElasticsearchDomainConfig`,

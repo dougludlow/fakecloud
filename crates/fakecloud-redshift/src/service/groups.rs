@@ -359,12 +359,55 @@ impl RedshiftService {
     }
 
     // ── Subnet groups ─────────────────────────────────────────────
+    /// Resolve a cluster subnet group's VPC and subnets (with their
+    /// Availability Zones) from EC2: every subnet must exist in one VPC
+    /// (`InvalidSubnet`). Without EC2 state (memory-only unit tests) the
+    /// subnets are taken as given in the region's first zone and the group
+    /// has no VPC.
+    fn place_subnets(
+        &self,
+        req: &AwsRequest,
+        subnet_ids: &[String],
+    ) -> Result<(String, Vec<Subnet>), AwsServiceError> {
+        let Some(ec2) = &self.ec2_state else {
+            let subnets = subnet_ids
+                .iter()
+                .map(|id| Subnet {
+                    subnet_identifier: id.clone(),
+                    subnet_availability_zone: format!("{}a", req.region),
+                    subnet_status: "Active".to_string(),
+                })
+                .collect();
+            return Ok((String::new(), subnets));
+        };
+        let placed =
+            fakecloud_ec2::vpc_lookup::resolve_subnet_group(ec2, &req.account_id, subnet_ids)
+                .map_err(|e| {
+                    AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        e.message(),
+                    )
+                })?;
+        let subnets = placed
+            .subnets
+            .iter()
+            .map(|s| Subnet {
+                subnet_identifier: s.subnet_id.clone(),
+                subnet_availability_zone: s.availability_zone.clone(),
+                subnet_status: "Active".to_string(),
+            })
+            .collect();
+        Ok((placed.vpc_id, subnets))
+    }
+
     pub(super) fn create_cluster_subnet_group(
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = param(req, "ClusterSubnetGroupName").unwrap_or_default();
         let subnet_ids = member_list(req, "SubnetIds", "SubnetIdentifier");
+        let (vpc_id, subnets) = self.place_subnets(req, &subnet_ids)?;
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         if acct.subnet_groups.contains_key(&name) {
@@ -373,16 +416,9 @@ impl RedshiftService {
         let g = ClusterSubnetGroup {
             cluster_subnet_group_name: name.clone(),
             description: param(req, "Description").unwrap_or_default(),
-            vpc_id: "vpc-fakecloud".to_string(),
+            vpc_id,
             subnet_group_status: "Complete".to_string(),
-            subnets: subnet_ids
-                .into_iter()
-                .map(|id| Subnet {
-                    subnet_identifier: id,
-                    subnet_availability_zone: format!("{}a", req.region),
-                    subnet_status: "Active".to_string(),
-                })
-                .collect(),
+            subnets,
             tags: parse_tags(req),
         };
         acct.subnet_groups.insert(name, g.clone());
@@ -453,6 +489,11 @@ impl RedshiftService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = param(req, "ClusterSubnetGroupName").unwrap_or_default();
         let subnet_ids = member_list(req, "SubnetIds", "SubnetIdentifier");
+        let placed = if subnet_ids.is_empty() {
+            None
+        } else {
+            Some(self.place_subnets(req, &subnet_ids)?)
+        };
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         let g = acct
@@ -462,15 +503,9 @@ impl RedshiftService {
         if let Some(d) = param(req, "Description") {
             g.description = d;
         }
-        if !subnet_ids.is_empty() {
-            g.subnets = subnet_ids
-                .into_iter()
-                .map(|id| Subnet {
-                    subnet_identifier: id,
-                    subnet_availability_zone: format!("{}a", req.region),
-                    subnet_status: "Active".to_string(),
-                })
-                .collect();
+        if let Some((vpc_id, subnets)) = placed {
+            g.vpc_id = vpc_id;
+            g.subnets = subnets;
         }
         let out = render_subnet_group(g);
         Ok(xml_resp(

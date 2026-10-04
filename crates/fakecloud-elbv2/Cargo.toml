@@ -12,6 +12,7 @@ fakecloud-aws = { workspace = true }
 fakecloud-core = { workspace = true }
 fakecloud-persistence = { workspace = true }
 fakecloud-wafv2 = { workspace = true }
+fakecloud-ec2 = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

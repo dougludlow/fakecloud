@@ -309,13 +309,29 @@ impl ResourceProvisioner {
             .ok_or("AWS::EFS::MountTarget requires SubnetId")?
             .to_string();
 
-        // Resolve the subnet's real Availability Zone / VPC from EC2 state,
-        // exactly as the direct CreateMountTarget does. A subnet that does not
-        // resolve is rejected the same way (`SubnetNotFound`).
-        let (az_name, az_id, vpc_id) = self
-            .efs_resolve_subnet(&subnet_id)
-            .ok_or_else(|| format!("The subnet ID '{subnet_id}' is invalid or does not exist."))?;
-        let h = efs_hash(&subnet_id);
+        // The subnet and security groups must exist in EC2, exactly as the
+        // direct CreateMountTarget requires; the mount target's AZ / VPC come
+        // from the subnet.
+        let requested_groups: Vec<String> = props
+            .get("SecurityGroups")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let subnet =
+            fakecloud_efs::network::resolve_subnet(&self.ec2_state, &self.account_id, &subnet_id)
+                .map_err(|e| e.message())?;
+        let groups = fakecloud_efs::network::resolve_security_groups(
+            &self.ec2_state,
+            &self.account_id,
+            &subnet.vpc_id,
+            &requested_groups,
+        )
+        .map_err(|e| e.message())?;
+        let az_name = subnet.availability_zone.clone();
 
         let mut guard = self.efs_state.write();
         let data = guard.get_or_create(&self.account_id);
@@ -348,20 +364,21 @@ impl ResourceProvisioner {
         }
 
         let mtid = format!("fsmt-{}", efs_hex17());
-        let ip = efs_str(props, "IpAddress")
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("10.0.{}.{}", (h >> 8) % 256, h % 254 + 1));
-        let eni_id = format!("eni-{}", efs_hex17());
-        let security_groups: Vec<String> = props
-            .get("SecurityGroups")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .filter(|v: &Vec<String>| !v.is_empty())
-            .unwrap_or_else(|| vec![format!("sg-{:017x}", h & 0x000f_ffff_ffff_ffff)]);
+        let net = fakecloud_efs::network::create_mount_target_eni(
+            &self.ec2_state,
+            &self.account_id,
+            &fsid,
+            &mtid,
+            &subnet,
+            groups,
+            efs_str(props, "IpAddress"),
+        )
+        .map_err(|e| e.message())?;
+        let ip = net.ip_address.clone();
+        let eni_id = net.network_interface_id.clone();
+        let security_groups = net.security_groups.clone();
+        let az_id = subnet.availability_zone_id.clone();
+        let vpc_id = subnet.vpc_id.clone();
 
         let mut mt = Map::new();
         mt.insert("OwnerId".into(), json!(self.account_id));
@@ -423,6 +440,33 @@ impl ResourceProvisioner {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
+            let eni_id = data
+                .mount_targets
+                .get(&mtid)
+                .and_then(|m| m.get("NetworkInterfaceId").and_then(Value::as_str))
+                .map(str::to_string);
+            let sgs = match eni_id.as_deref().and_then(|eni| {
+                fakecloud_efs::network::eni_vpc_id(&self.ec2_state, &self.account_id, eni)
+                    .map(|vpc| (eni, vpc))
+            }) {
+                Some((eni, vpc_id)) => {
+                    let sgs = fakecloud_efs::network::resolve_security_groups(
+                        &self.ec2_state,
+                        &self.account_id,
+                        &vpc_id,
+                        &sgs,
+                    )
+                    .map_err(|e| e.message())?;
+                    fakecloud_efs::network::set_mount_target_eni_groups(
+                        &self.ec2_state,
+                        &self.account_id,
+                        eni,
+                        &sgs,
+                    );
+                    sgs
+                }
+                None => sgs,
+            };
             data.mount_target_security_groups.insert(mtid.clone(), sgs);
         }
         Ok(ProvisionResult::new(mtid.clone())
@@ -451,8 +495,15 @@ impl ResourceProvisioner {
     pub(super) fn delete_efs_mount_target(&self, physical_id: &str) {
         let mut guard = self.efs_state.write();
         let data = guard.get_or_create(&self.account_id);
-        data.mount_targets.remove(physical_id);
+        let removed = data.mount_targets.remove(physical_id);
         data.mount_target_security_groups.remove(physical_id);
+        drop(guard);
+        if let Some(eni) = removed
+            .as_ref()
+            .and_then(|m| m.get("NetworkInterfaceId").and_then(Value::as_str))
+        {
+            fakecloud_efs::network::delete_mount_target_eni(&self.ec2_state, &self.account_id, eni);
+        }
     }
 
     // --------------------------------------------------------- AccessPoint
@@ -601,19 +652,6 @@ impl ResourceProvisioner {
     fn efs_ap_arn(&self, apid: &str) -> String {
         fakecloud_efs::state::access_point_arn(&self.region, &self.account_id, apid)
     }
-
-    /// Resolve a subnet's `(availability_zone, availability_zone_id, vpc_id)`
-    /// from EC2 state, mirroring the direct `CreateMountTarget` resolution so a
-    /// mount target on a (CFN- or API-created) subnet reports the true AZ/VPC.
-    fn efs_resolve_subnet(&self, subnet_id: &str) -> Option<(String, String, String)> {
-        let guard = self.ec2_state.read();
-        let subnet = guard.get(&self.account_id)?.subnets.get(subnet_id)?;
-        Some((
-            subnet.availability_zone.clone(),
-            subnet.availability_zone_id.clone(),
-            subnet.vpc_id.clone(),
-        ))
-    }
 }
 
 /// Read a non-empty string property.
@@ -643,17 +681,6 @@ fn efs_hex17() -> String {
 
 fn efs_now_ts() -> f64 {
     chrono::Utc::now().timestamp() as f64
-}
-
-/// FNV-1a hash for deterministic synthesis of an IP / security group from a
-/// subnet id, matching the direct handler.
-fn efs_hash(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// Convert a CFN tag list (`[{Key,Value}]`) at the given property into a flat

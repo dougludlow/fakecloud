@@ -82,12 +82,13 @@ const TEMPLATE: &str = r#"{
 #[tokio::test]
 async fn cfn_provisions_rds_metadata_resources() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let cfn = server.cloudformation_client().await;
     let rds = aws_sdk_rds::Client::new(&server.aws_config().await);
 
     cfn.create_stack()
         .stack_name("rds-metadata-stack")
-        .template_body(TEMPLATE)
+        .template_body(with_default_subnets(TEMPLATE, &vpc_subnets))
         .capabilities(Capability::CapabilityIam)
         .on_failure(OnFailure::Rollback)
         .send()
@@ -168,4 +169,12 @@ async fn cfn_provisions_rds_metadata_resources() {
             .any(|g| g.db_subnet_group_name() == Some("cfn-subnets")),
         "subnet group should be gone after stack deletion"
     );
+}
+
+/// The template with its `subnet-aaa` / `subnet-bbb` placeholders replaced by
+/// the account's default subnets, which the resources resolve in EC2.
+fn with_default_subnets(template: &str, subnets: &[String]) -> String {
+    template
+        .replace("subnet-aaa", &subnets[0])
+        .replace("subnet-bbb", &subnets[1])
 }

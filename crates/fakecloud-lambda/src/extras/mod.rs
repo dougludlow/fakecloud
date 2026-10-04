@@ -339,6 +339,11 @@ impl LambdaService {
                 self.iam_mode,
             )?;
         }
+        let vpc_config = if body["VpcConfig"].is_object() {
+            Some(self.resolve_vpc_config(&req.account_id, body["VpcConfig"].clone())?)
+        } else {
+            None
+        };
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably
         // for the function. Layer ARNs may live in sibling accounts.
@@ -388,8 +393,8 @@ impl LambdaService {
         if let Some(size) = validated_ephemeral {
             func.ephemeral_storage_size = Some(size);
         }
-        if body["VpcConfig"].is_object() {
-            func.vpc_config = Some(body["VpcConfig"].clone());
+        if let Some(cfg) = vpc_config {
+            func.vpc_config = Some(cfg);
         }
         if body["SnapStart"].is_object() {
             func.snap_start = Some(body["SnapStart"].clone());

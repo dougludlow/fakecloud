@@ -155,6 +155,7 @@ async fn elasticache_describe_cache_clusters_paginates() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     for group_name in ["page-subnet-a", "page-subnet-b", "page-subnet-c"] {
@@ -162,7 +163,7 @@ async fn elasticache_describe_cache_clusters_paginates() {
             .create_cache_subnet_group()
             .cache_subnet_group_name(group_name)
             .cache_subnet_group_description("Pagination test subnet group")
-            .subnet_ids("subnet-aaa111")
+            .subnet_ids(&vpc_subnets[0])
             .send()
             .await
             .unwrap();
@@ -323,14 +324,15 @@ async fn elasticache_create_subnet_group_and_describe() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create_resp = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("my-subnet-group")
         .cache_subnet_group_description("My test subnet group")
-        .subnet_ids("subnet-aaa111")
-        .subnet_ids("subnet-bbb222")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -362,13 +364,14 @@ async fn elasticache_describe_subnet_groups_with_name_filter() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("filtered-group")
         .cache_subnet_group_description("For filtering test")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -392,13 +395,14 @@ async fn elasticache_modify_subnet_group_description() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("mod-group")
         .cache_subnet_group_description("Original")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -440,13 +444,14 @@ async fn elasticache_delete_subnet_group_and_verify_gone() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("del-group")
         .cache_subnet_group_description("Will be deleted")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -475,13 +480,14 @@ async fn elasticache_create_duplicate_subnet_group_errors() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("dup-group")
         .cache_subnet_group_description("First")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -490,7 +496,7 @@ async fn elasticache_create_duplicate_subnet_group_errors() {
         .create_cache_subnet_group()
         .cache_subnet_group_name("dup-group")
         .cache_subnet_group_description("Second")
-        .subnet_ids("subnet-bbb222")
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await;
 
@@ -524,13 +530,14 @@ async fn elasticache_add_and_list_tags_on_subnet_group() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("tag-e2e-group")
         .cache_subnet_group_description("For tag e2e test")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -586,13 +593,14 @@ async fn elasticache_remove_tags_from_subnet_group() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("tag-remove-group")
         .cache_subnet_group_description("For remove tag test")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -651,13 +659,14 @@ async fn elasticache_tag_update_existing_key() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create = client
         .create_cache_subnet_group()
         .cache_subnet_group_name("tag-update-group")
         .cache_subnet_group_description("For tag update test")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .send()
         .await
         .unwrap();
@@ -2289,6 +2298,7 @@ async fn elasticache_create_serverless_cache_and_describe() {
     }
 
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     let create_resp = client
@@ -2297,7 +2307,7 @@ async fn elasticache_create_serverless_cache_and_describe() {
         .engine("redis")
         .description("Main serverless cache")
         .security_group_ids("sg-123")
-        .subnet_ids("subnet-123")
+        .subnet_ids(&vpc_subnets[0])
         .snapshot_retention_limit(7)
         .daily_snapshot_time("04:00")
         .send()
@@ -3471,6 +3481,7 @@ async fn delete_during_create_does_not_orphan() {
 #[tokio::test]
 async fn elasticache_subnet_group_name_lowercased_and_tags_round_trip() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     // AWS lowercases subnet-group names; create with mixed case and the
@@ -3479,7 +3490,7 @@ async fn elasticache_subnet_group_name_lowercased_and_tags_round_trip() {
         .create_cache_subnet_group()
         .cache_subnet_group_name("Mixed-Case-SG")
         .cache_subnet_group_description("d")
-        .subnet_ids("subnet-aaa111")
+        .subnet_ids(&vpc_subnets[0])
         .tags(
             aws_sdk_elasticache::types::Tag::builder()
                 .key("Name")

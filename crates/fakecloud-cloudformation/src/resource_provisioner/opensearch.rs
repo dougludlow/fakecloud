@@ -62,6 +62,18 @@ impl ResourceProvisioner {
                 config.insert(k.clone(), v.clone());
             }
         }
+        // VPCOptions resolve against EC2 (VPCId, AvailabilityZones, default
+        // security group), exactly as the direct CreateDomain does.
+        if let Some(v) = config.get("VPCOptions").filter(|v| v.is_object()).cloned() {
+            config.insert(
+                "VPCOptions".into(),
+                fakecloud_opensearch::vpc::derive_vpc_options(
+                    &self.ec2_state,
+                    &self.account_id,
+                    &v,
+                )?,
+            );
+        }
 
         let mut tags: BTreeMap<String, String> = BTreeMap::new();
         if let Some(arr) = props.get("Tags").and_then(Value::as_array) {
@@ -150,6 +162,18 @@ impl ResourceProvisioner {
                 }
                 config.insert(k.clone(), v.clone());
             }
+        }
+        // VPCOptions resolve against EC2 (VPCId, AvailabilityZones, default
+        // security group), exactly as the direct CreateDomain does.
+        if let Some(v) = config.get("VPCOptions").filter(|v| v.is_object()).cloned() {
+            config.insert(
+                "VPCOptions".into(),
+                fakecloud_opensearch::vpc::derive_vpc_options(
+                    &self.ec2_state,
+                    &self.account_id,
+                    &v,
+                )?,
+            );
         }
 
         let mut tags: BTreeMap<String, String> = BTreeMap::new();

@@ -346,14 +346,15 @@ async fn persistence_round_trip_user_and_group() {
 async fn persistence_round_trip_subnet_group() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.elasticache_client().await;
 
     client
         .create_cache_subnet_group()
         .cache_subnet_group_name("persist-sg")
         .cache_subnet_group_description("Persistence test subnet group")
-        .subnet_ids("subnet-aaa")
-        .subnet_ids("subnet-bbb")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();

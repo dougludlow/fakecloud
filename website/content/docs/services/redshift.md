@@ -23,15 +23,20 @@ CRUD with validation, pagination, and AWS-shaped error codes rather than stubs.
   honouring the `Source=user` filter so only explicitly-modified parameters are
   returned (no perpetual Terraform drift on engine defaults).
 - **Subnet & security groups** — full CRUD, ingress authorize/revoke, and tag
-  round-tripping.
+  round-tripping. Cluster subnet groups resolve their subnets in EC2
+  (`InvalidSubnet` for unknown subnets or ones spanning VPCs) and report the
+  subnets' `VpcId` and Availability Zones; a cluster reports its subnet group's
+  VPC (or the default VPC without one).
 - **Snapshots** — manual and cluster snapshots carrying a real `SnapshotArn`,
   `RestoreFromClusterSnapshot`, `RestoreTableFromClusterSnapshot`, batch
   operations, cross-region snapshot-copy configuration
   (`EnableSnapshotCopy` / `ModifySnapshotCopyRetentionPeriod`), and snapshot
   schedules with cluster associations surfaced under `AssociatedClusters`.
 - **Endpoint access** — Redshift-managed VPC endpoints that inherit the
-  cluster's security groups (or a default), settle to `active`, and expose a
-  well-formed interface VPC endpoint with a network interface.
+  cluster's security groups (or the VPC's `default` group) and settle to
+  `active`. Each creates a real interface VPC endpoint in EC2 with one
+  requester-managed network interface per subnet of its subnet group, reported
+  under `VpcEndpoint` and deleted with the endpoint.
 - **HSM objects, event subscriptions, usage limits, snapshot copy grants,
   scheduled actions, authentication profiles, IAM-role attach, partner
   registration** — all real CRUD.

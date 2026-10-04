@@ -114,6 +114,7 @@ fn cache_subnet_group_xml_contains_all_fields() {
         vpc_id: "vpc-123".to_string(),
         subnet_ids: vec!["subnet-aaa".to_string(), "subnet-bbb".to_string()],
         arn: "arn:aws:elasticache:us-east-1:123:subnetgroup:my-group".to_string(),
+        subnet_availability_zones: Vec::new(),
     };
     let xml = cache_subnet_group_xml(&group, "us-east-1");
     assert!(xml.contains("<CacheSubnetGroupName>my-group</CacheSubnetGroupName>"));

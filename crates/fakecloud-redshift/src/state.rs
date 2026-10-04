@@ -345,6 +345,11 @@ pub struct EndpointAccess {
     pub port: i32,
     pub address: String,
     pub vpc_security_group_ids: Vec<String>,
+    /// The interface VPC endpoint (and its per-subnet network interfaces)
+    /// created in EC2 for this endpoint. `None` when EC2 is not wired or for
+    /// endpoints persisted before the endpoint was created in EC2.
+    #[serde(default)]
+    pub vpc_endpoint: Option<fakecloud_ec2::vpc_lookup::ServiceEndpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

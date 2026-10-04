@@ -4,6 +4,50 @@
 use super::*;
 
 impl ElastiCacheService {
+    /// Resolve a cache subnet group's VPC and per-subnet Availability Zones
+    /// from the EC2 subnets: every subnet must exist and share one VPC
+    /// (`InvalidSubnet`). Without EC2 state (memory-only unit tests) the
+    /// group has no VPC and zones are derived at render time.
+    fn place_subnet_group(
+        &self,
+        request: &AwsRequest,
+        subnet_ids: &[String],
+    ) -> Result<(String, Vec<String>), AwsServiceError> {
+        let Some(ec2) = &self.ec2_state else {
+            return Ok((String::new(), Vec::new()));
+        };
+        let placed =
+            fakecloud_ec2::vpc_lookup::resolve_subnet_group(ec2, &request.account_id, subnet_ids)
+                .map_err(|e| {
+                AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidSubnet", e.message())
+            })?;
+        let zones = placed.availability_zones();
+        Ok((placed.vpc_id, zones))
+    }
+
+    /// Point the account's `default` cache subnet group at the default VPC's
+    /// subnets, as on AWS, when EC2 state is wired.
+    pub(super) fn sync_default_subnet_group(&self, account_id: &str) {
+        let Some(ec2) = &self.ec2_state else {
+            return;
+        };
+        let subnets = fakecloud_ec2::vpc_lookup::default_vpc_subnets(ec2, account_id);
+        let Some(first) = subnets.first() else {
+            return;
+        };
+        let vpc_id = first.vpc_id.clone();
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(account_id);
+        if let Some(group) = state.subnet_groups.get_mut("default") {
+            group.vpc_id = vpc_id;
+            group.subnet_ids = subnets.iter().map(|s| s.subnet_id.clone()).collect();
+            group.subnet_availability_zones = subnets
+                .iter()
+                .map(|s| s.availability_zone.clone())
+                .collect();
+        }
+    }
+
     pub(super) fn create_cache_subnet_group(
         &self,
         request: &AwsRequest,
@@ -34,6 +78,8 @@ impl ElastiCacheService {
             ));
         }
 
+        let (vpc_id, subnet_availability_zones) = self.place_subnet_group(request, &subnet_ids)?;
+
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
 
@@ -53,19 +99,13 @@ impl ElastiCacheService {
             "subnetgroup",
             &name,
         );
-        let vpc_id = format!(
-            "vpc-{:08x}",
-            name.as_bytes()
-                .iter()
-                .fold(0u32, |acc, &b| acc.wrapping_add(b as u32))
-        );
-
         let group = CacheSubnetGroup {
             cache_subnet_group_name: name.clone(),
             cache_subnet_group_description: description,
             vpc_id,
             subnet_ids,
             arn,
+            subnet_availability_zones,
         };
 
         let xml = cache_subnet_group_xml(&group, request.region.as_str());
@@ -91,6 +131,7 @@ impl ElastiCacheService {
         &self,
         request: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        self.sync_default_subnet_group(&request.account_id);
         let group_name =
             optional_query_param(request, "CacheSubnetGroupName").map(|n| n.to_lowercase());
         let max_records = optional_usize_param(request, "MaxRecords")?;
@@ -196,6 +237,12 @@ impl ElastiCacheService {
             ));
         }
 
+        let placed = if subnet_ids.is_empty() {
+            None
+        } else {
+            Some(self.place_subnet_group(request, &subnet_ids)?)
+        };
+
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         let region = request.region.clone();
@@ -211,8 +258,12 @@ impl ElastiCacheService {
         if let Some(desc) = description {
             group.cache_subnet_group_description = desc;
         }
-        if !subnet_ids.is_empty() {
+        if let Some((vpc_id, zones)) = placed {
+            if !vpc_id.is_empty() {
+                group.vpc_id = vpc_id;
+            }
             group.subnet_ids = subnet_ids;
+            group.subnet_availability_zones = zones;
         }
 
         let xml = cache_subnet_group_xml(group, &region);

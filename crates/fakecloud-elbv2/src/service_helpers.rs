@@ -52,24 +52,39 @@ pub(crate) fn parse_query_string_pairs(
     out
 }
 
-pub(crate) fn parse_subnet_mappings(req: &AwsRequest) -> Vec<SubnetMapping> {
+pub(crate) fn parse_subnet_mappings(req: &AwsRequest) -> Vec<crate::network::SubnetRequest> {
     let mut out = Vec::new();
     for n in 1..=20 {
         let prefix = format!("SubnetMappings.member.{n}");
-        let subnet_id = req.query_params.get(&format!("{prefix}.SubnetId")).cloned();
-        let allocation_id = req
-            .query_params
-            .get(&format!("{prefix}.AllocationId"))
-            .cloned();
+        let field = |name: &str| req.query_params.get(&format!("{prefix}.{name}")).cloned();
+        let subnet_id = field("SubnetId");
+        let allocation_id = field("AllocationId");
         if subnet_id.is_none() && allocation_id.is_none() {
             break;
         }
-        out.push(SubnetMapping {
-            subnet_id,
+        out.push(crate::network::SubnetRequest {
+            subnet_id: subnet_id.unwrap_or_default(),
             allocation_id,
+            private_ipv4_address: field("PrivateIPv4Address"),
+            ipv6_address: field("IPv6Address"),
+            source_nat_ipv6_prefix: field("SourceNatIpv6Prefix"),
         });
     }
     out
+}
+
+/// The subnets a `CreateLoadBalancer` / `SetSubnets` request names, from
+/// `Subnets.member.N` or (when absent) `SubnetMappings.member.N`.
+pub(crate) fn parse_subnet_requests(req: &AwsRequest) -> Vec<crate::network::SubnetRequest> {
+    let explicit = parse_member_list(req, "Subnets");
+    if explicit.is_empty() {
+        parse_subnet_mappings(req)
+    } else {
+        explicit
+            .into_iter()
+            .map(crate::network::SubnetRequest::subnet)
+            .collect()
+    }
 }
 
 pub(crate) fn parse_tags(req: &AwsRequest) -> Vec<Tag> {
@@ -414,20 +429,40 @@ pub(crate) fn render_address_xml(addr: &LoadBalancerAddress) -> String {
     s
 }
 
-pub(crate) fn az_for_subnet(region: &str, subnet_id: &str) -> String {
-    let suffix = match subnet_id
-        .chars()
-        .fold(0u32, |a, c| a.wrapping_add(c as u32))
-        % 6
-    {
-        0 => 'a',
-        1 => 'b',
-        2 => 'c',
-        3 => 'd',
-        4 => 'e',
-        _ => 'f',
-    };
-    format!("{region}{suffix}")
+/// Availability Zones for subnets when no EC2 state is wired (memory-only
+/// unit tests): zones are assigned in request order and addresses are kept
+/// as requested.
+pub(crate) fn unresolved_availability_zones(
+    region: &str,
+    subnets: &[crate::network::SubnetRequest],
+) -> Vec<AvailabilityZone> {
+    subnets
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let has_address = s.allocation_id.is_some()
+                || s.private_ipv4_address.is_some()
+                || s.ipv6_address.is_some();
+            AvailabilityZone {
+                zone_name: format!("{region}{}", char::from(b'a' + (i % 6) as u8)),
+                subnet_id: s.subnet_id.clone(),
+                outpost_id: None,
+                load_balancer_addresses: if has_address {
+                    vec![LoadBalancerAddress {
+                        ip_address: None,
+                        allocation_id: s.allocation_id.clone(),
+                        private_ipv4_address: s.private_ipv4_address.clone(),
+                        ipv6_address: s.ipv6_address.clone(),
+                        ipv4_prefix: None,
+                        ipv6_prefix: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                source_nat_ipv6_prefixes: s.source_nat_ipv6_prefix.iter().cloned().collect(),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn alphanumeric_id(len: usize) -> String {
@@ -573,8 +608,9 @@ pub(crate) fn parse_actions(req: &AwsRequest, prefix: &str) -> Vec<crate::state:
                 redirect,
                 fixed_response,
                 forward,
-                authenticate_cognito: None,
-                authenticate_oidc: None,
+                authenticate_cognito: parse_authenticate_cognito(req, &p),
+                authenticate_oidc: parse_authenticate_oidc(req, &p),
+                jwt_validation: parse_jwt_validation(req, &p),
             });
         } else {
             break;
@@ -656,13 +692,249 @@ pub(crate) fn parse_forward(req: &AwsRequest, prefix: &str) -> Option<crate::sta
             break;
         }
     }
-    if target_groups.is_empty() {
+    let stickiness_prefix = format!("{prefix}.ForwardConfig.TargetGroupStickinessConfig");
+    let enabled = req
+        .query_params
+        .get(&format!("{stickiness_prefix}.Enabled"))
+        .map(|s| s == "true");
+    let duration_seconds = req
+        .query_params
+        .get(&format!("{stickiness_prefix}.DurationSeconds"))
+        .and_then(|s| s.parse().ok());
+    let stickiness = (enabled.is_some() || duration_seconds.is_some()).then_some(
+        crate::state::TargetGroupStickinessConfig {
+            enabled,
+            duration_seconds,
+        },
+    );
+    if target_groups.is_empty() && stickiness.is_none() {
         return None;
     }
     Some(crate::state::ForwardConfig {
         target_groups,
-        stickiness: None,
+        stickiness,
     })
+}
+
+/// Read the scalar members of an action sub-config (`{prefix}.{config}.X`)
+/// into a JSON object keyed by member name. Integer members are stored as
+/// numbers and boolean members as booleans so they render back unchanged.
+fn parse_config_members(
+    req: &AwsRequest,
+    prefix: &str,
+    strings: &[&str],
+    integers: &[&str],
+    booleans: &[&str],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for m in strings {
+        if let Some(v) = req.query_params.get(&format!("{prefix}.{m}")) {
+            out.insert((*m).to_string(), serde_json::Value::String(v.clone()));
+        }
+    }
+    for m in integers {
+        if let Some(v) = req
+            .query_params
+            .get(&format!("{prefix}.{m}"))
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            out.insert((*m).to_string(), serde_json::Value::from(v));
+        }
+    }
+    for m in booleans {
+        if let Some(v) = req.query_params.get(&format!("{prefix}.{m}")) {
+            out.insert((*m).to_string(), serde_json::Value::Bool(v == "true"));
+        }
+    }
+    out
+}
+
+/// Normalize an action sub-config given as JSON (a CloudFormation
+/// `AuthenticateOidcConfig` / `AuthenticateCognitoConfig` /
+/// `JwtValidationConfig`, whose scalar members may arrive as strings) to the
+/// stored form: `SessionTimeout` a number, `UseExistingClientSecret` a bool.
+pub fn normalize_action_config(cfg: &serde_json::Value) -> serde_json::Value {
+    let mut cfg = cfg.clone();
+    if let Some(obj) = cfg.as_object_mut() {
+        if let Some(n) = obj
+            .get("SessionTimeout")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            obj.insert("SessionTimeout".into(), serde_json::Value::from(n));
+        }
+        if let Some(b) = obj
+            .get("UseExistingClientSecret")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "true")
+        {
+            obj.insert("UseExistingClientSecret".into(), serde_json::Value::Bool(b));
+        }
+    }
+    cfg
+}
+
+/// `{prefix}.AuthenticationRequestExtraParams.entry.N.{key,value}` as a JSON
+/// object.
+fn parse_extra_params(req: &AwsRequest, prefix: &str) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for n in 1..=10 {
+        let base = format!("{prefix}.AuthenticationRequestExtraParams.entry.{n}");
+        let Some(k) = req.query_params.get(&format!("{base}.key")) else {
+            break;
+        };
+        let v = req
+            .query_params
+            .get(&format!("{base}.value"))
+            .cloned()
+            .unwrap_or_default();
+        map.insert(k.clone(), serde_json::Value::String(v));
+    }
+    (!map.is_empty()).then_some(serde_json::Value::Object(map))
+}
+
+pub(crate) fn parse_authenticate_oidc(req: &AwsRequest, prefix: &str) -> Option<serde_json::Value> {
+    let p = format!("{prefix}.AuthenticateOidcConfig");
+    let mut cfg = parse_config_members(
+        req,
+        &p,
+        &[
+            "Issuer",
+            "AuthorizationEndpoint",
+            "TokenEndpoint",
+            "UserInfoEndpoint",
+            "ClientId",
+            "ClientSecret",
+            "SessionCookieName",
+            "Scope",
+            "OnUnauthenticatedRequest",
+        ],
+        &["SessionTimeout"],
+        &["UseExistingClientSecret"],
+    );
+    if let Some(extra) = parse_extra_params(req, &p) {
+        cfg.insert("AuthenticationRequestExtraParams".into(), extra);
+    }
+    (!cfg.is_empty()).then_some(serde_json::Value::Object(cfg))
+}
+
+pub(crate) fn parse_authenticate_cognito(
+    req: &AwsRequest,
+    prefix: &str,
+) -> Option<serde_json::Value> {
+    let p = format!("{prefix}.AuthenticateCognitoConfig");
+    let mut cfg = parse_config_members(
+        req,
+        &p,
+        &[
+            "UserPoolArn",
+            "UserPoolClientId",
+            "UserPoolDomain",
+            "SessionCookieName",
+            "Scope",
+            "OnUnauthenticatedRequest",
+        ],
+        &["SessionTimeout"],
+        &[],
+    );
+    if let Some(extra) = parse_extra_params(req, &p) {
+        cfg.insert("AuthenticationRequestExtraParams".into(), extra);
+    }
+    (!cfg.is_empty()).then_some(serde_json::Value::Object(cfg))
+}
+
+pub(crate) fn parse_jwt_validation(req: &AwsRequest, prefix: &str) -> Option<serde_json::Value> {
+    let p = format!("{prefix}.JwtValidationConfig");
+    let mut cfg = parse_config_members(req, &p, &["JwksEndpoint", "Issuer"], &[], &[]);
+    let mut claims = Vec::new();
+    for n in 1..=10 {
+        let base = format!("{p}.AdditionalClaims.member.{n}");
+        let Some(name) = req.query_params.get(&format!("{base}.Name")) else {
+            break;
+        };
+        let mut claim = serde_json::Map::new();
+        if let Some(f) = req.query_params.get(&format!("{base}.Format")) {
+            claim.insert("Format".into(), serde_json::Value::String(f.clone()));
+        }
+        claim.insert("Name".into(), serde_json::Value::String(name.clone()));
+        claim.insert(
+            "Values".into(),
+            serde_json::Value::from(parse_member_list(req, &format!("{base}.Values"))),
+        );
+        claims.push(serde_json::Value::Object(claim));
+    }
+    if !claims.is_empty() {
+        cfg.insert("AdditionalClaims".into(), serde_json::Value::Array(claims));
+    }
+    (!cfg.is_empty()).then_some(serde_json::Value::Object(cfg))
+}
+
+/// Render an action sub-config stored as a JSON object back to query-protocol
+/// XML. Members in `order` are emitted in that order; `hidden` members (the
+/// OIDC client secret) are never returned.
+fn render_config_xml(
+    tag: &str,
+    cfg: &serde_json::Value,
+    order: &[&str],
+    hidden: &[&str],
+) -> String {
+    let Some(obj) = cfg.as_object() else {
+        return String::new();
+    };
+    let mut s = format!("<{tag}>");
+    for key in order {
+        if hidden.contains(key) {
+            continue;
+        }
+        let Some(v) = obj.get(*key) else { continue };
+        match v {
+            serde_json::Value::Object(map) => {
+                // AuthenticationRequestExtraParams: a string map.
+                s.push_str(&format!("<{key}>"));
+                for (k, val) in map {
+                    s.push_str(&format!(
+                        "<entry><key>{}</key><value>{}</value></entry>",
+                        xml_escape(k),
+                        xml_escape(val.as_str().unwrap_or_default())
+                    ));
+                }
+                s.push_str(&format!("</{key}>"));
+            }
+            serde_json::Value::Array(items) => {
+                // JwtValidationConfig.AdditionalClaims.
+                s.push_str(&format!("<{key}>"));
+                for item in items {
+                    s.push_str("<member>");
+                    if let Some(f) = item.get("Format").and_then(|v| v.as_str()) {
+                        s.push_str(&format!("<Format>{}</Format>", xml_escape(f)));
+                    }
+                    if let Some(n) = item.get("Name").and_then(|v| v.as_str()) {
+                        s.push_str(&format!("<Name>{}</Name>", xml_escape(n)));
+                    }
+                    s.push_str("<Values>");
+                    for val in item
+                        .get("Values")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        s.push_str(&format!(
+                            "<member>{}</member>",
+                            xml_escape(val.as_str().unwrap_or_default())
+                        ));
+                    }
+                    s.push_str("</Values></member>");
+                }
+                s.push_str(&format!("</{key}>"));
+            }
+            serde_json::Value::String(v) => {
+                s.push_str(&format!("<{key}>{}</{key}>", xml_escape(v)));
+            }
+            other => s.push_str(&format!("<{key}>{other}</{key}>")),
+        }
+    }
+    s.push_str(&format!("</{tag}>"));
+    s
 }
 
 pub(crate) fn parse_mutual_authentication(
@@ -856,11 +1128,88 @@ pub(crate) fn render_action_xml(a: &crate::state::Action) -> String {
                     )
                 })
                 .collect::<String>();
-            format!("<ForwardConfig><TargetGroups>{groups}</TargetGroups></ForwardConfig>")
+            let stickiness = f
+                .stickiness
+                .as_ref()
+                .map(|st| {
+                    let enabled = st
+                        .enabled
+                        .map(|e| format!("<Enabled>{e}</Enabled>"))
+                        .unwrap_or_default();
+                    let duration = st
+                        .duration_seconds
+                        .map(|d| format!("<DurationSeconds>{d}</DurationSeconds>"))
+                        .unwrap_or_default();
+                    format!(
+                        "<TargetGroupStickinessConfig>{enabled}{duration}</TargetGroupStickinessConfig>"
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "<ForwardConfig><TargetGroups>{groups}</TargetGroups>{stickiness}</ForwardConfig>"
+            )
+        })
+        .unwrap_or_default();
+    let oidc = a
+        .authenticate_oidc
+        .as_ref()
+        .map(|c| {
+            render_config_xml(
+                "AuthenticateOidcConfig",
+                c,
+                &[
+                    "Issuer",
+                    "AuthorizationEndpoint",
+                    "TokenEndpoint",
+                    "UserInfoEndpoint",
+                    "ClientId",
+                    "ClientSecret",
+                    "SessionCookieName",
+                    "Scope",
+                    "SessionTimeout",
+                    "AuthenticationRequestExtraParams",
+                    "OnUnauthenticatedRequest",
+                    "UseExistingClientSecret",
+                ],
+                &["ClientSecret"],
+            )
+        })
+        .unwrap_or_default();
+    let cognito = a
+        .authenticate_cognito
+        .as_ref()
+        .map(|c| {
+            render_config_xml(
+                "AuthenticateCognitoConfig",
+                c,
+                &[
+                    "UserPoolArn",
+                    "UserPoolClientId",
+                    "UserPoolDomain",
+                    "SessionCookieName",
+                    "Scope",
+                    "SessionTimeout",
+                    "AuthenticationRequestExtraParams",
+                    "OnUnauthenticatedRequest",
+                ],
+                &[],
+            )
+        })
+        .unwrap_or_default();
+    let jwt = a
+        .jwt_validation
+        .as_ref()
+        .map(|c| {
+            render_config_xml(
+                "JwtValidationConfig",
+                c,
+                &["JwksEndpoint", "Issuer", "AdditionalClaims"],
+                &[],
+            )
         })
         .unwrap_or_default();
     format!(
-        "<member><Type>{ty}</Type>{tg}{order}{redirect}{fixed}{forward}</member>",
+        "<member><Type>{ty}</Type>{tg}{oidc}{cognito}{order}{redirect}{fixed}{forward}{jwt}</member>",
         ty = xml_escape(&a.action_type),
     )
 }

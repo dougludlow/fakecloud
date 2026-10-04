@@ -15,7 +15,7 @@ fakecloud implements **163 of 163** RDS operations at 100% Smithy conformance. D
 - **Storage encryption** - `StorageEncrypted` without a `KmsKeyId` encrypts with the account's AWS-managed `aws/rds` key for the region and reports its key ARN; a key named by alias or key id is reported as its key ARN. Aurora cluster members report their cluster's encryption and key, and snapshots, copies, read replicas and restores carry the source's key (a restore or copy that names a `KmsKeyId` uses it).
 - **Parameter groups** — DBParameterGroup and DBClusterParameterGroup CRUD, parameter management
 - **Option groups** — CRUD
-- **Subnet groups** — CRUD
+- **Subnet groups** — CRUD. Subnets resolve in EC2: the group reports their `VpcId` and each subnet's real Availability Zone, unknown subnets or subnets spanning VPCs are rejected with `InvalidSubnet`, and fewer than two zones with `DBSubnetGroupDoesNotCoverEnoughAZs`
 - **DB clusters** — Aurora-style clusters with full lifecycle: ModifyDBCluster (every mutable field on AWS's surface, including ServerlessV2 scaling, log-export updates, VPC SGs, NewDBClusterIdentifier rename), StartDBCluster / StopDBCluster (status transitions with `InvalidDBClusterStateFault` validation), RebootDBCluster, FailoverDBCluster (auto-picks a replica when no target is provided, swaps the writer flag, rejects non-member targets when the cluster tracks members), BacktrackDBCluster (Aurora MySQL only — `InvalidParameterCombination` on Aurora PostgreSQL — records BacktrackTo and the change-record count, append-tracked under DescribeDBClusterBacktracks)
 - **Events** — DescribeEvents, DescribeEventCategories, DescribeEventSubscriptions
 - **Engine discovery** — DescribeDBEngineVersions with real engine metadata

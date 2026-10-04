@@ -96,10 +96,10 @@ pub fn config_region(cfg: &Value) -> Option<&str> {
     cfg.get("arn").and_then(Value::as_str).and_then(arn_region)
 }
 
-/// Deterministic default-VPC subnet ids AWS synthesizes when the caller omits
-/// `SubnetIds`: one for `SINGLE_INSTANCE`, two for the multi-AZ deployment
-/// modes. Shared so the direct API and the CFN provisioner produce identical
-/// ids for a given broker id.
+/// Deterministic subnet ids for a broker created without `SubnetIds` when no
+/// EC2 state is wired (memory-only unit tests): one for `SINGLE_INSTANCE`, two
+/// for the multi-AZ deployment modes. With EC2, [`resolve_broker_network`]
+/// places the broker in the real default-VPC subnets instead.
 pub fn synthesize_subnets(id: &str, deployment_mode: &str) -> Vec<Value> {
     let n = if deployment_mode == "SINGLE_INSTANCE" {
         1
@@ -112,6 +112,79 @@ pub fn synthesize_subnets(id: &str, deployment_mode: &str) -> Vec<Value> {
             json!(format!("subnet-{h:017x}"))
         })
         .collect()
+}
+
+/// Place a broker in the customer VPC, as `CreateBroker` does on AWS:
+/// supplied `subnetIds` must exist in one VPC, and without any the broker
+/// lands in the account's default VPC (one default subnet for
+/// `SINGLE_INSTANCE`, two in different Availability Zones for the multi-AZ
+/// modes). Supplied `securityGroups` must exist in that VPC; without any the
+/// VPC's `default` group is used. Returns `b` with `subnetIds` and
+/// `securityGroups` resolved; `Err` carries the `BadRequestException` message.
+pub fn resolve_broker_network(
+    ec2: &fakecloud_ec2::SharedEc2State,
+    account: &str,
+    b: &Value,
+) -> Result<Value, String> {
+    use fakecloud_ec2::vpc_lookup;
+    let list = |key: &str| -> Vec<String> {
+        b.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deployment = b
+        .get("deploymentMode")
+        .and_then(Value::as_str)
+        .unwrap_or("SINGLE_INSTANCE");
+    let requested_subnets = list("subnetIds");
+    let subnets = if requested_subnets.is_empty() {
+        let wanted = if deployment == "SINGLE_INSTANCE" {
+            1
+        } else {
+            2
+        };
+        vpc_lookup::default_vpc_subnets(ec2, account)
+            .into_iter()
+            .take(wanted)
+            .collect::<Vec<_>>()
+    } else {
+        vpc_lookup::resolve_subnets(ec2, account, &requested_subnets)
+            .map_err(|id| format!("The subnet '{id}' does not exist."))?
+    };
+    let vpc_id = subnets
+        .first()
+        .map(|s| s.vpc_id.clone())
+        .unwrap_or_default();
+    if subnets.iter().any(|s| s.vpc_id != vpc_id) {
+        return Err("The subnets you specified must be in the same VPC.".to_string());
+    }
+    let requested_groups = list("securityGroups");
+    let groups = if requested_groups.is_empty() {
+        vpc_lookup::default_security_group_id(ec2, account, &vpc_id)
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        let resolved = vpc_lookup::security_group_vpcs(ec2, account, &requested_groups)
+            .map_err(|id| format!("The security group '{id}' does not exist."))?;
+        if let Some((id, _)) = resolved.iter().find(|(_, v)| *v != vpc_id) {
+            return Err(format!(
+                "The security group '{id}' is not in the broker's VPC '{vpc_id}'."
+            ));
+        }
+        requested_groups
+    };
+    let mut out = b.clone();
+    out["subnetIds"] = json!(subnets
+        .iter()
+        .map(|s| s.subnet_id.clone())
+        .collect::<Vec<_>>());
+    out["securityGroups"] = json!(groups);
+    Ok(out)
 }
 
 /// Per-protocol wire endpoint lists for a broker, derived deterministically
@@ -351,10 +424,10 @@ pub fn create_broker_record(
         "securityGroups".into(),
         b.get("securityGroups").cloned().unwrap_or(json!([])),
     );
-    // When no subnets are supplied, AWS places the broker in subnets of the
-    // account's default VPC. Synthesize deterministic ids so DescribeBroker
-    // returns a stable, non-empty list (Terraform's `subnet_ids` is Computed
-    // and must round-trip through import).
+    // Callers resolve the broker's subnets against EC2 first (see
+    // `resolve_broker_network`); only an EC2-less context reaches the
+    // synthesized fallback, so DescribeBroker still returns a non-empty list
+    // (Terraform's `subnet_ids` is Computed).
     let subnets = match b.get("subnetIds").and_then(Value::as_array) {
         Some(a) if !a.is_empty() => Value::Array(a.clone()),
         _ => Value::Array(synthesize_subnets(&id, &deployment)),

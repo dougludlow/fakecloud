@@ -228,14 +228,15 @@ async fn start_stop_activity_stream_round_trips_on_cluster() {
 #[tokio::test]
 async fn modify_db_subnet_group_applies_description() {
     let server = TestServer::start().await;
+    let vpc_subnets = server.default_subnet_ids().await;
     let client = server.rds_client().await;
 
     client
         .create_db_subnet_group()
         .db_subnet_group_name("sng-desc")
         .db_subnet_group_description("original")
-        .subnet_ids("subnet-aaaa1111")
-        .subnet_ids("subnet-bbbb2222")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();
@@ -244,8 +245,8 @@ async fn modify_db_subnet_group_applies_description() {
         .modify_db_subnet_group()
         .db_subnet_group_name("sng-desc")
         .db_subnet_group_description("updated description")
-        .subnet_ids("subnet-aaaa1111")
-        .subnet_ids("subnet-bbbb2222")
+        .subnet_ids(&vpc_subnets[0])
+        .subnet_ids(&vpc_subnets[1])
         .send()
         .await
         .unwrap();

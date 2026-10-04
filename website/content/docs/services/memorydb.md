@@ -22,7 +22,10 @@ persistent mode.
 - **Parameter and subnet groups** (`CreateParameterGroup`,
   `DescribeParameterGroups`, `DescribeParameters`, `UpdateParameterGroup`,
   `ResetParameterGroup`, `DeleteParameterGroup`, `CreateSubnetGroup`,
-  `DescribeSubnetGroups`, `UpdateSubnetGroup`, `DeleteSubnetGroup`).
+  `DescribeSubnetGroups`, `UpdateSubnetGroup`, `DeleteSubnetGroup`). Subnet
+  groups resolve their subnets in EC2 and report the subnets' `VpcId` and
+  Availability Zones (`InvalidSubnet` for unknown subnets or ones spanning
+  VPCs).
 - **Snapshots** (`CreateSnapshot`, `CopySnapshot`, `DescribeSnapshots`,
   `DeleteSnapshot`) capture cluster configuration.
 - **Multi-region clusters** (`CreateMultiRegionCluster`,

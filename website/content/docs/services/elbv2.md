@@ -11,6 +11,7 @@ fakecloud implements ELBv2 with full control-plane coverage across all three loa
 ## Supported today (full API)
 
 - **Load balancers** — `CreateLoadBalancer`, `DescribeLoadBalancers`, `DeleteLoadBalancer`, `SetSubnets`, `SetSecurityGroups`, `SetIpAddressType`, `ModifyIpPools`
+- **VPC placement** — a load balancer's `VpcId` and each `AvailabilityZones` entry's `ZoneName` come from the EC2 subnets it is attached to (`SubnetNotFound` for unknown subnets, `InvalidSubnet` when they span VPCs, `InvalidConfigurationRequest` for two subnets in one zone or a pinned `PrivateIPv4Address` outside its subnet). `SubnetMappings` keep `AllocationId` (reporting the Elastic IP's address), `PrivateIPv4Address` and `IPv6Address`. Security groups must exist in the load balancer's VPC (`InvalidSecurityGroup`); an Application Load Balancer created without any gets the VPC's `default` group. `CanonicalHostedZoneId` is the Route 53 zone AWS publishes for Elastic Load Balancing in the region (separate tables for Application and Network Load Balancers). With no subnets the load balancer sits in the default VPC.
 - **Load balancer attributes** — `ModifyLoadBalancerAttributes`, `DescribeLoadBalancerAttributes`
 - **Capacity reservations** — `ModifyCapacityReservation`, `DescribeCapacityReservation`
 - **Target groups** — `CreateTargetGroup`, `DescribeTargetGroups`, `ModifyTargetGroup`, `DeleteTargetGroup` with cross-resource reference checks (rejects delete while a listener or rule still references the target group, including `ForwardConfig.TargetGroups`)
@@ -18,6 +19,7 @@ fakecloud implements ELBv2 with full control-plane coverage across all three loa
 - **Target group attributes** — `ModifyTargetGroupAttributes`, `DescribeTargetGroupAttributes`
 - **Listeners** — `CreateListener`, `DescribeListeners`, `ModifyListener`, `DeleteListener` (cascades to rules), `DescribeListenerAttributes`, `ModifyListenerAttributes`
 - **Listener certificates** — `AddListenerCertificates`, `RemoveListenerCertificates`, `DescribeListenerCertificates`
+- **Action configs** — listener default actions and rule actions keep `AuthenticateOidcConfig` (the `ClientSecret` is stored but, as on AWS, never returned), `AuthenticateCognitoConfig`, `JwtValidationConfig`, `ForwardConfig.TargetGroupStickinessConfig`, redirects and fixed responses, and return them from `Describe*`.
 - **Listener rules** — `CreateRule`, `DescribeRules`, `ModifyRule`, `DeleteRule`, `SetRulePriorities` with positive-integer priority validation and target-group existence checks on `Actions`
 - **mTLS trust stores** — `CreateTrustStore`, `DescribeTrustStores`, `ModifyTrustStore`, `DeleteTrustStore`, `DescribeTrustStoreAssociations`, `DeleteSharedTrustStoreAssociation`, `GetTrustStoreCaCertificatesBundle`
 - **Trust store revocations** — `AddTrustStoreRevocations`, `RemoveTrustStoreRevocations`, `DescribeTrustStoreRevocations`, `GetTrustStoreRevocationContent`
@@ -45,10 +47,15 @@ fakecloud implements ELBv2 with full control-plane coverage across all three loa
 ```sh
 fakecloud &
 
+# Subnets come from EC2 (here: the default VPC's)
+SUBNETS=$(aws --endpoint-url http://localhost:4566 ec2 describe-subnets \
+    --filters Name=default-for-az,Values=true \
+    --query 'Subnets[0:2].SubnetId' --output text)
+
 # Create an ALB
 LB=$(aws --endpoint-url http://localhost:4566 elbv2 create-load-balancer \
     --name web-alb --type application \
-    --subnets subnet-aaa subnet-bbb \
+    --subnets $SUBNETS \
     --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
 # Create a target group

@@ -346,10 +346,13 @@ fn service_key_for_type(resource_type: &str) -> Option<&'static str> {
 /// or non-snapshot-backed services) are skipped.
 /// Snapshot-hook keys of services a resource type's provisioner mutates in
 /// addition to its owning service: an `AWS::EKS::Cluster` also creates and
-/// deletes its EKS-managed cluster security group in EC2.
+/// deletes its EKS-managed cluster security group in EC2, an
+/// `AWS::EFS::MountTarget` its network interface, and an `AWS::EKS::Nodegroup`
+/// its Auto Scaling group.
 fn secondary_service_keys_for_type(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
-        "AWS::EKS::Cluster" => &["ec2"],
+        "AWS::EKS::Cluster" | "AWS::EFS::MountTarget" => &["ec2"],
+        "AWS::EKS::Nodegroup" => &["autoscaling"],
         _ => &[],
     }
 }
@@ -6418,7 +6421,7 @@ mod tests {
         assert_eq!(eks.load(Ordering::SeqCst), 1);
         assert_eq!(ec2.load(Ordering::SeqCst), 1);
 
-        // Other EKS resources only touch EKS state.
+        // Other EKS resources do not touch EC2.
         persist_touched_services(&hooks, vec!["AWS::EKS::Nodegroup".to_string()]).await;
         assert_eq!(eks.load(Ordering::SeqCst), 2);
         assert_eq!(ec2.load(Ordering::SeqCst), 1);

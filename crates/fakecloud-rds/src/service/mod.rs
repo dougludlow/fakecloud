@@ -199,6 +199,9 @@ pub struct RdsService {
     /// KMS access, so storage encrypted without a named key reports the
     /// account's AWS-managed `aws/rds` key and a named key reports its ARN.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// EC2 state: a DB subnet group's subnets resolve there (its `VpcId` and
+    /// per-subnet Availability Zones). `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 /// Source type for RDS EventBridge events. Maps `aws.rds` detail-type.
@@ -276,7 +279,13 @@ impl RdsService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             delivery_bus: None,
             kms_hook: None,
+            ec2_state: None,
         }
+    }
+
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
     }
 
     pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {

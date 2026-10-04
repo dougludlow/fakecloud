@@ -96,15 +96,77 @@ pub struct DocDbService {
     /// KMS access, so encrypted storage reports a real key ARN (the
     /// AWS-managed `aws/rds` key when none is named).
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// EC2 state: a DB subnet group's subnets resolve there (its `VpcId` and
+    /// per-subnet Availability Zones). `None` in memory-only unit tests.
+    ec2_state: Option<fakecloud_ec2::SharedEc2State>,
 }
 
 impl DocDbService {
+    pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {
+        self.ec2_state = Some(ec2_state);
+        self
+    }
+
+    /// Resolve a DB subnet group's VPC and subnets (with their Availability
+    /// Zones) from EC2: every subnet must exist in one VPC (`InvalidSubnet`)
+    /// and they must span at least two Availability Zones. Without EC2 state
+    /// (memory-only unit tests) zones are assigned in request order and the
+    /// group gets a generated VPC id.
+    fn place_subnets(
+        &self,
+        req: &AwsRequest,
+        subnet_ids: &[String],
+    ) -> Result<(String, Vec<Subnet>), AwsServiceError> {
+        let Some(ec2) = &self.ec2_state else {
+            let subnets = subnet_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| Subnet {
+                    subnet_identifier: id.clone(),
+                    availability_zone: format!("{}{}", req.region, (b'a' + (i % 3) as u8) as char),
+                    status: "Active".to_string(),
+                })
+                .collect();
+            return Ok((
+                format!("vpc-{}", resource_token()[..12].to_lowercase()),
+                subnets,
+            ));
+        };
+        let placed =
+            fakecloud_ec2::vpc_lookup::resolve_subnet_group(ec2, &req.account_id, subnet_ids)
+                .map_err(|e| {
+                    AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidSubnet",
+                        e.message(),
+                    )
+                })?;
+        if placed.distinct_availability_zones() < 2 {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "DBSubnetGroupDoesNotCoverEnoughAZs",
+                "DB Subnet Group must contain at least 2 subnets in different Availability Zones.",
+            ));
+        }
+        let subnets = placed
+            .subnets
+            .iter()
+            .map(|s| Subnet {
+                subnet_identifier: s.subnet_id.clone(),
+                availability_zone: s.availability_zone.clone(),
+                status: "Active".to_string(),
+            })
+            .collect();
+        Ok((placed.vpc_id, subnets))
+    }
+
     pub fn new(state: SharedDocDbState) -> Self {
         Self {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             kms_hook: None,
+            ec2_state: None,
         }
     }
 
@@ -1680,20 +1742,12 @@ impl DocDbService {
         if st.subnet_groups.contains_key(&name) {
             return Err(subnet_group_already_exists(&name));
         }
-        let subnets = subnet_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| Subnet {
-                subnet_identifier: id.clone(),
-                availability_zone: format!("{}{}", req.region, (b'a' + (i % 3) as u8) as char),
-                status: "Active".to_string(),
-            })
-            .collect();
+        let (vpc_id, subnets) = self.place_subnets(req, &subnet_ids)?;
         let group = DbSubnetGroup {
             db_subnet_group_name: name.clone(),
             db_subnet_group_arn: rds_arn(&req.region, &req.account_id, "subgrp", &name),
             db_subnet_group_description: description,
-            vpc_id: format!("vpc-{}", resource_token()[..12].to_lowercase()),
+            vpc_id,
             subnet_group_status: "Complete".to_string(),
             subnets,
             tags: parse_tags(req),
@@ -1712,6 +1766,11 @@ impl DocDbService {
     fn modify_db_subnet_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let name = required_query_param(req, "DBSubnetGroupName")?;
         let subnet_ids = collect_list(req, "SubnetIds", &["SubnetIdentifier", "member"]);
+        let placed = if subnet_ids.is_empty() {
+            None
+        } else {
+            Some(self.place_subnets(req, &subnet_ids)?)
+        };
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         let group = st
@@ -1721,16 +1780,11 @@ impl DocDbService {
         if let Some(v) = optional_query_param(req, "DBSubnetGroupDescription") {
             group.db_subnet_group_description = v;
         }
-        if !subnet_ids.is_empty() {
-            group.subnets = subnet_ids
-                .iter()
-                .enumerate()
-                .map(|(i, id)| Subnet {
-                    subnet_identifier: id.clone(),
-                    availability_zone: format!("{}{}", req.region, (b'a' + (i % 3) as u8) as char),
-                    status: "Active".to_string(),
-                })
-                .collect();
+        if let Some((vpc_id, subnets)) = placed {
+            if self.ec2_state.is_some() {
+                group.vpc_id = vpc_id;
+            }
+            group.subnets = subnets;
         }
         let group = group.clone();
         Ok(ok_xml(

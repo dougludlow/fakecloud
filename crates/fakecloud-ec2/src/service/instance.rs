@@ -1140,6 +1140,7 @@ fn attach_secondary_network_interfaces(
                     ipv6_addresses: Vec::new(),
                     attachment: None,
                     public_ip_dns_hostname_type: None,
+                    requester_managed: false,
                 };
                 crate::service::tags::apply_tag_specifications(
                     state,

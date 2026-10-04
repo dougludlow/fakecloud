@@ -786,6 +786,72 @@ impl TestServer {
         aws_sdk_ec2::Client::new(&self.aws_config().await)
     }
 
+    /// The ids of the account's default-VPC subnets (one per Availability
+    /// Zone), ordered by zone. Services that place resources in subnets
+    /// (subnet groups, load balancers, mount targets, ...) resolve them in
+    /// EC2, so tests that do not build their own VPC use these.
+    pub async fn default_subnet_ids(&self) -> Vec<String> {
+        let resp = self
+            .ec2_client()
+            .await
+            .describe_subnets()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("default-for-az")
+                    .values("true")
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("describe default subnets");
+        let mut subnets: Vec<(String, String)> = resp
+            .subnets()
+            .iter()
+            .map(|s| {
+                (
+                    s.availability_zone().unwrap_or_default().to_string(),
+                    s.subnet_id().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        subnets.sort();
+        subnets.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The id of the default VPC's `default` security group.
+    pub async fn default_security_group_id(&self) -> String {
+        let ec2 = self.ec2_client().await;
+        let vpcs = ec2.describe_vpcs().send().await.expect("describe vpcs");
+        let vpc_id = vpcs
+            .vpcs()
+            .iter()
+            .find(|v| v.is_default() == Some(true))
+            .and_then(|v| v.vpc_id())
+            .expect("default VPC")
+            .to_string();
+        let groups = ec2
+            .describe_security_groups()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("vpc-id")
+                    .values(vpc_id)
+                    .build(),
+            )
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("group-name")
+                    .values("default")
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("describe default security group");
+        groups.security_groups()[0]
+            .group_id()
+            .expect("group id")
+            .to_string()
+    }
+
     pub async fn docdb_client(&self) -> aws_sdk_docdb::Client {
         aws_sdk_docdb::Client::new(&self.aws_config().await)
     }
