@@ -476,7 +476,7 @@ pub(crate) fn execute_pass_state(
     if output_path == Some("null") {
         Ok(json!({}))
     } else {
-        Ok(apply_output_path(&after_result, output_path))
+        apply_output_path(&after_result, output_path)
     }
 }
 
@@ -1909,10 +1909,10 @@ mod tests {
             "Parameters": {"r.$": "States.ArrayRange(1, 5000, 1)"},
             "End": true,
         });
-        let (error, cause) = execute_pass_state(&state_def, &json!({})).unwrap_err();
+        let (error, cause) = execute_pass_state(&state_def, &json!({}), None).unwrap_err();
         assert_eq!(error, "States.IntrinsicFailure");
         assert!(cause.contains("1000"), "{cause}");
-        let (error, _) = try_apply_parameters(
+        let (error, _) = apply_parameters(
             &json!({"nested": [{"r.$": "States.ArrayRange(1, 5000, 1)"}]}),
             &json!({}),
             None,
