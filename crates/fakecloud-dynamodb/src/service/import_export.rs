@@ -790,7 +790,15 @@ fn export_content(exp: &ExportDescription, table: &DynamoTable) -> ExportContent
         code: code.to_string(),
         message,
     };
-    let enabled_at = table.pitr_history.enabled_at.filter(|_| table.pitr_enabled);
+    // The same earliest restorable time DescribeContinuousBackups reports:
+    // when recovery was enabled, or the start of the retained window.
+    let enabled_at = crate::state::earliest_restorable(table, exp.start_time);
+    if exp.export_time > exp.start_time {
+        return invalid(
+            "InvalidExportTimeException",
+            "Export time is in the future".to_string(),
+        );
+    }
     if exp.export_type.as_deref() != Some("INCREMENTAL_EXPORT") {
         // A full export reflects the table at ExportTime. With recovery on,
         // the history rebuilds that state; a time before the history starts
@@ -1105,21 +1113,14 @@ impl DynamoDbService {
             .to_string();
 
         let now = Utc::now();
-        let export_time = match body.get("ExportTime").and_then(Value::as_f64) {
-            Some(secs) => {
-                let t =
-                    DateTime::<Utc>::from_timestamp_millis((secs * 1000.0) as i64).unwrap_or(now);
-                if t > now {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidExportTimeException",
-                        "Export time is in the future",
-                    ));
-                }
-                t
-            }
-            None => now,
-        };
+        // Time problems (a future ExportTime, a window the point-in-time
+        // history cannot serve) fail the export job rather than the call; see
+        // `export_content`.
+        let export_time = body
+            .get("ExportTime")
+            .and_then(Value::as_f64)
+            .and_then(|secs| DateTime::<Utc>::from_timestamp_millis((secs * 1000.0) as i64))
+            .unwrap_or(now);
 
         let export_type = body["ExportType"]
             .as_str()
@@ -2001,18 +2002,23 @@ mod tests {
     }
 
     #[test]
-    fn export_rejects_future_export_time() {
+    fn export_with_future_export_time_fails_the_job() {
+        // Like the other time checks, a future ExportTime fails the export
+        // job (DescribeExport reports it) rather than the call.
         let (svc, _s3) = setup();
         let table_arn = seed_table(&svc);
-        let err = svc
-            .export_table_to_point_in_time(&request(
+        let resp = body_of(
+            svc.export_table_to_point_in_time(&request(
                 "ExportTableToPointInTime",
                 json!({ "TableArn": table_arn, "S3Bucket": "src",
                         "ExportTime": (Utc::now().timestamp() + 3600) as f64 }),
             ))
-            .err()
-            .unwrap();
-        assert_eq!(err.code(), "InvalidExportTimeException");
+            .unwrap(),
+        );
+        let arn = resp["ExportDescription"]["ExportArn"].as_str().unwrap();
+        let d = describe_export(&svc, arn);
+        assert_eq!(d["ExportStatus"], "FAILED", "{d}");
+        assert_eq!(d["FailureCode"], "InvalidExportTimeException");
     }
 
     /// A restart leaves persisted jobs IN_PROGRESS; resuming runs them again.
@@ -2080,6 +2086,7 @@ mod tests {
 
     fn change(mins_ago: i64, pk: &str, old: Option<Item>, new: Option<Item>) -> ItemChange {
         ItemChange {
+            seq: 0,
             at: Utc::now() - chrono::Duration::minutes(mins_ago),
             keys: item(pk, None),
             old_image: old,
@@ -2116,6 +2123,7 @@ mod tests {
         t.remove_item_by_key(&item("b", None));
         t.pitr_enabled = true;
         t.pitr_history = crate::state::PitrHistory {
+            next_seq: 6,
             enabled_at: Some(Utc::now() - chrono::Duration::hours(2)),
             changes: vec![
                 change(100, "x", None, Some(item("x", Some("1")))),
@@ -2380,5 +2388,73 @@ mod tests {
         let d = describe_import(&svc, &arn);
         assert_eq!(d["ErrorCount"], 1, "{d}");
         assert_eq!(d["ImportedItemCount"], 1, "{d}");
+    }
+
+    fn continuous_backups(svc: &DynamoDbService, action: &str, extra: Value) -> Value {
+        let mut body = json!({ "TableName": "src-table" });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let req = request(action, body);
+        let resp = if action == "UpdateContinuousBackups" {
+            svc.update_continuous_backups(&req)
+        } else {
+            svc.describe_continuous_backups(&req)
+        };
+        body_of(resp.unwrap())["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
+            .clone()
+    }
+
+    #[test]
+    fn export_at_the_reported_earliest_restorable_time_succeeds() {
+        let (svc, _s3) = setup();
+        seed_table(&svc);
+        let updated = continuous_backups(
+            &svc,
+            "UpdateContinuousBackups",
+            json!({ "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": true } }),
+        );
+        let described = continuous_backups(&svc, "DescribeContinuousBackups", json!({}));
+        let earliest = described["EarliestRestorableDateTime"].clone();
+        assert_eq!(updated["EarliestRestorableDateTime"], earliest);
+        let arn = start_export(&svc, json!({ "ExportTime": earliest }));
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["ExportStatus"], "COMPLETED", "{d}");
+    }
+
+    #[test]
+    fn exports_before_the_retained_window_fail() {
+        let (svc, _s3) = setup();
+        seed_table(&svc);
+        {
+            let mut accounts = svc.state.write();
+            let t = accounts
+                .get_or_create(ACCOUNT)
+                .tables
+                .get_mut("src-table")
+                .unwrap();
+            t.pitr_enabled = true;
+            t.pitr_history.enabled_at = Some(Utc::now() - chrono::Duration::days(40));
+        }
+        let described = continuous_backups(&svc, "DescribeContinuousBackups", json!({}));
+        let earliest = described["EarliestRestorableDateTime"].as_f64().unwrap();
+        let window_start = (Utc::now() - chrono::Duration::days(35)).timestamp() as f64;
+        assert!(
+            (earliest - window_start).abs() <= 2.0,
+            "{earliest} vs {window_start}"
+        );
+
+        let arn = start_export(&svc, json!({ "ExportTime": secs_ago(60 * 24 * 36) }));
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["FailureCode"], "InvalidExportTimeException", "{d}");
+        let arn = start_export(
+            &svc,
+            json!({ "ExportType": "INCREMENTAL_EXPORT",
+                    "IncrementalExportSpecification": {
+                        "ExportFromTime": secs_ago(60 * 24 * 36),
+                        "ExportToTime": secs_ago(60 * 24 * 36 - 60) } }),
+        );
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["FailureCode"], "InvalidExportTimeException", "{d}");
     }
 }

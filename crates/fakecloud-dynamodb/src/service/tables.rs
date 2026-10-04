@@ -1444,7 +1444,8 @@ impl DynamoDbService {
         let table =
             get_table_mut_with_code(&mut state.tables, table_name, "TableNotFoundException")?;
         table.set_pitr(enabled);
-        let earliest = table.pitr_history.enabled_at.unwrap_or_else(Utc::now);
+        let now = Utc::now();
+        let earliest = crate::state::earliest_restorable(table, now).unwrap_or(now);
 
         let status = if enabled { "ENABLED" } else { "DISABLED" };
         Self::ok_json(json!({
@@ -1478,13 +1479,8 @@ impl DynamoDbService {
         } else {
             "DISABLED"
         };
-        // The earliest restorable time is when recovery was enabled (the
-        // history only reaches back that far), capped to the recovery window.
-        let window_start = Utc::now() - chrono::Duration::days(crate::state::PITR_RETENTION_DAYS);
-        let earliest = table
-            .pitr_history
-            .enabled_at
-            .map_or_else(Utc::now, |t| t.max(window_start));
+        let now = Utc::now();
+        let earliest = crate::state::earliest_restorable(table, now).unwrap_or(now);
         Self::ok_json(json!({
             "ContinuousBackupsDescription": {
                 "ContinuousBackupsStatus": status,

@@ -611,6 +611,11 @@ pub const PITR_RETENTION_DAYS: i64 = 35;
 /// and after (`None` for a delete).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemChange {
+    /// Position in the table's history, unique and increasing, so a rolled
+    /// back transaction can remove exactly the entries it appended even if
+    /// pruning dropped older ones meanwhile.
+    #[serde(default)]
+    pub seq: u64,
     pub at: DateTime<Utc>,
     pub keys: HashMap<String, AttributeValue>,
     pub old_image: Option<HashMap<String, AttributeValue>>,
@@ -622,10 +627,33 @@ pub struct ItemChange {
 /// pruned to the recovery window.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PitrHistory {
+    /// When recovery was enabled, at whole-second precision (the precision
+    /// `EarliestRestorableDateTime` is reported at).
     #[serde(default)]
     pub enabled_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub changes: Vec<ItemChange>,
+    #[serde(default)]
+    pub next_seq: u64,
+}
+
+/// `t` truncated to whole seconds.
+fn whole_seconds(t: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(t.timestamp(), 0).unwrap_or(t)
+}
+
+/// The earliest time a PITR-enabled table can be restored or exported at:
+/// when recovery was enabled, or the start of the retained window if that
+/// is later. Whole-second precision, exactly what DescribeContinuousBackups
+/// reports, so a request for the reported time is accepted. `None` while
+/// recovery is disabled.
+pub fn earliest_restorable(table: &DynamoTable, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if !table.pitr_enabled {
+        return None;
+    }
+    let window_start = now - chrono::Duration::days(PITR_RETENTION_DAYS);
+    let enabled_at = table.pitr_history.enabled_at.unwrap_or(now);
+    Some(whole_seconds(enabled_at.max(window_start)))
 }
 
 pub(crate) fn default_table_class() -> String {
@@ -939,13 +967,17 @@ impl DynamoTable {
             })
             .collect();
         let now = Utc::now();
-        let cutoff = now - chrono::Duration::days(PITR_RETENTION_DAYS);
+        // Entries before the earliest restorable time can never be served.
+        let cutoff = earliest_restorable(self, now).unwrap_or(now);
+        let seq = self.pitr_history.next_seq;
+        self.pitr_history.next_seq += 1;
         let changes = &mut self.pitr_history.changes;
         let stale = changes.iter().take_while(|c| c.at < cutoff).count();
         if stale > 0 {
             changes.drain(..stale);
         }
         changes.push(ItemChange {
+            seq,
             at: now,
             keys,
             old_image: old_image.cloned(),
@@ -953,14 +985,20 @@ impl DynamoTable {
         });
     }
 
-    /// Number of recorded changes, so a reverted transaction can drop the
-    /// ones it recorded with [`Self::truncate_changes`].
-    pub fn change_count(&self) -> usize {
-        self.pitr_history.changes.len()
+    /// A marker for the next history entry, so a reverted transaction can
+    /// drop exactly the entries it recorded with
+    /// [`Self::discard_changes_since`].
+    pub fn change_marker(&self) -> u64 {
+        self.pitr_history.next_seq
     }
 
-    pub fn truncate_changes(&mut self, len: usize) {
-        self.pitr_history.changes.truncate(len);
+    pub fn discard_changes_since(&mut self, marker: u64) {
+        self.pitr_history.changes.retain(|c| c.seq < marker);
+    }
+
+    /// Number of recorded history entries.
+    pub fn change_count(&self) -> usize {
+        self.pitr_history.changes.len()
     }
 
     /// Turn point-in-time recovery on or off. Enabling starts a fresh history
@@ -969,9 +1007,14 @@ impl DynamoTable {
     pub fn set_pitr(&mut self, enabled: bool) {
         if enabled && !self.pitr_enabled {
             self.pitr_history = PitrHistory {
-                enabled_at: Some(Utc::now()),
+                enabled_at: Some(whole_seconds(Utc::now())),
                 changes: Vec::new(),
+                next_seq: 0,
             };
+        } else if enabled && self.pitr_history.enabled_at.is_none() {
+            // Enabled by a path that predates the history (an older
+            // snapshot): the history starts now.
+            self.pitr_history.enabled_at = Some(whole_seconds(Utc::now()));
         } else if !enabled {
             self.pitr_history = PitrHistory::default();
         }
@@ -1603,6 +1646,11 @@ impl DynamoDbState {
     pub fn rebuild_derived_state(&mut self) {
         for table in self.tables.values_mut() {
             table.recalculate_stats();
+            // A snapshot written before the history existed has PITR on but
+            // no start time; the history starts at load.
+            if table.pitr_enabled && table.pitr_history.enabled_at.is_none() {
+                table.set_pitr(true);
+            }
         }
     }
 
@@ -2253,12 +2301,64 @@ mod tests {
         assert_eq!(c[3].new_image.as_ref().unwrap()["v"], json!({"N": "4"}));
         assert!(c[4].new_image.is_none());
 
-        t.truncate_changes(2);
-        assert_eq!(t.change_count(), 2);
+        let marker = t.change_marker();
+        t.put_item_at_key(mk_pk("z"));
+        t.discard_changes_since(marker);
+        assert_eq!(t.change_count(), 5);
         // Disabling PITR discards the history, as on DynamoDB.
         t.set_pitr(false);
         assert_eq!(t.change_count(), 0);
         assert!(t.pitr_history.enabled_at.is_none());
+    }
+
+    #[test]
+    fn earliest_restorable_is_whole_seconds_within_the_window() {
+        let mut t = table_with_hash_key("pk");
+        let now = Utc::now();
+        assert_eq!(earliest_restorable(&t, now), None);
+        t.set_pitr(true);
+        let e = earliest_restorable(&t, now).unwrap();
+        assert_eq!(e.timestamp_subsec_nanos(), 0);
+        assert_eq!(Some(e), t.pitr_history.enabled_at);
+        t.pitr_history.enabled_at = Some(now - chrono::Duration::days(40));
+        let e = earliest_restorable(&t, now).unwrap();
+        assert_eq!(
+            e.timestamp(),
+            (now - chrono::Duration::days(PITR_RETENTION_DAYS)).timestamp()
+        );
+    }
+
+    #[test]
+    fn rollback_removes_exactly_its_entries_even_after_pruning() {
+        let mut t = table_with_hash_key("pk");
+        t.set_pitr(true);
+        // An entry that has fallen out of the window: the next write prunes
+        // it, so the list shrinks during the "transaction".
+        t.pitr_history.enabled_at = Some(Utc::now() - chrono::Duration::days(40));
+        t.pitr_history.changes.push(ItemChange {
+            seq: 0,
+            at: Utc::now() - chrono::Duration::days(36),
+            keys: mk_pk("old"),
+            old_image: None,
+            new_image: Some(mk_pk("old")),
+        });
+        t.pitr_history.next_seq = 1;
+        let marker = t.change_marker();
+        t.put_item_at_key(mk_pk("tx"));
+        assert_eq!(t.change_count(), 1, "stale entry pruned");
+        t.discard_changes_since(marker);
+        assert_eq!(t.change_count(), 0, "the transaction's write is gone");
+    }
+
+    #[test]
+    fn loading_a_pitr_table_without_history_start_initialises_it() {
+        let mut state = DynamoDbState::new("123456789012", "us-east-1");
+        let mut t = table_with_hash_key("pk");
+        t.pitr_enabled = true;
+        state.tables.insert("t".into(), t);
+        state.rebuild_derived_state();
+        assert!(state.tables["t"].pitr_history.enabled_at.is_some());
+        assert!(earliest_restorable(&state.tables["t"], Utc::now()).is_some());
     }
 
     fn pks(t: &DynamoTable) -> Vec<String> {

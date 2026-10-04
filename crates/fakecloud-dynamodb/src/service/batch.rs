@@ -1066,7 +1066,7 @@ impl DynamoDbService {
         #[allow(clippy::type_complexity)]
         let mut snapshots: HashMap<
             (String, String),
-            (Vec<HashMap<String, AttributeValue>>, usize),
+            (Vec<HashMap<String, AttributeValue>>, u64),
         > = HashMap::new();
         for ti in transact_items {
             for op_key in ["Put", "Delete", "Update"] {
@@ -1080,7 +1080,7 @@ impl DynamoDbService {
                         .or_insert_with(|| {
                             tables_of(&accounts, req, table_name)
                                 .get(super::resolve_table_name(table_name))
-                                .map(|t| (t.items.to_vec(), t.change_count()))
+                                .map(|t| (t.items.to_vec(), t.change_marker()))
                                 .unwrap_or_default()
                         });
                 }
@@ -1302,13 +1302,13 @@ impl DynamoDbService {
             // surface the failure as a TransactionCanceledException
             // whose CancellationReasons array marks the offending op
             // with `ValidationError` and leaves siblings as `None`.
-            for ((account, table_name), (items, change_count)) in snapshots {
+            for ((account, table_name), (items, change_marker)) in snapshots {
                 if let Some(table) = accounts
                     .get_mut(&account)
                     .and_then(|state| state.tables.get_mut(&table_name))
                 {
                     table.replace_items(items);
-                    table.truncate_changes(change_count);
+                    table.discard_changes_since(change_marker);
                 }
             }
             let reasons: Vec<Value> = (0..transact_items.len())
