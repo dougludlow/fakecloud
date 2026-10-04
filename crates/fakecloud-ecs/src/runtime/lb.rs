@@ -32,9 +32,6 @@ impl EcsRuntime {
         account_id: &str,
         task_id: &str,
     ) {
-        let Some(ref bus) = self.delivery_bus else {
-            return;
-        };
         let accounts = state.read();
         let Some(s) = accounts.get(account_id) else {
             return;
@@ -42,6 +39,17 @@ impl EcsRuntime {
         let Some(task) = s.tasks.get(task_id) else {
             return;
         };
+        // The task's published awsvpc ports are gone with its containers.
+        if let Some(ip) = super::eni::task_eni_ip(task) {
+            fakecloud_core::dataplane::unregister_target(account_id, &ip);
+        }
+        let Some(ref bus) = self.delivery_bus else {
+            return;
+        };
+        // Its ENI goes with the task, as on ECS.
+        if let Some(eni_id) = super::eni::task_eni_id(task) {
+            bus.delete_task_eni(account_id, &eni_id);
+        }
         let targets = compute_elbv2_targets(s, task);
         drop(accounts);
         for (tg_arn, tg_targets) in targets {

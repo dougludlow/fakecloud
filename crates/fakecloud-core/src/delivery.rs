@@ -31,6 +31,7 @@ pub struct DeliveryBus {
     ecs_task_runner: Option<Arc<dyn EcsTaskRunner>>,
     /// Register/deregister ELBv2 targets from ECS runtime.
     elbv2_target_registration: Option<Arc<dyn Elbv2TargetRegistration>>,
+    ec2_network_lookup: Option<Arc<dyn Ec2NetworkLookup>>,
     /// Publish CloudWatch metric data points (CloudWatch Logs metric
     /// filters extract these on PutLogEvents).
     cloudwatch_metrics: Option<Arc<dyn CloudwatchDelivery>>,
@@ -338,6 +339,32 @@ pub trait Elbv2TargetRegistration: Send + Sync {
     );
 }
 
+/// A requester-managed network interface EC2 created for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEni {
+    pub eni_id: String,
+    pub private_ip: String,
+    pub mac_address: String,
+}
+
+/// EC2 VPC networking from outside the ec2 crate. Used by the ECS runtime to
+/// give an `awsvpc` task a real ENI in its subnet (visible to
+/// DescribeNetworkInterfaces, its private IP allocated by EC2 like any other
+/// interface's) and to delete it when the task stops.
+pub trait Ec2NetworkLookup: Send + Sync {
+    /// Create a requester-managed ENI in `subnet_id`. `Err` when the subnet
+    /// doesn't exist or has no free address.
+    fn create_task_eni(
+        &self,
+        account_id: &str,
+        subnet_id: &str,
+        group_ids: Vec<String>,
+        description: String,
+    ) -> Result<TaskEni, String>;
+    /// Delete an ENI [`Self::create_task_eni`] created (no-op otherwise).
+    fn delete_task_eni(&self, account_id: &str, eni_id: &str);
+}
+
 /// Publish CloudWatch metric data points from outside the cloudwatch
 /// crate. Used by CloudWatch Logs metric filters when an incoming log
 /// event matches their pattern.
@@ -585,6 +612,7 @@ impl DeliveryBus {
             ses_dispatcher: None,
             ecs_task_runner: None,
             elbv2_target_registration: None,
+            ec2_network_lookup: None,
             cloudwatch_metrics: None,
             cloudwatch_logs: None,
             cognito_jwt_verifier: None,
@@ -726,6 +754,32 @@ impl DeliveryBus {
     pub fn with_elbv2_target_registration(mut self, reg: Arc<dyn Elbv2TargetRegistration>) -> Self {
         self.elbv2_target_registration = Some(reg);
         self
+    }
+
+    pub fn with_ec2_network_lookup(mut self, lookup: Arc<dyn Ec2NetworkLookup>) -> Self {
+        self.ec2_network_lookup = Some(lookup);
+        self
+    }
+
+    /// Create a task ENI in an EC2 subnet. `None` when no EC2 lookup is
+    /// wired; `Some(Err)` when EC2 refused (unknown subnet, subnet full).
+    pub fn create_task_eni(
+        &self,
+        account_id: &str,
+        subnet_id: &str,
+        group_ids: Vec<String>,
+        description: String,
+    ) -> Option<Result<TaskEni, String>> {
+        self.ec2_network_lookup
+            .as_ref()
+            .map(|l| l.create_task_eni(account_id, subnet_id, group_ids, description))
+    }
+
+    /// Delete a task ENI created with [`Self::create_task_eni`].
+    pub fn delete_task_eni(&self, account_id: &str, eni_id: &str) {
+        if let Some(l) = &self.ec2_network_lookup {
+            l.delete_task_eni(account_id, eni_id);
+        }
     }
 
     /// Register targets with an ELBv2 target group. Silently no-ops when
