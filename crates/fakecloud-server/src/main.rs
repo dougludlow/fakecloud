@@ -5076,9 +5076,7 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_stepfunctions::StepFunctionsSnapshot>(
-                        &bytes,
-                    ) {
+                    match fakecloud_stepfunctions::parse_stepfunctions_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_stepfunctions::STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION
@@ -5097,8 +5095,11 @@ async fn main() {
                                     "loaded stepfunctions persistence snapshot (multi-account)",
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let sm_count = single_state.state_machines.len();
-                                let account_id = single_state.account_id.clone();
+                                let sm_count: usize = single_state
+                                    .regions()
+                                    .map(|(_, s)| s.state_machines.len())
+                                    .sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = stepfunctions_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
                                 tracing::info!(
@@ -10980,10 +10981,11 @@ async fn main() {
                     let ss = ss.clone();
                     async move {
                         let accounts = ss.read();
-                        let state = accounts.default_ref();
-                        let mut executions: Vec<types::StepFunctionsExecution> = state
-                            .executions
-                            .values()
+                        // The default account's executions in every region.
+                        let mut executions: Vec<types::StepFunctionsExecution> = accounts
+                            .default_ref()
+                            .regions()
+                            .flat_map(|(_, state)| state.executions.values())
                             .map(|exec| types::StepFunctionsExecution {
                                 execution_arn: exec.execution_arn.clone(),
                                 state_machine_arn: exec.state_machine_arn.clone(),
@@ -11009,10 +11011,11 @@ async fn main() {
                     let ss = ss.clone();
                     async move {
                         let accounts = ss.read();
-                        let state = accounts.default_ref();
-                        let mut executions: Vec<types::StepFunctionsSyncExecution> = state
-                            .executions
-                            .values()
+                        // The default account's executions in every region.
+                        let mut executions: Vec<types::StepFunctionsSyncExecution> = accounts
+                            .default_ref()
+                            .regions()
+                            .flat_map(|(_, state)| state.executions.values())
                             .filter(|exec| exec.is_sync)
                             .map(|exec| {
                                 let duration_ms = exec.billed_duration_ms.unwrap_or_else(|| {
@@ -11053,7 +11056,15 @@ async fn main() {
                     let ss = ss.clone();
                     async move {
                         let accounts = ss.read();
-                        let state = accounts.default_ref();
+                        // The execution lives in the region its ARN names
+                        // (default account, as before); so do its children.
+                        let empty = fakecloud_stepfunctions::StepFunctionsState::new(
+                            accounts.default_account_id(),
+                            accounts.region(),
+                        );
+                        let state = fakecloud_aws::arn::region_of(&arn)
+                            .and_then(|r| accounts.default_ref().region(r))
+                            .unwrap_or(&empty);
                         // Index children by parent arn for O(N) tree build.
                         let mut children_by_parent: std::collections::HashMap<
                             String,
@@ -11373,16 +11384,20 @@ async fn main() {
                         // Default-account namespace keeps the introspection
                         // endpoint simple. Multi-account callers can switch
                         // FAKECLOUD's default account before calling, or
-                        // create the activity in the default account.
-                        let state = accounts.default_mut();
-                        if !state.activities.contains_key(&activity_arn) {
+                        // create the activity in the default account. The
+                        // activity lives in the region its ARN names.
+                        let Some(state) = fakecloud_aws::arn::region_of(&activity_arn)
+                            .map(str::to_string)
+                            .and_then(|r| accounts.default_mut().get_region_mut(&r))
+                            .filter(|s| s.activities.contains_key(&activity_arn))
+                        else {
                             return (
                                 axum::http::StatusCode::NOT_FOUND,
                                 axum::Json(serde_json::json!({
                                     "error": "ActivityDoesNotExist"
                                 })),
                             );
-                        }
+                        };
                         state.task_tokens.insert(
                             token.clone(),
                             fakecloud_stepfunctions::TaskTokenState {

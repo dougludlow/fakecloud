@@ -36,7 +36,7 @@ impl ResourceProvisioner {
         let arn = self
             .stepfunctions_state
             .write()
-            .get_or_create(&self.account_id)
+            .regional_mut(&self.account_id, &self.region)
             .state_machine_arn(&self.region, &name);
         let now = Utc::now();
         let revision_id = Uuid::new_v4().to_string();
@@ -59,7 +59,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.state_machines.insert(arn.clone(), sm);
 
         // Expose the real revision id (not a literal "INITIAL") so a sibling
@@ -141,7 +141,7 @@ impl ResourceProvisioner {
         let definition = self.resolve_sfn_definition(props)?;
 
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let sm = state
             .state_machines
             .get_mut(&arn)
@@ -172,7 +172,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sfn_state_machine(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.state_machines.remove(physical_id);
         Ok(())
     }
@@ -196,7 +196,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.activities.insert(arn.clone(), activity);
 
         Ok(ProvisionResult::new(arn.clone())
@@ -206,7 +206,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sfn_activity(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.activities.remove(physical_id);
         Ok(())
     }
@@ -233,7 +233,7 @@ impl ResourceProvisioner {
             .to_string();
 
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
 
         // Derive next version number for this state machine.
         let next_version = state
@@ -262,7 +262,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sfn_version(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.state_machine_versions.remove(physical_id);
         Ok(())
     }
@@ -333,7 +333,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.state_machine_aliases.insert(arn.clone(), alias);
 
         Ok(ProvisionResult::new(arn.clone())
@@ -343,7 +343,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_sfn_alias(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.stepfunctions_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.state_machine_aliases.remove(physical_id);
         Ok(())
     }

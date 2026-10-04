@@ -165,11 +165,8 @@ pub async fn save_stepfunctions_snapshot(
         return;
     };
     let _guard = lock.lock().await;
-    let snapshot = StepFunctionsSnapshot {
-        schema_version: STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION,
-        state: None,
-        accounts: Some(state.read().clone()),
-    };
+    let snapshot =
+        StepFunctionsSnapshot::of(STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION, state.read().clone());
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -196,11 +193,7 @@ pub fn reconcile_interrupted_executions(state: &SharedStepFunctionsState) -> usi
     let now = Utc::now();
     let mut count = 0;
     let mut accounts = state.write();
-    let account_ids: Vec<String> = accounts.iter().map(|(id, _)| id.to_string()).collect();
-    for account_id in account_ids {
-        let Some(s) = accounts.get_mut(&account_id) else {
-            continue;
-        };
+    for (_, _, s) in accounts.iter_regional_mut() {
         for exec in s.executions.values_mut() {
             if matches!(
                 exec.status,
@@ -329,7 +322,9 @@ impl StepFunctionsService {
         };
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut activities: Vec<&crate::state::Activity> = state.activities.values().collect();
         activities.sort_by(|a, b| a.name.cmp(&b.name));
         let items: Vec<Value> = activities
@@ -1032,15 +1027,15 @@ pub fn start_execution_from_delivery(
 
     let execution_name = uuid::Uuid::new_v4().to_string();
 
-    // Extract account_id from the state machine ARN
-    let account_id = state_machine_arn
-        .split(':')
-        .nth(4)
-        .unwrap_or("000000000000")
-        .to_string();
-
     let mut accounts = state.write();
-    let st = accounts.get_or_create(&account_id);
+    // The state machine lives in the account and region its ARN names.
+    let Some(st) = accounts.by_arn_mut(state_machine_arn) else {
+        tracing::warn!(
+            state_machine_arn,
+            "Step Functions delivery: state machine not found"
+        );
+        return;
+    };
     let sm = match st.state_machines.get(state_machine_arn) {
         Some(sm) => sm,
         None => {

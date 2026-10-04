@@ -31,7 +31,7 @@ impl StepFunctionsService {
             .ok_or_else(|| missing("taskToken"))?
             .to_string();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let entry = state
             .task_tokens
             .get_mut(&token)
@@ -51,7 +51,7 @@ impl StepFunctionsService {
             .ok_or_else(|| missing("taskToken"))?
             .to_string();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let entry = state
             .task_tokens
             .get_mut(&token)

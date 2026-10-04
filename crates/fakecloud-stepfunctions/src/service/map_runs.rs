@@ -16,7 +16,9 @@ impl StepFunctionsService {
             .to_string();
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mr = state
             .map_runs
             .get(&arn)
@@ -46,7 +48,9 @@ impl StepFunctionsService {
         };
         let accounts = self.state.read();
         let empty = crate::state::StepFunctionsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut runs: Vec<&crate::state::MapRun> = state
             .map_runs
             .values()
@@ -82,7 +86,7 @@ impl StepFunctionsService {
             .ok_or_else(|| missing("mapRunArn"))?
             .to_string();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let mr = state
             .map_runs
             .get_mut(&arn)

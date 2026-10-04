@@ -436,7 +436,8 @@ async fn execute_task_state(
         context["Task"] = json!({ "Token": token.clone() });
         {
             let mut accounts = shared_state.write();
-            let state = accounts.get_or_create(account_id);
+            let region = arn_region(execution_arn, accounts.region());
+            let state = accounts.regional_mut(account_id, &region);
             state.task_tokens.insert(
                 token.clone(),
                 crate::state::TaskTokenState {
@@ -508,9 +509,11 @@ async fn execute_task_state(
             Ok(result) => {
                 if let Some((token, _)) = &task_token {
                     let account_id = account_id_from_arn(execution_arn);
+                    let region = arn_region(execution_arn, shared_state.read().region());
                     match poll_task_token(
                         shared_state,
                         account_id,
+                        &region,
                         token,
                         timeout_seconds,
                         heartbeat_seconds,
@@ -1010,7 +1013,8 @@ fn start_map_run(
 ) {
     let account = account_id_from_arn(execution_arn).to_string();
     let mut accounts = shared_state.write();
-    let s = accounts.get_or_create(&account);
+    let region = arn_region(execution_arn, accounts.region());
+    let s = accounts.regional_mut(&account, &region);
     s.map_runs.insert(
         map_run_arn.to_string(),
         MapRun {
@@ -1041,7 +1045,8 @@ fn finish_map_run(
 ) {
     let account = account_id_from_arn(execution_arn).to_string();
     let mut accounts = shared_state.write();
-    let s = accounts.get_or_create(&account);
+    let region = arn_region(execution_arn, accounts.region());
+    let s = accounts.regional_mut(&account, &region);
     if let Some(mr) = s.map_runs.get_mut(map_run_arn) {
         mr.status = status.to_string();
         mr.succeeded_count = succeeded;
@@ -1369,7 +1374,7 @@ async fn invoke_resource(
                     .and_then(Value::as_str)
                 {
                     let mut accounts = shared_state.write();
-                    if let Some(state) = accounts.get_mut(&account_id) {
+                    if let Some(state) = accounts.by_arn_mut(inner_arn) {
                         if let Some(exec) = state.executions.get_mut(inner_arn) {
                             exec.parent_execution_arn = Some(execution_arn.to_string());
                         }
@@ -1437,10 +1442,19 @@ fn map_sdk_service_id(service_id: &str) -> &str {
 fn execution_role_arn(state: &SharedStepFunctionsState, execution_arn: &str) -> String {
     let accounts = state.read();
     accounts
-        .get(account_id_from_arn(execution_arn))
+        .by_arn(execution_arn)
         .and_then(|s| s.executions.get(execution_arn))
         .map(|exec| exec.role_arn.clone())
         .unwrap_or_default()
+}
+
+/// The region a Step Functions ARN names, or `fallback` (the server region)
+/// for a malformed one. An execution's map runs, task tokens and child
+/// executions live in its own region.
+fn arn_region(arn: &str, fallback: &str) -> String {
+    fakecloud_aws::arn::region_of(arn)
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// Extract the AWS account id from a Step Functions execution ARN
@@ -2219,7 +2233,7 @@ async fn invoke_activity(
     {
         let accounts = shared_state.read();
         let exists = accounts
-            .get(&activity_account)
+            .by_arn(activity_arn)
             .map(|s| s.activities.contains_key(activity_arn))
             .unwrap_or(false);
         if !exists {
@@ -2240,7 +2254,8 @@ async fn invoke_activity(
         serde_json::to_string(input).expect("serde_json::Value serialization is infallible");
     {
         let mut accounts = shared_state.write();
-        let state = accounts.get_or_create(&activity_account);
+        let region = arn_region(activity_arn, accounts.region());
+        let state = accounts.regional_mut(&activity_account, &region);
         state.task_tokens.insert(
             token.clone(),
             TaskTokenState {
@@ -2258,9 +2273,11 @@ async fn invoke_activity(
         );
     }
 
+    let activity_region = arn_region(activity_arn, shared_state.read().region());
     poll_task_token(
         shared_state,
         &activity_account,
+        &activity_region,
         &token,
         timeout_seconds,
         heartbeat_seconds,

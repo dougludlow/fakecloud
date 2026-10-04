@@ -9,7 +9,7 @@ use serde_json::Value;
 use fakecloud_aws::arn::Arn;
 
 pub type SharedStepFunctionsState =
-    Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<StepFunctionsState>>>;
+    Arc<RwLock<fakecloud_core::multi_account::MultiRegionState<StepFunctionsState>>>;
 
 impl fakecloud_core::multi_account::AccountState for StepFunctionsState {
     fn new_for_account(account_id: &str, region: &str, _endpoint: &str) -> Self {
@@ -17,15 +17,72 @@ impl fakecloud_core::multi_account::AccountState for StepFunctionsState {
     }
 }
 
-pub const STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+/// v3: state partitioned by (account, region). v2 kept one state per
+/// account; v1 a single account's.
+pub const STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StepFunctionsSnapshot {
-    pub schema_version: u32,
-    #[serde(default)]
-    pub accounts: Option<fakecloud_core::multi_account::MultiAccountState<StepFunctionsState>>,
-    #[serde(default)]
-    pub state: Option<StepFunctionsState>,
+pub type StepFunctionsSnapshot =
+    fakecloud_core::multi_account::RegionalSnapshot<StepFunctionsState>;
+
+/// Parse a persisted Step Functions snapshot, migrating pre-regional schemas
+/// by moving every resource into the region its ARN names.
+pub fn parse_stepfunctions_snapshot(
+    bytes: &[u8],
+) -> Result<StepFunctionsSnapshot, serde_json::Error> {
+    fakecloud_core::multi_account::parse_regional_snapshot(
+        bytes,
+        STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION,
+        |s: StepFunctionsState| {
+            let (account, region) = (s.account_id.clone(), s.region.clone());
+            fakecloud_core::multi_account::RegionalState::from_legacy(&account, &region, "", s)
+        },
+    )
+}
+
+impl fakecloud_core::multi_account::SplitByRegion for StepFunctionsState {
+    /// State machines, executions, activities, versions, aliases and map
+    /// runs are all keyed by their own ARN and go to its region; an activity
+    /// task token follows its activity (a `.waitForTaskToken` token has none
+    /// and lands in the default region).
+    fn split_by_region(self, into: &mut fakecloud_core::multi_account::RegionalState<Self>) {
+        use fakecloud_aws::arn::region_of;
+        for (k, v) in self.state_machines {
+            into.region_or_default_mut(region_of(&k))
+                .state_machines
+                .insert(k, v);
+        }
+        for (k, v) in self.executions {
+            into.region_or_default_mut(region_of(&k))
+                .executions
+                .insert(k, v);
+        }
+        for (k, v) in self.activities {
+            into.region_or_default_mut(region_of(&k))
+                .activities
+                .insert(k, v);
+        }
+        for (k, v) in self.state_machine_versions {
+            into.region_or_default_mut(region_of(&k))
+                .state_machine_versions
+                .insert(k, v);
+        }
+        for (k, v) in self.state_machine_aliases {
+            into.region_or_default_mut(region_of(&k))
+                .state_machine_aliases
+                .insert(k, v);
+        }
+        for (k, v) in self.map_runs {
+            into.region_or_default_mut(region_of(&k))
+                .map_runs
+                .insert(k, v);
+        }
+        for (k, v) in self.task_tokens {
+            let region = region_of(&v.activity_arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .task_tokens
+                .insert(k, v);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
