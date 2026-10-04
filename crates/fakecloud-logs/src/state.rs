@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-pub type SharedLogsState = Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<LogsState>>>;
+pub type SharedLogsState = Arc<RwLock<fakecloud_core::multi_account::MultiRegionState<LogsState>>>;
 
 impl fakecloud_core::multi_account::AccountState for LogsState {
     fn new_for_account(account_id: &str, region: &str, _endpoint: &str) -> Self {
@@ -499,18 +499,119 @@ pub struct ScheduledQuery {
     pub state: Option<String>,
 }
 
-/// On-disk snapshot envelope for CloudWatch Logs state. Versioned so
-/// format changes fail loudly on upgrade.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct LogsSnapshot {
-    pub schema_version: u32,
-    #[serde(default)]
-    pub accounts: Option<fakecloud_core::multi_account::MultiAccountState<LogsState>>,
-    #[serde(default)]
-    pub state: Option<LogsState>,
+/// On-disk snapshot envelope for CloudWatch Logs state: per (account,
+/// region) metadata. Versioned so format changes fail loudly on upgrade.
+pub type LogsSnapshot = fakecloud_core::multi_account::RegionalSnapshot<LogsState>;
+
+/// v3: state partitioned by (account, region). v2 kept one state per account;
+/// v1 a single account's.
+pub const LOGS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+
+/// Parse a persisted Logs snapshot (manifest metadata or a legacy
+/// `snapshot.json`), splitting pre-regional state by each record's ARN.
+pub fn parse_logs_snapshot(bytes: &[u8]) -> Result<LogsSnapshot, serde_json::Error> {
+    fakecloud_core::multi_account::parse_regional_snapshot(
+        bytes,
+        LOGS_SNAPSHOT_SCHEMA_VERSION,
+        |s: LogsState| {
+            let (account, region) = (s.account_id.clone(), s.region.clone());
+            fakecloud_core::multi_account::RegionalState::from_legacy(&account, &region, "", s)
+        },
+    )
 }
 
-pub const LOGS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+impl fakecloud_core::multi_account::SplitByRegion for LogsState {
+    /// Log groups, destinations, deliveries, anomaly detectors, lookup tables
+    /// and scheduled queries go to the region of their ARN. Records naming a
+    /// log group (metric filters, queries, export tasks, bearer-token flags,
+    /// syslog configurations) and anomalies (their detector) follow it.
+    /// Records with no ARN of their own (resource policies, query
+    /// definitions, account policies, integrations, import tasks, export
+    /// storage, the storage-tier policy) stay in the server's region.
+    fn split_by_region(self, into: &mut fakecloud_core::multi_account::RegionalState<Self>) {
+        use fakecloud_aws::arn::region_of;
+        let default = into.default_region().to_string();
+        let mut group_regions: BTreeMap<String, String> = BTreeMap::new();
+        for (name, group) in self.log_groups {
+            let region = region_of(&group.arn).unwrap_or(&default).to_string();
+            group_regions.insert(name.clone(), region.clone());
+            into.region_mut(&region).log_groups.insert(name, group);
+        }
+        let of_group = |name: &str| group_regions.get(name).cloned().unwrap_or(default.clone());
+        let of_arn = |arn: &str| region_of(arn).unwrap_or(&default).to_string();
+        for f in self.metric_filters {
+            into.region_mut(&of_group(&f.log_group_name))
+                .metric_filters
+                .push(f);
+        }
+        for (k, v) in self.destinations {
+            into.region_mut(&of_arn(&v.arn)).destinations.insert(k, v);
+        }
+        for (k, v) in self.queries {
+            into.region_mut(&of_group(&v.log_group_name))
+                .queries
+                .insert(k, v);
+        }
+        for t in self.export_tasks {
+            into.region_mut(&of_group(&t.log_group_name))
+                .export_tasks
+                .push(t);
+        }
+        for (k, v) in self.delivery_destinations {
+            into.region_mut(&of_arn(&v.arn))
+                .delivery_destinations
+                .insert(k, v);
+        }
+        for (k, v) in self.delivery_sources {
+            into.region_mut(&of_arn(&v.arn))
+                .delivery_sources
+                .insert(k, v);
+        }
+        for (k, v) in self.deliveries {
+            into.region_mut(&of_arn(&v.arn)).deliveries.insert(k, v);
+        }
+        for (k, v) in self.anomaly_detectors {
+            into.region_mut(&of_arn(&v.arn))
+                .anomaly_detectors
+                .insert(k, v);
+        }
+        for (k, v) in self.lookup_tables {
+            into.region_mut(&of_arn(&v.arn)).lookup_tables.insert(k, v);
+        }
+        for (k, v) in self.scheduled_queries {
+            into.region_mut(&of_arn(&v.arn))
+                .scheduled_queries
+                .insert(k, v);
+        }
+        for (k, v) in self.bearer_token_auth {
+            into.region_mut(&of_group(&k))
+                .bearer_token_auth
+                .insert(k, v);
+        }
+        for (k, v) in self.anomalies {
+            into.region_mut(&of_arn(&v.anomaly_detector_arn))
+                .anomalies
+                .insert(k, v);
+        }
+        for (k, v) in self.syslog_configurations {
+            into.region_mut(&of_arn(&v.log_group_arn))
+                .syslog_configurations
+                .insert(k, v);
+        }
+        let home = into.region_mut(&default);
+        home.resource_policies.extend(self.resource_policies);
+        home.query_definitions.extend(self.query_definitions);
+        home.account_policies.extend(self.account_policies);
+        home.import_tasks.extend(self.import_tasks);
+        home.integrations.extend(self.integrations);
+        home.s3_table_sources.extend(self.s3_table_sources);
+        home.export_storage.extend(self.export_storage);
+        if self.storage_tier.is_some() {
+            home.storage_tier = self.storage_tier;
+            home.storage_tier_last_updated = self.storage_tier_last_updated;
+        }
+    }
+}
 
 /// The only `retentionInDays` values CloudWatch Logs accepts. Retention deletes
 /// stored events, so an out-of-set value (0, negative) must never reach state.

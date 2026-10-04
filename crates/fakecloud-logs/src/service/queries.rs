@@ -64,7 +64,7 @@ impl LogsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Verify single-name shape exists, when provided. The array shapes are
         // accepted as-is; AWS returns results keyed off whichever groups exist.
@@ -138,7 +138,9 @@ impl LogsService {
         let (status, start_time, end_time, parsed, streams) = {
             let accounts = self.state.read();
             let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-            let state = accounts.get(&req.account_id).unwrap_or(&empty);
+            let state = accounts
+                .regional(&req.account_id, &req.region)
+                .unwrap_or(&empty);
             let query_info = state.queries.get(query_id).ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -246,7 +248,7 @@ impl LogsService {
         if status == "Complete" {
             let mut accounts = self.state.write();
             if let Some(q) = accounts
-                .get_mut(&req.account_id)
+                .regional_get_mut(&req.account_id, &req.region)
                 .and_then(|st| st.queries.get_mut(query_id))
             {
                 q.results = Some(std::sync::Arc::new(out.clone()));
@@ -291,7 +293,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let queries: Vec<Value> = state
             .queries
             .values()
@@ -398,7 +402,7 @@ impl LogsService {
         let now = Utc::now().timestamp_millis();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.query_definitions.insert(
             query_definition_id.clone(),
             QueryDefinition {
@@ -442,7 +446,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let defs: Vec<Value> = state
             .query_definitions
             .values()
@@ -495,7 +501,7 @@ impl LogsService {
         validate_string_length("queryDefinitionId", qd_id, 1, 256)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let success = state.query_definitions.remove(qd_id).is_some();
 
         Ok(AwsResponse::json(
@@ -515,7 +521,7 @@ impl LogsService {
         })?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let query = state.queries.get_mut(query_id).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -547,7 +553,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let identifiers = state
             .queries
             .get(query_id)
@@ -779,7 +787,7 @@ mod tests {
         create_group(&svc, "app");
         {
             let mut accounts = svc.state.write();
-            let state = accounts.get_or_create("123456789012");
+            let state = accounts.regional_mut("123456789012", "us-east-1");
             state.queries.insert(
                 "q-bad".to_string(),
                 crate::state::QueryInfo {

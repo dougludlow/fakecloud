@@ -56,7 +56,7 @@ impl LogsService {
         validate_optional_string_length("filterPattern", Some(&filter_pattern), 0, 1024)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(log_group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -124,7 +124,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state.log_groups.get(log_group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -184,7 +186,7 @@ impl LogsService {
         validate_string_length("filterName", filter_name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(log_group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -293,7 +295,7 @@ impl LogsService {
         let now = Utc::now().timestamp_millis();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Update existing or add new
         if let Some(existing) = state
@@ -335,7 +337,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let filters: Vec<Value> = state
             .metric_filters
             .iter()
@@ -428,7 +432,7 @@ impl LogsService {
         validate_string_length("logGroupName", log_group_name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let idx = state
             .metric_filters
             .iter()

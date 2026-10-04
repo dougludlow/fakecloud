@@ -1186,7 +1186,7 @@ async fn main() {
                     if let Some(accounts) = snapshot.accounts {
                         *logs_state.write() = accounts;
                     } else if let Some(single) = snapshot.state {
-                        let account_id = single.account_id.clone();
+                        let account_id = single.account_id().to_string();
                         *logs_state.write().get_or_create(&account_id) = single;
                     } else {
                         tracing::warn!(
@@ -8450,7 +8450,13 @@ async fn main() {
                     let anomaly_id = uuid::Uuid::new_v4().to_string();
                     let pattern_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
                     let mut accounts = ls.write();
-                    let state = accounts.default_mut();
+                    // The anomaly belongs to its detector's region (default
+                    // account, as before).
+                    let account = accounts.default_account_id().to_string();
+                    let region = fakecloud_aws::arn::region_of(&body.anomaly_detector_arn)
+                        .unwrap_or(accounts.region())
+                        .to_string();
+                    let state = accounts.regional_mut(&account, &region);
                     state.anomalies.insert(
                         anomaly_id.clone(),
                         fakecloud_logs::LogAnomaly {
@@ -8482,7 +8488,7 @@ async fn main() {
                     async move {
                         let accounts = ls.read();
                         let mut configurations: Vec<types::LogsDeliveryConfiguration> = Vec::new();
-                        for (_account, state) in accounts.iter() {
+                        for (_account, _region, state) in accounts.iter_regional() {
                             for delivery in state.deliveries.values() {
                                 let log_type = state
                                     .delivery_sources
@@ -8521,7 +8527,7 @@ async fn main() {
                         let accounts = ls.read();
                         let mut indexes: Vec<types::LogsFieldIndex> = Vec::new();
                         let mut found = false;
-                        for (_account, state) in accounts.iter() {
+                        for (_account, _region, state) in accounts.iter_regional() {
                             let Some(group) = state.log_groups.get(&log_group_name) else {
                                 continue;
                             };

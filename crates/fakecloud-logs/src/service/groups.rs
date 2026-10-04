@@ -57,7 +57,7 @@ impl LogsService {
         validate_optional_string_length("kmsKeyId", body["kmsKeyId"].as_str(), 1, 256)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.log_groups.contains_key(&name) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -123,7 +123,7 @@ impl LogsService {
         validate_string_length("logGroupName", name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // Check deletion protection
         if let Some(group) = state.log_groups.get(name) {
             if group.deletion_protection {
@@ -177,7 +177,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut groups: Vec<&LogGroup> = state
             .log_groups
             .values()
@@ -292,7 +294,7 @@ impl LogsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -322,7 +324,7 @@ impl LogsService {
         validate_string_length("logGroupName", name, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -365,7 +367,7 @@ impl LogsService {
         let resolved_name = resolve_log_group_name(log_group_name, resource_identifier)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state
             .log_groups
             .get_mut(resolved_name.as_str())
@@ -398,7 +400,7 @@ impl LogsService {
         let resolved_name = resolve_log_group_name(log_group_name, resource_identifier)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state
             .log_groups
             .get_mut(resolved_name.as_str())
@@ -445,7 +447,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let group = state.log_groups.get(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -528,7 +532,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get_mut(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -578,7 +582,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
 
         // Aggregate the actual stored log groups by their derived data-source
         // characteristics. fakecloud stores raw plaintext events with no OCSF
@@ -675,7 +681,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let mut groups: Vec<&LogGroup> = state
             .log_groups
             .values()
@@ -737,6 +745,62 @@ impl LogsService {
 mod tests {
     use crate::service::test_helpers::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn same_log_group_name_coexists_in_two_regions() {
+        let svc = make_service();
+        let in_region = |action: &str, body: Value, region: &str| {
+            let mut req = make_request(action, body);
+            req.region = region.to_string();
+            req
+        };
+        for (region, days) in [("us-east-1", 7), ("eu-west-1", 30)] {
+            svc.create_log_group(&in_region(
+                "CreateLogGroup",
+                json!({ "logGroupName": "/app" }),
+                region,
+            ))
+            .unwrap();
+            svc.put_retention_policy(&in_region(
+                "PutRetentionPolicy",
+                json!({ "logGroupName": "/app", "retentionInDays": days }),
+                region,
+            ))
+            .unwrap();
+        }
+        svc.create_log_group(&in_region(
+            "CreateLogGroup",
+            json!({ "logGroupName": "/west-only" }),
+            "eu-west-1",
+        ))
+        .unwrap();
+        let describe = |region: &str| -> Vec<Value> {
+            let resp = svc
+                .describe_log_groups(&in_region("DescribeLogGroups", json!({}), region))
+                .unwrap();
+            let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            body["logGroups"].as_array().unwrap().clone()
+        };
+        let east = describe("us-east-1");
+        let west = describe("eu-west-1");
+        assert_eq!(east.len(), 1);
+        assert_eq!(west.len(), 2);
+        assert_eq!(east[0]["retentionInDays"], 7);
+        assert!(east[0]["arn"].as_str().unwrap().contains(":us-east-1:"));
+        let west_app = west.iter().find(|g| g["logGroupName"] == "/app").unwrap();
+        assert_eq!(west_app["retentionInDays"], 30);
+        assert!(west_app["arn"].as_str().unwrap().contains(":eu-west-1:"));
+        assert!(describe("ap-south-1").is_empty());
+
+        svc.delete_log_group(&in_region(
+            "DeleteLogGroup",
+            json!({ "logGroupName": "/app" }),
+            "eu-west-1",
+        ))
+        .unwrap();
+        assert_eq!(describe("us-east-1").len(), 1);
+        assert_eq!(describe("eu-west-1").len(), 1);
+    }
 
     // ---- describe_log_groups: logGroupNamePattern ----
 
@@ -823,7 +887,7 @@ mod tests {
         assert_eq!(strip(&groups[0]), strip(&groups[1]));
 
         let mas = svc.state.read();
-        let state = mas.default_ref();
+        let state = mas.default_regional().unwrap();
         assert_eq!(
             state.log_groups["implicit"].arn,
             "arn:aws:logs:us-east-1:123456789012:log-group:implicit:*"
@@ -859,7 +923,7 @@ mod tests {
         svc.associate_kms_key(&req).unwrap();
 
         let _mas = svc.state.read();
-        let state = _mas.default_ref();
+        let state = _mas.default_regional().unwrap();
         assert_eq!(
             state.log_groups["grp"].kms_key_id.as_deref(),
             Some("arn:aws:kms:us-east-1:123456789012:key/abc-123")
@@ -883,7 +947,7 @@ mod tests {
         svc.disassociate_kms_key(&req).unwrap();
 
         let _mas = svc.state.read();
-        let state = _mas.default_ref();
+        let state = _mas.default_regional().unwrap();
         assert!(state.log_groups["grp"].kms_key_id.is_none());
     }
 
@@ -917,7 +981,7 @@ mod tests {
         );
         svc.create_log_group(&req).unwrap();
         let mas = svc.state.read();
-        let state = mas.default_ref();
+        let state = mas.default_regional().unwrap();
         let grp = state.log_groups.get("/secure/app").unwrap();
         assert_eq!(
             grp.kms_key_id.as_deref(),
@@ -951,7 +1015,8 @@ mod tests {
         assert!(!svc
             .state
             .read()
-            .default_ref()
+            .default_regional()
+            .unwrap()
             .log_groups
             .contains_key("gone"));
     }
@@ -985,7 +1050,7 @@ mod tests {
         );
         svc.put_retention_policy(&req).unwrap();
         assert_eq!(
-            svc.state.read().default_ref().log_groups["ret"].retention_in_days,
+            svc.state.read().default_regional().unwrap().log_groups["ret"].retention_in_days,
             Some(30)
         );
     }
@@ -1008,9 +1073,11 @@ mod tests {
                 "{days}"
             );
         }
-        assert!(svc.state.read().default_ref().log_groups["ret"]
-            .retention_in_days
-            .is_none());
+        assert!(
+            svc.state.read().default_regional().unwrap().log_groups["ret"]
+                .retention_in_days
+                .is_none()
+        );
     }
 
     #[test]
@@ -1024,9 +1091,11 @@ mod tests {
         svc.put_retention_policy(&put).unwrap();
         let del = make_request("DeleteRetentionPolicy", json!({"logGroupName": "dr"}));
         svc.delete_retention_policy(&del).unwrap();
-        assert!(svc.state.read().default_ref().log_groups["dr"]
-            .retention_in_days
-            .is_none());
+        assert!(
+            svc.state.read().default_regional().unwrap().log_groups["dr"]
+                .retention_in_days
+                .is_none()
+        );
     }
 
     #[test]

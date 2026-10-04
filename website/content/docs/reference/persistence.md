@@ -122,6 +122,7 @@ On load, such a snapshot is split once: every resource moves to the region its A
 - **Step Functions** - state machines, executions, versions, aliases, activities and map runs go to the region of their own ARN; an activity task token follows its activity.
 - **EventBridge Scheduler** - schedule groups and schedules go to the region of their ARN; every region keeps its own `default` group.
 - **EventBridge Pipes** - each pipe goes to the region of its ARN, and its tags and source checkpoints follow it.
+- **CloudWatch Logs** - log groups (with their streams and events), destinations, deliveries, anomaly detectors, lookup tables and scheduled queries go to the region of their ARN; metric filters, queries, export tasks and syslog configurations follow their log group. Records with no ARN of their own (resource and account policies, query definitions, integrations, import tasks) stay in the server's region.
 
 ## S3 object body handling
 

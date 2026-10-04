@@ -40,7 +40,7 @@ impl ResourceProvisioner {
         let retention_in_days = retention_in_days_property(props)?;
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         let arn = format!(
             "{}:*",
             fakecloud_logs::log_group_arn(&self.region, &self.account_id, log_group_name)
@@ -91,7 +91,7 @@ impl ResourceProvisioner {
             .map(String::from);
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         let group = state
             .log_groups
             .values_mut()
@@ -115,7 +115,7 @@ impl ResourceProvisioner {
     /// surfaces back to the caller.
     pub(crate) fn delete_log_group(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         // physical_id is the ARN; find the log group name
         let name = state
             .log_groups
@@ -146,7 +146,7 @@ impl ResourceProvisioner {
             .to_string();
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         let group = state
             .log_groups
             .get_mut(&log_group_name)
@@ -184,7 +184,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_log_stream(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         if let Some((group_name, stream_name)) = physical_id.split_once('|') {
             if let Some(group) = state.log_groups.get_mut(group_name) {
                 group.log_streams.remove(stream_name);
@@ -258,7 +258,7 @@ impl ResourceProvisioner {
         }
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         if !state.log_groups.contains_key(&log_group_name) {
             return Err(format!("Log group {log_group_name} does not exist"));
         }
@@ -280,7 +280,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_metric_filter(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         if let Some((group_name, filter_name)) = physical_id.split_once('|') {
             state
                 .metric_filters
@@ -326,7 +326,7 @@ impl ResourceProvisioner {
             .to_string();
 
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         let group = state
             .log_groups
             .get_mut(&log_group_name)
@@ -351,7 +351,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_subscription_filter(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.get_or_create(&self.account_id);
+        let state = logs_accounts.regional_mut(&self.account_id, &self.region);
         if let Some((group_name, filter_name)) = physical_id.split_once('|') {
             if let Some(group) = state.log_groups.get_mut(group_name) {
                 group

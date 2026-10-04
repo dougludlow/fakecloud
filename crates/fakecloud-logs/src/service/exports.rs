@@ -46,9 +46,11 @@ type StreamEvents = (String, Vec<crate::state::LogEvent>);
 
 /// Set the status of `task_id` if it still holds `expected`. Returns false
 /// when the task is gone or moved on (e.g. cancelled), so the job stops.
+#[allow(clippy::too_many_arguments)]
 fn transition_export(
     state: &crate::state::SharedLogsState,
     account_id: &str,
+    region: &str,
     task_id: &str,
     expected: &str,
     code: &str,
@@ -56,7 +58,7 @@ fn transition_export(
     completed: bool,
 ) -> bool {
     let mut accounts = state.write();
-    let Some(st) = accounts.get_mut(account_id) else {
+    let Some(st) = accounts.regional_get_mut(account_id, region) else {
         return false;
     };
     let Some(task) = st.export_tasks.iter_mut().find(|t| t.task_id == task_id) else {
@@ -76,11 +78,12 @@ fn transition_export(
 fn export_still_running(
     state: &crate::state::SharedLogsState,
     account_id: &str,
+    region: &str,
     task_id: &str,
 ) -> bool {
     state
         .read()
-        .get(account_id)
+        .regional(account_id, region)
         .and_then(|st| st.export_tasks.iter().find(|t| t.task_id == task_id))
         .is_some_and(|t| t.status_code == "RUNNING")
 }
@@ -93,11 +96,13 @@ pub(crate) fn run_export_task(
     state: &crate::state::SharedLogsState,
     bus: &fakecloud_core::delivery::DeliveryBus,
     account_id: &str,
+    region: &str,
     task_id: &str,
 ) {
     if !transition_export(
         state,
         account_id,
+        region,
         task_id,
         "PENDING",
         "RUNNING",
@@ -111,7 +116,7 @@ pub(crate) fn run_export_task(
     // stream by stream under the read guard; nothing slow happens here.
     let (task, per_stream): (ExportTask, Vec<StreamEvents>) = {
         let accounts = state.read();
-        let Some(st) = accounts.get(account_id) else {
+        let Some(st) = accounts.regional(account_id, region) else {
             return;
         };
         let Some(task) = st
@@ -148,7 +153,7 @@ pub(crate) fn run_export_task(
 
     let written_at = chrono::Utc::now().timestamp_millis();
     for (stream_name, events) in &per_stream {
-        if !export_still_running(state, account_id, task_id) {
+        if !export_still_running(state, account_id, region, task_id) {
             return;
         }
         let mut data = String::new();
@@ -188,6 +193,7 @@ pub(crate) fn run_export_task(
     transition_export(
         state,
         account_id,
+        region,
         task_id,
         "RUNNING",
         "COMPLETED",
@@ -243,7 +249,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         if !state.log_groups.contains_key(&log_group_name) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -264,7 +272,7 @@ impl LogsService {
         // DescribeExportTasks reports moving PENDING -> RUNNING -> COMPLETED.
         {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             state.export_tasks.push(ExportTask {
                 task_id: task_id.clone(),
                 task_name,
@@ -280,7 +288,7 @@ impl LogsService {
                 completion_time: None,
             });
         }
-        self.spawn_export_task(req.account_id.clone(), task_id.clone());
+        self.spawn_export_task(req.account_id.clone(), req.region.clone(), task_id.clone());
 
         Ok(AwsResponse::json(
             StatusCode::OK,
@@ -291,11 +299,11 @@ impl LogsService {
     /// Run export task `task_id` off the request path. On a Tokio runtime the
     /// job runs on the blocking pool and the result is persisted when it
     /// finishes; with no runtime (synchronous callers) it runs inline.
-    pub(crate) fn spawn_export_task(&self, account_id: String, task_id: String) {
+    pub(crate) fn spawn_export_task(&self, account_id: String, region: String, task_id: String) {
         let state = self.state.clone();
         let bus = self.delivery_bus.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            run_export_task(&state, &bus, &account_id, &task_id);
+            run_export_task(&state, &bus, &account_id, &region, &task_id);
             return;
         };
         let store = self.snapshot_store.clone();
@@ -303,7 +311,7 @@ impl LogsService {
         handle.spawn(async move {
             let job_state = state.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                run_export_task(&job_state, &bus, &account_id, &task_id)
+                run_export_task(&job_state, &bus, &account_id, &region, &task_id)
             })
             .await;
             if let Err(error) = joined {
@@ -319,22 +327,22 @@ impl LogsService {
     /// (it stopped before they finished). Without this they would report an
     /// in-flight status forever after a restart.
     pub fn resume_interrupted_export_tasks(&self) {
-        let interrupted: Vec<(String, String)> = {
+        let interrupted: Vec<(String, String, String)> = {
             let mut accounts = self.state.write();
             let mut out = Vec::new();
-            for (account_id, state) in accounts.iter_mut() {
+            for (account_id, region, state) in accounts.iter_regional_mut() {
                 for task in &mut state.export_tasks {
                     if task.status_code == "PENDING" || task.status_code == "RUNNING" {
                         task.status_code = "PENDING".to_string();
                         task.status_message = "Task is pending".to_string();
-                        out.push((account_id.to_string(), task.task_id.clone()));
+                        out.push((account_id.to_string(), region.to_string(), task.task_id.clone()));
                     }
                 }
             }
             out
         };
-        for (account_id, task_id) in interrupted {
-            self.spawn_export_task(account_id, task_id);
+        for (account_id, region, task_id) in interrupted {
+            self.spawn_export_task(account_id, region, task_id);
         }
     }
 
@@ -363,7 +371,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
 
         // Real CloudWatch Logs returns an empty `exportTasks` array for an
         // unknown taskId — `DescribeExportTasks` doesn't declare
@@ -444,7 +454,7 @@ impl LogsService {
         validate_string_length("taskId", task_id, 1, 512)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let task = state
             .export_tasks
             .iter_mut()
@@ -488,7 +498,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let entries: Vec<Value> = state
             .export_storage
             .iter()
@@ -1183,7 +1195,7 @@ mod tests {
         // running it, then cancel before the worker picks it up.
         {
             let mut accounts = svc.state.write();
-            let st = accounts.get_or_create("123456789012");
+            let st = accounts.regional_mut("123456789012", "us-east-1");
             st.export_tasks.push(ExportTask {
                 task_id: "t-1".into(),
                 task_name: None,
@@ -1201,7 +1213,7 @@ mod tests {
         }
         let req = make_request("CancelExportTask", json!({ "taskId": "t-1" }));
         svc.cancel_export_task(&req).unwrap();
-        super::run_export_task(&svc.state, &svc.delivery_bus, "123456789012", "t-1");
+        super::run_export_task(&svc.state, &svc.delivery_bus, "123456789012", "us-east-1", "t-1");
         assert_eq!(task_status(&svc, "t-1")["status"]["code"], "CANCELLED");
         assert!(
             recorder.objects.lock().is_empty(),
@@ -1278,7 +1290,7 @@ mod tests {
         let now = put_one_event(&svc, "g", "s1");
         {
             let mut accounts = svc.state.write();
-            let st = accounts.get_or_create("123456789012");
+            let st = accounts.regional_mut("123456789012", "us-east-1");
             st.export_tasks.push(ExportTask {
                 task_id: "t-run".into(),
                 task_name: None,

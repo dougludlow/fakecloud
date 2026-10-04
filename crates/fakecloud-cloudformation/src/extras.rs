@@ -3034,7 +3034,7 @@ pub(crate) mod tests {
             s3: shared::<S3State>(),
             eventbridge: shared::<EventBridgeState>(),
             dynamodb: shared::<fakecloud_core::multi_account::RegionalState<DynamoDbState>>(),
-            logs: shared::<LogsState>(),
+            logs: shared::<fakecloud_core::multi_account::RegionalState<LogsState>>(),
             lambda: shared::<LambdaState>(),
             secretsmanager: shared::<SecretsManagerState>(),
             kinesis: shared::<KinesisState>(),

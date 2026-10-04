@@ -35,7 +35,7 @@ pub fn append_events(
     }
     let now = Utc::now().timestamp_millis();
     let mut accounts = state.write();
-    let logs = accounts.get_or_create(account_id);
+    let logs = accounts.regional_mut(account_id, region);
     let group = logs
         .log_groups
         .entry(group_name.to_string())
@@ -111,17 +111,15 @@ pub fn append_events(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use fakecloud_core::multi_account::MultiAccountState;
     use parking_lot::RwLock;
+    use std::sync::Arc;
 
     use super::*;
 
     #[test]
     fn append_creates_group_and_stream_then_appends() {
         let state = Arc::new(RwLock::new(
-            MultiAccountState::<crate::state::LogsState>::new(
+            fakecloud_core::multi_account::MultiRegionState::<crate::state::LogsState>::new(
                 "123456789012",
                 "us-east-1",
                 "http://localhost:4566",
@@ -145,7 +143,7 @@ mod tests {
             ],
         );
         let s = state.read();
-        let logs = s.get("123456789012").unwrap();
+        let logs = s.regional("123456789012", "us-east-1").unwrap();
         let group = logs.log_groups.get("/ecs/svc").unwrap();
         let stream = group.log_streams.get("app/123").unwrap();
         assert_eq!(stream.events.len(), 2);
@@ -158,7 +156,7 @@ mod tests {
     #[test]
     fn append_no_op_for_empty() {
         let state = Arc::new(RwLock::new(
-            MultiAccountState::<crate::state::LogsState>::new(
+            fakecloud_core::multi_account::MultiRegionState::<crate::state::LogsState>::new(
                 "123456789012",
                 "us-east-1",
                 "http://localhost:4566",
@@ -167,7 +165,7 @@ mod tests {
         append_events(&state, "123456789012", "us-east-1", "g", "s", &[]);
         let s = state.read();
         assert!(s
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .is_none_or(|a| a.log_groups.is_empty()));
     }
 }

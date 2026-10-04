@@ -454,7 +454,7 @@ impl ResetState {
             "logs" => {
                 let mut mas = self.logs.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "kms" => {
@@ -676,7 +676,7 @@ impl ResetState {
         }
         self.secretsmanager.write().reset();
         self.s3.write().reset();
-        self.logs.write().default_mut().reset();
+        self.logs.write().reset();
         self.kms.write().reset();
         self.cloudformation.write().reset();
         self.ses.write().reset();

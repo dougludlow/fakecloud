@@ -831,7 +831,7 @@ pub(crate) mod test_helpers {
         assert!(restored
             .accounts
             .unwrap()
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .log_groups
             .contains_key("cfn-group"));
@@ -856,7 +856,10 @@ pub(crate) mod test_helpers {
         svc.handle(request).await.unwrap();
         let restored = SegmentedLogsStore::new(blocked).load().unwrap().unwrap();
         let accounts = restored.accounts.unwrap();
-        let groups = &accounts.get("123456789012").unwrap().log_groups;
+        let groups = &accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .log_groups;
         assert!(groups.contains_key("g") && groups.contains_key("h"));
     }
 }

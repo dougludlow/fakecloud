@@ -1671,7 +1671,13 @@ pub(crate) fn deliver_execution_logs(
     drop(accounts);
 
     if let Some(d) = delivery {
-        d.put_log_events(log_account_id, log_group_name, &stream_name, &events);
+        d.put_log_events(
+            log_account_id,
+            parts[3],
+            log_group_name,
+            &stream_name,
+            &events,
+        );
     }
 }
 

@@ -59,7 +59,7 @@ impl LogsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let group = state.log_groups.get(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -101,7 +101,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
 
         let configs: Vec<_> = state
             .syslog_configurations
@@ -137,7 +139,7 @@ impl LogsService {
         let group_name = identifier_to_group_name(&identifier)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.syslog_configurations.remove(&group_name).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,

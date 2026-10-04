@@ -34,7 +34,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.import_tasks.insert(import_id.clone(), task);
 
         Ok(AwsResponse::json(
@@ -59,7 +59,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let tasks: Vec<Value> = state
             .import_tasks
             .values()
@@ -102,7 +104,7 @@ impl LogsService {
         let import_id = require_str(&body, "importId")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         match state.import_tasks.get_mut(import_id) {
             Some(task) => {
                 task.status = "CANCELLED".to_string();
@@ -137,7 +139,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .integrations
             .insert(integration_name.to_string(), integration);
@@ -158,7 +160,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         match state.integrations.get(integration_name) {
             Some(i) => Ok(AwsResponse::json(
                 StatusCode::OK,
@@ -186,7 +190,7 @@ impl LogsService {
         validate_string_length("integrationName", integration_name, 1, 50)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.integrations.remove(integration_name);
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
@@ -211,7 +215,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let integrations: Vec<Value> = state
             .integrations
             .values()
@@ -266,7 +272,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.lookup_tables.insert(arn.clone(), table);
 
         Ok(AwsResponse::json(
@@ -284,7 +290,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         match state.lookup_tables.get(lookup_table_arn) {
             Some(t) => {
                 let mut out = json!({
@@ -329,7 +337,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let tables: Vec<Value> = state
             .lookup_tables
             .values()
@@ -354,7 +364,7 @@ impl LogsService {
         let lookup_table_arn = require_str(&body, "lookupTableArn")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.lookup_tables.remove(lookup_table_arn);
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
@@ -368,7 +378,7 @@ impl LogsService {
         let table_body = require_str(&body, "tableBody")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         match state.lookup_tables.get_mut(lookup_table_arn) {
             Some(t) => {
                 t.table_body = table_body.to_string();
@@ -456,7 +466,7 @@ impl LogsService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.scheduled_queries.insert(arn.clone(), sq);
 
         Ok(AwsResponse::json(
@@ -475,7 +485,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         match state.scheduled_queries.get(identifier) {
             Some(sq) => {
                 let mut out = json!({
@@ -546,7 +558,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let queries: Vec<Value> = state
             .scheduled_queries
             .values()
@@ -571,7 +585,7 @@ impl LogsService {
         let identifier = require_str(&body, "identifier")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state.scheduled_queries.remove(identifier);
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
@@ -588,7 +602,7 @@ impl LogsService {
         let execution_role_arn = require_str(&body, "executionRoleArn")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         match state.scheduled_queries.get_mut(identifier) {
             Some(sq) => {
                 sq.query_string = query_string.to_string();
@@ -710,7 +724,7 @@ impl LogsService {
             .unwrap_or(false);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .bearer_token_auth
             .insert(log_group_identifier.to_string(), enabled);
@@ -741,13 +755,15 @@ impl LogsService {
                 )
             })?;
         let accounts = self.state.read();
-        let state = accounts.get(&req.account_id).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                "log object not found",
-            )
-        })?;
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceNotFoundException",
+                    "log object not found",
+                )
+            })?;
         let group = state.log_groups.get(&group_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -813,7 +829,7 @@ impl LogsService {
         ] {
             fields.insert(k.to_string(), t);
         }
-        if let Some(state) = accounts.get(&req.account_id) {
+        if let Some(state) = accounts.regional(&req.account_id, &req.region) {
             if let Some(group) = state.log_groups.get(&group_name) {
                 for stream in group.log_streams.values() {
                     for ev in &stream.events {
@@ -855,7 +871,7 @@ impl LogsService {
             .to_string();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .s3_table_sources
             .entry(integration_arn.to_string())
@@ -875,7 +891,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let sources: Vec<Value> = state
             .s3_table_sources
             .get(integration_arn)
@@ -909,7 +927,7 @@ impl LogsService {
         // it was associated with, mirroring what AssociateSource recorded.
         // Previously a no-op, so ListSources kept returning a removed source.
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         for sources in state.s3_table_sources.values_mut() {
             sources.retain(|s| s != &identifier);
         }
@@ -1063,7 +1081,7 @@ mod tests {
         // Manually set query status to Running so we can test cancellation
         {
             let mut _mas = svc.state.write();
-            let state = _mas.default_mut();
+            let state = _mas.default_regional_mut();
             state.queries.get_mut(&qid).unwrap().status = "Running".to_string();
         }
 
@@ -1073,7 +1091,7 @@ mod tests {
         assert_eq!(body["success"], true);
 
         let _mas = svc.state.read();
-        let state = _mas.default_ref();
+        let state = _mas.default_regional().unwrap();
         assert_eq!(state.queries[&qid].status, "Cancelled");
     }
 
@@ -1092,7 +1110,7 @@ mod tests {
         svc.put_log_group_deletion_protection(&req).unwrap();
 
         let _mas = svc.state.read();
-        let state = _mas.default_ref();
+        let state = _mas.default_regional().unwrap();
         assert!(state.log_groups["prot-group"].deletion_protection);
     }
 
@@ -1706,7 +1724,7 @@ mod tests {
 
         {
             let _mas = svc.state.read();
-            let state = _mas.default_ref();
+            let state = _mas.default_regional().unwrap();
             assert!(state.log_groups["dp-toggle"].deletion_protection);
         }
 
@@ -1721,7 +1739,7 @@ mod tests {
         svc.put_log_group_deletion_protection(&req).unwrap();
 
         let _mas = svc.state.read();
-        let state = _mas.default_ref();
+        let state = _mas.default_regional().unwrap();
         assert!(!state.log_groups["dp-toggle"].deletion_protection);
     }
 

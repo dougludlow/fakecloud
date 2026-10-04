@@ -393,6 +393,7 @@ pub trait CloudwatchLogsDelivery: Send + Sync {
     fn put_log_events(
         &self,
         account_id: &str,
+        region: &str,
         log_group_name: &str,
         log_stream_name: &str,
         events: &[(i64, String)],
@@ -734,12 +735,13 @@ impl DeliveryBus {
     pub fn put_log_events(
         &self,
         account_id: &str,
+        region: &str,
         log_group_name: &str,
         log_stream_name: &str,
         events: &[(i64, String)],
     ) {
         if let Some(ref sender) = self.cloudwatch_logs {
-            sender.put_log_events(account_id, log_group_name, log_stream_name, events);
+            sender.put_log_events(account_id, region, log_group_name, log_stream_name, events);
         }
     }
 

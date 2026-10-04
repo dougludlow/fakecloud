@@ -93,7 +93,7 @@ impl LogsService {
             .unwrap_or_default();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Check if updating - cannot change output format
         if let Some(existing) = state.delivery_destinations.get(&name) {
@@ -193,7 +193,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let dd = state.delivery_destinations.get(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -228,7 +230,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let dds: Vec<Value> = state
             .delivery_destinations
             .values()
@@ -268,7 +272,7 @@ impl LogsService {
         validate_string_length("name", name, 1, 60)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.delivery_destinations.remove(name).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -307,7 +311,7 @@ impl LogsService {
         validate_string_length("deliveryDestinationPolicy", &policy, 1, 51200)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let dd = state.delivery_destinations.get_mut(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -346,7 +350,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let dd = state.delivery_destinations.get(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -388,7 +394,7 @@ impl LogsService {
         validate_string_length("deliveryDestinationName", name, 1, 60)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let dd = state.delivery_destinations.get_mut(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -491,7 +497,7 @@ impl LogsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Cannot update with different resourceArn
         if let Some(existing) = state.delivery_sources.get(&name) {
@@ -566,7 +572,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let ds = state.delivery_sources.get(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -601,7 +609,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let sources: Vec<Value> = state
             .delivery_sources
             .values()
@@ -639,7 +649,7 @@ impl LogsService {
         validate_string_length("name", name, 1, 60)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.delivery_sources.remove(name).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -700,7 +710,7 @@ impl LogsService {
         let s3_delivery_config = body["s3DeliveryConfiguration"].clone();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Verify source exists
         if !state.delivery_sources.contains_key(&delivery_source_name) {
@@ -812,7 +822,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let d = state.deliveries.get(delivery_id).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -838,7 +850,9 @@ impl LogsService {
 
         let accounts = self.state.read();
         let empty = crate::state::LogsState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty);
         let deliveries: Vec<Value> = state.deliveries.values().map(delivery_to_json).collect();
 
         Ok(AwsResponse::json(
@@ -860,7 +874,7 @@ impl LogsService {
         validate_string_length("id", delivery_id, 1, 64)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.deliveries.remove(delivery_id).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -880,7 +894,7 @@ impl LogsService {
         let id = require_str(&body, "id")?.to_string();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let delivery = state.deliveries.get_mut(&id).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -1490,7 +1504,9 @@ mod tests {
         svc.create_delivery(&req).unwrap();
 
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").expect("default account state");
+        let state = accounts
+            .regional("123456789012", "us-east-1")
+            .expect("default account state");
         let src = state.delivery_sources.get("intro-src").unwrap();
         assert!(
             src.created_at >= before,

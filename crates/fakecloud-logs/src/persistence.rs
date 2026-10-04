@@ -15,22 +15,42 @@ use std::path::PathBuf;
 use parking_lot::RwLock;
 
 use crate::state::{LogEvent, LogGroup, LogsSnapshot, LogsState, LOGS_SNAPSHOT_SCHEMA_VERSION};
-use fakecloud_core::multi_account::MultiAccountState;
+use fakecloud_core::multi_account::MultiRegionState;
 use fakecloud_persistence::atomic::write_atomic_bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-type Accounts = MultiAccountState<LogsState>;
+type Accounts = MultiRegionState<LogsState>;
 const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 const DAY_MS: i64 = 86_400_000;
 /// Per-event storage overhead CloudWatch Logs counts toward `storedBytes`.
 pub(crate) const EVENT_OVERHEAD_BYTES: i64 = 26;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct Manifest {
     version: u32,
     metadata: LogsSnapshot,
     streams: BTreeMap<String, StreamFiles>,
+}
+
+/// A manifest as read from disk: its metadata may predate the per-region
+/// schema and is migrated by [`crate::state::parse_logs_snapshot`].
+#[derive(Deserialize)]
+struct RawManifest {
+    version: u32,
+    metadata: serde_json::Value,
+    streams: BTreeMap<String, StreamFiles>,
+}
+
+impl RawManifest {
+    fn migrate(self) -> io::Result<Manifest> {
+        let metadata = serde_json::to_vec(&self.metadata).map_err(invalid)?;
+        Ok(Manifest {
+            version: self.version,
+            metadata: crate::state::parse_logs_snapshot(&metadata).map_err(invalid)?,
+            streams: self.streams,
+        })
+    }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct StreamFiles {
@@ -86,7 +106,9 @@ impl SegmentedLogsStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(invalid)?;
+        let manifest = serde_json::from_slice::<RawManifest>(&bytes)
+            .map_err(invalid)?
+            .migrate()?;
         if manifest.version != 1 || manifest.metadata.schema_version > LOGS_SNAPSHOT_SCHEMA_VERSION
         {
             return Err(invalid(format!(
@@ -118,7 +140,11 @@ impl SegmentedLogsStore {
     pub fn load(&self) -> io::Result<Option<LogsSnapshot>> {
         let Some((mut manifest, manifest_bytes)) = self.read_manifest_bytes()? else {
             let legacy = match File::open(self.directory.join("snapshot.json")) {
-                Ok(file) => serde_json::from_reader(BufReader::new(file)).map_err(invalid)?,
+                Ok(file) => {
+                    let mut bytes = Vec::new();
+                    BufReader::new(file).read_to_end(&mut bytes)?;
+                    crate::state::parse_logs_snapshot(&bytes).map_err(invalid)?
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
             };
@@ -137,7 +163,7 @@ impl SegmentedLogsStore {
             .accounts
             .as_mut()
             .ok_or_else(|| invalid("missing Logs accounts"))?;
-        for (_, account) in accounts.iter_mut() {
+        for (_, _, account) in accounts.iter_regional_mut() {
             for group in account.log_groups.values_mut() {
                 for stream in group.log_streams.values_mut() {
                     if !stream.events.is_empty() {
@@ -231,7 +257,7 @@ impl SegmentedLogsStore {
         }
         let committed = guard.as_mut().expect("committed state initialized");
         let mut streams = BTreeMap::new();
-        for (_, account) in state.iter_mut() {
+        for (_, _, account) in state.iter_regional_mut() {
             for group in account.log_groups.values_mut() {
                 let cutoff = retention_cutoff(group, now);
                 let expired = cutoff.map(|cutoff| (cutoff, prune_group(group, cutoff)));
@@ -278,7 +304,7 @@ impl SegmentedLogsStore {
         Ok(PendingSave {
             metadata: LogsSnapshot {
                 schema_version: LOGS_SNAPSHOT_SCHEMA_VERSION,
-                accounts: Some(state.map(LogsState::metadata)),
+                accounts: Some(state.map(|account| account.map(LogsState::metadata))),
                 state: None,
             },
             streams,
@@ -436,7 +462,7 @@ impl SegmentedLogsStore {
 /// Retention is a storage policy, not merely a query filter. Used directly in
 /// memory mode; persistent saves apply it inside [`SegmentedLogsStore::prepare`].
 pub fn prune_expired(state: &mut Accounts, now: i64) {
-    for (_, account) in state.iter_mut() {
+    for (_, _, account) in state.iter_regional_mut() {
         for group in account.log_groups.values_mut() {
             if let Some(cutoff) = retention_cutoff(group, now) {
                 prune_group(group, cutoff);
@@ -494,12 +520,13 @@ fn renumber_legacy_sequences(stream: &mut crate::state::LogStream) {
 
 /// Manifest encoding that does not depend on the account map's hash order.
 fn fingerprint(manifest: &Manifest) -> io::Result<Vec<u8>> {
-    let accounts: BTreeMap<&str, &LogsState> = manifest
+    let mut accounts: Vec<(&str, &str, &LogsState)> = manifest
         .metadata
         .accounts
         .as_ref()
-        .map(|accounts| accounts.iter().collect())
+        .map(|accounts| accounts.iter_regional().collect())
         .unwrap_or_default();
+    accounts.sort_by_key(|(account, region, _)| (*account, *region));
     serde_json::to_vec(&(accounts, &manifest.streams)).map_err(invalid)
 }
 

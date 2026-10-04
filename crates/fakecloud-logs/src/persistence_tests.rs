@@ -24,12 +24,24 @@ fn put(state: &SharedLogsState, account: &str, timestamp: i64, message: &str) {
         }],
     );
 }
+/// The v2 (pre-regional) snapshot shape of `state`: one Logs state per
+/// account, here each account's us-east-1 state.
+fn legacy_v2(state: &SharedLogsState) -> serde_json::Value {
+    let accounts = state.read().map(|account| {
+        account
+            .region("us-east-1")
+            .cloned()
+            .unwrap_or_else(|| crate::state::LogsState::new(account.account_id(), "us-east-1"))
+    });
+    serde_json::json!({ "schema_version": 2, "accounts": accounts })
+}
+
 fn events(snapshot: &LogsSnapshot, account: &str) -> Vec<String> {
     snapshot
         .accounts
         .as_ref()
         .unwrap()
-        .get(account)
+        .regional(account, "us-east-1")
         .unwrap()
         .log_groups["g"]
         .log_streams["s"]
@@ -94,14 +106,9 @@ fn migrates_legacy_snapshot_and_isolates_accounts() {
     let state = state();
     put(&state, "a", 100, "a-event");
     put(&state, "b", 100, "b-event");
-    let old = LogsSnapshot {
-        schema_version: 2,
-        accounts: Some(state.read().clone()),
-        state: None,
-    };
     std::fs::write(
         dir.path().join("snapshot.json"),
-        serde_json::to_vec(&old).unwrap(),
+        serde_json::to_vec(&legacy_v2(&state)).unwrap(),
     )
     .unwrap();
     let store = SegmentedLogsStore::new(dir.path().into());
@@ -124,7 +131,9 @@ fn retention_reclaims_memory_and_expired_segments_without_reusing_sequences() {
     let now = chrono::Utc::now().timestamp_millis();
     put(&state, "a", now - 2 * 86_400_000, "expired");
     store.save(&mut state.write()).unwrap();
-    let old_seq = state.read().get("a").unwrap().log_groups["g"].log_streams["s"].events[0].seq;
+    let old_seq = state.read().regional("a", "us-east-1").unwrap().log_groups["g"].log_streams["s"]
+        .events[0]
+        .seq;
     let old_file = store
         .read_manifest()
         .unwrap()
@@ -138,7 +147,7 @@ fn retention_reclaims_memory_and_expired_segments_without_reusing_sequences() {
         .clone();
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -146,14 +155,16 @@ fn retention_reclaims_memory_and_expired_segments_without_reusing_sequences() {
         .retention_in_days = Some(1);
     store.save(&mut state.write()).unwrap();
     assert!(
-        state.read().get("a").unwrap().log_groups["g"].log_streams["s"]
+        state.read().regional("a", "us-east-1").unwrap().log_groups["g"].log_streams["s"]
             .events
             .is_empty()
     );
     assert!(!dir.path().join(old_file).exists());
     put(&state, "a", now, "fresh");
     assert!(
-        state.read().get("a").unwrap().log_groups["g"].log_streams["s"].events[0].seq > old_seq
+        state.read().regional("a", "us-east-1").unwrap().log_groups["g"].log_streams["s"].events[0]
+            .seq
+            > old_seq
     );
     store.save(&mut state.write()).unwrap();
     assert_eq!(events(&store.load().unwrap().unwrap(), "a"), vec!["fresh"]);
@@ -167,7 +178,7 @@ fn deleted_and_recreated_stream_does_not_resurrect_events() {
     store.save(&mut state.write()).unwrap();
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -194,7 +205,7 @@ fn removing_retention_never_resurrects_deleted_rows_but_accepts_new_late_events(
     store.save(&mut state.write()).unwrap();
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -204,12 +215,15 @@ fn removing_retention_never_resurrects_deleted_rows_but_accepts_new_late_events(
     for _ in 0..2 {
         let restored = store.load().unwrap().unwrap();
         let accounts = restored.accounts.as_ref().unwrap();
-        assert_eq!(accounts.get("a").unwrap().log_groups["g"].stored_bytes, 30);
+        assert_eq!(
+            accounts.regional("a", "us-east-1").unwrap().log_groups["g"].stored_bytes,
+            30
+        );
         assert_eq!(events(&restored, "a"), vec!["live"]);
     }
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -279,7 +293,7 @@ fn expiration_during_downtime_is_committed_before_policy_removal() {
         .accounts
         .as_mut()
         .unwrap()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -294,7 +308,7 @@ fn expiration_during_downtime_is_committed_before_policy_removal() {
     assert_eq!(events(&restored, "a"), vec!["live"]);
     let mut accounts = restored.accounts.unwrap();
     accounts
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -310,7 +324,8 @@ fn migrates_v1_snapshot_without_sequence_or_persistence_fields() {
     let state = state();
     put(&state, "a", 100, "first");
     put(&state, "a", 200, "second");
-    let mut single = serde_json::to_value(state.read().get("a").unwrap()).unwrap();
+    let mut single =
+        serde_json::to_value(state.read().regional("a", "us-east-1").unwrap()).unwrap();
     let stream = single["log_groups"]["g"]["log_streams"]["s"]
         .as_object_mut()
         .unwrap();
@@ -336,7 +351,7 @@ fn migrates_v1_snapshot_without_sequence_or_persistence_fields() {
         .accounts
         .as_ref()
         .unwrap()
-        .get("a")
+        .regional("a", "us-east-1")
         .unwrap()
         .log_groups["g"]
         .log_streams["s"]
@@ -389,7 +404,7 @@ fn expiration_from_a_failed_save_is_not_resurrected_by_policy_removal() {
     store.save(&mut state.write()).unwrap();
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -399,7 +414,7 @@ fn expiration_from_a_failed_save_is_not_resurrected_by_policy_removal() {
     drop(store.prepare(&mut state.write()).unwrap());
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -468,7 +483,7 @@ fn legacy_migration_normalizes_stored_bytes() {
     put(&state, "a", 100, "abc");
     state
         .write()
-        .get_mut("a")
+        .regional_get_mut("a", "us-east-1")
         .unwrap()
         .log_groups
         .get_mut("g")
@@ -476,19 +491,14 @@ fn legacy_migration_normalizes_stored_bytes() {
         .stored_bytes = 3;
     std::fs::write(
         dir.path().join("snapshot.json"),
-        serde_json::to_vec(&LogsSnapshot {
-            schema_version: 2,
-            accounts: Some(state.read().clone()),
-            state: None,
-        })
-        .unwrap(),
+        serde_json::to_vec(&legacy_v2(&state)).unwrap(),
     )
     .unwrap();
     let store = SegmentedLogsStore::new(dir.path().into());
     let mut loaded = store.load().unwrap().unwrap().accounts.unwrap();
     store.save(&mut loaded).unwrap();
     assert_eq!(
-        loaded.get("a").unwrap().log_groups["g"].stored_bytes,
+        loaded.regional("a", "us-east-1").unwrap().log_groups["g"].stored_bytes,
         3 + EVENT_OVERHEAD_BYTES
     );
 }
@@ -502,7 +512,7 @@ fn retention_subtracts_only_pruned_bytes() {
     {
         let mut accounts = state.write();
         let group = accounts
-            .get_mut("a")
+            .regional_get_mut("a", "us-east-1")
             .unwrap()
             .log_groups
             .get_mut("g")
@@ -512,7 +522,36 @@ fn retention_subtracts_only_pruned_bytes() {
     }
     prune_expired(&mut state.write(), now);
     let accounts = state.read();
-    let group = &accounts.get("a").unwrap().log_groups["g"];
+    let group = &accounts.regional("a", "us-east-1").unwrap().log_groups["g"];
     assert_eq!(group.stored_bytes, 4 + 26);
     assert_eq!(group.log_streams["s"].last_sequence, 1);
+}
+
+#[test]
+fn legacy_snapshot_splits_log_groups_by_arn_region() {
+    let mut legacy = crate::state::LogsState::new("a", "us-east-1");
+    let state = state();
+    put(&state, "a", 100, "east-event");
+    let east = state.read().regional("a", "us-east-1").unwrap().log_groups["g"].clone();
+    let mut west = east.clone();
+    west.name = "w".into();
+    west.arn = crate::state::log_group_stored_arn("eu-west-1", "a", "w");
+    legacy.log_groups.insert("g".into(), east);
+    legacy.log_groups.insert("w".into(), west);
+    legacy.metric_filters.push(
+        serde_json::from_value(serde_json::json!({
+            "filter_name": "f", "filter_pattern": "", "log_group_name": "w",
+            "metric_transformations": [], "creation_time": 0
+        }))
+        .unwrap(),
+    );
+    let bytes =
+        serde_json::to_vec(&serde_json::json!({"schema_version": 1, "state": legacy})).unwrap();
+    let snap = crate::state::parse_logs_snapshot(&bytes).unwrap();
+    let regional = snap.state.unwrap();
+    let west = regional.region("eu-west-1").unwrap();
+    assert!(west.log_groups.contains_key("w"));
+    assert_eq!(west.metric_filters.len(), 1);
+    let east = regional.region("us-east-1").unwrap();
+    assert!(east.log_groups.contains_key("g") && !east.log_groups.contains_key("w"));
 }

@@ -7584,7 +7584,7 @@ mod tests {
         assert!(prov
             .logs_state
             .read()
-            .get("222222222222")
+            .regional("222222222222", &prov.region)
             .is_some_and(|s| s.log_groups.contains_key("/app/logs")));
         assert!(prov
             .lambda_state
@@ -7604,7 +7604,7 @@ mod tests {
         assert!(!prov
             .logs_state
             .read()
-            .get("222222222222")
+            .regional("222222222222", &prov.region)
             .unwrap()
             .log_groups
             .contains_key("/app/logs"));
@@ -11018,7 +11018,7 @@ mod tests {
         .expect("update succeeds")
         .expect("AWS::Logs::LogGroup is updatable");
         let logs = prov.logs_state.read();
-        let acct = logs.get("123456789012").unwrap();
+        let acct = logs.regional("123456789012", "us-east-1").unwrap();
         let group = acct.log_groups.get("/svc/logs").unwrap();
         assert_eq!(group.retention_in_days, Some(30));
     }

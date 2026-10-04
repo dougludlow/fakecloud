@@ -1190,7 +1190,8 @@ mod tests {
 
         let accounts = logs_state.read();
         let group = accounts
-            .default_ref()
+            .default_regional()
+            .expect("default region")
             .log_groups
             .get("/aws/events/s3")
             .expect("log group auto-created by the Logs target");
