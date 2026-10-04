@@ -184,7 +184,7 @@ pub(crate) fn run_export_task(
         {
             let fallback_key = format!("{}/{s3_key}", task.destination);
             let mut accounts = state.write();
-            if let Some(st) = accounts.get_mut(account_id) {
+            if let Some(st) = accounts.regional_get_mut(account_id, region) {
                 st.export_storage.insert(fallback_key, body);
             }
         }
@@ -769,6 +769,82 @@ mod tests {
         let first: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["timestamp"].as_i64().unwrap(), now);
         assert_eq!(first["message"].as_str().unwrap(), "evt-a");
+    }
+
+    #[test]
+    fn export_task_runs_against_its_own_region() {
+        let recorder = std::sync::Arc::new(S3Recorder::default());
+        let svc = make_service_with_s3(recorder.clone());
+        let in_region = |action: &str, body: Value, region: &str| {
+            let mut req = make_request(action, body);
+            req.region = region.to_string();
+            req
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        for region in ["us-east-1", "eu-west-1"] {
+            svc.create_log_group(&in_region(
+                "CreateLogGroup",
+                json!({"logGroupName": "g"}),
+                region,
+            ))
+            .unwrap();
+            svc.create_log_stream(&in_region(
+                "CreateLogStream",
+                json!({"logGroupName": "g", "logStreamName": "s"}),
+                region,
+            ))
+            .unwrap();
+            svc.put_log_events(&in_region(
+                "PutLogEvents",
+                json!({
+                    "logGroupName": "g",
+                    "logStreamName": "s",
+                    "logEvents": [{ "timestamp": now, "message": format!("from-{region}") }],
+                }),
+                region,
+            ))
+            .unwrap();
+        }
+        let resp = svc
+            .create_export_task(&in_region(
+                "CreateExportTask",
+                json!({
+                    "logGroupName": "g",
+                    "from": now - 1,
+                    "to": now + 100,
+                    "destination": "exp-bucket",
+                }),
+                "eu-west-1",
+            ))
+            .unwrap();
+        let task_id = serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()["taskId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let objects = recorder.objects.lock();
+        assert_eq!(objects.len(), 1);
+        let text = decompress_gzip(&objects[0].3);
+        assert!(text.contains("from-eu-west-1") && !text.contains("from-us-east-1"));
+        drop(objects);
+
+        let describe = |region: &str| -> Value {
+            let resp = svc
+                .describe_export_tasks(&in_region(
+                    "DescribeExportTasks",
+                    json!({ "taskId": task_id }),
+                    region,
+                ))
+                .unwrap();
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+        };
+        assert_eq!(
+            describe("eu-west-1")["exportTasks"][0]["status"]["code"],
+            "COMPLETED"
+        );
+        assert!(describe("us-east-1")["exportTasks"]
+            .as_array()
+            .is_none_or(|a| a.is_empty()));
     }
 
     fn decompress_gzip(body: &[u8]) -> String {
