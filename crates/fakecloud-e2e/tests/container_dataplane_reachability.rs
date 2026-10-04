@@ -682,3 +682,37 @@ async fn ecs_pulls_ecr_image_when_fakecloud_is_containerized() {
     );
     assert_eq!(task.containers()[0].exit_code(), Some(0));
 }
+
+/// A reset right after RunInstances answers promptly: the instance's IMDS
+/// setup (helper image build, sidecar) runs in the background, never under
+/// the instance lifecycle lock a reset waits on.
+#[tokio::test]
+async fn reset_right_after_run_instances_is_prompt() {
+    if !require_docker_or_skip("reset_right_after_run_instances_is_prompt") {
+        return;
+    }
+    let server = TestServer::start_with_env(&[(
+        "FAKECLOUD_EC2_DEFAULT_IMAGE",
+        "public.ecr.aws/docker/library/alpine:3.20",
+    )])
+    .await;
+    let ec2 = server.ec2_client().await;
+    ec2.run_instances()
+        .image_id("ami-12345678")
+        .min_count(1)
+        .max_count(1)
+        .send()
+        .await
+        .expect("run_instances");
+    // Give the background boot a moment to take the lifecycle lock.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .post(format!("{}/_reset", server.endpoint()))
+        .send()
+        .await
+        .expect("reset timed out right after RunInstances");
+    assert!(resp.status().is_success(), "reset: {}", resp.status());
+}

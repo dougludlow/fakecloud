@@ -480,6 +480,7 @@ impl Ec2Runtime {
                 running: true,
             },
         );
+        self.spawn_imds(instance_id, &running.container_id);
         Ok(running)
     }
 
@@ -521,8 +522,8 @@ impl Ec2Runtime {
                 // A started container has a fresh network namespace: give it
                 // IMDS again.
                 d.remove_sidecars(instance_id).await;
-                d.start_imds(instance_id, &record.handle).await;
                 self.update_ip(instance_id, &private_ip);
+                self.spawn_imds(instance_id, &record.handle);
                 Some(RunningInstance {
                     container_id: record.handle,
                     private_ip,
@@ -562,10 +563,10 @@ impl Ec2Runtime {
                 // The restart replaced the network namespace the sidecar had
                 // joined; the IP can change with it.
                 d.remove_sidecars(instance_id).await;
-                d.start_imds(instance_id, &record.handle).await;
                 if let Some(ip) = d.inspect_ip(&record.handle).await {
                     self.update_ip(instance_id, &ip);
                 }
+                self.spawn_imds(instance_id, &record.handle);
                 None
             }
             InstanceBackend::K8s(k) => {
@@ -744,6 +745,35 @@ impl Ec2Runtime {
             .read()
             .get(instance_id)
             .map(|r| r.handle.clone())
+    }
+
+    /// Give a Docker-backed instance IMDS in the background. The sidecar
+    /// (and, the first time, the helper image build) can take tens of
+    /// seconds, and the caller holds the instance's lifecycle lock -- which a
+    /// reset, stop or terminate waits on -- so it never runs inline. The task
+    /// re-checks that the instance is still this running container before
+    /// and after starting the sidecar, so a stop / terminate that lands
+    /// meanwhile never leaves a sidecar behind.
+    fn spawn_imds(&self, instance_id: &str, handle: &str) {
+        let InstanceBackend::Docker(d) = &self.backend else {
+            return;
+        };
+        let d = d.clone();
+        let instances = self.instances.clone();
+        let id = instance_id.to_string();
+        let handle = handle.to_string();
+        tokio::spawn(async move {
+            let current = {
+                let (instances, id, handle) = (instances.clone(), id.clone(), handle.clone());
+                move || {
+                    instances
+                        .read()
+                        .get(&id)
+                        .is_some_and(|r| r.running && r.handle == handle)
+                }
+            };
+            d.start_imds(&id, &handle, current).await;
+        });
     }
 
     fn update_handle(&self, instance_id: &str, handle: &str) {
@@ -1061,8 +1091,9 @@ impl DockerInstances {
         args.extend(imds::readiness_tmpfs_args());
         // IMDS answers at 169.254.169.254 through the sidecar; without a
         // helper image, point SDKs at fakecloud's per-instance IMDS instead.
-        let helper = self.ensure_helper_image().await;
-        if helper.is_none() {
+        // Decided from what is already known, never by building the image
+        // here (see `Ec2Runtime::spawn_imds`).
+        if self.helper_known_failed() {
             let (k, v) =
                 imds::metadata_endpoint_env(&self.net.host_alias, self.server_port, instance_id);
             args.push("-e".to_string());
@@ -1095,11 +1126,6 @@ impl DockerInstances {
             .inspect_ip(&container_id)
             .await
             .unwrap_or_else(|| "10.0.0.1".to_string());
-        if helper.is_some() {
-            self.start_imds(instance_id, &container_id).await;
-        } else {
-            self.mark_boot_ready(&container_id).await;
-        }
 
         Ok(RunningInstance {
             container_id,
@@ -1154,6 +1180,17 @@ impl DockerInstances {
         resolved.ok()
     }
 
+    /// Whether resolving the helper image failed recently, without waiting:
+    /// a resolution in progress, or none yet, counts as "not failed".
+    fn helper_known_failed(&self) -> bool {
+        self.helper_image.try_lock().is_ok_and(|cached| {
+            matches!(
+                cached.as_ref(),
+                Some(imds::HelperImage::Failed { at }) if at.elapsed() < imds::HELPER_RETRY_AFTER
+            )
+        })
+    }
+
     async fn image_present(&self, tag: &str) -> bool {
         tokio::process::Command::new(&self.cli)
             .args(["image", "inspect", tag])
@@ -1196,11 +1233,22 @@ impl DockerInstances {
     /// its sidecar, wait for the redirect, then release the boot (user-data
     /// waits on [`imds::READY_FILE`]). Best-effort: on failure the boot is
     /// released anyway and the instance runs without link-local IMDS.
-    async fn start_imds(&self, instance_id: &str, container_id: &str) {
+    ///
+    /// `still_current` says whether the instance is still this running
+    /// container.
+    async fn start_imds(
+        &self,
+        instance_id: &str,
+        container_id: &str,
+        still_current: impl Fn() -> bool,
+    ) {
         let Some(helper) = self.ensure_helper_image().await else {
             self.mark_boot_ready(container_id).await;
             return;
         };
+        if !still_current() {
+            return;
+        }
         let name = imds::sidecar_name(instance_id);
         let _ = tokio::process::Command::new(&self.cli)
             .args(["rm", "-f", &name])
@@ -1226,6 +1274,14 @@ impl DockerInstances {
             Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
             Err(e) => Err(e.to_string()),
         };
+        if result.is_ok() && !still_current() {
+            // Stopped / terminated while the sidecar came up.
+            let _ = tokio::process::Command::new(&self.cli)
+                .args(["rm", "-f", &name])
+                .output()
+                .await;
+            return;
+        }
         if let Err(error) = result {
             tracing::warn!(
                 instance = %instance_id,
@@ -2047,6 +2103,44 @@ mod reachability_tests {
         rt.stop_instance("i-race").await;
         assert_eq!(pending.await.unwrap(), None);
         assert!(rt.with_docker(|d| d.forwarders.lock().is_empty()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn boot_does_not_wait_on_the_imds_helper() {
+        // The helper image build and sidecar setup are slow (tens of seconds
+        // on a cold CI runner). They must not run inside `run_instance`,
+        // whose caller holds the instance's lifecycle lock -- a reset or
+        // terminate right after RunInstances waits on that lock.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let script = dir.path().join("slowcli");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$1 $2 $3\" in\n  \"image inspect fakecloud-ec2-helper\"*) sleep 30; exit 1 ;;\nesac\ncase \"$1\" in\n  build) sleep 30 ;;\n  run) echo cid-instance ;;\n  inspect) echo 172.30.0.11 ;;\nesac\nexit 0\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rt = runtime_with_cli(&script.display().to_string());
+        let started = std::time::Instant::now();
+        let running = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rt.run_instance("123456789012", "i-fast", None, &BTreeMap::new(), None),
+        )
+        .await
+        .expect("run_instance waited on the IMDS helper")
+        .expect("run_instance");
+        assert_eq!(running.private_ip, "172.30.0.11");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Terminating right away doesn't wait on the background setup either.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rt.terminate_instance("123456789012", "i-fast"),
+        )
+        .await
+        .expect("terminate waited on the IMDS helper");
     }
 
     impl Ec2Runtime {
