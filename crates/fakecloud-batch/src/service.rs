@@ -101,8 +101,10 @@ pub struct BatchService {
     /// ECS backend so a submitted job runs as a REAL container (the wedge:
     /// every rival fakes Batch compute). `None` parks jobs at SUBMITTED
     /// honestly (unit tests / no container runtime), never auto-succeeds.
-    ecs_state: Option<fakecloud_ecs::SharedEcsState>,
-    ecs_runtime: Option<Arc<fakecloud_ecs::runtime::EcsRuntime>>,
+    /// This is the server's fully wired ECS service (snapshot store, runtime,
+    /// role-trust validator, IAM mode), so the cluster, task definitions and
+    /// tasks a job creates persist and are validated like any ECS call.
+    ecs: Option<Arc<fakecloud_ecs::EcsService>>,
 }
 
 impl BatchService {
@@ -111,8 +113,7 @@ impl BatchService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
-            ecs_state: None,
-            ecs_runtime: None,
+            ecs: None,
         }
     }
 
@@ -122,14 +123,11 @@ impl BatchService {
     }
 
     /// Attach the ECS backend so SubmitJob launches a real container-backed
-    /// task and drives the job status off its real exit code.
-    pub fn with_ecs(
-        mut self,
-        state: fakecloud_ecs::SharedEcsState,
-        runtime: Option<Arc<fakecloud_ecs::runtime::EcsRuntime>>,
-    ) -> Self {
-        self.ecs_state = Some(state);
-        self.ecs_runtime = runtime;
+    /// task and drives the job status off its real exit code. Pass the same
+    /// wired service the registry dispatches to, so the job's ECS resources
+    /// go through its persistence and task-role checks.
+    pub fn with_ecs(mut self, ecs: Arc<fakecloud_ecs::EcsService>) -> Self {
+        self.ecs = Some(ecs);
         self
     }
 
@@ -1070,6 +1068,12 @@ impl BatchService {
             self.launch_job(req, &job_id, &job_name, container, now)
                 .await;
         }
+        // Launches defer ECS's per-call snapshot; persist the cluster, task
+        // definition and every task this request started once, here. The
+        // handler's post-mutation snapshot covers the Batch job state.
+        if let Some(ecs) = &self.ecs {
+            ecs.persist().await;
+        }
 
         Ok(AwsResponse::ok_json(json!({
             "jobArn": arn,
@@ -1087,8 +1091,7 @@ impl BatchService {
     fn launch_ctx(&self) -> LaunchCtx {
         LaunchCtx {
             batch_state: self.state.clone(),
-            ecs_state: self.ecs_state.clone(),
-            ecs_runtime: self.ecs_runtime.clone(),
+            ecs: self.ecs.clone(),
             snapshot_store: self.snapshot_store.clone(),
             snapshot_lock: self.snapshot_lock.clone(),
         }
@@ -1460,8 +1463,7 @@ fn merge_updates(stored: &mut Value, body: &Value, fields: &[&str], arn_key: &st
 #[derive(Clone)]
 struct LaunchCtx {
     batch_state: SharedBatchState,
-    ecs_state: Option<fakecloud_ecs::SharedEcsState>,
-    ecs_runtime: Option<Arc<fakecloud_ecs::runtime::EcsRuntime>>,
+    ecs: Option<Arc<fakecloud_ecs::EcsService>>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
 }
@@ -1481,7 +1483,7 @@ async fn launch(
     container: Option<Value>,
     now: i64,
 ) {
-    let (Some(ecs_state), Some(container)) = (ctx.ecs_state.clone(), container) else {
+    let (Some(ecs), Some(container)) = (ctx.ecs.clone(), container) else {
         return;
     };
     if container.get("image").and_then(Value::as_str).is_none() {
@@ -1507,7 +1509,7 @@ async fn launch(
         return;
     }
     launch_now(
-        ctx, ecs_state, account, region, request_id, job_id, job_name, container, now,
+        ctx, ecs, account, region, request_id, job_id, job_name, container, now,
     )
     .await;
 }
@@ -1554,7 +1556,7 @@ fn spawn_consumable_waiter(
     container: Value,
     now: i64,
 ) {
-    let Some(ecs_state) = ctx.ecs_state.clone() else {
+    let Some(ecs) = ctx.ecs.clone() else {
         return;
     };
     tokio::spawn(async move {
@@ -1580,7 +1582,7 @@ fn spawn_consumable_waiter(
             if admitted {
                 launch_now(
                     &ctx,
-                    ecs_state,
+                    ecs,
                     &account,
                     &region,
                     &request_id,
@@ -1590,7 +1592,7 @@ fn spawn_consumable_waiter(
                     now,
                 )
                 .await;
-                save_snapshot_now(&ctx.batch_state, &ctx.snapshot_store, &ctx.snapshot_lock).await;
+                persist_launch(&ctx).await;
                 return;
             }
         }
@@ -1601,7 +1603,7 @@ fn spawn_consumable_waiter(
 #[allow(clippy::too_many_arguments)]
 async fn launch_now(
     ctx: &LaunchCtx,
-    ecs_state: fakecloud_ecs::SharedEcsState,
+    ecs: Arc<fakecloud_ecs::EcsService>,
     account: &str,
     region: &str,
     request_id: &str,
@@ -1611,16 +1613,7 @@ async fn launch_now(
     now: i64,
 ) {
     let src = bare_request(account, region, request_id);
-    match launch_ecs_task(
-        &ecs_state,
-        &ctx.ecs_runtime,
-        &src,
-        job_id,
-        job_name,
-        &container,
-    )
-    .await
-    {
+    match launch_ecs_task(&ecs, &src, job_id, job_name, &container).await {
         Ok((cluster, task_arn)) => {
             {
                 let mut accounts = ctx.batch_state.write();
@@ -1638,7 +1631,7 @@ async fn launch_now(
             }
             spawn_status_sync(
                 ctx,
-                ecs_state,
+                ecs,
                 account.to_string(),
                 region.to_string(),
                 request_id.to_string(),
@@ -1661,6 +1654,18 @@ async fn launch_now(
                 j.insert("statusReason".into(), json!(err.message().to_string()));
             }
         }
+    }
+}
+
+/// Persist both the Batch job state and the ECS resources a launch created.
+/// Launches defer ECS's per-call snapshot, so the detached launch paths (the
+/// dependency and consumable waiters, retries) call this once afterwards, and
+/// SubmitJob calls the ECS half once after launching every child (the
+/// handler's own post-mutation snapshot covers the Batch half).
+async fn persist_launch(ctx: &LaunchCtx) {
+    save_snapshot_now(&ctx.batch_state, &ctx.snapshot_store, &ctx.snapshot_lock).await;
+    if let Some(ecs) = &ctx.ecs {
+        ecs.persist().await;
     }
 }
 
@@ -1724,6 +1729,9 @@ fn spawn_dependency_waiter(
                     now,
                 )
                 .await;
+                // Detached from any handler, so nothing else snapshots the
+                // STARTING / FAILED status or the job's ECS resources.
+                persist_launch(&ctx).await;
                 return;
             }
         }
@@ -1735,26 +1743,95 @@ fn spawn_dependency_waiter(
 /// Cross-service calls go through ECS's public `handle()` — reusing all of
 /// ECS's real container / portability / k8s handling, not re-deriving it.
 async fn launch_ecs_task(
-    ecs_state: &fakecloud_ecs::SharedEcsState,
-    ecs_runtime: &Option<Arc<fakecloud_ecs::runtime::EcsRuntime>>,
+    ecs: &fakecloud_ecs::EcsService,
     src: &AwsRequest,
     job_id: &str,
     job_name: &str,
     container: &Value,
 ) -> Result<(String, String), AwsServiceError> {
-    let mut ecs = fakecloud_ecs::EcsService::new(ecs_state.clone());
-    if let Some(rt) = ecs_runtime.clone() {
-        ecs = ecs.with_runtime(rt);
-    }
+    // Mutations defer ECS's per-call snapshot (an array job launches every
+    // child in one request); callers persist once via `EcsService::persist`.
     let cluster = "fakecloud-batch".to_string();
-    let _ = ecs
-        .handle(ecs_request(
-            "CreateCluster",
-            json!({ "clusterName": cluster }),
+    let described = ecs
+        .handle_deferring_snapshot(ecs_request(
+            "DescribeClusters",
+            json!({ "clusters": [cluster] }),
             src,
         ))
-        .await;
+        .await
+        .map(|r| parse_body(&r))
+        .unwrap_or(Value::Null);
+    let active = described
+        .get("clusters")
+        .and_then(Value::as_array)
+        .is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.get("status").and_then(Value::as_str) == Some("ACTIVE"))
+        });
+    if !active {
+        let _ = ecs
+            .handle_deferring_snapshot(ecs_request(
+                "CreateCluster",
+                json!({ "clusterName": cluster }),
+                src,
+            ))
+            .await;
+    }
 
+    // An array child's index travels as a RunTask container override, as on
+    // AWS Batch, so every child of a job shares one task definition revision.
+    let (container_def, overrides) = task_definition_container(container);
+    let family = format!("batch-{job_name}");
+    let task_def_arn =
+        match latest_matching_task_definition(ecs, src, &family, &container_def).await {
+            Some(arn) => arn,
+            None => {
+                let reg = ecs
+                    .handle_deferring_snapshot(ecs_request(
+                        "RegisterTaskDefinition",
+                        json!({
+                            "family": family,
+                            "containerDefinitions": [container_def],
+                            "networkMode": "bridge",
+                            "requiresCompatibilities": ["EC2"],
+                        }),
+                        src,
+                    ))
+                    .await?;
+                parse_body(&reg)
+                    .pointer("/taskDefinition/taskDefinitionArn")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or(family)
+            }
+        };
+
+    let mut run_body = json!({
+        "cluster": cluster,
+        "taskDefinition": task_def_arn,
+        "count": 1,
+        "launchType": "EC2",
+        "startedBy": format!("batch:{job_id}"),
+    });
+    if let Some(ov) = overrides {
+        run_body["overrides"] = json!({ "containerOverrides": [ov] });
+    }
+    let run = ecs
+        .handle_deferring_snapshot(ecs_request("RunTask", run_body, src))
+        .await?;
+    let run_body: Value = parse_body(&run);
+    let task_arn = run_body
+        .pointer("/tasks/0/taskArn")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| client_error("ServerException", "RunTask returned no task"))?;
+    Ok((cluster, task_arn))
+}
+
+/// Split a job's container properties into the ECS container definition the
+/// job definition maps to and the per-job RunTask container override (the
+/// array index, which differs per child and must not mint a revision each).
+fn task_definition_container(container: &Value) -> (Value, Option<Value>) {
     let image = container.get("image").and_then(Value::as_str).unwrap_or("");
     let (vcpus, memory) = container_resources(container);
     let mut cdef = serde_json::Map::new();
@@ -1766,49 +1843,60 @@ async fn launch_ecs_task(
     if let Some(cmd) = container.get("command").filter(|v| v.is_array()) {
         cdef.insert("command".into(), cmd.clone());
     }
-    if let Some(env) = container.get("environment").filter(|v| v.is_array()) {
-        cdef.insert("environment".into(), env.clone());
+    let mut per_job = Vec::new();
+    if let Some(env) = container.get("environment").and_then(Value::as_array) {
+        let (index, base): (Vec<Value>, Vec<Value>) = env.iter().cloned().partition(|e| {
+            e.get("name").and_then(Value::as_str) == Some("AWS_BATCH_JOB_ARRAY_INDEX")
+        });
+        per_job = index;
+        if !base.is_empty() {
+            cdef.insert("environment".into(), Value::Array(base));
+        }
     }
-    let family = format!("batch-{job_name}");
-    let reg = ecs
-        .handle(ecs_request(
-            "RegisterTaskDefinition",
-            json!({
-                "family": family,
-                "containerDefinitions": [Value::Object(cdef)],
-                "networkMode": "bridge",
-                "requiresCompatibilities": ["EC2"],
-            }),
-            src,
-        ))
-        .await?;
-    let reg_body: Value = parse_body(&reg);
-    let task_def_arn = reg_body
-        .pointer("/taskDefinition/taskDefinitionArn")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .unwrap_or(family);
+    let overrides =
+        (!per_job.is_empty()).then(|| json!({ "name": "default", "environment": per_job }));
+    (Value::Object(cdef), overrides)
+}
 
-    let run = ecs
-        .handle(ecs_request(
-            "RunTask",
-            json!({
-                "cluster": cluster,
-                "taskDefinition": task_def_arn,
-                "count": 1,
-                "launchType": "EC2",
-                "startedBy": format!("batch:{job_id}"),
-            }),
+/// The ARN of the family's latest ACTIVE revision when its container
+/// definition already matches `container_def`, so relaunches (array children,
+/// retries, repeat submissions) reuse it instead of minting a new revision.
+async fn latest_matching_task_definition(
+    ecs: &fakecloud_ecs::EcsService,
+    src: &AwsRequest,
+    family: &str,
+    container_def: &Value,
+) -> Option<String> {
+    let resp = ecs
+        .handle_deferring_snapshot(ecs_request(
+            "DescribeTaskDefinition",
+            json!({ "taskDefinition": family }),
             src,
         ))
-        .await?;
-    let run_body: Value = parse_body(&run);
-    let task_arn = run_body
-        .pointer("/tasks/0/taskArn")
+        .await
+        .ok()?;
+    let td = parse_body(&resp).get("taskDefinition").cloned()?;
+    if td.get("status").and_then(Value::as_str) != Some("ACTIVE") {
+        return None;
+    }
+    let existing = td.pointer("/containerDefinitions/0")?;
+    let same = ["name", "image", "cpu", "memory", "command", "environment"]
+        .iter()
+        .all(|k| {
+            let want = container_def.get(*k);
+            let have = existing.get(*k);
+            match (want, have) {
+                (None, None) => true,
+                (None, Some(v)) => v.as_array().is_some_and(|a| a.is_empty()),
+                (Some(w), h) => Some(w) == h,
+            }
+        });
+    if !same {
+        return None;
+    }
+    td.get("taskDefinitionArn")
         .and_then(Value::as_str)
         .map(String::from)
-        .ok_or_else(|| client_error("ServerException", "RunTask returned no task"))?;
-    Ok((cluster, task_arn))
 }
 
 /// Poll the ECS task in the background and map its real lifecycle + container
@@ -1819,7 +1907,7 @@ async fn launch_ecs_task(
 #[allow(clippy::too_many_arguments)]
 fn spawn_status_sync(
     ctx: &LaunchCtx,
-    ecs_state: fakecloud_ecs::SharedEcsState,
+    ecs: Arc<fakecloud_ecs::EcsService>,
     account_id: String,
     region: String,
     request_id: String,
@@ -1832,9 +1920,7 @@ fn spawn_status_sync(
     let batch_state = ctx.batch_state.clone();
     let snapshot_store = ctx.snapshot_store.clone();
     let snapshot_lock = ctx.snapshot_lock.clone();
-    let ecs_runtime = ctx.ecs_runtime.clone();
     tokio::spawn(async move {
-        let ecs = fakecloud_ecs::EcsService::new(ecs_state.clone());
         let src = bare_request(&account_id, &region, &request_id);
         // retryStrategy.attempts (1-10) and timeout.attemptDurationSeconds.
         let (max_attempts, timeout_secs) = {
@@ -1951,16 +2037,9 @@ fn spawn_status_sync(
                 if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await {
                     break;
                 }
-                match launch_ecs_task(
-                    &ecs_state,
-                    &ecs_runtime,
-                    &src,
-                    &job_id,
-                    &job_name,
-                    &container,
-                )
-                .await
-                {
+                let relaunched = launch_ecs_task(&ecs, &src, &job_id, &job_name, &container).await;
+                ecs.persist().await;
+                match relaunched {
                     Ok((_, new_task)) => {
                         task = new_task;
                         attempt += 1;
@@ -2674,6 +2753,192 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(d["jobs"][0]["status"], "SUBMITTED");
+    }
+
+    #[derive(Default)]
+    struct CapturingStore {
+        saves: parking_lot::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl SnapshotStore for CapturingStore {
+        fn load(&self) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.saves.lock().last().cloned())
+        }
+
+        fn save(&self, bytes: &[u8]) -> std::io::Result<()> {
+            self.saves.lock().push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_persists_ecs_resources_and_job_status() {
+        // The job's ECS cluster / task definition / task must go through the
+        // wired ECS service's snapshot store (else they vanish on restart and
+        // ecsTaskArn dangles), and the detached launch path must persist the
+        // Batch job's resulting status itself.
+        let ecs_store = Arc::new(CapturingStore::default());
+        let ecs_state: fakecloud_ecs::SharedEcsState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new(
+                "123456789012",
+                "us-east-1",
+                "http://localhost:4566",
+            ),
+        ));
+        let ecs = Arc::new(
+            fakecloud_ecs::EcsService::new(ecs_state)
+                .with_snapshot_store(ecs_store.clone() as Arc<dyn SnapshotStore>),
+        );
+        let batch_store = Arc::new(CapturingStore::default());
+        let s = svc()
+            .with_snapshot_store(batch_store.clone() as Arc<dyn SnapshotStore>)
+            .with_ecs(ecs);
+        s.state.write().get_or_create("123456789012").jobs.insert(
+            "job-1".into(),
+            json!({"jobId": "job-1", "status": "SUBMITTED"}),
+        );
+
+        // As the detached launch paths (dependency / consumable waiters) do.
+        let ctx = s.launch_ctx();
+        launch(
+            &ctx,
+            "123456789012",
+            "us-east-1",
+            "t",
+            "job-1",
+            "persisted",
+            Some(json!({"image": "alpine", "vcpus": 1, "memory": 128})),
+            0,
+        )
+        .await;
+        persist_launch(&ctx).await;
+
+        let ecs_saved = String::from_utf8(ecs_store.saves.lock().last().cloned().unwrap()).unwrap();
+        assert!(
+            ecs_saved.contains("fakecloud-batch"),
+            "cluster not persisted"
+        );
+        assert!(
+            ecs_saved.contains("batch-persisted"),
+            "task definition not persisted"
+        );
+
+        let status = s.state.read().get("123456789012").unwrap().jobs["job-1"]["status"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(status, "SUBMITTED");
+        let batch_saved: Value =
+            serde_json::from_slice(&batch_store.saves.lock().last().cloned().unwrap()).unwrap();
+        assert_eq!(
+            batch_saved.pointer("/accounts/accounts/123456789012/jobs/job-1/status"),
+            Some(&json!(status)),
+            "job status not snapshotted: {batch_saved}"
+        );
+    }
+
+    /// An array job launches every child inside one SubmitJob: the children
+    /// share one task definition revision (the index rides on a RunTask
+    /// container override) and ECS is snapshotted once for the whole request,
+    /// not several times per child.
+    #[tokio::test]
+    async fn array_submit_shares_one_revision_and_snapshots_ecs_once() {
+        let ecs_store = Arc::new(CapturingStore::default());
+        let ecs_state: fakecloud_ecs::SharedEcsState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new(
+                "123456789012",
+                "us-east-1",
+                "http://localhost:4566",
+            ),
+        ));
+        let ecs = Arc::new(
+            fakecloud_ecs::EcsService::new(ecs_state)
+                .with_snapshot_store(ecs_store.clone() as Arc<dyn SnapshotStore>),
+        );
+        let s = svc().with_ecs(ecs.clone());
+        mk_queue(&s, "q").await;
+        s.handle(req(
+            "/v1/registerjobdefinition",
+            json!({"jobDefinitionName": "jd", "type": "container",
+                   "containerProperties": {"image": "alpine", "vcpus": 1, "memory": 128,
+                       "environment": [{"name": "MODE", "value": "batch"}]}}),
+        ))
+        .await
+        .unwrap();
+        let before = ecs_store.saves.lock().len();
+        let sub = body_of(
+            s.handle(req(
+                "/v1/submitjob",
+                json!({"jobName": "arr", "jobQueue": "q", "jobDefinition": "jd",
+                       "arrayProperties": {"size": 4}}),
+            ))
+            .await
+            .unwrap(),
+        );
+        assert!(sub["jobId"].is_string());
+        assert_eq!(
+            ecs_store.saves.lock().len() - before,
+            1,
+            "one ECS snapshot for the whole array submit"
+        );
+
+        let src = bare_request("123456789012", "us-east-1", "t");
+        let call = |action: &str, body: Value| ecs.handle(ecs_request(action, body, &src));
+        let defs = parse_body(
+            &call("ListTaskDefinitions", json!({"familyPrefix": "batch-arr"}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            defs["taskDefinitionArns"].as_array().unwrap().len(),
+            1,
+            "children share one revision: {defs}"
+        );
+        let tasks = parse_body(
+            &call("ListTasks", json!({"cluster": "fakecloud-batch"}))
+                .await
+                .unwrap(),
+        );
+        let arns = tasks["taskArns"].as_array().unwrap().clone();
+        assert_eq!(arns.len(), 4, "{tasks}");
+        let described = parse_body(
+            &call(
+                "DescribeTasks",
+                json!({"cluster": "fakecloud-batch", "tasks": arns}),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut indexes: Vec<String> = described["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let env = &t["overrides"]["containerOverrides"][0]["environment"];
+                assert_eq!(env[0]["name"], "AWS_BATCH_JOB_ARRAY_INDEX", "{t}");
+                env[0]["value"].as_str().unwrap().to_string()
+            })
+            .collect();
+        indexes.sort();
+        assert_eq!(indexes, ["0", "1", "2", "3"]);
+
+        // A later submit of the same definition reuses the revision too.
+        s.handle(req(
+            "/v1/submitjob",
+            json!({"jobName": "arr", "jobQueue": "q", "jobDefinition": "jd"}),
+        ))
+        .await
+        .unwrap();
+        let defs = parse_body(
+            &call("ListTaskDefinitions", json!({"familyPrefix": "batch-arr"}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            defs["taskDefinitionArns"].as_array().unwrap().len(),
+            1,
+            "{defs}"
+        );
     }
 
     #[tokio::test]

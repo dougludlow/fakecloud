@@ -1097,6 +1097,7 @@ impl ContainerBackingHandles {
                     let ec2_runtime = self.ec2_runtime.clone();
                     let account = self.account_id.clone();
                     let region = self.region.clone();
+                    let ec2_hook = self.ec2_snapshot_hook.clone();
                     tokio::spawn(async move {
                         fakecloud_ec2::cfn_provision::cfn_terminate(
                             ec2_state,
@@ -1104,6 +1105,7 @@ impl ContainerBackingHandles {
                             account,
                             region,
                             instance_id,
+                            ec2_hook,
                         )
                         .await;
                     });
@@ -1114,6 +1116,7 @@ impl ContainerBackingHandles {
                     let ec2_runtime = self.ec2_runtime.clone();
                     let account = self.account_id.clone();
                     let region = self.region.clone();
+                    let ec2_hook = self.ec2_snapshot_hook.clone();
                     tokio::spawn(async move {
                         fakecloud_autoscaling::cfn_provision::cfn_terminate_instances(
                             asg_state,
@@ -1122,6 +1125,7 @@ impl ContainerBackingHandles {
                             instance_ids,
                             account,
                             region,
+                            ec2_hook,
                         )
                         .await;
                     });
@@ -1456,6 +1460,7 @@ impl CloudFormationService {
         let existing = reconstruct_stack_resource(type_name, physical_id, prior_attributes);
         provisioner.delete_resource(&existing)?;
         ContainerBackingHandles::from_provisioner(&provisioner)
+            .with_snapshot_hooks(&self.snapshot_hooks)
             .spawn_teardown_intents(std::mem::take(&mut *teardowns.lock()));
         Ok(())
     }
@@ -2509,9 +2514,14 @@ impl CloudFormationService {
                 // path, so a stack delete does not leak running containers (the
                 // create-side #2031-#2034 hardening reaching the delete path).
                 // Each delete_resource above only removed the in-memory record.
-                ContainerBackingHandles::from_provisioner(&provisioner).spawn_teardown_intents(
-                    std::mem::take(&mut *provisioner.pending_container_teardowns.lock()),
-                );
+                // The snapshot hooks let the detached teardown persist the EC2
+                // records it terminates, which this stack op has already
+                // serialized as still running.
+                ContainerBackingHandles::from_provisioner(&provisioner)
+                    .with_snapshot_hooks(&self.snapshot_hooks)
+                    .spawn_teardown_intents(std::mem::take(
+                        &mut *provisioner.pending_container_teardowns.lock(),
+                    ));
                 spawn_custom_invokes(&provisioner);
 
                 // Re-acquire the write lock to update stack status
