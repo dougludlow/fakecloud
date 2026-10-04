@@ -1339,7 +1339,7 @@ async fn invoke_resource(
         {
             let account = account_from_execution_arn(execution_arn);
             let region = fakecloud_aws::arn::region_of(execution_arn).unwrap_or("us-east-1");
-            return call_sdk_action_in(&registry_arc, "dynamodb", action, input, &account, region)
+            return call_sdk_action(&registry_arc, "dynamodb", action, input, &account, region)
                 .await
                 .map_err(optimized_dynamodb_error);
         }
@@ -1655,28 +1655,9 @@ fn optimized_dynamodb_error((error, cause): (String, String)) -> (String, String
     }
 }
 
-/// Call a single AWS SDK action against the registered service handler.
+/// Call a single AWS SDK action against the registered service handler, as
+/// the execution's account in the execution's region.
 async fn call_sdk_action(
-    registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
-    service_name: &str,
-    action_pascal: &str,
-    input: &Value,
-    account_id: &str,
-    region: &str,
-) -> Result<Value, (String, String)> {
-    call_sdk_action_in(
-        registry,
-        service_name,
-        action_pascal,
-        input,
-        account_id,
-        "us-east-1",
-    )
-    .await
-}
-
-/// [`call_sdk_action`] in a given region.
-async fn call_sdk_action_in(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     service_name: &str,
     action_pascal: &str,
