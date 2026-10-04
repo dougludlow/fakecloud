@@ -495,89 +495,7 @@ impl AwsService for EcsService {
 
     async fn handle(&self, request: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let mutates = is_mutating(request.action.as_str());
-        let result = match request.action.as_str() {
-            "CreateCluster" => self.create_cluster(&request),
-            "DescribeClusters" => self.describe_clusters(&request),
-            "DeleteCluster" => self.delete_cluster(&request),
-            "ListClusters" => self.list_clusters(&request),
-            "UpdateCluster" => self.update_cluster(&request),
-            "UpdateClusterSettings" => self.update_cluster_settings(&request),
-            "PutClusterCapacityProviders" => self.put_cluster_capacity_providers(&request),
-            "RegisterTaskDefinition" => self.register_task_definition(&request),
-            "DescribeTaskDefinition" => self.describe_task_definition(&request),
-            "DeregisterTaskDefinition" => self.deregister_task_definition(&request),
-            "DeleteTaskDefinitions" => self.delete_task_definitions(&request),
-            "ListTaskDefinitions" => self.list_task_definitions(&request),
-            "ListTaskDefinitionFamilies" => self.list_task_definition_families(&request),
-            "TagResource" => self.tag_resource(&request),
-            "UntagResource" => self.untag_resource(&request),
-            "ListTagsForResource" => self.list_tags_for_resource(&request),
-            "PutAccountSetting" => self.put_account_setting(&request),
-            "PutAccountSettingDefault" => self.put_account_setting_default(&request),
-            "DeleteAccountSetting" => self.delete_account_setting(&request),
-            "ListAccountSettings" => self.list_account_settings(&request),
-            "RunTask" => self.run_task(&request),
-            "StartTask" => self.start_task(&request),
-            "StopTask" => self.stop_task(&request).await,
-            "DescribeTasks" => self.describe_tasks(&request),
-            "ListTasks" => self.list_tasks(&request),
-            "CreateService" => self.create_service(&request),
-            "UpdateService" => self.update_service(&request),
-            "DeleteService" => self.delete_service(&request).await,
-            "DescribeServices" => self.describe_services(&request),
-            "ListServices" => self.list_services(&request),
-            "ListServicesByNamespace" => self.list_services_by_namespace(&request),
-            "RegisterContainerInstance" => self.register_container_instance(&request),
-            "DeregisterContainerInstance" => self.deregister_container_instance(&request),
-            "DescribeContainerInstances" => self.describe_container_instances(&request),
-            "ListContainerInstances" => self.list_container_instances(&request),
-            "UpdateContainerAgent" => self.update_container_agent(&request),
-            "UpdateContainerInstancesState" => self.update_container_instances_state(&request),
-            "PutAttributes" => self.put_attributes(&request),
-            "DeleteAttributes" => self.delete_attributes(&request),
-            "ListAttributes" => self.list_attributes(&request),
-            "CreateCapacityProvider" => self.create_capacity_provider(&request),
-            "DeleteCapacityProvider" => self.delete_capacity_provider(&request),
-            "DescribeCapacityProviders" => self.describe_capacity_providers(&request),
-            "UpdateCapacityProvider" => self.update_capacity_provider(&request),
-            "GetTaskProtection" => self.get_task_protection(&request),
-            "UpdateTaskProtection" => self.update_task_protection(&request),
-            "CreateTaskSet" => self.create_task_set(&request),
-            "UpdateTaskSet" => self.update_task_set(&request),
-            "DeleteTaskSet" => self.delete_task_set(&request),
-            "DescribeTaskSets" => self.describe_task_sets(&request),
-            "UpdateServicePrimaryTaskSet" => self.update_service_primary_task_set(&request),
-            "ExecuteCommand" => self.execute_command(&request).await,
-            "SubmitContainerStateChange" => self.submit_container_state_change(&request),
-            "SubmitTaskStateChange" => self.submit_task_state_change(&request),
-            "SubmitAttachmentStateChanges" => self.submit_attachment_state_changes(&request),
-            "DiscoverPollEndpoint" => self.discover_poll_endpoint(&request),
-            "StopServiceDeployment" => self.stop_service_deployment(&request),
-            "ContinueServiceDeployment" => self.continue_service_deployment(&request),
-            "ListServiceDeployments" => self.list_service_deployments(&request),
-            "DescribeServiceDeployments" => self.describe_service_deployments(&request),
-            "DescribeServiceRevisions" => self.describe_service_revisions(&request),
-            "RegisterDaemonTaskDefinition" => self.register_daemon_task_definition(&request),
-            "DescribeDaemonTaskDefinition" => self.describe_daemon_task_definition(&request),
-            "DeleteDaemonTaskDefinition" => self.delete_daemon_task_definition(&request),
-            "ListDaemonTaskDefinitions" => self.list_daemon_task_definitions(&request),
-            "CreateDaemon" => self.create_daemon(&request),
-            "DescribeDaemon" => self.describe_daemon(&request),
-            "UpdateDaemon" => self.update_daemon(&request),
-            "DeleteDaemon" => self.delete_daemon(&request),
-            "ListDaemons" => self.list_daemons(&request),
-            "DescribeDaemonDeployments" => self.describe_daemon_deployments(&request),
-            "ListDaemonDeployments" => self.list_daemon_deployments(&request),
-            "DescribeDaemonRevisions" => self.describe_daemon_revisions(&request),
-            "CreateExpressGatewayService" => self.create_express_gateway_service(&request),
-            "DescribeExpressGatewayService" => self.describe_express_gateway_service(&request),
-            "UpdateExpressGatewayService" => self.update_express_gateway_service(&request),
-            "DeleteExpressGatewayService" => self.delete_express_gateway_service(&request),
-            _ => Err(AwsServiceError::action_not_implemented(
-                "ecs",
-                &request.action,
-            )),
-        };
+        let result = self.dispatch(&request).await;
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
         }
@@ -586,6 +504,112 @@ impl AwsService for EcsService {
 
     fn supported_actions(&self) -> &[&str] {
         SUPPORTED_ACTIONS
+    }
+}
+
+impl EcsService {
+    /// Run an ECS action with every check `handle` applies but without the
+    /// per-call snapshot, for a cross-service caller issuing many mutations
+    /// in one request (a Batch array job's child tasks). The caller must
+    /// call [`EcsService::persist`] once it is done.
+    pub async fn handle_deferring_snapshot(
+        &self,
+        request: AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        self.dispatch(&request).await
+    }
+
+    /// Persist the current state (a no-op in memory mode). Pairs with
+    /// [`EcsService::handle_deferring_snapshot`].
+    pub async fn persist(&self) {
+        self.save_snapshot().await;
+    }
+
+    async fn dispatch(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let result = match request.action.as_str() {
+            "CreateCluster" => self.create_cluster(request),
+            "DescribeClusters" => self.describe_clusters(request),
+            "DeleteCluster" => self.delete_cluster(request),
+            "ListClusters" => self.list_clusters(request),
+            "UpdateCluster" => self.update_cluster(request),
+            "UpdateClusterSettings" => self.update_cluster_settings(request),
+            "PutClusterCapacityProviders" => self.put_cluster_capacity_providers(request),
+            "RegisterTaskDefinition" => self.register_task_definition(request),
+            "DescribeTaskDefinition" => self.describe_task_definition(request),
+            "DeregisterTaskDefinition" => self.deregister_task_definition(request),
+            "DeleteTaskDefinitions" => self.delete_task_definitions(request),
+            "ListTaskDefinitions" => self.list_task_definitions(request),
+            "ListTaskDefinitionFamilies" => self.list_task_definition_families(request),
+            "TagResource" => self.tag_resource(request),
+            "UntagResource" => self.untag_resource(request),
+            "ListTagsForResource" => self.list_tags_for_resource(request),
+            "PutAccountSetting" => self.put_account_setting(request),
+            "PutAccountSettingDefault" => self.put_account_setting_default(request),
+            "DeleteAccountSetting" => self.delete_account_setting(request),
+            "ListAccountSettings" => self.list_account_settings(request),
+            "RunTask" => self.run_task(request),
+            "StartTask" => self.start_task(request),
+            "StopTask" => self.stop_task(request).await,
+            "DescribeTasks" => self.describe_tasks(request),
+            "ListTasks" => self.list_tasks(request),
+            "CreateService" => self.create_service(request),
+            "UpdateService" => self.update_service(request),
+            "DeleteService" => self.delete_service(request).await,
+            "DescribeServices" => self.describe_services(request),
+            "ListServices" => self.list_services(request),
+            "ListServicesByNamespace" => self.list_services_by_namespace(request),
+            "RegisterContainerInstance" => self.register_container_instance(request),
+            "DeregisterContainerInstance" => self.deregister_container_instance(request),
+            "DescribeContainerInstances" => self.describe_container_instances(request),
+            "ListContainerInstances" => self.list_container_instances(request),
+            "UpdateContainerAgent" => self.update_container_agent(request),
+            "UpdateContainerInstancesState" => self.update_container_instances_state(request),
+            "PutAttributes" => self.put_attributes(request),
+            "DeleteAttributes" => self.delete_attributes(request),
+            "ListAttributes" => self.list_attributes(request),
+            "CreateCapacityProvider" => self.create_capacity_provider(request),
+            "DeleteCapacityProvider" => self.delete_capacity_provider(request),
+            "DescribeCapacityProviders" => self.describe_capacity_providers(request),
+            "UpdateCapacityProvider" => self.update_capacity_provider(request),
+            "GetTaskProtection" => self.get_task_protection(request),
+            "UpdateTaskProtection" => self.update_task_protection(request),
+            "CreateTaskSet" => self.create_task_set(request),
+            "UpdateTaskSet" => self.update_task_set(request),
+            "DeleteTaskSet" => self.delete_task_set(request),
+            "DescribeTaskSets" => self.describe_task_sets(request),
+            "UpdateServicePrimaryTaskSet" => self.update_service_primary_task_set(request),
+            "ExecuteCommand" => self.execute_command(request).await,
+            "SubmitContainerStateChange" => self.submit_container_state_change(request),
+            "SubmitTaskStateChange" => self.submit_task_state_change(request),
+            "SubmitAttachmentStateChanges" => self.submit_attachment_state_changes(request),
+            "DiscoverPollEndpoint" => self.discover_poll_endpoint(request),
+            "StopServiceDeployment" => self.stop_service_deployment(request),
+            "ContinueServiceDeployment" => self.continue_service_deployment(request),
+            "ListServiceDeployments" => self.list_service_deployments(request),
+            "DescribeServiceDeployments" => self.describe_service_deployments(request),
+            "DescribeServiceRevisions" => self.describe_service_revisions(request),
+            "RegisterDaemonTaskDefinition" => self.register_daemon_task_definition(request),
+            "DescribeDaemonTaskDefinition" => self.describe_daemon_task_definition(request),
+            "DeleteDaemonTaskDefinition" => self.delete_daemon_task_definition(request),
+            "ListDaemonTaskDefinitions" => self.list_daemon_task_definitions(request),
+            "CreateDaemon" => self.create_daemon(request),
+            "DescribeDaemon" => self.describe_daemon(request),
+            "UpdateDaemon" => self.update_daemon(request),
+            "DeleteDaemon" => self.delete_daemon(request),
+            "ListDaemons" => self.list_daemons(request),
+            "DescribeDaemonDeployments" => self.describe_daemon_deployments(request),
+            "ListDaemonDeployments" => self.list_daemon_deployments(request),
+            "DescribeDaemonRevisions" => self.describe_daemon_revisions(request),
+            "CreateExpressGatewayService" => self.create_express_gateway_service(request),
+            "DescribeExpressGatewayService" => self.describe_express_gateway_service(request),
+            "UpdateExpressGatewayService" => self.update_express_gateway_service(request),
+            "DeleteExpressGatewayService" => self.delete_express_gateway_service(request),
+            _ => Err(AwsServiceError::action_not_implemented(
+                "ecs",
+                &request.action,
+            )),
+        };
+        result
     }
 }
 

@@ -608,7 +608,7 @@ fn build_container_plans(
                 })
                 .unwrap_or_default()
         };
-        let env = def
+        let mut env = def
             .as_ref()
             .and_then(|d| d.get("environment").and_then(|v| v.as_array()).cloned())
             .map(|arr| {
@@ -686,12 +686,19 @@ fn build_container_plans(
             .as_ref()
             .and_then(|d| d.get("readonlyRootFilesystem").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+        // RunTask `overrides.containerOverrides[]` for this container: its
+        // `environment` entries add to / replace the definition's by name, and
+        // a `command` replaces the definition's.
+        let mut command = str_array("command");
+        if let Some(ov) = container_override(&task.overrides, &container.name) {
+            apply_container_override(ov, &mut env, &mut command);
+        }
         plans.push(ContainerPlan {
             container_name: container.name.clone(),
             image: container.image.clone(),
             env,
             entry_point: str_array("entryPoint"),
-            command: str_array("command"),
+            command,
             secrets_refs,
             essential: container.essential,
             has_task_role,
@@ -1677,6 +1684,47 @@ fn build_local_registry_docker_config(server_port: u16) -> Option<TempDir> {
     Some(dir)
 }
 
+/// The `overrides.containerOverrides[]` entry naming `name`, if any.
+fn container_override<'a>(
+    overrides: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    overrides
+        .get("containerOverrides")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// Apply one container override: `environment` entries replace same-named
+/// definition entries (or are appended), and a non-empty `command` replaces
+/// the definition's.
+fn apply_container_override(
+    ov: &serde_json::Value,
+    env: &mut Vec<(String, String)>,
+    command: &mut Vec<String>,
+) {
+    if let Some(entries) = ov.get("environment").and_then(|v| v.as_array()) {
+        for e in entries {
+            let Some(k) = e.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let v = e.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            env.retain(|(name, _)| name != k);
+            env.push((k.to_string(), v.to_string()));
+        }
+    }
+    if let Some(cmd) = ov.get("command").and_then(|v| v.as_array()) {
+        let cmd: Vec<String> = cmd
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !cmd.is_empty() {
+            *command = cmd;
+        }
+    }
+}
+
 fn find_container_definition(
     state: &crate::state::EcsState,
     family: &str,
@@ -2000,6 +2048,36 @@ pub(crate) mod tests_support {
 mod tests {
     use super::tests_support::minimal_plan;
     use super::*;
+
+    #[test]
+    fn container_override_replaces_env_by_name_and_command() {
+        let overrides = serde_json::json!({"containerOverrides": [
+            {"name": "other", "environment": [{"name": "X", "value": "no"}]},
+            {"name": "app", "environment": [
+                {"name": "MODE", "value": "child"},
+                {"name": "AWS_BATCH_JOB_ARRAY_INDEX", "value": "3"}
+            ], "command": ["run", "3"]}
+        ]});
+        let ov = container_override(&overrides, "app").expect("override for app");
+        let mut env = vec![
+            ("MODE".to_string(), "base".to_string()),
+            ("KEEP".into(), "1".into()),
+        ];
+        let mut command = vec!["run".to_string()];
+        apply_container_override(ov, &mut env, &mut command);
+        env.sort();
+        assert_eq!(
+            env,
+            vec![
+                ("AWS_BATCH_JOB_ARRAY_INDEX".to_string(), "3".to_string()),
+                ("KEEP".into(), "1".into()),
+                ("MODE".into(), "child".into()),
+            ]
+        );
+        assert_eq!(command, vec!["run".to_string(), "3".to_string()]);
+        assert!(container_override(&overrides, "missing").is_none());
+        assert!(container_override(&serde_json::json!({}), "app").is_none());
+    }
 
     /// The container owns its namespace on a ready per-task network.
     const OWN_NET: ContainerNetwork<'static> = ContainerNetwork::Own {
