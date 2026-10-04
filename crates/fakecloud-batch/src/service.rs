@@ -271,6 +271,29 @@ impl BatchService {
         })
     }
 
+    /// Run one consumable-resource / service-environment / quota-share
+    /// mutation synchronously through the handler the API dispatches to.
+    /// Used by the CloudFormation provisioner, which persists the touched
+    /// state itself afterwards.
+    pub fn provision_sync(
+        &self,
+        action: &str,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        match action {
+            "CreateConsumableResource"
+            | "UpdateConsumableResource"
+            | "DeleteConsumableResource"
+            | "CreateServiceEnvironment"
+            | "UpdateServiceEnvironment"
+            | "DeleteServiceEnvironment"
+            | "CreateQuotaShare"
+            | "UpdateQuotaShare"
+            | "DeleteQuotaShare" => self.dispatch(action, req),
+            other => Err(AwsServiceError::action_not_implemented("batch", other)),
+        }
+    }
+
     fn dispatch(&self, action: &str, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         match action {
             "CreateComputeEnvironment" => self.create_compute_environment(req),

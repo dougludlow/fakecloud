@@ -653,9 +653,9 @@ impl CloudFormationService {
                 .get(aid)
                 // The physical id is the table name (an ARN on older stacks).
                 .map(|s| {
-                    s.tables.values().any(|t| {
-                        t.arn == resource.physical_id || t.name == resource.physical_id
-                    })
+                    s.tables
+                        .values()
+                        .any(|t| t.arn == resource.physical_id || t.name == resource.physical_id)
                 })
                 .unwrap_or(false),
             "AWS::KMS::Key" => self

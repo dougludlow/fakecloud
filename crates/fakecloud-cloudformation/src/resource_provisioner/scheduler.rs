@@ -131,12 +131,8 @@ impl ResourceProvisioner {
         query.insert("groupName".to_string(), group.to_string());
         // Already gone (deleted out of band, or with its group) is not a
         // stack failure.
-        let _ = self.scheduler_dispatch(
-            "DeleteSchedule",
-            &resource.physical_id,
-            Value::Null,
-            query,
-        );
+        let _ =
+            self.scheduler_dispatch("DeleteSchedule", &resource.physical_id, Value::Null, query);
         Ok(())
     }
 

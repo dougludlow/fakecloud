@@ -59,8 +59,8 @@ pub async fn cfn_launch_service_tasks(
         // started some (or all) of these tasks before this drain ran.
         // Spawning the full desired count regardless would double the
         // service's tasks.
-        let shortfall = service.desired_count
-            - st.active_service_task_count(&cluster_name, &service_name);
+        let shortfall =
+            service.desired_count - st.active_service_task_count(&cluster_name, &service_name);
         if shortfall <= 0 {
             return;
         }

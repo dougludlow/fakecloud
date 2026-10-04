@@ -23,7 +23,11 @@ pub fn rds_arn(region: &str, account_id: &str, kind: &str, id: &str) -> String {
 pub fn endpoint_hash(account_id: &str, region: &str) -> String {
     // FNV-1a over "<account>:<region>", rendered in base 36.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in account_id.bytes().chain(std::iter::once(b':')).chain(region.bytes()) {
+    for b in account_id
+        .bytes()
+        .chain(std::iter::once(b':'))
+        .chain(region.bytes())
+    {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }

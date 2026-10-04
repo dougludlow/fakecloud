@@ -1159,7 +1159,10 @@ impl ResourceProvisioner {
         Ok(result)
     }
 
-    pub(super) fn delete_lambda_event_invoke_config(&self, physical_id: &str) -> Result<(), String> {
+    pub(super) fn delete_lambda_event_invoke_config(
+        &self,
+        physical_id: &str,
+    ) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
         let state = accounts.get_or_create(&self.account_id);
         state.event_invoke_configs.remove(physical_id);

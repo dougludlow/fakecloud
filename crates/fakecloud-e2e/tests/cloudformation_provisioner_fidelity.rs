@@ -24,12 +24,8 @@ async fn wait_terminal(cfn: &aws_sdk_cloudformation::Client, stack: &str) -> Str
         let out = cfn.describe_stacks().stack_name(stack).send().await.ok()?;
         let s = out.stacks().first()?;
         let status = s.stack_status()?.as_str().to_string();
-        (!status.ends_with("IN_PROGRESS")).then(|| {
-            format!(
-                "{status} {}",
-                s.stack_status_reason().unwrap_or_default()
-            )
-        })
+        (!status.ends_with("IN_PROGRESS"))
+            .then(|| format!("{status} {}", s.stack_status_reason().unwrap_or_default()))
     })
     .await
     .expect("stack reached a terminal status")
@@ -301,11 +297,7 @@ async fn cfn_refs_and_previously_unbacked_types_reach_their_services() {
     })
     .await
     .expect("schedule removed with the stack");
-    let inline = iam
-        .list_role_policies()
-        .role_name("fid-role")
-        .send()
-        .await;
+    let inline = iam.list_role_policies().role_name("fid-role").send().await;
     assert!(inline.is_err() || inline.unwrap().policy_names().is_empty());
 }
 
@@ -373,7 +365,10 @@ async fn cfn_sqs_dlq_added_by_an_update_receives_failed_messages() {
             .then_some(())
     })
     .await;
-    assert!(got.is_some(), "message never reached the DLQ added by the update");
+    assert!(
+        got.is_some(),
+        "message never reached the DLQ added by the update"
+    );
 }
 
 const KINESIS_V1: &str = r#"{"Resources": {"S": {"Type": "AWS::Kinesis::Stream", "Properties": {"Name": "fid-stream", "ShardCount": 1, "Tags": [{"Key": "env", "Value": "dev"}]}}}}"#;
@@ -598,7 +593,9 @@ async fn cfn_aurora_member_joins_its_cluster_on_the_engine_port() {
     assert_eq!(c.port(), Some(3306));
     assert!(
         c.endpoint().unwrap().contains(".cluster-")
-            && c.endpoint().unwrap().ends_with(".us-east-1.rds.amazonaws.com"),
+            && c.endpoint()
+                .unwrap()
+                .ends_with(".us-east-1.rds.amazonaws.com"),
         "{:?}",
         c.endpoint()
     );
@@ -614,6 +611,7 @@ const SAM_SFN_API: &str = r#"{
     "Machine": {
       "Type": "AWS::Serverless::StateMachine",
       "Properties": {
+        "Role": "arn:aws:iam::123456789012:role/sfn-role",
         "Definition": {"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}},
         "Events": {"Start": {"Type": "Api", "Properties": {"Path": "/start", "Method": "post"}}}
       }
@@ -638,7 +636,12 @@ async fn cfn_sam_state_machine_api_event_is_deployed_to_prod() {
     assert!(status.starts_with("CREATE_COMPLETE"), "{status}");
     let api_id = outputs(&server, "fid-sam-sfn").await["ApiId"].clone();
     let apigw = aws_sdk_apigateway::Client::new(&server.aws_config().await);
-    let stages = apigw.get_stages().rest_api_id(&api_id).send().await.unwrap();
+    let stages = apigw
+        .get_stages()
+        .rest_api_id(&api_id)
+        .send()
+        .await
+        .unwrap();
     assert!(
         stages.item().iter().any(|s| s.stage_name() == Some("Prod")),
         "{:?}",
@@ -650,8 +653,31 @@ async fn cfn_sam_state_machine_api_event_is_deployed_to_prod() {
         .send()
         .await
         .unwrap();
-    assert!(resources
-        .items()
-        .iter()
-        .any(|r| r.path() == Some("/start")));
+    assert!(resources.items().iter().any(|r| r.path() == Some("/start")));
+}
+
+const BATCH_TEMPLATE: &str = r#"{
+  "Resources": {
+    "Licenses": {
+      "Type": "AWS::Batch::ConsumableResource",
+      "Properties": {"ConsumableResourceName": "fid-licenses", "TotalQuantity": 3, "ResourceType": "REPLENISHABLE"}
+    }
+  },
+  "Outputs": {"Arn": {"Value": {"Ref": "Licenses"}}}
+}"#;
+
+#[tokio::test]
+async fn cfn_batch_consumable_resource_is_real() {
+    let server = TestServer::start().await;
+    deploy(&server, "fid-batch", BATCH_TEMPLATE).await;
+    let arn = outputs(&server, "fid-batch").await["Arn"].clone();
+    assert!(arn.contains(":consumable-resource/fid-licenses"), "{arn}");
+    let batch = aws_sdk_batch::Client::new(&server.aws_config().await);
+    let out = batch
+        .describe_consumable_resource()
+        .consumable_resource("fid-licenses")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.total_quantity(), Some(3));
 }

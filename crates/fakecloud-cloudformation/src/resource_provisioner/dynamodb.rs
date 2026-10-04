@@ -665,7 +665,10 @@ impl ResourceProvisioner {
 /// (point-in-time recovery, deletion protection, table class, contributor
 /// insights, Kinesis destination, tags) and, under PROVISIONED billing, the
 /// replica's read capacity with the table-wide write capacity.
-fn global_table_local_props(props: &serde_json::Value, local: &serde_json::Value) -> serde_json::Value {
+fn global_table_local_props(
+    props: &serde_json::Value,
+    local: &serde_json::Value,
+) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for key in [
         "TableName",

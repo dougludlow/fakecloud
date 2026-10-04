@@ -633,10 +633,7 @@ fn parse_lambda_function_props(props: &serde_json::Value) -> Result<LambdaFuncti
         .get("LoggingConfig")
         .filter(|v| v.is_object())
         .cloned();
-    let image_config = props
-        .get("ImageConfig")
-        .filter(|v| v.is_object())
-        .cloned();
+    let image_config = props.get("ImageConfig").filter(|v| v.is_object()).cloned();
     let reserved_concurrent_executions = match props.get("ReservedConcurrentExecutions") {
         None | Some(serde_json::Value::Null) => None,
         Some(v) => Some(
@@ -1263,9 +1260,9 @@ mod elbv2;
 mod emr;
 mod eventbridge;
 #[cfg(test)]
-mod fidelity_tests;
-#[cfg(test)]
 mod fidelity2_tests;
+#[cfg(test)]
+mod fidelity_tests;
 mod firehose;
 mod glue;
 mod iam;
@@ -1287,8 +1284,8 @@ mod redshiftlike;
 mod route;
 mod route53resolver;
 mod s3;
-mod scheduler;
 mod sagemaker;
+mod scheduler;
 mod secrets;
 mod servicediscovery;
 mod ses;
@@ -1469,6 +1466,9 @@ impl ResourceProvisioner {
             "AWS::Batch::JobQueue" => self.create_batch_job_queue(resource),
             "AWS::Batch::JobDefinition" => self.create_batch_job_definition(resource),
             "AWS::Batch::SchedulingPolicy" => self.create_batch_scheduling_policy(resource),
+            "AWS::Batch::ConsumableResource"
+            | "AWS::Batch::ServiceEnvironment"
+            | "AWS::Batch::QuotaShare" => self.create_batch_api_resource(resource),
             "AWS::Pipes::Pipe" => self.create_pipes_pipe(resource),
             "AWS::CodeArtifact::Domain" => self.create_codeartifact_domain(resource),
             "AWS::CodeArtifact::Repository" => self.create_codeartifact_repository(resource),
@@ -1798,6 +1798,9 @@ impl ResourceProvisioner {
             "AWS::Lambda::EventInvokeConfig" => {
                 Some(self.update_lambda_event_invoke_config(existing, new_def)?)
             }
+            "AWS::Batch::ConsumableResource"
+            | "AWS::Batch::ServiceEnvironment"
+            | "AWS::Batch::QuotaShare" => Some(self.update_batch_api_resource(existing, new_def)?),
             "AWS::Scheduler::Schedule" => Some(self.update_scheduler_schedule(existing, new_def)?),
             "AWS::Scheduler::ScheduleGroup" => {
                 Some(self.update_scheduler_schedule_group(existing, new_def)?)
@@ -2665,6 +2668,9 @@ impl ResourceProvisioner {
             "AWS::Lambda::EventInvokeConfig" => {
                 self.delete_lambda_event_invoke_config(&resource.physical_id)
             }
+            "AWS::Batch::ConsumableResource"
+            | "AWS::Batch::ServiceEnvironment"
+            | "AWS::Batch::QuotaShare" => self.delete_batch_api_resource(resource),
             "AWS::Scheduler::Schedule" => self.delete_scheduler_schedule(resource),
             "AWS::Scheduler::ScheduleGroup" => {
                 self.delete_scheduler_schedule_group(&resource.physical_id)
@@ -7288,7 +7294,11 @@ mod tests {
             })
         };
         let err = prov
-            .create_resource(&make_resource("AWS::IAM::Policy", "AutoPol", props(serde_json::json!([]))))
+            .create_resource(&make_resource(
+                "AWS::IAM::Policy",
+                "AutoPol",
+                props(serde_json::json!([])),
+            ))
             .unwrap_err();
         assert!(err.contains("at least one"), "{err}");
         prov.create_resource(&make_resource(
@@ -7298,10 +7308,19 @@ mod tests {
         ))
         .unwrap();
         let sr = prov
-            .create_resource(&make_resource("AWS::IAM::Policy", "AutoPol", props(serde_json::json!(["u1"]))))
+            .create_resource(&make_resource(
+                "AWS::IAM::Policy",
+                "AutoPol",
+                props(serde_json::json!(["u1"])),
+            ))
             .unwrap();
         assert!(!sr.physical_id.is_empty());
-        assert!(prov.iam_state.read().get("123456789012").unwrap().user_inline_policies["u1"]
+        assert!(prov
+            .iam_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .user_inline_policies["u1"]
             .contains_key("inline-pol"));
     }
 
@@ -10897,9 +10916,12 @@ mod tests {
         assert_eq!(stream.shard_count, 3);
         let original = &stream.shards[0];
         assert!(!original.is_open);
-        assert!(stream.shards[1..]
-            .iter()
-            .all(|s| s.is_open && s.parent_shard_id.as_deref() == Some(original.shard_id.as_str())));
+        assert!(
+            stream.shards[1..]
+                .iter()
+                .all(|s| s.is_open
+                    && s.parent_shard_id.as_deref() == Some(original.shard_id.as_str()))
+        );
     }
 
     #[test]

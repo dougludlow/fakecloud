@@ -43,7 +43,10 @@ fn tag_spec_params(props: &Value, resource_type: &str, params: &mut HashMap<Stri
     );
     for (i, t) in tags.iter().enumerate() {
         if let (Some(k), Some(v)) = (prop_str(t, "Key"), prop_str(t, "Value")) {
-            params.insert(format!("TagSpecification.1.Tag.{}.Key", i + 1), k.to_string());
+            params.insert(
+                format!("TagSpecification.1.Tag.{}.Key", i + 1),
+                k.to_string(),
+            );
             params.insert(
                 format!("TagSpecification.1.Tag.{}.Value", i + 1),
                 v.to_string(),
@@ -299,14 +302,20 @@ impl ResourceProvisioner {
             "Domain".to_string(),
             prop_str(props, "Domain").unwrap_or("vpc").to_string(),
         );
-        for key in ["NetworkBorderGroup", "PublicIpv4Pool", "Address", "IpamPoolId"] {
+        for key in [
+            "NetworkBorderGroup",
+            "PublicIpv4Pool",
+            "Address",
+            "IpamPoolId",
+        ] {
             if let Some(v) = prop_str(props, key) {
                 params.insert(key.to_string(), v.to_string());
             }
         }
         tag_spec_params(props, "elastic-ip", &mut params);
         let body = self.ec2_dispatch("AllocateAddress", params)?;
-        let public_ip = xml_elem(&body, "publicIp").ok_or("AllocateAddress returned no publicIp")?;
+        let public_ip =
+            xml_elem(&body, "publicIp").ok_or("AllocateAddress returned no publicIp")?;
         let allocation_id =
             xml_elem(&body, "allocationId").ok_or("AllocateAddress returned no allocationId")?;
         if let Some(instance) = prop_str(props, "InstanceId") {

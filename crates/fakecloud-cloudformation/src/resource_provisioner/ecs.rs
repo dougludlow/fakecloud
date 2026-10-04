@@ -798,7 +798,9 @@ fn cfn_desired_count(n: i64) -> Result<i32, String> {
 
 /// `DeploymentConfiguration.DeploymentCircuitBreaker` as the service's
 /// circuit-breaker config.
-fn cfn_ecs_circuit_breaker(props: &serde_json::Value) -> Option<fakecloud_ecs::CircuitBreakerConfig> {
+fn cfn_ecs_circuit_breaker(
+    props: &serde_json::Value,
+) -> Option<fakecloud_ecs::CircuitBreakerConfig> {
     let cb = props
         .get("DeploymentConfiguration")?
         .get("DeploymentCircuitBreaker")

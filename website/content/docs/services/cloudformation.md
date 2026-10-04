@@ -101,6 +101,7 @@ For **container-backed** services, a CloudFormation-provisioned resource is back
 - **Athena** — `WorkGroup`, `DataCatalog`, `NamedQuery`, `PreparedStatement`
 - **Auto Scaling** — `LaunchConfiguration` (including `BlockDeviceMappings` and `MetadataOptions`), `AutoScalingGroup` (the group reconciles its `DesiredCapacity` to real container-backed EC2 instances launched through `RunInstances` from its launch configuration, `LaunchTemplate` or `MixedInstancesPolicy`, with its `Tags` propagated at launch; a missing launch configuration or template fails the resource)
 - **ACM** — `Certificate`, `Account`
+- **Batch** - `ComputeEnvironment`, `JobQueue`, `JobDefinition`, `SchedulingPolicy`, `ConsumableResource`, `ServiceEnvironment`, `QuotaShare` (the last three through the Batch API handlers; `Ref` is the ARN)
 - **CloudFormation** — `Stack` (nested), `CustomResource` / `Custom::*`
 - **CloudFront** — `Distribution`, `Function`, `CachePolicy`, `OriginRequestPolicy`, `ResponseHeadersPolicy`, `KeyGroup`, `PublicKey`, `OriginAccessControl`, `CloudFrontOriginAccessIdentity`
 - **CloudWatch** — `Alarm`, `Dashboard`

@@ -1854,7 +1854,10 @@ pub fn detach_cluster_member(state: &mut RdsState, cluster_id: &str, instance_id
         .min_by_key(|m| m["PromotionTier"].as_i64().unwrap_or(i64::MAX));
     let new_writer = next.map(|m| {
         m["IsClusterWriter"] = Value::Bool(true);
-        m["DBInstanceIdentifier"].as_str().unwrap_or_default().to_string()
+        m["DBInstanceIdentifier"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     });
     match new_writer {
         Some(id) => {

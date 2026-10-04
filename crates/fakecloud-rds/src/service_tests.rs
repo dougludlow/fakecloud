@@ -7846,7 +7846,10 @@ fn detaching_the_writer_promotes_the_next_member() {
         .extras
         .entry("clusters".to_string())
         .or_default()
-        .insert("c1".to_string(), serde_json::json!({"DBClusterIdentifier": "c1"}));
+        .insert(
+            "c1".to_string(),
+            serde_json::json!({"DBClusterIdentifier": "c1"}),
+        );
     attach_cluster_member(&mut state, "c1", "a");
     attach_cluster_member(&mut state, "c1", "b");
     let cluster = &state.extras["clusters"]["c1"];

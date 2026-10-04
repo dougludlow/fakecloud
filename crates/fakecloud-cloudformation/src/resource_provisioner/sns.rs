@@ -139,7 +139,12 @@ fn sns_owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
 
 /// Whether a topic policy lets `account_id` (its root, which a stack runs
 /// as) call `sns:Subscribe` on `topic_arn`.
-fn sns_policy_allows_subscribe(policy: &str, topic_arn: &str, account_id: &str, region: &str) -> bool {
+fn sns_policy_allows_subscribe(
+    policy: &str,
+    topic_arn: &str,
+    account_id: &str,
+    region: &str,
+) -> bool {
     let doc = fakecloud_iam::evaluator::PolicyDocument::parse(policy);
     let root = fakecloud_aws::arn::Arn::global_in(region, "iam", account_id, "root").to_string();
     let principal = fakecloud_core::auth::Principal {
@@ -400,9 +405,11 @@ impl ResourceProvisioner {
             }
         }
         // Subscribe is idempotent on (topic, protocol, endpoint).
-        if let Some(existing) = state.subscriptions.values().find(|s| {
-            s.topic_arn == topic_arn && s.protocol == protocol && s.endpoint == endpoint
-        }) {
+        if let Some(existing) = state
+            .subscriptions
+            .values()
+            .find(|s| s.topic_arn == topic_arn && s.protocol == protocol && s.endpoint == endpoint)
+        {
             let sub_arn = existing.subscription_arn.clone();
             return Ok(ProvisionResult::new(sub_arn.clone()).with("Arn", sub_arn));
         }

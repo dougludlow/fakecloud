@@ -1974,6 +1974,14 @@ pub(crate) use helpers::*;
 #[path = "service_tests.rs"]
 mod tests;
 
+/// The account a topic or subscription ARN belongs to (its topic owner's),
+/// or `caller` when the ARN carries none.
+fn owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
+    fakecloud_aws::arn::account_of(arn)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(caller)
+}
+
 #[cfg(test)]
 mod effective_policy_tests {
     use super::{
@@ -2116,12 +2124,4 @@ mod effective_policy_tests {
             "exponential"
         );
     }
-}
-
-/// The account a topic or subscription ARN belongs to (its topic owner's),
-/// or `caller` when the ARN carries none.
-fn owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
-    fakecloud_aws::arn::account_of(arn)
-        .filter(|a| !a.is_empty())
-        .unwrap_or(caller)
 }

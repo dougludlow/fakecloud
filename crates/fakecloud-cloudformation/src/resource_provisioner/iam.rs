@@ -267,17 +267,23 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         for role in &targets.roles {
             if !state.roles.contains_key(role) {
-                return Err(format!("NoSuchEntity: The role with name {role} cannot be found."));
+                return Err(format!(
+                    "NoSuchEntity: The role with name {role} cannot be found."
+                ));
             }
         }
         for user in &targets.users {
             if !state.users.contains_key(user) {
-                return Err(format!("NoSuchEntity: The user with name {user} cannot be found."));
+                return Err(format!(
+                    "NoSuchEntity: The user with name {user} cannot be found."
+                ));
             }
         }
         for group in &targets.groups {
             if !state.groups.contains_key(group) {
-                return Err(format!("NoSuchEntity: The group with name {group} cannot be found."));
+                return Err(format!(
+                    "NoSuchEntity: The group with name {group} cannot be found."
+                ));
             }
         }
         for role in &targets.roles {

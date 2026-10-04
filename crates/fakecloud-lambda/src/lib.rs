@@ -10,8 +10,7 @@ pub(crate) mod workflows;
 pub use service::{validate_execution_role, LambdaService};
 pub use state::{
     function_arn, layer_arn, qualified_function_arn, AttachedLayer, EventInvokeConfig,
-    EventSourceMapping,
-    FunctionAlias, FunctionUrlConfig, LambdaFunction, LambdaInvocation, LambdaSnapshot,
-    LambdaState, Layer, LayerVersion, ProvisionedConcurrencyConfig, SharedLambdaState,
-    LAMBDA_SNAPSHOT_SCHEMA_VERSION,
+    EventSourceMapping, FunctionAlias, FunctionUrlConfig, LambdaFunction, LambdaInvocation,
+    LambdaSnapshot, LambdaState, Layer, LayerVersion, ProvisionedConcurrencyConfig,
+    SharedLambdaState, LAMBDA_SNAPSHOT_SCHEMA_VERSION,
 };

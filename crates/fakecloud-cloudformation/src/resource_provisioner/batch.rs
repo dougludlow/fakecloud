@@ -7,7 +7,7 @@
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner};
+use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
 
 fn prop_str<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
     p.get(k).and_then(|v| v.as_str())
@@ -263,5 +263,189 @@ impl ResourceProvisioner {
             }
             _ => {}
         }
+    }
+}
+
+/// The kinds of Batch resource the CloudFormation provisioner drives through
+/// the Batch API handlers: (create, update, delete action, the id request
+/// key update/delete take, the ARN response key, and the name property).
+struct BatchApiKind {
+    create: &'static str,
+    update: &'static str,
+    delete: &'static str,
+    id_key: &'static str,
+    arn_key: &'static str,
+    name_prop: &'static str,
+}
+
+fn batch_api_kind(resource_type: &str) -> Option<BatchApiKind> {
+    Some(match resource_type {
+        "AWS::Batch::ConsumableResource" => BatchApiKind {
+            create: "CreateConsumableResource",
+            update: "UpdateConsumableResource",
+            delete: "DeleteConsumableResource",
+            id_key: "consumableResource",
+            arn_key: "consumableResourceArn",
+            name_prop: "ConsumableResourceName",
+        },
+        "AWS::Batch::ServiceEnvironment" => BatchApiKind {
+            create: "CreateServiceEnvironment",
+            update: "UpdateServiceEnvironment",
+            delete: "DeleteServiceEnvironment",
+            id_key: "serviceEnvironment",
+            arn_key: "serviceEnvironmentArn",
+            name_prop: "ServiceEnvironmentName",
+        },
+        "AWS::Batch::QuotaShare" => BatchApiKind {
+            create: "CreateQuotaShare",
+            update: "UpdateQuotaShare",
+            delete: "DeleteQuotaShare",
+            id_key: "quotaShareArn",
+            arn_key: "quotaShareArn",
+            name_prop: "QuotaShareName",
+        },
+        _ => return None,
+    })
+}
+
+/// A CFN property map as the Batch API's camelCase JSON body. Tag keys are
+/// user data and keep their case.
+fn batch_api_body(props: &Value) -> Map<String, Value> {
+    let mut out = Map::new();
+    if let Some(obj) = props.as_object() {
+        for (k, v) in obj {
+            let mut key = String::with_capacity(k.len());
+            let mut chars = k.chars();
+            if let Some(first) = chars.next() {
+                key.extend(first.to_lowercase());
+                key.push_str(chars.as_str());
+            }
+            let value = if k == "Tags" {
+                v.clone()
+            } else {
+                super::lowercase_first_keys(v.clone())
+            };
+            out.insert(key, value);
+        }
+    }
+    out
+}
+
+impl ResourceProvisioner {
+    fn batch_dispatch(&self, action: &str, body: Map<String, Value>) -> Result<Value, String> {
+        let req = fakecloud_core::service::AwsRequest {
+            service: "batch".to_string(),
+            action: action.to_string(),
+            region: self.region.clone(),
+            account_id: self.account_id.clone(),
+            request_id: "cfn".to_string(),
+            headers: http::HeaderMap::new(),
+            query_params: Default::default(),
+            body: bytes::Bytes::from(Value::Object(body).to_string()),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: Vec::new(),
+            raw_path: "/".to_string(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        };
+        let resp = fakecloud_batch::BatchService::new(self.batch_state.clone())
+            .provision_sync(action, &req)
+            .map_err(|e| format!("{}: {}", e.code(), e.message()))?;
+        Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap_or(Value::Null))
+    }
+
+    /// `AWS::Batch::ConsumableResource` / `ServiceEnvironment` /
+    /// `QuotaShare`, created through the Batch API handler. `Ref` returns the
+    /// ARN.
+    pub(super) fn create_batch_api_resource(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let kind = batch_api_kind(&resource.resource_type)
+            .ok_or_else(|| format!("unsupported type {}", resource.resource_type))?;
+        let mut body = batch_api_body(&resource.properties);
+        let name_key = batch_api_body(&serde_json::json!({ kind.name_prop: "" }))
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_default();
+        if !body.contains_key(&name_key) {
+            body.insert(name_key, json!(self.physical_name(resource)));
+        }
+        let out = self.batch_dispatch(kind.create, body)?;
+        let arn = out[kind.arn_key].as_str().unwrap_or_default().to_string();
+        let attr = format!("{}{}", kind.arn_key[..1].to_uppercase(), &kind.arn_key[1..]);
+        Ok(ProvisionResult::new(arn.clone()).with(&attr, arn))
+    }
+
+    /// In-place update through the Batch Update* handler. A consumable
+    /// resource's `TotalQuantity` is SET to the new value.
+    pub(super) fn update_batch_api_resource(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let kind = batch_api_kind(&resource.resource_type)
+            .ok_or_else(|| format!("unsupported type {}", resource.resource_type))?;
+        let props = &resource.properties;
+        let mut body = Map::new();
+        body.insert(kind.id_key.to_string(), json!(existing.physical_id));
+        if resource.resource_type == "AWS::Batch::ConsumableResource" {
+            if let Some(q) = props.get("TotalQuantity") {
+                body.insert("operation".into(), json!("SET"));
+                body.insert("quantity".into(), q.clone());
+            }
+        } else {
+            for (k, v) in batch_api_body(props) {
+                if matches!(
+                    k.as_str(),
+                    "state"
+                        | "capacityLimits"
+                        | "resourceSharingConfiguration"
+                        | "preemptionConfiguration"
+                ) {
+                    body.insert(k, v);
+                }
+            }
+        }
+        self.batch_dispatch(kind.update, body)?;
+        let mut result = ProvisionResult::new(existing.physical_id.clone());
+        for (k, v) in &existing.attributes {
+            result = result.with(k, v.clone());
+        }
+        Ok(result)
+    }
+
+    /// Delete through the Batch handler. A service environment or quota
+    /// share has to be DISABLED first, so it is disabled and then deleted,
+    /// as CloudFormation's handler does.
+    pub(super) fn delete_batch_api_resource(&self, resource: &StackResource) -> Result<(), String> {
+        let Some(kind) = batch_api_kind(&resource.resource_type) else {
+            return Ok(());
+        };
+        let id = json!(resource.physical_id);
+        if resource.resource_type != "AWS::Batch::ConsumableResource" {
+            let mut disable = Map::new();
+            disable.insert(kind.id_key.to_string(), id.clone());
+            disable.insert("state".into(), json!("DISABLED"));
+            // Already gone is not a stack failure.
+            if self.batch_dispatch(kind.update, disable).is_err() {
+                return Ok(());
+            }
+        }
+        let mut body = Map::new();
+        body.insert(kind.id_key.to_string(), id);
+        self.batch_dispatch(kind.delete, body)
+            .map(|_| ())
+            .or_else(|e| {
+                if e.contains("does not exist") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
     }
 }

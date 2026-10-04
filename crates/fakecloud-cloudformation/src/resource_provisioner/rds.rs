@@ -358,7 +358,10 @@ impl ResourceProvisioner {
         match attribute {
             "Endpoint.Address" => field("Endpoint"),
             "ReadEndpoint.Address" => field("ReaderEndpoint"),
-            "Endpoint.Port" => cluster.get("Port").and_then(|v| v.as_i64()).map(|p| p.to_string()),
+            "Endpoint.Port" => cluster
+                .get("Port")
+                .and_then(|v| v.as_i64())
+                .map(|p| p.to_string()),
             "DBClusterArn" => field("DBClusterArn"),
             "DBClusterResourceId" => field("DbClusterResourceId"),
             _ => None,
@@ -954,8 +957,7 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "cluster", &identifier);
         let cluster_resource_id = format!("cluster-{}", Uuid::new_v4().simple());
-        let endpoint =
-            fakecloud_rds::cluster_endpoint(&identifier, &self.account_id, &self.region);
+        let endpoint = fakecloud_rds::cluster_endpoint(&identifier, &self.account_id, &self.region);
         let reader_endpoint =
             fakecloud_rds::cluster_reader_endpoint(&identifier, &self.account_id, &self.region);
         let body = serde_json::json!({
@@ -1102,7 +1104,9 @@ impl ResourceProvisioner {
             .to_string();
         let port = obj.get("Port").and_then(|v| v.as_i64()).unwrap_or_else(|| {
             i64::from(fakecloud_rds::default_port_for_engine(
-                obj.get("Engine").and_then(|v| v.as_str()).unwrap_or_default(),
+                obj.get("Engine")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
             ))
         });
         let resource_id = obj

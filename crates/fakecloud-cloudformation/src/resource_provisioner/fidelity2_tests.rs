@@ -9,7 +9,12 @@ use serde_json::json;
 
 const ACCT: &str = "123456789012";
 
-fn create(prov: &ResourceProvisioner, ty: &str, id: &str, props: serde_json::Value) -> StackResource {
+fn create(
+    prov: &ResourceProvisioner,
+    ty: &str,
+    id: &str,
+    props: serde_json::Value,
+) -> StackResource {
     prov.create_resource(&make_resource(ty, id, props))
         .unwrap_or_else(|e| panic!("create {id}: {e}"))
 }
@@ -108,7 +113,10 @@ fn lambda_image_config_reserved_concurrency_and_tags_follow_the_template() {
         let lambda = prov.lambda_state.read();
         let st = lambda.get(ACCT).unwrap();
         let func = &st.functions["img"];
-        assert_eq!(func.image_config.as_ref().unwrap()["Command"][0], "app.handler");
+        assert_eq!(
+            func.image_config.as_ref().unwrap()["Command"][0],
+            "app.handler"
+        );
         assert_eq!(st.function_concurrency.get("img"), Some(&5));
     }
     update(
@@ -133,7 +141,12 @@ fn lambda_image_config_reserved_concurrency_and_tags_follow_the_template() {
 #[test]
 fn lambda_event_invoke_config_is_stored_for_the_qualifier() {
     let prov = make_provisioner();
-    create(&prov, "AWS::Lambda::Function", "F", function_props(json!({})));
+    create(
+        &prov,
+        "AWS::Lambda::Function",
+        "F",
+        function_props(json!({})),
+    );
     let cfg = create(
         &prov,
         "AWS::Lambda::EventInvokeConfig",
@@ -163,7 +176,13 @@ fn lambda_event_invoke_config_is_stored_for_the_qualifier() {
         .unwrap_err();
     assert!(err.contains("MaximumRetryAttempts"), "{err}");
     prov.delete_resource(&cfg).unwrap();
-    assert!(prov.lambda_state.read().get(ACCT).unwrap().event_invoke_configs.is_empty());
+    assert!(prov
+        .lambda_state
+        .read()
+        .get(ACCT)
+        .unwrap()
+        .event_invoke_configs
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +273,14 @@ fn rds_instance_endpoint_get_att_is_live() {
         i.endpoint_address = "127.0.0.1".to_string();
         i.port = 54321;
     }
-    assert_eq!(prov.get_att(&inst, "Endpoint.Address").as_deref(), Some("127.0.0.1"));
-    assert_eq!(prov.get_att(&inst, "Endpoint.Port").as_deref(), Some("54321"));
+    assert_eq!(
+        prov.get_att(&inst, "Endpoint.Address").as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        prov.get_att(&inst, "Endpoint.Port").as_deref(),
+        Some("54321")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,12 +384,14 @@ fn kinesis_tags_encryption_and_reshard_keep_records() {
         assert_eq!(stream.encryption_type, "KMS");
         assert_eq!(stream.key_id.as_deref(), Some("alias/aws/kinesis"));
         assert_eq!(stream.tags["env"], "dev");
-        stream.shards[0].records.push(fakecloud_kinesis::KinesisRecord {
-            sequence_number: "1".to_string(),
-            partition_key: "pk".to_string(),
-            data: b"hello".to_vec(),
-            approximate_arrival_timestamp: Utc::now(),
-        });
+        stream.shards[0]
+            .records
+            .push(fakecloud_kinesis::KinesisRecord {
+                sequence_number: "1".to_string(),
+                partition_key: "pk".to_string(),
+                data: b"hello".to_vec(),
+                approximate_arrival_timestamp: Utc::now(),
+            });
     }
     update(&prov, &s, json!({"Name": "events", "ShardCount": 2}));
     let k = prov.kinesis_state.read();
@@ -433,7 +460,10 @@ fn sns_topic_update_applies_tags_and_diffs_inline_subscriptions() {
     assert_eq!(updated.attributes["TopicArn"], arn);
     let sns = prov.sns_state.read();
     let st = sns.get(ACCT).unwrap();
-    assert_eq!(st.topics[&arn].tags, vec![("b".to_string(), "2".to_string())]);
+    assert_eq!(
+        st.topics[&arn].tags,
+        vec![("b".to_string(), "2".to_string())]
+    );
     let mut endpoints: Vec<&str> = st
         .subscriptions
         .values()
@@ -489,7 +519,13 @@ fn sns_subscription_to_another_accounts_topic_lands_with_the_topic() {
         assert_eq!(s.owner, ACCT);
     }
     prov.delete_resource(&sub).unwrap();
-    assert!(prov.sns_state.read().get("111111111111").unwrap().subscriptions.is_empty());
+    assert!(prov
+        .sns_state
+        .read()
+        .get("111111111111")
+        .unwrap()
+        .subscriptions
+        .is_empty());
 
     // Under strict IAM the topic policy has to allow the subscriber.
     let mut strict = make_provisioner();
@@ -556,7 +592,13 @@ fn dynamodb_table_ref_is_the_table_name() {
         ..t.clone()
     };
     prov.delete_resource(&legacy).unwrap();
-    assert!(prov.dynamodb_state.read().get(ACCT).unwrap().tables.is_empty());
+    assert!(prov
+        .dynamodb_state
+        .read()
+        .get(ACCT)
+        .unwrap()
+        .tables
+        .is_empty());
 }
 
 #[test]
@@ -591,7 +633,13 @@ fn events_rule_ref_and_tags() {
         assert!(rule.tags.is_empty());
     }
     prov.delete_resource(&r).unwrap();
-    assert!(prov.eventbridge_state.read().get(ACCT).unwrap().rules.is_empty());
+    assert!(prov
+        .eventbridge_state
+        .read()
+        .get(ACCT)
+        .unwrap()
+        .rules
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +649,12 @@ fn events_rule_ref_and_tags() {
 #[test]
 fn ec2_networking_resources_exist_in_ec2() {
     let prov = make_provisioner();
-    let vpc = create(&prov, "AWS::EC2::VPC", "V", json!({"CidrBlock": "10.9.0.0/16"}));
+    let vpc = create(
+        &prov,
+        "AWS::EC2::VPC",
+        "V",
+        json!({"CidrBlock": "10.9.0.0/16"}),
+    );
     let subnet = create(
         &prov,
         "AWS::EC2::Subnet",
@@ -616,7 +669,12 @@ fn ec2_networking_resources_exist_in_ec2() {
         json!({"VpcId": vpc.physical_id, "InternetGatewayId": igw.physical_id}),
     );
     assert_eq!(att.physical_id, format!("IGW|{}", vpc.physical_id));
-    let rtb = create(&prov, "AWS::EC2::RouteTable", "RT", json!({"VpcId": vpc.physical_id}));
+    let rtb = create(
+        &prov,
+        "AWS::EC2::RouteTable",
+        "RT",
+        json!({"VpcId": vpc.physical_id}),
+    );
     let route = create(
         &prov,
         "AWS::EC2::Route",
@@ -652,7 +710,11 @@ fn ec2_networking_resources_exist_in_ec2() {
             "CidrIp": "0.0.0.0/0"
         }),
     );
-    assert!(ingress.physical_id.starts_with("sgr-"), "{}", ingress.physical_id);
+    assert!(
+        ingress.physical_id.starts_with("sgr-"),
+        "{}",
+        ingress.physical_id
+    );
     {
         let ec2 = prov.ec2_state.read();
         let st = ec2.get(ACCT).unwrap();
@@ -660,7 +722,10 @@ fn ec2_networking_resources_exist_in_ec2() {
             .attachments
             .iter()
             .any(|(v, _)| *v == vpc.physical_id));
-        assert!(st.elastic_ips.values().any(|e| e.public_ip == eip.physical_id));
+        assert!(st
+            .elastic_ips
+            .values()
+            .any(|e| e.public_ip == eip.physical_id));
         assert!(st.nat_gateways.contains_key(&nat.physical_id));
         assert!(st.security_groups[&sg.physical_id]
             .rules
@@ -673,8 +738,13 @@ fn ec2_networking_resources_exist_in_ec2() {
     }
     let ec2 = prov.ec2_state.read();
     let st = ec2.get(ACCT).unwrap();
-    assert!(st.internet_gateways[&igw.physical_id].attachments.is_empty());
-    assert!(!st.elastic_ips.values().any(|e| e.public_ip == eip.physical_id));
+    assert!(st.internet_gateways[&igw.physical_id]
+        .attachments
+        .is_empty());
+    assert!(!st
+        .elastic_ips
+        .values()
+        .any(|e| e.public_ip == eip.physical_id));
     assert!(!st.security_groups[&sg.physical_id]
         .rules
         .iter()
@@ -707,10 +777,20 @@ fn iam_role_policy_is_an_inline_policy_on_the_role() {
             ]}
         }),
     );
-    assert!(prov.iam_state.read().get(ACCT).unwrap().role_inline_policies["app"]
+    assert!(prov
+        .iam_state
+        .read()
+        .get(ACCT)
+        .unwrap()
+        .role_inline_policies["app"]
         .contains_key("read-items"));
     prov.delete_resource(&rp).unwrap();
-    assert!(!prov.iam_state.read().get(ACCT).unwrap().role_inline_policies["app"]
+    assert!(!prov
+        .iam_state
+        .read()
+        .get(ACCT)
+        .unwrap()
+        .role_inline_policies["app"]
         .contains_key("read-items"));
 }
 
@@ -755,7 +835,12 @@ fn dynamodb_global_table_creates_the_local_replica_and_replication_group() {
 #[test]
 fn scheduler_schedule_and_group_are_real() {
     let prov = make_provisioner();
-    let group = create(&prov, "AWS::Scheduler::ScheduleGroup", "G", json!({"Name": "jobs"}));
+    let group = create(
+        &prov,
+        "AWS::Scheduler::ScheduleGroup",
+        "G",
+        json!({"Name": "jobs"}),
+    );
     assert!(group.attributes["Arn"].ends_with(":schedule-group/jobs"));
     let sched = create(
         &prov,
@@ -810,4 +895,72 @@ fn scheduler_schedule_and_group_are_real() {
     let st = sch.get(ACCT).unwrap();
     assert!(st.schedules.is_empty());
     assert!(!st.groups.contains_key("jobs"));
+}
+
+// ---------------------------------------------------------------------------
+// Batch consumable resources and service environments
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_consumable_resource_and_service_environment_go_through_batch() {
+    let prov = make_provisioner();
+    let cr = create(
+        &prov,
+        "AWS::Batch::ConsumableResource",
+        "CR",
+        json!({
+            "ConsumableResourceName": "licenses",
+            "TotalQuantity": 10,
+            "ResourceType": "REPLENISHABLE",
+            "Tags": {"Team": "ml"}
+        }),
+    );
+    assert!(
+        cr.physical_id.contains(":consumable-resource/licenses"),
+        "{}",
+        cr.physical_id
+    );
+    assert_eq!(cr.attributes["ConsumableResourceArn"], cr.physical_id);
+    {
+        let b = prov.batch_state.read();
+        let st = b.get(ACCT).unwrap();
+        assert_eq!(st.tags[&cr.physical_id]["Team"], "ml");
+    }
+    update(
+        &prov,
+        &cr,
+        json!({"ConsumableResourceName": "licenses", "TotalQuantity": 25, "ResourceType": "REPLENISHABLE"}),
+    );
+    assert!(format!(
+        "{:?}",
+        prov.batch_state
+            .read()
+            .get(ACCT)
+            .unwrap()
+            .consumable_resources
+    )
+    .contains("25"));
+
+    let env = create(
+        &prov,
+        "AWS::Batch::ServiceEnvironment",
+        "SE",
+        json!({
+            "ServiceEnvironmentName": "training",
+            "ServiceEnvironmentType": "SAGEMAKER_TRAINING",
+            "CapacityLimits": [{"MaxCapacity": 4, "CapacityUnit": "NUM_INSTANCES"}]
+        }),
+    );
+    assert!(
+        env.physical_id.contains(":service-environment/training"),
+        "{}",
+        env.physical_id
+    );
+    // Delete disables first, then deletes (an ENABLED environment can't be).
+    prov.delete_resource(&env).unwrap();
+    prov.delete_resource(&cr).unwrap();
+    let b = prov.batch_state.read();
+    let st = b.get(ACCT).unwrap();
+    assert!(st.service_environments.is_empty());
+    assert!(st.consumable_resources.is_empty());
 }

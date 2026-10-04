@@ -103,7 +103,10 @@ impl SchedulerService {
     ) -> Result<(), AwsServiceError> {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(account_id);
-        let group = state.groups.get_mut(name).ok_or_else(not_found_group(name))?;
+        let group = state
+            .groups
+            .get_mut(name)
+            .ok_or_else(not_found_group(name))?;
         group.tags = tags;
         group.last_modification_date = Utc::now();
         Ok(())

@@ -979,17 +979,19 @@ mod tests {
         let resources = expand_sam(&template).unwrap()["Resources"].clone();
         let api = &resources["ServerlessRestApi"];
         assert_eq!(api["Type"], json!("AWS::ApiGateway::RestApi"));
-        let integration =
-            &api["Properties"]["Body"]["paths"]["/orders"]["post"]["x-amazon-apigateway-integration"];
+        let integration = &api["Properties"]["Body"]["paths"]["/orders"]["post"]
+            ["x-amazon-apigateway-integration"];
         assert_eq!(integration["type"], json!("aws"));
         assert_eq!(
             integration["credentials"],
             json!({"Fn::GetAtt": ["MySMStartRole", "Arn"]})
         );
-        assert!(integration["requestTemplates"]["application/json"]["Fn::Sub"]
-            .as_str()
-            .unwrap()
-            .contains("${MySM}"));
+        assert!(
+            integration["requestTemplates"]["application/json"]["Fn::Sub"]
+                .as_str()
+                .unwrap()
+                .contains("${MySM}")
+        );
         // Deployed: a Deployment and the Prod stage, as SAM emits.
         let (_, deployment) = resources
             .as_object()

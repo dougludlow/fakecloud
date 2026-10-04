@@ -4385,7 +4385,10 @@ fn update_user_pool_client_resets_omitted_settings_to_defaults() {
     });
     let req = make_req("UpdateUserPoolClient", &body.to_string());
     let b = resp_json(&svc.update_user_pool_client(&req).unwrap());
-    assert_eq!(b["UserPoolClient"]["CallbackURLs"][0], "https://example.com/cb");
+    assert_eq!(
+        b["UserPoolClient"]["CallbackURLs"][0],
+        "https://example.com/cb"
+    );
     assert_eq!(b["UserPoolClient"]["RefreshTokenValidity"], 10);
 
     // A second update that sends only the name puts every other setting back
@@ -4405,13 +4408,16 @@ fn update_user_pool_client_resets_omitted_settings_to_defaults() {
         "WriteAttributes",
     ] {
         assert!(
-            c.get(key).is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())),
+            c.get(key)
+                .is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())),
             "{key} should be reset: {c}"
         );
     }
     assert_eq!(c["AllowedOAuthFlowsUserPoolClient"], false);
     assert_eq!(c["RefreshTokenValidity"], 30);
-    assert!(c.get("AccessTokenValidity").is_none_or(|v| v.is_null() || v == 0));
+    assert!(c
+        .get("AccessTokenValidity")
+        .is_none_or(|v| v.is_null() || v == 0));
     assert_eq!(c["EnableTokenRevocation"], true);
     assert_eq!(c["AuthSessionValidity"], 3);
 }
