@@ -595,29 +595,60 @@ impl Ec2Runtime {
 
     /// Tear down the given `(account, instance_id)`s for a reset: their
     /// containers and data volumes. Instance ids are unique per instance, so
-    /// this never reaches an instance launched after the reset; a boot still in
-    /// flight for a reset instance reaps itself once it finds its row gone.
-    /// Covers stopped instances recovered from disk too, which have no
-    /// runtime record but still have a volume.
+    /// this never reaches an instance launched after the reset. Covers stopped
+    /// instances recovered from disk too, which have no runtime record but
+    /// still have a volume.
+    ///
+    /// An instance with a lifecycle task in flight (a boot pulling its image,
+    /// a reboot recreating its Pod) is torn down once that task lets go, on a
+    /// task of its own: waiting for it here would hold the reset response for
+    /// as long as an image pull takes. The task removes what the in-flight one
+    /// leaves, so nothing outlives the reset either way.
     pub async fn remove_instances(&self, instances: Vec<(String, String)>) {
         for (account_id, instance_id) in instances {
-            // Wait out any lifecycle task in flight on this instance (a
-            // reboot recreating its Pod, a boot), so the teardown removes
-            // what that task leaves rather than racing it.
-            let lifecycle = self.lock_lifecycle(&instance_id).await;
-            let record = self.instances.write().remove(&instance_id);
-            if let Some(record) = record {
-                match &self.backend {
-                    InstanceBackend::Docker(d) => d.remove(&record.handle).await,
-                    InstanceBackend::K8s(k) => k.delete_pod(&record.handle).await,
+            let lock = self
+                .lifecycle_locks
+                .lock()
+                .entry(instance_id.clone())
+                .or_default()
+                .clone();
+            match lock.clone().try_lock_owned() {
+                Ok(guard) => {
+                    self.remove_instance_locked(&account_id, &instance_id, guard)
+                        .await
+                }
+                Err(_) => {
+                    let rt = self.clone();
+                    tokio::spawn(async move {
+                        let guard = lock.lock_owned().await;
+                        rt.remove_instance_locked(&account_id, &instance_id, guard)
+                            .await;
+                    });
                 }
             }
-            if let InstanceBackend::Docker(d) = &self.backend {
-                d.remove_data_volume(&account_id, &instance_id).await;
-            }
-            drop(lifecycle);
-            self.lifecycle_locks.lock().remove(&instance_id);
         }
+    }
+
+    /// Remove one reset instance's container and data volume while holding
+    /// its lifecycle lock.
+    async fn remove_instance_locked(
+        &self,
+        account_id: &str,
+        instance_id: &str,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let record = self.instances.write().remove(instance_id);
+        if let Some(record) = record {
+            match &self.backend {
+                InstanceBackend::Docker(d) => d.remove(&record.handle).await,
+                InstanceBackend::K8s(k) => k.delete_pod(&record.handle).await,
+            }
+        }
+        if let InstanceBackend::Docker(d) = &self.backend {
+            d.remove_data_volume(account_id, instance_id).await;
+        }
+        drop(lifecycle);
+        self.lifecycle_locks.lock().remove(instance_id);
     }
 
     /// Sweep instance Pods orphaned by a previous fakecloud process (k8s
@@ -1068,5 +1099,80 @@ mod volume_tests {
         // The scoped volume always wins once it exists.
         assert_eq!(pick(true, false), "scoped");
         assert_eq!(pick(true, true), "scoped");
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A reset must not wait for an instance's in-flight lifecycle task (a
+    /// boot pulling a large image holds the lock for as long as the pull
+    /// takes): `remove_instances` returns at once, and the teardown happens
+    /// once the task lets go.
+    #[tokio::test]
+    async fn reset_does_not_wait_for_an_in_flight_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let cli = dir.path().join("fakecli");
+        std::fs::write(
+            &cli,
+            format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rt = Ec2Runtime {
+            backend: InstanceBackend::Docker(DockerInstances {
+                cli: cli.display().to_string(),
+                podman: false,
+                instance_id: "fakecloud-test".into(),
+            }),
+            instances: Arc::new(RwLock::new(HashMap::new())),
+            firewall: FirewallEnforcer::disabled(),
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
+        rt.instances.write().insert(
+            "i-booting".into(),
+            InstanceRecord {
+                handle: "cid-booting".into(),
+                image: "amazonlinux:2023".into(),
+                user_data: None,
+                tags: BTreeMap::new(),
+                network: None,
+            },
+        );
+        // The boot task holds the lifecycle lock while its image pulls.
+        let boot = rt.lock_lifecycle("i-booting").await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rt.remove_instances(vec![("123456789012".into(), "i-booting".into())]),
+        )
+        .await
+        .expect("reset waited on the in-flight boot");
+        assert!(rt.is_registered("i-booting"), "torn down under the boot");
+
+        // The boot finishes: the deferred teardown removes its container.
+        drop(boot);
+        for _ in 0..100 {
+            if !rt.is_registered("i-booting") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!rt.is_registered("i-booting"));
+        let mut removed = false;
+        for _ in 0..100 {
+            removed = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("rm -f cid-booting");
+            if removed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(removed, "deferred teardown never removed the container");
     }
 }

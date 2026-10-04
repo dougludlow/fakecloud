@@ -232,3 +232,52 @@ async fn run_instances_boots_real_container_with_user_data() {
         "container should be removed after TerminateInstances"
     );
 }
+
+/// A reset right after RunInstances answers promptly even while the
+/// instance is still booting (pulling its image): the reset doesn't wait on
+/// the boot, the teardown follows once the boot lets go.
+#[tokio::test]
+async fn reset_right_after_run_instances_is_prompt() {
+    if !require_docker_or_skip("reset_right_after_run_instances_is_prompt") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+    let instance_id = c
+        .run_instances()
+        .image_id("ami-12345678")
+        .min_count(1)
+        .max_count(1)
+        .send()
+        .await
+        .unwrap()
+        .instances()[0]
+        .instance_id()
+        .unwrap()
+        .to_string();
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .post(format!("{}/_reset", server.endpoint()))
+        .send()
+        .await
+        .expect("reset timed out while the instance was booting");
+    assert!(resp.status().is_success(), "reset: {}", resp.status());
+
+    // The booting instance's container doesn't outlive the reset.
+    let mut gone = false;
+    for _ in 0..240 {
+        if container_for(&instance_id).is_empty() {
+            gone = true;
+            // Stay gone: the boot finishing must reap, not resurrect.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if container_for(&instance_id).is_empty() {
+                break;
+            }
+            gone = false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(gone, "the reset instance's container was left behind");
+}
