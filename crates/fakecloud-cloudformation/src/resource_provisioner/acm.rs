@@ -131,10 +131,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.acm_state.write();
-        let account = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let account = accounts.region_mut(&self.account_id, &self.region);
         account.certificates.insert(arn.clone(), cert);
 
         Ok(ProvisionResult::new(arn))
@@ -142,7 +139,8 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_acm_certificate(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.acm_state.write();
-        if let Some(account) = accounts.accounts.get_mut(&self.account_id) {
+        // The physical id is the certificate ARN, which names its region.
+        if let Some(account) = accounts.by_arn_mut(physical_id) {
             account.certificates.remove(physical_id);
         }
         Ok(())
@@ -162,10 +160,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_i64())
             .map(|n| n as i32);
         let mut accounts = self.acm_state.write();
-        let account = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let account = accounts.region_mut(&self.account_id, &self.region);
         account.account_config.expiry_events_days_before_expiry = days;
         Ok(ProvisionResult::new(format!(
             "acm-account-{}",
@@ -178,7 +173,7 @@ impl ResourceProvisioner {
     /// per-account override.
     pub(super) fn delete_acm_account(&self) -> Result<(), String> {
         let mut accounts = self.acm_state.write();
-        if let Some(account) = accounts.accounts.get_mut(&self.account_id) {
+        if let Some(account) = accounts.region_get_mut(&self.account_id, &self.region) {
             account.account_config.expiry_events_days_before_expiry = None;
         }
         Ok(())

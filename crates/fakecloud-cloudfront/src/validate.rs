@@ -84,7 +84,33 @@ pub fn validate_distribution_config(config: &DistributionConfig) -> Result<(), A
             b.function_associations.as_ref(),
         )?;
     }
+    if let Some(arn) = config
+        .viewer_certificate
+        .as_ref()
+        .and_then(|vc| vc.acm_certificate_arn.as_deref())
+    {
+        validate_acm_certificate_region(arn)?;
+    }
     Ok(())
+}
+
+/// CloudFront only serves ACM certificates from the partition's global
+/// region (`us-east-1` for `aws`); ACM certificates are regional, so one
+/// requested anywhere else is not visible to CloudFront.
+fn validate_acm_certificate_region(arn: &str) -> Result<(), AwsServiceError> {
+    use fakecloud_aws::arn::{arn_resource, implicit_global_region, partition_of, region_of};
+    if arn_resource(arn, "acm").is_none() {
+        return Ok(());
+    }
+    if region_of(arn) == Some(implicit_global_region(partition_of(arn))) {
+        return Ok(());
+    }
+    Err(aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidViewerCertificate",
+        "The specified SSL certificate doesn't exist, isn't in us-east-1 region, isn't valid, \
+         or doesn't include a valid certificate chain.",
+    ))
 }
 
 fn validate_behavior(
@@ -205,6 +231,32 @@ mod tests {
         MethodList {
             method: m.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn an_acm_certificate_outside_us_east_1_is_rejected() {
+        let mut c = config();
+        c.viewer_certificate = Some(crate::model::ViewerCertificate {
+            acm_certificate_arn: Some("arn:aws:acm:eu-west-1:123456789012:certificate/abc".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            validate_distribution_config(&c).unwrap_err().code(),
+            "InvalidViewerCertificate"
+        );
+        c.viewer_certificate = Some(crate::model::ViewerCertificate {
+            acm_certificate_arn: Some("arn:aws:acm:us-east-1:123456789012:certificate/abc".into()),
+            ..Default::default()
+        });
+        validate_distribution_config(&c).unwrap();
+        // China's CloudFront uses certificates from its global region.
+        c.viewer_certificate = Some(crate::model::ViewerCertificate {
+            acm_certificate_arn: Some(
+                "arn:aws-cn:acm:cn-northwest-1:123456789012:certificate/abc".into(),
+            ),
+            ..Default::default()
+        });
+        validate_distribution_config(&c).unwrap();
     }
 
     #[test]

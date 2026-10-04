@@ -9,14 +9,77 @@ use serde::{Deserialize, Serialize};
 
 pub type SharedAcmState = Arc<RwLock<AcmAccounts>>;
 
+/// ACM state, partitioned by account and then by region.
+///
+/// ACM is a regional service: a certificate (and an ACME endpoint, binding,
+/// domain validation or account configuration) lives in exactly one region,
+/// and a request only sees the resources of the region it is sent to. A
+/// certificate ARN names its region, so a lookup by ARN resolves in that
+/// region and an ARN from another region is simply not found.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AcmAccounts {
-    pub accounts: BTreeMap<String, AccountState>,
+    /// account id -> region -> that account's state in that region.
+    pub accounts: BTreeMap<String, BTreeMap<String, AccountState>>,
 }
 
 impl AcmAccounts {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The state of `account_id` in `region`, `None` when nothing has
+    /// touched it. Never creates anything.
+    pub fn region(&self, account_id: &str, region: &str) -> Option<&AccountState> {
+        self.accounts.get(account_id).and_then(|r| r.get(region))
+    }
+
+    /// The state of `account_id` in `region`, created empty on first use.
+    pub fn region_mut(&mut self, account_id: &str, region: &str) -> &mut AccountState {
+        self.accounts
+            .entry(account_id.to_string())
+            .or_default()
+            .entry(region.to_string())
+            .or_default()
+    }
+
+    /// The state of `account_id` in `region` without creating it.
+    pub fn region_get_mut(&mut self, account_id: &str, region: &str) -> Option<&mut AccountState> {
+        self.accounts
+            .get_mut(account_id)
+            .and_then(|r| r.get_mut(region))
+    }
+
+    /// The state of the account and region an ARN names, without creating
+    /// it. `None` when the ARN carries no account or region.
+    pub fn by_arn(&self, arn: &str) -> Option<&AccountState> {
+        let account = fakecloud_aws::arn::account_of(arn)?;
+        let region = fakecloud_aws::arn::region_of(arn)?;
+        self.region(account, region)
+    }
+
+    /// Mutable [`Self::by_arn`].
+    pub fn by_arn_mut(&mut self, arn: &str) -> Option<&mut AccountState> {
+        let account = fakecloud_aws::arn::account_of(arn)?.to_string();
+        let region = fakecloud_aws::arn::region_of(arn)?.to_string();
+        self.region_get_mut(&account, &region)
+    }
+
+    /// Every (account, region, state) triple.
+    pub fn iter_regional(&self) -> impl Iterator<Item = (&str, &str, &AccountState)> {
+        self.accounts.iter().flat_map(|(account, regions)| {
+            regions
+                .iter()
+                .map(move |(region, s)| (account.as_str(), region.as_str(), s))
+        })
+    }
+
+    /// Every (account, region, state) triple (mutable).
+    pub fn iter_regional_mut(&mut self) -> impl Iterator<Item = (&str, &str, &mut AccountState)> {
+        self.accounts.iter_mut().flat_map(|(account, regions)| {
+            regions
+                .iter_mut()
+                .map(move |(region, s)| (account.as_str(), region.as_str(), s))
+        })
     }
 }
 
@@ -280,4 +343,109 @@ pub struct AcmSnapshot {
 /// Bumped to 2 when the ACME resources landed. An older binary reading a
 /// snapshot that carries them would drop the unknown maps silently, so the
 /// version guard has to reject the downgrade rather than lose state.
-pub const ACM_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+/// Bumped to 3 when the state was split by region: v1/v2 kept one
+/// account-wide state, migrated on load by [`parse_acm_snapshot`].
+pub const ACM_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Deserialize)]
+struct SnapshotVersion {
+    schema_version: u32,
+}
+
+/// The v1/v2 snapshot shape: one account-wide state per account.
+#[derive(Deserialize)]
+struct LegacyAcmSnapshot {
+    #[serde(default)]
+    accounts: Option<LegacyAcmAccounts>,
+}
+
+#[derive(Deserialize)]
+struct LegacyAcmAccounts {
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountState>,
+}
+
+/// Parse an on-disk ACM snapshot, migrating the pre-region (v1/v2) shape.
+///
+/// A snapshot newer than this binary understands is returned with its
+/// version and no state so the caller can refuse it. Legacy state is split
+/// by region: every certificate, ACME endpoint, binding and domain
+/// validation goes to the region its ARN names, an ACME account follows its
+/// endpoint, and the account configuration (which named no region) goes to
+/// `default_region`, as does any record whose ARN names none.
+pub fn parse_acm_snapshot(
+    bytes: &[u8],
+    default_region: &str,
+) -> Result<AcmSnapshot, serde_json::Error> {
+    let SnapshotVersion { schema_version } = serde_json::from_slice(bytes)?;
+    if schema_version >= ACM_SNAPSHOT_SCHEMA_VERSION {
+        if schema_version > ACM_SNAPSHOT_SCHEMA_VERSION {
+            return Ok(AcmSnapshot {
+                schema_version,
+                accounts: None,
+            });
+        }
+        return serde_json::from_slice(bytes);
+    }
+    let legacy: LegacyAcmSnapshot = serde_json::from_slice(bytes)?;
+    let accounts = legacy.accounts.map(|legacy| {
+        let mut out = AcmAccounts::new();
+        for (account_id, state) in legacy.accounts {
+            split_legacy_account(&mut out, &account_id, state, default_region);
+        }
+        out
+    });
+    Ok(AcmSnapshot {
+        schema_version: ACM_SNAPSHOT_SCHEMA_VERSION,
+        accounts,
+    })
+}
+
+fn split_legacy_account(
+    out: &mut AcmAccounts,
+    account_id: &str,
+    legacy: AccountState,
+    default_region: &str,
+) {
+    let region_of = |arn: &str| -> String {
+        fakecloud_aws::arn::region_of(arn)
+            .unwrap_or(default_region)
+            .to_string()
+    };
+    let AccountState {
+        certificates,
+        account_config,
+        acme_endpoints,
+        acme_bindings,
+        acme_domain_validations,
+        acme_accounts,
+    } = legacy;
+    // The account configuration was applied to every region before; keep it
+    // where requests without a region override land.
+    out.region_mut(account_id, default_region).account_config = account_config;
+    for (arn, cert) in certificates {
+        out.region_mut(account_id, &region_of(&arn))
+            .certificates
+            .insert(arn, cert);
+    }
+    for (arn, endpoint) in acme_endpoints {
+        out.region_mut(account_id, &region_of(&arn))
+            .acme_endpoints
+            .insert(arn, endpoint);
+    }
+    for (arn, binding) in acme_bindings {
+        out.region_mut(account_id, &region_of(&arn))
+            .acme_bindings
+            .insert(arn, binding);
+    }
+    for (arn, validation) in acme_domain_validations {
+        out.region_mut(account_id, &region_of(&arn))
+            .acme_domain_validations
+            .insert(arn, validation);
+    }
+    for (key, account) in acme_accounts {
+        out.region_mut(account_id, &region_of(&account.endpoint_arn))
+            .acme_accounts
+            .insert(key, account);
+    }
+}
