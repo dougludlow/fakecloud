@@ -16,7 +16,7 @@ impl Wafv2Service {
         let tags = parse_tags(body.get("Tags"))?;
         let key = (scope.clone(), name.clone());
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if account.ip_sets.contains_key(&key) {
             return Err(already_exists(&format!("IPSet {name} already exists")));
         }
@@ -50,8 +50,7 @@ impl Wafv2Service {
         let id = require_str_len(&body, "Id", 1, 36)?;
         let state = self.state.read();
         let set = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.ip_sets.get(&(scope, name)))
             .ok_or_else(|| not_found("IPSet"))?
             .clone();
@@ -76,8 +75,7 @@ impl Wafv2Service {
             .map(str::to_owned);
         let state = self.state.read();
         let mut all: Vec<IpSet> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.ip_sets
                     .values()
@@ -123,7 +121,7 @@ impl Wafv2Service {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let set = account
             .ip_sets
             .get_mut(&(scope, name))
@@ -149,7 +147,7 @@ impl Wafv2Service {
         let id_in = require_str(&body, "Id")?;
         let lock_token_in = require_str(&body, "LockToken")?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let key = (scope, name);
         let set = account
             .ip_sets

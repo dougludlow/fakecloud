@@ -10,6 +10,6 @@ pub use evaluator::{
 pub use inspection::{evaluate_request, Decision, RequestContext, DEFAULT_BODY_INSPECTION_LIMIT};
 pub use service::{synth_arn, Wafv2Service};
 pub use state::{
-    AccountState, IpSet, RegexPatternSet, RuleGroup, ScopedKey, SharedWafv2State, Wafv2Accounts,
-    Wafv2Snapshot, WebAcl, WAFV2_SNAPSHOT_SCHEMA_VERSION,
+    parse_wafv2_snapshot, AccountState, IpSet, RegexPatternSet, RuleGroup, ScopedKey,
+    SharedWafv2State, Wafv2Accounts, Wafv2Snapshot, WebAcl, WAFV2_SNAPSHOT_SCHEMA_VERSION,
 };

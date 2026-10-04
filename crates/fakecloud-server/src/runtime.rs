@@ -302,7 +302,10 @@ pub(crate) fn wafv2_evaluate_admin(
     // need — evaluation itself does not need the lock.
     let snapshot = {
         let state = waf_state.read();
-        let Some(account) = state.accounts.get(account_id) else {
+        // The web ACL lives in the region its ARN names (CLOUDFRONT scope
+        // ARNs name the partition's global region).
+        let region = fakecloud_aws::arn::region_of(arn).unwrap_or("us-east-1");
+        let Some(account) = state.region(account_id, region) else {
             return bad("account not found");
         };
         let acl = account.web_acls.values().find(|a| a.arn == arn).cloned();

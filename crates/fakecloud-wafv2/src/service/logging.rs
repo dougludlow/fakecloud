@@ -18,7 +18,7 @@ impl Wafv2Service {
             .map(str::to_owned)
             .ok_or_else(|| invalid_param("LoggingConfiguration.ResourceArn is required"))?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if !account.web_acls.values().any(|a| a.arn == acl_arn) {
             return Err(not_found("WebACL"));
         }
@@ -36,8 +36,7 @@ impl Wafv2Service {
         let acl_arn = require_str(&body, "ResourceArn")?;
         let state = self.state.read();
         let cfg = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.logging_configs.get(&acl_arn))
             .cloned()
             .ok_or_else(|| not_found("LoggingConfiguration"))?;
@@ -53,7 +52,7 @@ impl Wafv2Service {
         let body = req.json_body();
         let acl_arn = require_str(&body, "ResourceArn")?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if account.logging_configs.remove(&acl_arn).is_none() {
             return Err(not_found("LoggingConfiguration"));
         }
@@ -83,8 +82,7 @@ impl Wafv2Service {
         let next_marker = body.get("NextMarker").and_then(Value::as_str).unwrap_or("");
         let state = self.state.read();
         let mut all: Vec<Value> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.logging_configs
                     .values()

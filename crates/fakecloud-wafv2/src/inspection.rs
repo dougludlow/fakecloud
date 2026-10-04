@@ -193,7 +193,9 @@ struct ResourceSnapshot {
 
 fn snapshot_for_resource(state: &SharedWafv2State, resource_arn: &str) -> Option<ResourceSnapshot> {
     let st = state.read();
-    for account in st.accounts.values() {
+    // An association lives in the resource's own region (and account, when
+    // its ARN names one).
+    for account in st.states_for_resource(resource_arn) {
         let Some(acl_arn) = account.associations.get(resource_arn) else {
             continue;
         };
@@ -369,7 +371,7 @@ mod tests {
         if let Some(resource) = association {
             acct.associations.insert(resource.into(), ACL_ARN.into());
         }
-        accounts.accounts.insert(ACCOUNT.into(), acct);
+        *accounts.region_mut(ACCOUNT, "us-east-1") = acct;
         Arc::new(RwLock::new(accounts))
     }
 

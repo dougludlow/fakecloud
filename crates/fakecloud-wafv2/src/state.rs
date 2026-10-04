@@ -10,14 +10,69 @@ use serde_json::Value;
 
 pub type SharedWafv2State = Arc<RwLock<Wafv2Accounts>>;
 
+/// WAFv2 state, partitioned by account and then by region.
+///
+/// REGIONAL-scope resources (web ACLs, rule groups, IP sets, regex pattern
+/// sets, API keys, managed rule sets, plus the logging configurations,
+/// permission policies and associations attached to them) live in the region
+/// they were created in. CLOUDFRONT-scope resources are global: AWS only
+/// accepts CLOUDFRONT-scope calls in the partition's global region
+/// (`us-east-1` for `aws`) and mints their ARNs there, so they live in that
+/// region's state.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Wafv2Accounts {
-    pub accounts: BTreeMap<String, AccountState>,
+    /// account id -> region -> that account's state in that region.
+    pub accounts: BTreeMap<String, BTreeMap<String, AccountState>>,
 }
 
 impl Wafv2Accounts {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The state of `account_id` in `region`, `None` when nothing has
+    /// touched it. Never creates anything.
+    pub fn region(&self, account_id: &str, region: &str) -> Option<&AccountState> {
+        self.accounts.get(account_id).and_then(|r| r.get(region))
+    }
+
+    /// The state of `account_id` in `region`, created empty on first use.
+    pub fn region_mut(&mut self, account_id: &str, region: &str) -> &mut AccountState {
+        self.accounts
+            .entry(account_id.to_string())
+            .or_default()
+            .entry(region.to_string())
+            .or_default()
+    }
+
+    /// Every (account, region, state) triple.
+    pub fn iter_regional(&self) -> impl Iterator<Item = (&str, &str, &AccountState)> {
+        self.accounts.iter().flat_map(|(account, regions)| {
+            regions
+                .iter()
+                .map(move |(region, s)| (account.as_str(), region.as_str(), s))
+        })
+    }
+
+    /// The states that can hold a WAF association for `resource_arn`: the
+    /// ARN's region (a region-less ARN, such as a CloudFront distribution's,
+    /// resolves to its partition's global region, where CLOUDFRONT-scope web
+    /// ACLs live) and the ARN's account, or every account when the ARN names
+    /// none (API Gateway stage ARNs carry no account).
+    pub fn states_for_resource<'a>(
+        &'a self,
+        resource_arn: &'a str,
+    ) -> impl Iterator<Item = &'a AccountState> + 'a {
+        let region = fakecloud_aws::arn::region_of(resource_arn).unwrap_or_else(|| {
+            fakecloud_aws::arn::implicit_global_region(fakecloud_aws::arn::partition_of(
+                resource_arn,
+            ))
+        });
+        let account = fakecloud_aws::arn::account_of(resource_arn);
+        self.accounts
+            .iter()
+            .filter(move |(id, _)| account.is_none_or(|a| a == id.as_str()))
+            .filter_map(move |(_, regions)| regions.get(region))
     }
 }
 
@@ -30,7 +85,157 @@ pub struct Wafv2Snapshot {
     pub accounts: Option<Wafv2Accounts>,
 }
 
-pub const WAFV2_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 when the state was split by region: v1 kept one account-wide
+/// state, migrated on load by [`parse_wafv2_snapshot`].
+pub const WAFV2_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Deserialize)]
+struct SnapshotVersion {
+    schema_version: u32,
+}
+
+/// The v1 snapshot shape: one account-wide state per account.
+#[derive(Deserialize)]
+struct LegacyWafv2Snapshot {
+    #[serde(default)]
+    accounts: Option<LegacyWafv2Accounts>,
+}
+
+#[derive(Deserialize)]
+struct LegacyWafv2Accounts {
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountState>,
+}
+
+/// Parse an on-disk WAFv2 snapshot, migrating the pre-region (v1) shape.
+///
+/// A snapshot newer than this binary understands is returned with its
+/// version and no state so the caller can refuse it. Legacy state is split
+/// by region: every resource goes to the region its ARN names (CLOUDFRONT
+/// scope ARNs name the global region), logging configurations and
+/// permission policies follow the ARN they are keyed by, an association
+/// follows its web ACL, a tag set follows its resource ARN, and records that
+/// name no region (API keys, managed rule sets) go to `default_region`, or
+/// the partition's global region for CLOUDFRONT scope.
+pub fn parse_wafv2_snapshot(
+    bytes: &[u8],
+    default_region: &str,
+) -> Result<Wafv2Snapshot, serde_json::Error> {
+    let SnapshotVersion { schema_version } = serde_json::from_slice(bytes)?;
+    if schema_version >= WAFV2_SNAPSHOT_SCHEMA_VERSION {
+        if schema_version > WAFV2_SNAPSHOT_SCHEMA_VERSION {
+            return Ok(Wafv2Snapshot {
+                schema_version,
+                accounts: None,
+            });
+        }
+        return serde_json::from_slice(bytes);
+    }
+    let legacy: LegacyWafv2Snapshot = serde_json::from_slice(bytes)?;
+    let accounts = legacy.accounts.map(|legacy| {
+        let mut out = Wafv2Accounts::new();
+        for (account_id, state) in legacy.accounts {
+            split_legacy_account(&mut out, &account_id, state, default_region);
+        }
+        out
+    });
+    Ok(Wafv2Snapshot {
+        schema_version: WAFV2_SNAPSHOT_SCHEMA_VERSION,
+        accounts,
+    })
+}
+
+/// The region a WAFv2 resource of `scope` lives in when its record names no
+/// ARN: CLOUDFRONT scope lives in the partition's global region.
+pub(crate) fn scope_region<'a>(scope: &str, region: &'a str) -> &'a str {
+    if scope == "CLOUDFRONT" {
+        fakecloud_aws::arn::implicit_global_region(fakecloud_aws::arn::partition_for(region))
+    } else {
+        region
+    }
+}
+
+fn split_legacy_account(
+    out: &mut Wafv2Accounts,
+    account_id: &str,
+    legacy: AccountState,
+    default_region: &str,
+) {
+    let region_of = |arn: &str| -> String {
+        fakecloud_aws::arn::region_of(arn)
+            .unwrap_or(default_region)
+            .to_string()
+    };
+    let AccountState {
+        web_acls,
+        rule_groups,
+        ip_sets,
+        regex_pattern_sets,
+        api_keys,
+        logging_configs,
+        permission_policies,
+        associations,
+        tags,
+        managed_rule_sets,
+    } = legacy;
+    // Ensure the account keeps a (possibly empty) state in the default
+    // region, matching what a fresh request would create.
+    out.region_mut(account_id, default_region);
+    for (key, acl) in web_acls {
+        out.region_mut(account_id, &region_of(&acl.arn))
+            .web_acls
+            .insert(key, acl);
+    }
+    for (key, group) in rule_groups {
+        out.region_mut(account_id, &region_of(&group.arn))
+            .rule_groups
+            .insert(key, group);
+    }
+    for (key, set) in ip_sets {
+        out.region_mut(account_id, &region_of(&set.arn))
+            .ip_sets
+            .insert(key, set);
+    }
+    for (key, set) in regex_pattern_sets {
+        out.region_mut(account_id, &region_of(&set.arn))
+            .regex_pattern_sets
+            .insert(key, set);
+    }
+    for (token, key) in api_keys {
+        let region = scope_region(&key.scope, default_region).to_string();
+        out.region_mut(account_id, &region)
+            .api_keys
+            .insert(token, key);
+    }
+    for (key, set) in managed_rule_sets {
+        let region = scope_region(&set.scope, default_region).to_string();
+        out.region_mut(account_id, &region)
+            .managed_rule_sets
+            .insert(key, set);
+    }
+    for (arn, config) in logging_configs {
+        out.region_mut(account_id, &region_of(&arn))
+            .logging_configs
+            .insert(arn, config);
+    }
+    for (arn, policy) in permission_policies {
+        out.region_mut(account_id, &region_of(&arn))
+            .permission_policies
+            .insert(arn, policy);
+    }
+    for (resource, acl_arn) in associations {
+        // The association lives with its web ACL (which must share the
+        // resource's region).
+        out.region_mut(account_id, &region_of(&acl_arn))
+            .associations
+            .insert(resource, acl_arn);
+    }
+    for (arn, set) in tags {
+        out.region_mut(account_id, &region_of(&arn))
+            .tags
+            .insert(arn, set);
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AccountState {

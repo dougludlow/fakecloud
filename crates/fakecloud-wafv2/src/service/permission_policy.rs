@@ -11,7 +11,7 @@ impl Wafv2Service {
         let resource_arn = require_str(&body, "ResourceArn")?;
         let policy = require_str(&body, "Policy")?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if !account.rule_groups.values().any(|r| r.arn == resource_arn) {
             return Err(not_found("RuleGroup"));
         }
@@ -27,8 +27,7 @@ impl Wafv2Service {
         let resource_arn = require_str(&body, "ResourceArn")?;
         let state = self.state.read();
         let policy = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.permission_policies.get(&resource_arn))
             .cloned()
             .ok_or_else(|| not_found("PermissionPolicy"))?;
@@ -42,7 +41,7 @@ impl Wafv2Service {
         let body = req.json_body();
         let resource_arn = require_str_len(&body, "ResourceArn", 20, 2048)?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         account.permission_policies.remove(&resource_arn);
         Ok(AwsResponse::ok_json(json!({})))
     }

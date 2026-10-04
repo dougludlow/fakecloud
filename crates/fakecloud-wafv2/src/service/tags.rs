@@ -8,7 +8,7 @@ impl Wafv2Service {
         let arn = require_str(&body, "ResourceARN")?;
         let tags = parse_tags(body.get("Tags"))?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if !resource_exists(account, &arn) {
             return Err(not_found("Resource"));
         }
@@ -24,7 +24,7 @@ impl Wafv2Service {
         let arn = require_str(&body, "ResourceARN")?;
         let keys = parse_string_list(body.get("TagKeys"));
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if !resource_exists(account, &arn) {
             return Err(not_found("Resource"));
         }
@@ -43,7 +43,7 @@ impl Wafv2Service {
         let body = req.json_body();
         let arn = require_str(&body, "ResourceARN")?;
         let state = self.state.read();
-        let account = state.accounts.get(&req.account_id);
+        let account = state.region(&req.account_id, &req.region);
         let exists = account.is_some_and(|a| resource_exists(a, &arn));
         if !exists {
             return Err(not_found("Resource"));

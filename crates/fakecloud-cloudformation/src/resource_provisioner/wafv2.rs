@@ -6,16 +6,39 @@
 use super::*;
 
 impl ResourceProvisioner {
+    /// The region a WAFv2 resource lives in: the one its ARN names (a
+    /// CLOUDFRONT-scope ARN names the partition's global region), else the
+    /// stack's region.
+    fn wafv2_arn_region(&self, arn: &str) -> String {
+        fakecloud_aws::arn::region_of(arn)
+            .unwrap_or(&self.region)
+            .to_string()
+    }
+
+    /// AWS only creates CLOUDFRONT-scope WAFv2 resources in the partition's
+    /// global region (`us-east-1` for `aws`); a stack elsewhere fails.
+    fn check_wafv2_scope_region(&self, scope: &str) -> Result<(), String> {
+        if scope == "CLOUDFRONT"
+            && self.region
+                != fakecloud_aws::arn::implicit_global_region(fakecloud_aws::arn::partition_for(
+                    &self.region,
+                ))
+        {
+            return Err(
+                "Error reason: The scope is not valid., field: SCOPE_VALUE, parameter: CLOUDFRONT"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn get_att_wafv2_web_acl(
         &self,
         physical_id: &str,
         attribute: &str,
     ) -> Option<String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         let acl = state.web_acls.values().find(|a| a.arn == physical_id)?;
         match attribute {
             "Arn" => Some(acl.arn.clone()),
@@ -33,10 +56,7 @@ impl ResourceProvisioner {
         attribute: &str,
     ) -> Option<String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         let ip_set = state.ip_sets.values().find(|i| i.arn == physical_id)?;
         match attribute {
             "Arn" => Some(ip_set.arn.clone()),
@@ -52,10 +72,7 @@ impl ResourceProvisioner {
         attribute: &str,
     ) -> Option<String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         let set = state
             .regex_pattern_sets
             .values()
@@ -74,10 +91,7 @@ impl ResourceProvisioner {
         attribute: &str,
     ) -> Option<String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         let rg = state.rule_groups.values().find(|r| r.arn == physical_id)?;
         match attribute {
             "Arn" => Some(rg.arn.clone()),
@@ -109,6 +123,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Scope is required")?
             .to_string();
+        self.check_wafv2_scope_region(&scope)?;
         let default_action = props
             .get("DefaultAction")
             .cloned()
@@ -165,10 +180,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&arn));
         state.web_acls.insert((scope.clone(), name.clone()), acl);
 
         Ok(ProvisionResult::new(arn.clone())
@@ -180,10 +192,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_wafv2_web_acl(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         state.web_acls.retain(|_, v| v.arn != physical_id);
         Ok(())
     }
@@ -203,6 +212,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Scope is required")?
             .to_string();
+        self.check_wafv2_scope_region(&scope)?;
         let ip_address_version = props
             .get("IPAddressVersion")
             .and_then(|v| v.as_str())
@@ -238,10 +248,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&arn));
         state.ip_sets.insert((scope, name.clone()), ip_set);
 
         Ok(ProvisionResult::new(arn.clone())
@@ -252,10 +259,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_wafv2_ip_set(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         state.ip_sets.retain(|_, v| v.arn != physical_id);
         Ok(())
     }
@@ -275,6 +279,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Scope is required")?
             .to_string();
+        self.check_wafv2_scope_region(&scope)?;
         let regular_expressions: Vec<serde_json::Value> = props
             .get("RegularExpressionList")
             .and_then(|v| v.as_array())
@@ -316,10 +321,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&arn));
         state.regex_pattern_sets.insert((scope, name.clone()), set);
 
         Ok(ProvisionResult::new(arn.clone())
@@ -330,10 +332,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_wafv2_regex_pattern_set(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         state.regex_pattern_sets.retain(|_, v| v.arn != physical_id);
         Ok(())
     }
@@ -353,6 +352,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Scope is required")?
             .to_string();
+        self.check_wafv2_scope_region(&scope)?;
         let capacity = props
             .get("Capacity")
             .and_then(|v| v.as_i64())
@@ -398,10 +398,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&arn));
         state.rule_groups.insert((scope, name.clone()), rg);
 
         Ok(ProvisionResult::new(arn.clone())
@@ -413,10 +410,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_wafv2_rule_group(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         state.rule_groups.retain(|_, v| v.arn != physical_id);
         Ok(())
     }
@@ -439,10 +433,7 @@ impl ResourceProvisioner {
         });
 
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&resource_arn));
         state.logging_configs.insert(resource_arn.clone(), cfg);
 
         Ok(ProvisionResult::new(resource_arn))
@@ -453,10 +444,7 @@ impl ResourceProvisioner {
         physical_id: &str,
     ) -> Result<(), String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         state.logging_configs.remove(physical_id);
         Ok(())
     }
@@ -478,10 +466,7 @@ impl ResourceProvisioner {
             .to_string();
 
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&web_acl_arn));
         state.associations.insert(resource_arn.clone(), web_acl_arn);
 
         // Physical id encodes the resource arn so delete can find it.
@@ -490,10 +475,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_wafv2_web_acl_association(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.wafv2_state.write();
-        let state = accounts
-            .accounts
-            .entry(self.account_id.clone())
-            .or_default();
+        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(physical_id));
         state.associations.remove(physical_id);
         Ok(())
     }
@@ -526,10 +508,10 @@ impl ResourceProvisioner {
             .to_string();
         let updated = {
             let mut accounts = self.wafv2_state.write();
-            let state = accounts
-                .accounts
-                .entry(self.account_id.clone())
-                .or_default();
+            let state = accounts.region_mut(
+                &self.account_id,
+                &self.wafv2_arn_region(&existing.physical_id),
+            );
             match state.web_acls.get_mut(&(scope.clone(), name.clone())) {
                 Some(acl) if acl.arn == existing.physical_id => {
                     acl.default_action = props
@@ -588,10 +570,10 @@ impl ResourceProvisioner {
             .to_string();
         let updated = {
             let mut accounts = self.wafv2_state.write();
-            let state = accounts
-                .accounts
-                .entry(self.account_id.clone())
-                .or_default();
+            let state = accounts.region_mut(
+                &self.account_id,
+                &self.wafv2_arn_region(&existing.physical_id),
+            );
             match state.ip_sets.get_mut(&(scope.clone(), name.clone())) {
                 Some(set) if set.arn == existing.physical_id => {
                     set.addresses = props
@@ -644,10 +626,10 @@ impl ResourceProvisioner {
             .to_string();
         let updated = {
             let mut accounts = self.wafv2_state.write();
-            let state = accounts
-                .accounts
-                .entry(self.account_id.clone())
-                .or_default();
+            let state = accounts.region_mut(
+                &self.account_id,
+                &self.wafv2_arn_region(&existing.physical_id),
+            );
             match state
                 .regex_pattern_sets
                 .get_mut(&(scope.clone(), name.clone()))
@@ -709,10 +691,10 @@ impl ResourceProvisioner {
             .to_string();
         let updated = {
             let mut accounts = self.wafv2_state.write();
-            let state = accounts
-                .accounts
-                .entry(self.account_id.clone())
-                .or_default();
+            let state = accounts.region_mut(
+                &self.account_id,
+                &self.wafv2_arn_region(&existing.physical_id),
+            );
             match state.rule_groups.get_mut(&(scope.clone(), name.clone())) {
                 Some(rg) if rg.arn == existing.physical_id => {
                     rg.rules = props

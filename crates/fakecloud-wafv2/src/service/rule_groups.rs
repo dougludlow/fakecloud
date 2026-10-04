@@ -51,7 +51,7 @@ impl Wafv2Service {
 
         let key = (scope.clone(), name.clone());
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if account.rule_groups.contains_key(&key) {
             return Err(already_exists(&format!("RuleGroup {name} already exists")));
         }
@@ -96,8 +96,7 @@ impl Wafv2Service {
         let arn_in = body.get("ARN").and_then(Value::as_str).map(str::to_owned);
         let state = self.state.read();
         let account = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .ok_or_else(|| not_found("RuleGroup"))?;
         let rg = if let Some(arn) = arn_in.as_deref() {
             account
@@ -134,8 +133,7 @@ impl Wafv2Service {
             .map(str::to_owned);
         let state = self.state.read();
         let mut all: Vec<RuleGroup> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.rule_groups
                     .values()
@@ -192,7 +190,7 @@ impl Wafv2Service {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let rg = account
             .rule_groups
             .get_mut(&(scope, name.clone()))
@@ -232,7 +230,7 @@ impl Wafv2Service {
         let id_in = require_str(&body, "Id")?;
         let lock_token_in = require_str(&body, "LockToken")?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let key = (scope, name);
         let rg = account
             .rule_groups
@@ -341,8 +339,7 @@ impl Wafv2Service {
         // for an unknown (scope, name) or a mismatched Id.
         let state = self.state.read();
         let set = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.managed_rule_sets.get(&(scope, name.clone())))
             .filter(|s| s.id == id)
             .ok_or_else(|| not_found("ManagedRuleSet"))?;
@@ -431,8 +428,7 @@ impl Wafv2Service {
         // otherwise fall back to the documented AWS-vendor sample set.
         let state = self.state.read();
         if let Some(set) = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.managed_rule_sets.get(&(scope.clone(), name.clone())))
         {
             let versions: Vec<Value> = set
@@ -472,8 +468,7 @@ impl Wafv2Service {
         // requested scope (via PutManagedRuleSetVersions).
         let state = self.state.read();
         let sets: Vec<Value> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.managed_rule_sets
                     .values()
@@ -525,7 +520,7 @@ impl Wafv2Service {
 
         let next_lock_token = synth_uuid();
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let key = (scope.clone(), name.clone());
         let entry =
             account
@@ -617,7 +612,7 @@ impl Wafv2Service {
         // state.
         let next_lock_token = synth_uuid();
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if let Some(set) = account
             .managed_rule_sets
             .get_mut(&(scope, name.clone()))
@@ -650,7 +645,7 @@ impl Wafv2Service {
         let acl_arn = require_str(&body, "WebACLArn")?;
         let lock_token = require_str(&body, "WebACLLockToken")?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let acl = account
             .web_acls
             .values_mut()
