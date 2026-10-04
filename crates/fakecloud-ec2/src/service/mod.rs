@@ -1013,6 +1013,24 @@ impl Ec2Service {
             "CreateLaunchTemplateVersion" => fleet::create_launch_template_version(self, request),
             "ModifyLaunchTemplate" => fleet::modify_launch_template(self, request),
             "DeleteLaunchTemplate" => fleet::delete_launch_template(self, request),
+            // Standalone VPC networking resources (AWS::EC2::
+            // SecurityGroupIngress/Egress, VPCGatewayAttachment, Route,
+            // EIP, NatGateway) create and delete through the same handlers.
+            "RevokeSecurityGroupIngress" => sg::revoke_security_group_ingress(self, request),
+            "RevokeSecurityGroupEgress" => sg::revoke_security_group_egress(self, request),
+            "AttachInternetGateway" => routing::attach_internet_gateway(self, request),
+            "DetachInternetGateway" => routing::detach_internet_gateway(self, request),
+            "AttachVpnGateway" => vpn::attach_vpn_gateway(self, request),
+            "DetachVpnGateway" => vpn::detach_vpn_gateway(self, request),
+            "CreateRoute" => routing::create_route(self, request),
+            "ReplaceRoute" => routing::replace_route(self, request),
+            "DeleteRoute" => routing::delete_route(self, request),
+            "AllocateAddress" => eip::allocate_address(self, request),
+            "ReleaseAddress" => eip::release_address(self, request),
+            "AssociateAddress" => eip::associate_address(self, request),
+            "DisassociateAddress" => eip::disassociate_address(self, request),
+            "CreateNatGateway" => routing::create_nat_gateway(self, request),
+            "DeleteNatGateway" => routing::delete_nat_gateway(self, request),
             other => Err(AwsServiceError::action_not_implemented("ec2", other)),
         }
     }

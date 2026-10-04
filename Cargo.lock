@@ -4976,6 +4976,7 @@ dependencies = [
  "fakecloud-route53resolver",
  "fakecloud-s3",
  "fakecloud-sagemaker",
+ "fakecloud-scheduler",
  "fakecloud-secretsmanager",
  "fakecloud-servicediscovery",
  "fakecloud-ses",

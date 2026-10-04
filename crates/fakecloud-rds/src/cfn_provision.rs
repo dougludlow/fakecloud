@@ -88,15 +88,28 @@ pub async fn cfn_ensure_instance_container(
             let present = {
                 let mut accounts = state.write();
                 let st = accounts.get_or_create(&account_id);
-                if let Some(inst) = st.instance_by_incarnation_mut(&incarnation) {
+                let member_of = st.instance_by_incarnation_mut(&incarnation).map(|inst| {
                     inst.db_instance_status = "available".to_string();
                     inst.endpoint_address = running.endpoint_address;
                     inst.port = i32::from(running.endpoint_port);
                     inst.host_port = running.host_port;
                     inst.container_id = running.container_id;
-                    true
-                } else {
-                    false
+                    (
+                        inst.db_cluster_identifier.clone(),
+                        inst.db_instance_identifier.clone(),
+                    )
+                });
+                match member_of {
+                    Some((cluster_id, instance_id)) => {
+                        // Same registration the CreateDBInstance path makes
+                        // once the container is up (idempotent: the
+                        // provisioner already attached it at insert time).
+                        if let Some(cluster_id) = cluster_id {
+                            crate::attach_cluster_member(st, &cluster_id, &instance_id);
+                        }
+                        true
+                    }
+                    None => false,
                 }
             };
             if !present {

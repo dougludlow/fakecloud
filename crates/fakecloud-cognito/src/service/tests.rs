@@ -4360,6 +4360,63 @@ fn update_user_pool_client() {
 }
 
 #[test]
+fn update_user_pool_client_resets_omitted_settings_to_defaults() {
+    let (svc, _) = make_svc();
+    let pool_id = create_pool(&svc);
+    let client_id = create_client(&svc, &pool_id);
+
+    let body = json!({
+        "UserPoolId": pool_id,
+        "ClientId": client_id,
+        "ClientName": "configured",
+        "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        "CallbackURLs": ["https://example.com/cb"],
+        "LogoutURLs": ["https://example.com/out"],
+        "AllowedOAuthFlows": ["code"],
+        "AllowedOAuthScopes": ["openid"],
+        "AllowedOAuthFlowsUserPoolClient": true,
+        "SupportedIdentityProviders": ["COGNITO"],
+        "ReadAttributes": ["email"],
+        "WriteAttributes": ["email"],
+        "RefreshTokenValidity": 10,
+        "AccessTokenValidity": 2,
+        "EnableTokenRevocation": false,
+        "AuthSessionValidity": 10,
+    });
+    let req = make_req("UpdateUserPoolClient", &body.to_string());
+    let b = resp_json(&svc.update_user_pool_client(&req).unwrap());
+    assert_eq!(b["UserPoolClient"]["CallbackURLs"][0], "https://example.com/cb");
+    assert_eq!(b["UserPoolClient"]["RefreshTokenValidity"], 10);
+
+    // A second update that sends only the name puts every other setting back
+    // to its default, as AWS does (it is not a merge).
+    let body = json!({"UserPoolId": pool_id, "ClientId": client_id, "ClientName": "bare"});
+    let req = make_req("UpdateUserPoolClient", &body.to_string());
+    let c = resp_json(&svc.update_user_pool_client(&req).unwrap())["UserPoolClient"].clone();
+    assert_eq!(c["ClientName"], "bare");
+    for key in [
+        "ExplicitAuthFlows",
+        "CallbackURLs",
+        "LogoutURLs",
+        "AllowedOAuthFlows",
+        "AllowedOAuthScopes",
+        "SupportedIdentityProviders",
+        "ReadAttributes",
+        "WriteAttributes",
+    ] {
+        assert!(
+            c.get(key).is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())),
+            "{key} should be reset: {c}"
+        );
+    }
+    assert_eq!(c["AllowedOAuthFlowsUserPoolClient"], false);
+    assert_eq!(c["RefreshTokenValidity"], 30);
+    assert!(c.get("AccessTokenValidity").is_none_or(|v| v.is_null() || v == 0));
+    assert_eq!(c["EnableTokenRevocation"], true);
+    assert_eq!(c["AuthSessionValidity"], 3);
+}
+
+#[test]
 fn delete_user_pool_client() {
     let (svc, _) = make_svc();
     let pool_id = create_pool(&svc);

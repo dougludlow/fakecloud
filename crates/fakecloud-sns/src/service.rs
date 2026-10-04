@@ -939,8 +939,13 @@ impl SnsService {
         }
         let endpoint = param(req, "Endpoint").unwrap_or_default();
 
+        // A subscription lives with its topic, in the topic owner's account
+        // (that is where Publish fans out from); a cross-account subscriber
+        // stays its owner. Cross-account access itself is authorized by the
+        // topic policy at dispatch.
+        let topic_account = owning_account(&topic_arn, &req.account_id).to_string();
         let accts = self.state.read();
-        let state_r = match accts.get(&req.account_id) {
+        let state_r = match accts.get(&topic_account) {
             Some(s) => s,
             None => return Err(not_found("Topic")),
         };
@@ -1022,7 +1027,7 @@ impl SnsService {
 
         // Check for duplicate subscription (same topic, protocol, endpoint)
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.get_or_create(&topic_account);
         for sub in state.subscriptions.values() {
             if sub.topic_arn == topic_arn && sub.protocol == protocol && sub.endpoint == endpoint {
                 return Ok(xml_resp(
@@ -1150,7 +1155,7 @@ impl SnsService {
         let token = required(req, "Token")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.get_or_create(owning_account(&topic_arn, &req.account_id));
         // AWS accepts both the confirmation token and the subscription ARN as the Token parameter.
         // Confirming an already-confirmed subscription is a no-op (idempotent).
         let sub_arn = state
@@ -1197,7 +1202,7 @@ impl SnsService {
     fn unsubscribe(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let sub_arn = required(req, "SubscriptionArn")?;
         let mut accts = self.state.write();
-        let state = accts.get_or_create(&req.account_id);
+        let state = accts.get_or_create(owning_account(&sub_arn, &req.account_id));
         // Snapshot the parent topic ARN before removing the subscription
         // so we can bump SubscriptionsDeleted on the right topic. Real
         // SNS exposes this counter on GetTopicAttributes.
@@ -1346,7 +1351,9 @@ impl SnsService {
         let sub_arn = required(req, "SubscriptionArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let state = _accts
+            .get(owning_account(&sub_arn, &req.account_id))
+            .unwrap_or(&_empty);
         let sub = state
             .subscriptions
             .get(&sub_arn)
@@ -1454,7 +1461,7 @@ impl SnsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.get_or_create(owning_account(&sub_arn, &req.account_id));
         let sub = state
             .subscriptions
             .get_mut(&sub_arn)
@@ -2109,4 +2116,12 @@ mod effective_policy_tests {
             "exponential"
         );
     }
+}
+
+/// The account a topic or subscription ARN belongs to (its topic owner's),
+/// or `caller` when the ARN carries none.
+fn owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
+    fakecloud_aws::arn::account_of(arn)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(caller)
 }

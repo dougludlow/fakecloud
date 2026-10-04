@@ -3,7 +3,7 @@ pub(crate) mod eventstream;
 pub(crate) mod service;
 pub(crate) mod state;
 
-pub use service::{build_stream_shards, KinesisService};
+pub use service::{build_stream_shards, reshard_uniform, KinesisService};
 pub use state::default_record_distribution_strategy;
 pub use state::{
     KinesisConsumer, KinesisRecord, KinesisShard, KinesisSnapshot, KinesisState, KinesisStream,

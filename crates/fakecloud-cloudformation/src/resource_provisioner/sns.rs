@@ -39,6 +39,133 @@ fn sns_subscription_attributes(props: &serde_json::Value) -> BTreeMap<String, St
     attributes
 }
 
+/// Where a topic's stack record keeps the ARNs of the subscriptions its
+/// inline `Subscription` list created, so a later update can tell them apart
+/// from subscriptions made outside the template. Not a real `GetAtt` name.
+const SNS_INLINE_SUBSCRIPTIONS_ATTR: &str = "__fakecloud_inline_subscriptions__";
+
+/// The topic attributes a CFN `AWS::SNS::Topic` manages (FifoTopic is
+/// immutable and left out).
+const SNS_TOPIC_MUTABLE_ATTRIBUTES: &[&str] = &[
+    "DisplayName",
+    "KmsMasterKeyId",
+    "SignatureVersion",
+    "TracingConfig",
+    "ArchivePolicy",
+    "FifoThroughputScope",
+    "ContentBasedDeduplication",
+];
+
+/// The topic configuration attributes a CFN topic's properties set.
+fn sns_topic_attributes(props: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    for key in [
+        "DisplayName",
+        "KmsMasterKeyId",
+        "SignatureVersion",
+        "TracingConfig",
+        "FifoThroughputScope",
+    ] {
+        if let Some(s) = props.get(key).and_then(|v| v.as_str()) {
+            attributes.insert(key.to_string(), s.to_string());
+        }
+    }
+    // ArchivePolicy is a JSON document: an inline object or a string.
+    if let Some(v) = props.get("ArchivePolicy").filter(|v| !v.is_null()) {
+        let doc = v
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| serde_json::to_string(v).unwrap_or_default());
+        attributes.insert("ArchivePolicy".to_string(), doc);
+    }
+    for key in ["FifoTopic", "ContentBasedDeduplication"] {
+        if let Some(b) = props
+            .get(key)
+            .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
+        {
+            attributes.insert(key.to_string(), b.to_string());
+        }
+    }
+    attributes
+}
+
+/// CFN `Tags` (`[{Key, Value}]`) as the topic's tag list.
+fn sns_topic_tags(props: &serde_json::Value) -> Vec<(String, String)> {
+    props
+        .get("Tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("Key").and_then(|v| v.as_str())?.to_string(),
+                        t.get("Value").and_then(|v| v.as_str())?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The inline `Subscription` list as (protocol, endpoint) pairs, duplicates
+/// dropped (SNS has one subscription per topic/protocol/endpoint).
+fn sns_inline_subscriptions(props: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for sub in props
+        .get("Subscription")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let (Some(protocol), Some(endpoint)) = (
+            sub.get("Protocol").and_then(|v| v.as_str()),
+            sub.get("Endpoint").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let pair = (protocol.to_string(), endpoint.to_string());
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// The account a topic or subscription ARN belongs to (the topic owner's),
+/// or `caller` when the ARN carries none.
+fn sns_owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
+    fakecloud_aws::arn::account_of(arn).unwrap_or(caller)
+}
+
+/// Whether a topic policy lets `account_id` (its root, which a stack runs
+/// as) call `sns:Subscribe` on `topic_arn`.
+fn sns_policy_allows_subscribe(policy: &str, topic_arn: &str, account_id: &str, region: &str) -> bool {
+    let doc = fakecloud_iam::evaluator::PolicyDocument::parse(policy);
+    let root = fakecloud_aws::arn::Arn::global_in(region, "iam", account_id, "root").to_string();
+    let principal = fakecloud_core::auth::Principal {
+        arn: root.clone(),
+        user_id: account_id.to_string(),
+        account_id: account_id.to_string(),
+        principal_type: fakecloud_core::auth::PrincipalType::Root,
+        source_identity: None,
+        tags: None,
+    };
+    let request = fakecloud_iam::evaluator::EvalRequest {
+        principal: &principal,
+        action: "sns:Subscribe".to_string(),
+        resource: topic_arn.to_string(),
+        context: fakecloud_iam::evaluator::RequestContext {
+            aws_principal_arn: Some(root),
+            aws_principal_account: Some(account_id.to_string()),
+            ..Default::default()
+        },
+    };
+    matches!(
+        fakecloud_iam::evaluator::evaluate_resource_policy_only(&doc, &request),
+        fakecloud_iam::evaluator::Decision::Allow
+    )
+}
+
 impl ResourceProvisioner {
     pub(super) fn get_att_sns_topic(&self, physical_id: &str, attribute: &str) -> Option<String> {
         let mut accounts = self.sns_state.write();
@@ -54,9 +181,12 @@ impl ResourceProvisioner {
     // --- SNS ---
 
     /// Apply a CFN property update to an existing SNS topic in place,
-    /// preserving its subscriptions/tags. Mirrors the attribute extraction in
-    /// `create_sns_topic` so a stack update re-applies DisplayName / KMS /
-    /// FIFO config instead of being silently dropped.
+    /// preserving its subscriptions. The template is the desired state: the
+    /// configuration attributes and Tags are re-applied (a dropped property
+    /// is cleared), and the inline `Subscription` list is diffed against the
+    /// subscriptions the previous template created inline -- removed entries
+    /// are unsubscribed and new ones subscribed, as CloudFormation does.
+    /// Subscriptions made outside the inline list are left alone.
     pub(super) fn update_sns_topic(
         &self,
         existing: &StackResource,
@@ -70,27 +200,75 @@ impl ResourceProvisioner {
             .topics
             .get_mut(arn)
             .ok_or_else(|| format!("SNS topic {arn} not yet provisioned"))?;
-        for key in [
-            "DisplayName",
-            "KmsMasterKeyId",
-            "SignatureVersion",
-            "TracingConfig",
-            "ArchivePolicy",
-            "FifoThroughputScope",
-        ] {
-            if let Some(s) = props.get(key).and_then(|v| v.as_str()) {
-                topic.attributes.insert(key.to_string(), s.to_string());
+        for key in SNS_TOPIC_MUTABLE_ATTRIBUTES {
+            topic.attributes.remove(*key);
+        }
+        topic.attributes.extend(sns_topic_attributes(props));
+        topic.tags = sns_topic_tags(props);
+        let topic_name = topic.name.clone();
+
+        // Inline subscriptions: keep the ones still listed, unsubscribe the
+        // rest of what the previous template created inline, subscribe the
+        // new entries.
+        let desired = sns_inline_subscriptions(props);
+        let previous: Vec<String> = existing
+            .attributes
+            .get(SNS_INLINE_SUBSCRIPTIONS_ATTR)
+            .map(|s| s.lines().map(String::from).collect())
+            .unwrap_or_default();
+        let mut kept: Vec<String> = Vec::new();
+        let mut covered: Vec<(String, String)> = Vec::new();
+        for sub_arn in previous {
+            let Some(sub) = state.subscriptions.get(&sub_arn) else {
+                continue;
+            };
+            let key = (sub.protocol.clone(), sub.endpoint.clone());
+            if desired.contains(&key) && !covered.contains(&key) {
+                covered.push(key);
+                kept.push(sub_arn);
+            } else {
+                state.subscriptions.remove(&sub_arn);
             }
         }
-        for key in ["FifoTopic", "ContentBasedDeduplication"] {
-            if let Some(b) = props
-                .get(key)
-                .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
-            {
-                topic.attributes.insert(key.to_string(), b.to_string());
+        for (protocol, endpoint) in desired {
+            if covered.contains(&(protocol.clone(), endpoint.clone())) {
+                continue;
             }
+            // Subscribe is idempotent on (topic, protocol, endpoint): an
+            // existing identical subscription is reused, not duplicated.
+            let existing_sub = state
+                .subscriptions
+                .values()
+                .find(|s| s.topic_arn == *arn && s.protocol == protocol && s.endpoint == endpoint)
+                .map(|s| s.subscription_arn.clone());
+            let sub_arn = match existing_sub {
+                Some(sub_arn) => sub_arn,
+                None => {
+                    let sub_arn = format!("{}:{}", arn, Uuid::new_v4());
+                    let owner = state.account_id.clone();
+                    state.subscriptions.insert(
+                        sub_arn.clone(),
+                        SnsSubscription {
+                            subscription_arn: sub_arn.clone(),
+                            topic_arn: arn.clone(),
+                            protocol: protocol.clone(),
+                            endpoint: endpoint.clone(),
+                            owner,
+                            attributes: BTreeMap::new(),
+                            confirmed: true,
+                            confirmation_token: None,
+                        },
+                    );
+                    sub_arn
+                }
+            };
+            covered.push((protocol, endpoint));
+            kept.push(sub_arn);
         }
-        Ok(ProvisionResult::new(arn.clone()))
+        Ok(ProvisionResult::new(arn.clone())
+            .with("TopicArn", arn.clone())
+            .with("TopicName", topic_name)
+            .with(SNS_INLINE_SUBSCRIPTIONS_ATTR, kept.join("\n")))
     }
 
     pub(super) fn create_sns_topic(
@@ -121,41 +299,8 @@ impl ResourceProvisioner {
 
         // Carry the topic configuration attributes a CFN topic can set, so
         // GetTopicAttributes round-trips them instead of returning defaults.
-        let mut attributes = BTreeMap::new();
-        for key in [
-            "DisplayName",
-            "KmsMasterKeyId",
-            "SignatureVersion",
-            "TracingConfig",
-            "ArchivePolicy",
-            "FifoThroughputScope",
-        ] {
-            if let Some(s) = props.get(key).and_then(|v| v.as_str()) {
-                attributes.insert(key.to_string(), s.to_string());
-            }
-        }
-        for key in ["FifoTopic", "ContentBasedDeduplication"] {
-            if let Some(b) = props
-                .get(key)
-                .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
-            {
-                attributes.insert(key.to_string(), b.to_string());
-            }
-        }
-        let tags: Vec<(String, String)> = props
-            .get("Tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        Some((
-                            t.get("Key").and_then(|v| v.as_str())?.to_string(),
-                            t.get("Value").and_then(|v| v.as_str())?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let attributes = sns_topic_attributes(props);
+        let tags = sns_topic_tags(props);
 
         let topic = SnsTopic {
             topic_arn: topic_arn.clone(),
@@ -174,34 +319,29 @@ impl ResourceProvisioner {
         // Inline `Subscription` list — SAM/CFN's shorthand for attaching
         // subscriptions at topic-create time. Without this the topic is
         // created with no subscribers and fan-out is silently broken.
-        if let Some(subs) = props.get("Subscription").and_then(|v| v.as_array()) {
-            for sub in subs {
-                let (Some(protocol), Some(endpoint)) = (
-                    sub.get("Protocol").and_then(|v| v.as_str()),
-                    sub.get("Endpoint").and_then(|v| v.as_str()),
-                ) else {
-                    continue;
-                };
-                let sub_arn = format!("{}:{}", topic_arn, Uuid::new_v4());
-                state.subscriptions.insert(
-                    sub_arn.clone(),
-                    SnsSubscription {
-                        subscription_arn: sub_arn,
-                        topic_arn: topic_arn.clone(),
-                        protocol: protocol.to_string(),
-                        endpoint: endpoint.to_string(),
-                        owner: state.account_id.clone(),
-                        attributes: BTreeMap::new(),
-                        confirmed: true,
-                        confirmation_token: None,
-                    },
-                );
-            }
+        let mut inline_arns: Vec<String> = Vec::new();
+        for (protocol, endpoint) in sns_inline_subscriptions(props) {
+            let sub_arn = format!("{}:{}", topic_arn, Uuid::new_v4());
+            state.subscriptions.insert(
+                sub_arn.clone(),
+                SnsSubscription {
+                    subscription_arn: sub_arn.clone(),
+                    topic_arn: topic_arn.clone(),
+                    protocol,
+                    endpoint,
+                    owner: state.account_id.clone(),
+                    attributes: BTreeMap::new(),
+                    confirmed: true,
+                    confirmation_token: None,
+                },
+            );
+            inline_arns.push(sub_arn);
         }
 
         Ok(ProvisionResult::new(topic_arn.clone())
             .with("TopicArn", topic_arn)
-            .with("TopicName", topic_name))
+            .with("TopicName", topic_name)
+            .with(SNS_INLINE_SUBSCRIPTIONS_ATTR, inline_arns.join("\n")))
     }
 
     pub(super) fn delete_sns_topic(&self, physical_id: &str) -> Result<(), String> {
@@ -235,12 +375,36 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("SNS Subscription requires Endpoint")?;
 
+        // The subscription lives with its topic, in the topic owner's account
+        // (where Publish fans out from), owned by the stack's account. A
+        // topic in another account is subscribable when its policy allows
+        // it, as Subscribe is.
+        let topic_account = sns_owning_account(topic_arn, &self.account_id).to_string();
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.get_or_create(&topic_account);
 
-        // Validate that the topic exists
-        if !state.topics.contains_key(topic_arn) {
-            return Err(format!("Topic ARN does not exist: {topic_arn}"));
+        let topic = state
+            .topics
+            .get(topic_arn)
+            .ok_or_else(|| format!("Topic ARN does not exist: {topic_arn}"))?;
+        if topic_account != self.account_id && self.iam_mode.is_strict() {
+            let allowed = topic.attributes.get("Policy").is_some_and(|policy| {
+                sns_policy_allows_subscribe(policy, topic_arn, &self.account_id, &self.region)
+            });
+            if !allowed {
+                return Err(format!(
+                    "AuthorizationError: User: arn:{}:iam::{}:root is not authorized to perform: SNS:Subscribe on resource: {topic_arn}",
+                    fakecloud_aws::arn::partition_for(&self.region),
+                    self.account_id
+                ));
+            }
+        }
+        // Subscribe is idempotent on (topic, protocol, endpoint).
+        if let Some(existing) = state.subscriptions.values().find(|s| {
+            s.topic_arn == topic_arn && s.protocol == protocol && s.endpoint == endpoint
+        }) {
+            let sub_arn = existing.subscription_arn.clone();
+            return Ok(ProvisionResult::new(sub_arn.clone()).with("Arn", sub_arn));
         }
 
         let sub_arn = format!("{}:{}", topic_arn, Uuid::new_v4());
@@ -250,7 +414,7 @@ impl ResourceProvisioner {
             topic_arn: topic_arn.to_string(),
             protocol: protocol.to_string(),
             endpoint: endpoint.to_string(),
-            owner: state.account_id.clone(),
+            owner: self.account_id.clone(),
             // Parse the delivery/filter attributes at create time (previously
             // hardcoded empty, so a CFN-created subscription silently ignored
             // its FilterPolicy/RawMessageDelivery until an unrelated stack
@@ -280,24 +444,22 @@ impl ResourceProvisioner {
         let sub_arn = &existing.physical_id;
 
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.get_or_create(sns_owning_account(sub_arn, &self.account_id));
         let subscription = state
             .subscriptions
             .get_mut(sub_arn)
             .ok_or_else(|| format!("SNS subscription {sub_arn} not yet provisioned"))?;
 
-        // Re-apply the same delivery/filter attributes create parses, so a
-        // stack update reaches the subscription instead of leaving stale values.
-        for (k, v) in sns_subscription_attributes(props) {
-            subscription.attributes.insert(k, v);
-        }
+        // The template is the desired state: re-apply the delivery/filter
+        // attributes create parses, clearing any the template dropped.
+        subscription.attributes = sns_subscription_attributes(props);
 
         Ok(ProvisionResult::new(sub_arn.clone()).with("Arn", sub_arn.clone()))
     }
 
     pub(super) fn delete_sns_subscription(&self, physical_id: &str) -> Result<(), String> {
         let mut __sns_mas = self.sns_state.write();
-        let state = __sns_mas.get_or_create(&self.account_id);
+        let state = __sns_mas.get_or_create(sns_owning_account(physical_id, &self.account_id));
         state.subscriptions.remove(physical_id);
         Ok(())
     }

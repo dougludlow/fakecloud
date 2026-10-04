@@ -1905,163 +1905,7 @@ impl KinesisService {
 
         let current = stream.open_shard_count;
 
-        // Real Kinesis UpdateShardCount (uniform scaling) does not simply close
-        // the old shards and open `target` new ones. It reshapes the current
-        // partition into the target partition through the shards' *common
-        // refinement*: every current open shard is split at the target
-        // boundaries (closing the originals), then adjacent refinement pieces
-        // that fall inside the same target shard are merged (closing those
-        // pieces). This is why scaling 2 -> 3 leaves 4 closed shards, not 2 —
-        // a fact the `aws_kinesis_stream` data source asserts. We reproduce the
-        // same lineage so `closed_shards` / `open_shards` match AWS.
-
-        // Current open shards as inclusive [start, end] hash-key ranges.
-        let mut open_ranges: Vec<(u128, u128)> = stream
-            .shards
-            .iter()
-            .filter(|s| s.is_open)
-            .map(|s| {
-                (
-                    s.starting_hash_key.parse::<u128>().unwrap_or(0),
-                    s.ending_hash_key.parse::<u128>().unwrap_or(MAX_HASH_KEY),
-                )
-            })
-            .collect();
-        open_ranges.sort_unstable();
-
-        // Target uniform partition as inclusive [start, end] ranges.
-        let count = target as u128;
-        let target_ranges: Vec<(u128, u128)> = (0..count)
-            .map(|idx| {
-                let start = if idx == 0 {
-                    0
-                } else {
-                    (MAX_HASH_KEY / count) * idx + 1
-                };
-                let end = if idx == count - 1 {
-                    MAX_HASH_KEY
-                } else {
-                    (MAX_HASH_KEY / count) * (idx + 1)
-                };
-                (start, end)
-            })
-            .collect();
-
-        // Cut points = the union of every range's *start* key. Each pair of
-        // consecutive starts defines a refinement interval `[start, next-1]`,
-        // with the final interval running to `MAX_HASH_KEY`. (Hash keys span
-        // the full u128 range, so an exclusive `end+1` upper bound would
-        // overflow — starts alone unambiguously define the partition.)
-        let mut cuts: Vec<u128> = Vec::with_capacity(open_ranges.len() + target_ranges.len() + 1);
-        cuts.push(0);
-        for (s, _) in open_ranges.iter().chain(target_ranges.iter()) {
-            cuts.push(*s);
-        }
-        cuts.sort_unstable();
-        cuts.dedup();
-
-        let refinement: Vec<(u128, u128)> = cuts
-            .iter()
-            .enumerate()
-            .map(|(i, &start)| {
-                let end = cuts.get(i + 1).map(|next| next - 1).unwrap_or(MAX_HASH_KEY);
-                (start, end)
-            })
-            .collect();
-
-        // Capture (id, start, end) of the pre-scale open shards *before*
-        // closing them, so the new shards can record them as parents — the
-        // lineage a consumer walks via `ChildShards` to discover the post-scale
-        // shards. Every refinement interval falls entirely inside exactly one
-        // of these (the cut points include every original start key).
-        let original_open: Vec<(String, u128, u128)> = stream
-            .shards
-            .iter()
-            .filter(|s| s.is_open)
-            .map(|s| {
-                (
-                    s.shard_id.clone(),
-                    s.starting_hash_key.parse::<u128>().unwrap_or(0),
-                    s.ending_hash_key.parse::<u128>().unwrap_or(MAX_HASH_KEY),
-                )
-            })
-            .collect();
-        let parent_for = |start: u128, end: u128| -> Option<String> {
-            original_open
-                .iter()
-                .find(|(_, ostart, oend)| start >= *ostart && end <= *oend)
-                .map(|(id, _, _)| id.clone())
-        };
-
-        // Close every current open shard — they are all split away.
-        for shard in &mut stream.shards {
-            shard.is_open = false;
-        }
-
-        // Materialise each refinement interval as a shard whose parent is the
-        // pre-scale shard that contained it. Every original shard thus becomes
-        // the parent of at least one new shard, so GetRecords on a drained
-        // original returns non-empty `ChildShards` instead of stranding the
-        // consumer at the closed parent.
-        let mut piece_ids: Vec<(u128, u128, String)> = Vec::new();
-        for (start, end) in &refinement {
-            let new_id = next_shard_id(stream);
-            let parent = parent_for(*start, *end);
-            stream.shards.push(KinesisShard {
-                shard_id: new_id.clone(),
-                starting_hash_key: start.to_string(),
-                ending_hash_key: end.to_string(),
-                parent_shard_id: parent,
-                adjacent_parent_shard_id: None,
-                is_open: true,
-                next_sequence_number: 1,
-                records: Vec::new(),
-            });
-            piece_ids.push((*start, *end, new_id));
-        }
-
-        // For each target shard, gather the refinement pieces inside it. A
-        // single-piece target keeps that piece open. A multi-piece target folds
-        // its pieces left-to-right into pairwise merges, closing each piece and
-        // every intermediate merge and leaving one open shard spanning the
-        // target range — so every piece has an open descendant and the lineage
-        // from each original shard stays connected end to end.
-        for (tstart, tend) in &target_ranges {
-            let pieces: Vec<(u128, String)> = piece_ids
-                .iter()
-                .filter(|(ps, pe, _)| ps >= tstart && pe <= tend)
-                .map(|(_, pe, id)| (*pe, id.clone()))
-                .collect();
-            if pieces.len() <= 1 {
-                continue;
-            }
-            // Fold: `acc` is the current open head of the merge chain, `acc_end`
-            // its ending hash key. Each step closes `acc` and the next piece and
-            // opens a merged shard parented on both.
-            let (_, mut acc) = pieces[0].clone();
-            close_shard(stream, &acc);
-            for (next_end, next_id) in &pieces[1..] {
-                close_shard(stream, next_id);
-                let merged_id = next_shard_id(stream);
-                stream.shards.push(KinesisShard {
-                    shard_id: merged_id.clone(),
-                    starting_hash_key: tstart.to_string(),
-                    ending_hash_key: next_end.to_string(),
-                    parent_shard_id: Some(acc.clone()),
-                    adjacent_parent_shard_id: Some(next_id.clone()),
-                    is_open: true,
-                    next_sequence_number: 1,
-                    records: Vec::new(),
-                });
-                // The previous head is now an interior (closed) merge node; the
-                // freshly pushed `merged_id` is the new open head.
-                close_shard(stream, &acc);
-                acc = merged_id;
-            }
-        }
-
-        stream.shard_count = stream.shards.len() as i32;
-        stream.open_shard_count = target as i32;
+        reshard_uniform(stream, target as i32);
 
         Ok(AwsResponse::ok_json(json!({
             "StreamName": stream_name,
@@ -2426,6 +2270,173 @@ impl crate::state::KinesisState {
 
 /// The maximum hash key value (2^128 - 1).
 const MAX_HASH_KEY: u128 = u128::MAX;
+
+/// Reshape `stream`'s open shards into a uniform partition of `target`
+/// shards, as UpdateShardCount (UNIFORM_SCALING) does: every open shard is
+/// split at the target boundaries and the pieces inside one target range are
+/// merged, closing the originals. Closed shards keep their records and every
+/// new shard records its parent(s), so data already written stays readable
+/// and consumers can walk the lineage to the new shards.
+pub fn reshard_uniform(stream: &mut KinesisStream, target: i32) {
+    let target = i64::from(target);
+    // Real Kinesis UpdateShardCount (uniform scaling) does not simply close
+    // the old shards and open `target` new ones. It reshapes the current
+    // partition into the target partition through the shards' *common
+    // refinement*: every current open shard is split at the target
+    // boundaries (closing the originals), then adjacent refinement pieces
+    // that fall inside the same target shard are merged (closing those
+    // pieces). This is why scaling 2 -> 3 leaves 4 closed shards, not 2 —
+    // a fact the `aws_kinesis_stream` data source asserts. We reproduce the
+    // same lineage so `closed_shards` / `open_shards` match AWS.
+
+    // Current open shards as inclusive [start, end] hash-key ranges.
+    let mut open_ranges: Vec<(u128, u128)> = stream
+        .shards
+        .iter()
+        .filter(|s| s.is_open)
+        .map(|s| {
+            (
+                s.starting_hash_key.parse::<u128>().unwrap_or(0),
+                s.ending_hash_key.parse::<u128>().unwrap_or(MAX_HASH_KEY),
+            )
+        })
+        .collect();
+    open_ranges.sort_unstable();
+
+    // Target uniform partition as inclusive [start, end] ranges.
+    let count = target as u128;
+    let target_ranges: Vec<(u128, u128)> = (0..count)
+        .map(|idx| {
+            let start = if idx == 0 {
+                0
+            } else {
+                (MAX_HASH_KEY / count) * idx + 1
+            };
+            let end = if idx == count - 1 {
+                MAX_HASH_KEY
+            } else {
+                (MAX_HASH_KEY / count) * (idx + 1)
+            };
+            (start, end)
+        })
+        .collect();
+
+    // Cut points = the union of every range's *start* key. Each pair of
+    // consecutive starts defines a refinement interval `[start, next-1]`,
+    // with the final interval running to `MAX_HASH_KEY`. (Hash keys span
+    // the full u128 range, so an exclusive `end+1` upper bound would
+    // overflow — starts alone unambiguously define the partition.)
+    let mut cuts: Vec<u128> = Vec::with_capacity(open_ranges.len() + target_ranges.len() + 1);
+    cuts.push(0);
+    for (s, _) in open_ranges.iter().chain(target_ranges.iter()) {
+        cuts.push(*s);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let refinement: Vec<(u128, u128)> = cuts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = cuts.get(i + 1).map(|next| next - 1).unwrap_or(MAX_HASH_KEY);
+            (start, end)
+        })
+        .collect();
+
+    // Capture (id, start, end) of the pre-scale open shards *before*
+    // closing them, so the new shards can record them as parents — the
+    // lineage a consumer walks via `ChildShards` to discover the post-scale
+    // shards. Every refinement interval falls entirely inside exactly one
+    // of these (the cut points include every original start key).
+    let original_open: Vec<(String, u128, u128)> = stream
+        .shards
+        .iter()
+        .filter(|s| s.is_open)
+        .map(|s| {
+            (
+                s.shard_id.clone(),
+                s.starting_hash_key.parse::<u128>().unwrap_or(0),
+                s.ending_hash_key.parse::<u128>().unwrap_or(MAX_HASH_KEY),
+            )
+        })
+        .collect();
+    let parent_for = |start: u128, end: u128| -> Option<String> {
+        original_open
+            .iter()
+            .find(|(_, ostart, oend)| start >= *ostart && end <= *oend)
+            .map(|(id, _, _)| id.clone())
+    };
+
+    // Close every current open shard — they are all split away.
+    for shard in &mut stream.shards {
+        shard.is_open = false;
+    }
+
+    // Materialise each refinement interval as a shard whose parent is the
+    // pre-scale shard that contained it. Every original shard thus becomes
+    // the parent of at least one new shard, so GetRecords on a drained
+    // original returns non-empty `ChildShards` instead of stranding the
+    // consumer at the closed parent.
+    let mut piece_ids: Vec<(u128, u128, String)> = Vec::new();
+    for (start, end) in &refinement {
+        let new_id = next_shard_id(stream);
+        let parent = parent_for(*start, *end);
+        stream.shards.push(KinesisShard {
+            shard_id: new_id.clone(),
+            starting_hash_key: start.to_string(),
+            ending_hash_key: end.to_string(),
+            parent_shard_id: parent,
+            adjacent_parent_shard_id: None,
+            is_open: true,
+            next_sequence_number: 1,
+            records: Vec::new(),
+        });
+        piece_ids.push((*start, *end, new_id));
+    }
+
+    // For each target shard, gather the refinement pieces inside it. A
+    // single-piece target keeps that piece open. A multi-piece target folds
+    // its pieces left-to-right into pairwise merges, closing each piece and
+    // every intermediate merge and leaving one open shard spanning the
+    // target range — so every piece has an open descendant and the lineage
+    // from each original shard stays connected end to end.
+    for (tstart, tend) in &target_ranges {
+        let pieces: Vec<(u128, String)> = piece_ids
+            .iter()
+            .filter(|(ps, pe, _)| ps >= tstart && pe <= tend)
+            .map(|(_, pe, id)| (*pe, id.clone()))
+            .collect();
+        if pieces.len() <= 1 {
+            continue;
+        }
+        // Fold: `acc` is the current open head of the merge chain, `acc_end`
+        // its ending hash key. Each step closes `acc` and the next piece and
+        // opens a merged shard parented on both.
+        let (_, mut acc) = pieces[0].clone();
+        close_shard(stream, &acc);
+        for (next_end, next_id) in &pieces[1..] {
+            close_shard(stream, next_id);
+            let merged_id = next_shard_id(stream);
+            stream.shards.push(KinesisShard {
+                shard_id: merged_id.clone(),
+                starting_hash_key: tstart.to_string(),
+                ending_hash_key: next_end.to_string(),
+                parent_shard_id: Some(acc.clone()),
+                adjacent_parent_shard_id: Some(next_id.clone()),
+                is_open: true,
+                next_sequence_number: 1,
+                records: Vec::new(),
+            });
+            // The previous head is now an interior (closed) merge node; the
+            // freshly pushed `merged_id` is the new open head.
+            close_shard(stream, &acc);
+            acc = merged_id;
+        }
+    }
+
+    stream.shard_count = stream.shards.len() as i32;
+    stream.open_shard_count = target as i32;
+}
 
 const SHARD_LEVEL_METRICS: &[&str] = &[
     "IncomingBytes",

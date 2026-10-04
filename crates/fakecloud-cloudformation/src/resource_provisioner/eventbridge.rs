@@ -5,6 +5,45 @@
 
 use super::*;
 
+/// The `(bus, rule)` key an `AWS::Events::Rule` physical id names: the rule
+/// name (default bus), `<bus>|<rule>`, or -- on stacks recorded before Ref
+/// returned the name -- the rule ARN.
+fn eventbridge_rule_key(
+    state: &fakecloud_eventbridge::EventBridgeState,
+    physical_id: &str,
+) -> Option<(String, String)> {
+    if physical_id.starts_with("arn:") {
+        return state
+            .rules
+            .iter()
+            .find(|(_, r)| r.arn == physical_id)
+            .map(|(k, _)| k.clone());
+    }
+    let key = match physical_id.split_once('|') {
+        Some((bus, rule)) => (bus.to_string(), rule.to_string()),
+        None => ("default".to_string(), physical_id.to_string()),
+    };
+    state.rules.contains_key(&key).then_some(key)
+}
+
+/// CFN `Tags` (`[{Key, Value}]`) as the rule's tag map.
+fn cfn_rule_tags(props: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    props
+        .get("Tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("Key")?.as_str()?.to_string(),
+                        t.get("Value")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ResourceProvisioner {
     // --- EventBridge ---
 
@@ -18,9 +57,11 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(|v| v.as_str())
             .unwrap_or(&generated_name);
+        // EventBusName takes a bus name or ARN.
         let event_bus_name = props
             .get("EventBusName")
             .and_then(|v| v.as_str())
+            .map(|b| b.rsplit_once(":event-bus/").map_or(b, |(_, name)| name))
             .unwrap_or("default");
 
         let mut eb_accounts = self.eventbridge_state.write();
@@ -82,14 +123,21 @@ impl ResourceProvisioner {
                         .collect()
                 })
                 .unwrap_or_default(),
-            tags: std::collections::BTreeMap::new(),
+            tags: cfn_rule_tags(props),
             last_fired: None,
         };
 
         state
             .rules
             .insert((event_bus_name.to_string(), rule_name.to_string()), rule);
-        Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
+        // Ref returns the rule name for a rule on the default bus and
+        // `<bus name>|<rule name>` for one on any other bus.
+        let physical_id = if event_bus_name == "default" {
+            rule_name.to_string()
+        } else {
+            format!("{event_bus_name}|{rule_name}")
+        };
+        Ok(ProvisionResult::new(physical_id).with("Arn", arn))
     }
 
     /// Apply a CFN property update to an existing EventBridge rule in place.
@@ -105,15 +153,18 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let arn = &existing.physical_id;
+        let physical_id = &existing.physical_id;
 
         let mut eb_accounts = self.eventbridge_state.write();
         let state = eb_accounts.get_or_create(&self.account_id);
+        let key = eventbridge_rule_key(state, physical_id)
+            .ok_or_else(|| format!("EventBridge rule {physical_id} not yet provisioned"))?;
         let rule = state
             .rules
-            .values_mut()
-            .find(|r| &r.arn == arn)
-            .ok_or_else(|| format!("EventBridge rule {arn} not yet provisioned"))?;
+            .get_mut(&key)
+            .ok_or_else(|| format!("EventBridge rule {physical_id} not yet provisioned"))?;
+        let arn = rule.arn.clone();
+        rule.tags = cfn_rule_tags(props);
 
         rule.event_pattern = props.get("EventPattern").map(|v| {
             if v.is_string() {
@@ -150,19 +201,13 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
 
-        Ok(ProvisionResult::new(arn.clone()).with("Arn", arn.clone()))
+        Ok(ProvisionResult::new(physical_id.clone()).with("Arn", arn))
     }
 
     pub(super) fn delete_eventbridge_rule(&self, physical_id: &str) -> Result<(), String> {
         let mut eb_accounts = self.eventbridge_state.write();
         let state = eb_accounts.get_or_create(&self.account_id);
-        // physical_id is the ARN; find the rule key
-        let key = state
-            .rules
-            .iter()
-            .find(|(_, r)| r.arn == physical_id)
-            .map(|(k, _)| k.clone());
-        if let Some(k) = key {
+        if let Some(k) = eventbridge_rule_key(state, physical_id) {
             state.rules.remove(&k);
         }
         Ok(())

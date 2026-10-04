@@ -32,7 +32,7 @@ const NS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 /// Password recorded for a cluster created without one. The engines
 /// refuse to start with an empty password, so a restore from such a
 /// cluster's snapshot needs a non-empty value to hand the container.
-pub(crate) const DEFAULT_CLUSTER_MASTER_PASSWORD: &str = "fakecloud";
+pub const DEFAULT_CLUSTER_MASTER_PASSWORD: &str = "fakecloud";
 
 /// Read a string field off an extras entry, treating an absent or
 /// non-string value as "the resource doesn't carry this attribute".
@@ -524,8 +524,8 @@ impl RdsService {
                     "EngineVersion": get_param(req, "EngineVersion").unwrap_or_else(|| {
                         crate::service::service_helpers::default_engine_version(&engine).to_string()
                     }),
-                    "Endpoint": format!("{id}.cluster-xxx.{region}.rds.amazonaws.com"),
-                    "ReaderEndpoint": format!("{id}.cluster-ro-xxx.{region}.rds.amazonaws.com"),
+                    "Endpoint": crate::cluster_endpoint(&id, &aid, region),
+                    "ReaderEndpoint": crate::cluster_reader_endpoint(&id, &aid, region),
                     "Port": port, "MasterUsername": get_param(req, "MasterUsername").unwrap_or_else(|| "postgres".to_string()),
                     // Persisted so a snapshot of this cluster carries
                     // usable credentials: RestoreDBInstanceFromDBSnapshot
@@ -3912,8 +3912,8 @@ impl RdsService {
                     "DbClusterResourceId": new_cluster_resource_id(),
                     "Status": "available", "Engine": engine,
                     "EngineVersion": get_param(req, "EngineVersion").unwrap_or_else(|| "8.0.mysql_aurora.3.04.0".to_string()),
-                    "Endpoint": format!("{id}.cluster-xxx.{region}.rds.amazonaws.com"),
-                    "ReaderEndpoint": format!("{id}.cluster-ro-xxx.{region}.rds.amazonaws.com"),
+                    "Endpoint": crate::cluster_endpoint(&id, &aid, region),
+                    "ReaderEndpoint": crate::cluster_reader_endpoint(&id, &aid, region),
                     "Port": port,
                     "MasterUsername": get_param(req, "MasterUsername").unwrap_or_else(|| "admin".to_string()),
                     "StorageEncrypted": get_param(req, "StorageEncrypted").is_some_and(|v| v.eq_ignore_ascii_case("true")),

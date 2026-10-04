@@ -37,6 +37,8 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_i64())
             .unwrap_or(24) as i32;
 
+        let (encryption_type, key_id) = cfn_kinesis_encryption(props)?;
+
         let mut accounts = self.kinesis_state.write();
         let state = accounts.get_or_create(&self.account_id);
         if state.streams.contains_key(&stream_name) {
@@ -50,11 +52,11 @@ impl ResourceProvisioner {
             stream_creation_timestamp: Utc::now(),
             retention_period_hours,
             stream_mode,
-            encryption_type: "NONE".to_string(),
-            key_id: None,
+            encryption_type,
+            key_id,
             shard_count,
             open_shard_count: shard_count,
-            tags: BTreeMap::new(),
+            tags: cfn_kinesis_tags(props),
             shards: build_stream_shards(shard_count),
             next_shard_index: shard_count,
             enhanced_metrics: Vec::new(),
@@ -69,14 +71,11 @@ impl ResourceProvisioner {
     }
 
     /// Apply a CFN property update to an existing Kinesis stream in place.
-    /// `RetentionPeriodHours`, `ShardCount` and `StreamModeDetails.StreamMode`
-    /// are update-without-replacement in real CloudFormation, so a stack update
-    /// must reach the stream and be reflected by `DescribeStreamSummary` instead
-    /// of being silently dropped. Retention and stream mode are applied exactly;
-    /// a `ShardCount` change reshapes the stream to the target uniform partition
-    /// (the fine-grained closed-shard lineage produced by the native
-    /// `UpdateShardCount` common-refinement is not reproduced here — only the
-    /// resulting open-shard partition, which is what Describe reports).
+    /// `RetentionPeriodHours`, `ShardCount`, `StreamModeDetails`,
+    /// `StreamEncryption` and `Tags` are update-without-replacement in real
+    /// CloudFormation. A `ShardCount` change goes through UpdateShardCount's
+    /// uniform resharding: the old shards are closed (keeping their records)
+    /// and the new ones record their parents, so no data is lost.
     pub(super) fn update_kinesis_stream(
         &self,
         existing: &StackResource,
@@ -106,17 +105,20 @@ impl ResourceProvisioner {
             stream.stream_mode = mode.to_string();
         }
         if let Some(target) = props.get("ShardCount").and_then(|v| v.as_i64()) {
-            if target <= 0 {
-                return Err("ShardCount must be greater than zero".to_string());
+            if !(1..=10000).contains(&target) {
+                return Err("ShardCount must be between 1 and 10000".to_string());
             }
             let target = target as i32;
-            if target != stream.shard_count {
-                stream.shards = build_stream_shards(target);
-                stream.shard_count = target;
-                stream.open_shard_count = target;
-                stream.next_shard_index = target;
+            if target != stream.open_shard_count {
+                fakecloud_kinesis::reshard_uniform(stream, target);
             }
         }
+        // StreamEncryption and Tags are desired state: dropping either from
+        // the template stops encryption / removes the tags.
+        let (encryption_type, key_id) = cfn_kinesis_encryption(props)?;
+        stream.encryption_type = encryption_type;
+        stream.key_id = key_id;
+        stream.tags = cfn_kinesis_tags(props);
 
         Ok(ProvisionResult::new(existing.physical_id.clone()).with("Arn", stream_arn))
     }
@@ -186,4 +188,45 @@ impl ResourceProvisioner {
         state.consumers.remove(physical_id);
         Ok(())
     }
+}
+
+/// `StreamEncryption` as the stream's (EncryptionType, KeyId): KMS with the
+/// given key, or NONE when the property is absent.
+fn cfn_kinesis_encryption(props: &serde_json::Value) -> Result<(String, Option<String>), String> {
+    let Some(enc) = props.get("StreamEncryption").filter(|v| v.is_object()) else {
+        return Ok(("NONE".to_string(), None));
+    };
+    let encryption_type = enc
+        .get("EncryptionType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("KMS");
+    if encryption_type != "KMS" {
+        return Err(format!(
+            "StreamEncryption.EncryptionType must be KMS, got {encryption_type}"
+        ));
+    }
+    let key_id = enc
+        .get("KeyId")
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "StreamEncryption.KeyId is required".to_string())?;
+    Ok(("KMS".to_string(), Some(key_id.to_string())))
+}
+
+/// CFN `Tags` (`[{Key, Value}]`) as the stream's tag map.
+fn cfn_kinesis_tags(props: &serde_json::Value) -> BTreeMap<String, String> {
+    props
+        .get("Tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("Key")?.as_str()?.to_string(),
+                        t.get("Value")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

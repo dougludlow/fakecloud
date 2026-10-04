@@ -157,15 +157,27 @@ fn apply_cfn_table_settings(
     Ok(())
 }
 
+/// The table name an `AWS::DynamoDB::Table` physical id names. The physical
+/// id (and so `Ref`) is the table name, as on AWS; stacks recorded before
+/// that carry the table ARN, which still resolves.
+pub(super) fn dynamodb_table_name(physical_id: &str) -> &str {
+    if physical_id.starts_with("arn:") {
+        if let Some((_, name)) = physical_id.split_once(":table/") {
+            return name.split('/').next().unwrap_or(name);
+        }
+    }
+    physical_id
+}
+
 impl ResourceProvisioner {
     pub(super) fn get_att_dynamodb_table(
         &self,
         physical_id: &str,
         attribute: &str,
     ) -> Option<String> {
-        let mut accounts = self.dynamodb_state.write();
-        let state = accounts.get_or_create(&self.account_id);
-        let table = state.tables.get(physical_id)?;
+        let accounts = self.dynamodb_state.read();
+        let state = accounts.get(&self.account_id)?;
+        let table = state.tables.get(dynamodb_table_name(physical_id))?;
         match attribute {
             "Arn" => Some(table.arn.clone()),
             "StreamArn" => table.stream_arn.clone(),
@@ -384,7 +396,8 @@ impl ResourceProvisioner {
         let table = table;
 
         state.tables.insert(table_name.to_string(), table);
-        let mut result = ProvisionResult::new(arn.clone()).with("Arn", arn);
+        // Ref returns the table name.
+        let mut result = ProvisionResult::new(table_name.to_string()).with("Arn", arn);
         if let Some(stream_arn_value) = stream_arn_attr {
             result = result.with("StreamArn", stream_arn_value);
         }
@@ -404,15 +417,14 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let arn = &existing.physical_id;
+        let table_name = dynamodb_table_name(&existing.physical_id).to_string();
 
         let mut __ddb_mas = self.dynamodb_state.write();
         let state = __ddb_mas.get_or_create(&self.account_id);
         let table = state
             .tables
-            .values_mut()
-            .find(|t| &t.arn == arn)
-            .ok_or_else(|| format!("DynamoDB table {arn} not yet provisioned"))?;
+            .get_mut(&table_name)
+            .ok_or_else(|| format!("DynamoDB table {table_name} not yet provisioned"))?;
 
         if let Some(billing_mode) = props.get("BillingMode").and_then(|v| v.as_str()) {
             table.billing_mode = billing_mode.to_string();
@@ -487,7 +499,8 @@ impl ResourceProvisioner {
 
         apply_cfn_table_settings(table, props, true)?;
 
-        let mut result = ProvisionResult::new(arn.clone()).with("Arn", arn.clone());
+        let arn = table.arn.clone();
+        let mut result = ProvisionResult::new(table_name).with("Arn", arn);
         if let Some(stream_arn) = table.stream_arn.clone().filter(|_| table.stream_enabled) {
             result = result.with("StreamArn", stream_arn);
         }
@@ -497,15 +510,223 @@ impl ResourceProvisioner {
     pub(super) fn delete_dynamodb_table(&self, physical_id: &str) -> Result<(), String> {
         let mut __ddb_mas = self.dynamodb_state.write();
         let state = __ddb_mas.get_or_create(&self.account_id);
-        // physical_id is the ARN; find the table name
-        let table_name = state
-            .tables
-            .iter()
-            .find(|(_, t)| t.arn == physical_id)
-            .map(|(name, _)| name.clone());
-        if let Some(name) = table_name {
-            state.tables.remove(&name);
-        }
+        state.tables.remove(dynamodb_table_name(physical_id));
         Ok(())
     }
+}
+
+impl ResourceProvisioner {
+    /// `AWS::DynamoDB::GlobalTable` (version 2019.11.21): the table in this
+    /// region, configured from the shared properties plus this region's
+    /// replica entry, and registered as a global table whose replication
+    /// group lists every replica region. `Ref` returns the table name.
+    pub(super) fn create_dynamodb_global_table(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let replicas = props
+            .get("Replicas")
+            .and_then(|v| v.as_array())
+            .filter(|r| !r.is_empty())
+            .ok_or("GlobalTable requires at least one entry in Replicas")?;
+        let local = replicas
+            .iter()
+            .find(|r| r.get("Region").and_then(|v| v.as_str()) == Some(self.region.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "Replicas must include the stack's region ({}) for a GlobalTable",
+                    self.region
+                )
+            })?;
+        let table_def = ResourceDefinition {
+            logical_id: resource.logical_id.clone(),
+            resource_type: "AWS::DynamoDB::Table".to_string(),
+            properties: global_table_local_props(props, local),
+            deletion_policy: resource.deletion_policy.clone(),
+            update_replace_policy: resource.update_replace_policy.clone(),
+        };
+        let mut result = self.create_dynamodb_table(&table_def)?;
+        let table_name = result.physical_id.clone();
+
+        let replication_group: Vec<fakecloud_dynamodb::ReplicaDescription> = replicas
+            .iter()
+            .filter_map(|r| r.get("Region").and_then(|v| v.as_str()))
+            .map(|region| fakecloud_dynamodb::ReplicaDescription {
+                region_name: region.to_string(),
+                replica_status: "ACTIVE".to_string(),
+                read_capacity_auto_scaling: None,
+                write_capacity_auto_scaling: None,
+                read_capacity_units: None,
+            })
+            .collect();
+        let billing_mode = props
+            .get("BillingMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("PROVISIONED")
+            .to_string();
+        let mut accounts = self.dynamodb_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        let table_id = state
+            .tables
+            .get(&table_name)
+            .map(|t| t.table_id.clone())
+            .unwrap_or_default();
+        state.global_tables.insert(
+            table_name.clone(),
+            fakecloud_dynamodb::GlobalTableDescription {
+                global_table_name: table_name.clone(),
+                global_table_arn: fakecloud_dynamodb::global_table_arn(
+                    &self.region,
+                    &self.account_id,
+                    &table_name,
+                ),
+                global_table_status: "ACTIVE".to_string(),
+                creation_date: Utc::now(),
+                replication_group,
+                billing_mode,
+                provisioned_write_capacity_units: None,
+            },
+        );
+        result = result.with("TableId", table_id);
+        Ok(result)
+    }
+
+    /// Updates the local table in place (the same mutable settings a Table
+    /// update applies) and refreshes the replication group.
+    pub(super) fn update_dynamodb_global_table(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let replicas = props
+            .get("Replicas")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let local = replicas
+            .iter()
+            .find(|r| r.get("Region").and_then(|v| v.as_str()) == Some(self.region.as_str()))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let table_def = ResourceDefinition {
+            logical_id: resource.logical_id.clone(),
+            resource_type: "AWS::DynamoDB::Table".to_string(),
+            properties: global_table_local_props(props, &local),
+            deletion_policy: resource.deletion_policy.clone(),
+            update_replace_policy: resource.update_replace_policy.clone(),
+        };
+        let result = self.update_dynamodb_table(existing, &table_def)?;
+        let mut accounts = self.dynamodb_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        if let Some(gt) = state.global_tables.get_mut(&result.physical_id) {
+            gt.replication_group = replicas
+                .iter()
+                .filter_map(|r| r.get("Region").and_then(|v| v.as_str()))
+                .map(|region| {
+                    gt.replication_group
+                        .iter()
+                        .find(|r| r.region_name == region)
+                        .cloned()
+                        .unwrap_or(fakecloud_dynamodb::ReplicaDescription {
+                            region_name: region.to_string(),
+                            replica_status: "ACTIVE".to_string(),
+                            read_capacity_auto_scaling: None,
+                            write_capacity_auto_scaling: None,
+                            read_capacity_units: None,
+                        })
+                })
+                .collect();
+            if let Some(mode) = props.get("BillingMode").and_then(|v| v.as_str()) {
+                gt.billing_mode = mode.to_string();
+            }
+        }
+        let table_id = state
+            .tables
+            .get(&result.physical_id)
+            .map(|t| t.table_id.clone())
+            .unwrap_or_default();
+        Ok(result.with("TableId", table_id))
+    }
+
+    pub(super) fn delete_dynamodb_global_table(&self, physical_id: &str) -> Result<(), String> {
+        let name = dynamodb_table_name(physical_id).to_string();
+        self.delete_dynamodb_table(&name)?;
+        let mut accounts = self.dynamodb_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        state.global_tables.remove(&name);
+        Ok(())
+    }
+}
+
+/// The `AWS::DynamoDB::Table` properties a GlobalTable's local replica
+/// amounts to: the shared table properties, the replica's own settings
+/// (point-in-time recovery, deletion protection, table class, contributor
+/// insights, Kinesis destination, tags) and, under PROVISIONED billing, the
+/// replica's read capacity with the table-wide write capacity.
+fn global_table_local_props(props: &serde_json::Value, local: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in [
+        "TableName",
+        "AttributeDefinitions",
+        "KeySchema",
+        "BillingMode",
+        "GlobalSecondaryIndexes",
+        "LocalSecondaryIndexes",
+        "StreamSpecification",
+        "SSESpecification",
+        "TimeToLiveSpecification",
+    ] {
+        if let Some(v) = props.get(key).filter(|v| !v.is_null()) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    // GlobalTable's SSESpecification uses `SSEType`; the replica carries the
+    // KMS key.
+    if let Some(key) = local
+        .get("SSESpecification")
+        .and_then(|s| s.get("KMSMasterKeyId"))
+        .filter(|v| !v.is_null())
+    {
+        if let Some(serde_json::Value::Object(sse)) = out.get_mut("SSESpecification") {
+            sse.insert("KMSMasterKeyId".to_string(), key.clone());
+        }
+    }
+    for key in [
+        "PointInTimeRecoverySpecification",
+        "DeletionProtectionEnabled",
+        "TableClass",
+        "ContributorInsightsSpecification",
+        "KinesisStreamSpecification",
+        "Tags",
+    ] {
+        if let Some(v) = local.get(key).filter(|v| !v.is_null()) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    let provisioned = props.get("BillingMode").and_then(|v| v.as_str()) != Some("PAY_PER_REQUEST");
+    if provisioned {
+        let write = props
+            .get("WriteProvisionedThroughputSettings")
+            .and_then(|w| w.get("WriteCapacityAutoScalingSettings"))
+            .and_then(|a| a.get("MinCapacity"))
+            .cloned()
+            .unwrap_or(serde_json::json!(5));
+        let read = local
+            .get("ReadProvisionedThroughputSettings")
+            .and_then(|r| {
+                r.get("ReadCapacityUnits").cloned().or_else(|| {
+                    r.get("ReadCapacityAutoScalingSettings")
+                        .and_then(|a| a.get("MinCapacity"))
+                        .cloned()
+                })
+            })
+            .unwrap_or(serde_json::json!(5));
+        out.insert(
+            "ProvisionedThroughput".to_string(),
+            serde_json::json!({"ReadCapacityUnits": read, "WriteCapacityUnits": write}),
+        );
+    }
+    serde_json::Value::Object(out)
 }

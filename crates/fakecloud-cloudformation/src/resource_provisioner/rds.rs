@@ -323,6 +323,48 @@ impl ResourceProvisioner {
         Ok(())
     }
 
+    /// Live `GetAtt` for `AWS::RDS::DBInstance`: the endpoint moves once a
+    /// backing container is up (and on a port change), so it is read from
+    /// the instance rather than the value captured at create time.
+    pub(super) fn get_att_rds_db_instance(
+        &self,
+        physical_id: &str,
+        attribute: &str,
+    ) -> Option<String> {
+        let accounts = self.rds_state.read();
+        let inst = accounts.get(&self.account_id)?.instances.get(physical_id)?;
+        match attribute {
+            "Endpoint.Address" => Some(inst.endpoint_address.clone()),
+            "Endpoint.Port" => Some(inst.port.to_string()),
+            "DBInstanceArn" => Some(inst.db_instance_arn.clone()),
+            "DbiResourceId" => Some(inst.dbi_resource_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Live `GetAtt` for `AWS::RDS::DBCluster` endpoint attributes.
+    pub(super) fn get_att_rds_db_cluster(
+        &self,
+        physical_id: &str,
+        attribute: &str,
+    ) -> Option<String> {
+        let accounts = self.rds_state.read();
+        let cluster = accounts
+            .get(&self.account_id)?
+            .extras
+            .get("clusters")?
+            .get(physical_id)?;
+        let field = |k: &str| cluster.get(k).and_then(|v| v.as_str()).map(String::from);
+        match attribute {
+            "Endpoint.Address" => field("Endpoint"),
+            "ReadEndpoint.Address" => field("ReaderEndpoint"),
+            "Endpoint.Port" => cluster.get("Port").and_then(|v| v.as_i64()).map(|p| p.to_string()),
+            "DBClusterArn" => field("DBClusterArn"),
+            "DBClusterResourceId" => field("DbClusterResourceId"),
+            _ => None,
+        }
+    }
+
     pub(super) fn create_rds_db_instance(
         &self,
         resource: &ResourceDefinition,
@@ -338,37 +380,74 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("db.t4g.micro")
             .to_string();
+        // An Aurora member takes its engine, version, credentials and port
+        // from its cluster (the template usually omits them on the
+        // instance), as CreateDBInstance does for a cluster member.
+        let cluster_id = props
+            .get("DBClusterIdentifier")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let cluster = cluster_id.as_deref().and_then(|cid| {
+            self.rds_state
+                .read()
+                .get(&self.account_id)?
+                .extras
+                .get("clusters")?
+                .get(cid)
+                .cloned()
+        });
+        let from_cluster = |key: &str| {
+            cluster
+                .as_ref()
+                .and_then(|c| c.get(key))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
         let engine = props
             .get("Engine")
             .and_then(|v| v.as_str())
-            .unwrap_or("postgres")
-            .to_string();
-        let engine_version = props
-            .get("EngineVersion")
-            .and_then(|v| v.as_str())
-            .unwrap_or("16.0")
-            .to_string();
-        let master_username = props
-            .get("MasterUsername")
-            .and_then(|v| v.as_str())
-            .unwrap_or("admin")
-            .to_string();
-        let master_user_password = props
-            .get("MasterUserPassword")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+            .map(String::from)
+            .or_else(|| from_cluster("Engine"))
+            .unwrap_or_else(|| "postgres".to_string());
+        let engine_version = from_cluster("EngineVersion")
+            .or_else(|| {
+                props
+                    .get("EngineVersion")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| fakecloud_rds::default_engine_version(&engine).to_string());
+        let master_username = from_cluster("MasterUsername")
+            .or_else(|| {
+                props
+                    .get("MasterUsername")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "admin".to_string());
+        let master_user_password = from_cluster("MasterUserPassword")
+            .or_else(|| {
+                props
+                    .get("MasterUserPassword")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
         let db_name = props
             .get("DBName")
             .and_then(|v| v.as_str())
             .map(String::from);
         // Default the port from the engine (MySQL/MariaDB -> 3306, Oracle ->
         // 1521, SQL Server -> 1433, Db2 -> 50000, Postgres -> 5432) instead of
-        // hardcoding 5432 for every engine.
-        let port = props
-            .get("Port")
+        // hardcoding 5432 for every engine; a cluster member listens on its
+        // cluster's port.
+        let cluster_port = cluster
+            .as_ref()
+            .and_then(|c| c.get("Port"))
             .and_then(|v| v.as_i64())
-            .map(|n| n as i32)
+            .map(|n| n as i32);
+        let port = cluster_port
+            .or_else(|| props.get("Port").and_then(|v| v.as_i64()).map(|n| n as i32))
             .unwrap_or_else(|| fakecloud_rds::default_port_for_engine(&engine));
         let allocated_storage = props
             .get("AllocatedStorage")
@@ -453,10 +532,8 @@ impl ResourceProvisioner {
         // Build the instance ARN from the stack's request region (self.region),
         // not the RDS sub-service state's frozen startup region.
         let arn = fakecloud_rds::rds_arn(&self.region, &state.account_id, "db", &identifier);
-        let endpoint_address = format!(
-            "{identifier}.cluster-fakecloud.{}.rds.amazonaws.com",
-            self.region
-        );
+        let endpoint_address =
+            fakecloud_rds::instance_endpoint(&identifier, &self.account_id, &self.region);
         let dbi_resource_id = format!("db-{}", Uuid::new_v4().simple());
         let dbi_resource_id_attr = dbi_resource_id.clone();
         let inst = DbInstance {
@@ -610,15 +687,17 @@ impl ResourceProvisioner {
                         .collect()
                 })
                 .unwrap_or_default(),
-            db_cluster_identifier: props
-                .get("DBClusterIdentifier")
-                .and_then(|v| v.as_str())
-                .map(String::from),
+            db_cluster_identifier: cluster_id.clone(),
             activity_stream: None,
         };
         let endpoint = inst.endpoint_address.clone();
         let endpoint_port = inst.port;
         state.instances.insert(identifier.clone(), inst);
+        // Register the member on its cluster now, so DescribeDBClusters lists
+        // it (and names a writer) while the instance is still creating.
+        if let Some(cid) = &cluster_id {
+            fakecloud_rds::attach_cluster_member(state, cid, &identifier);
+        }
         drop(accounts);
 
         if back_with_container {
@@ -759,7 +838,14 @@ impl ResourceProvisioner {
         let removed = {
             let mut accounts = self.rds_state.write();
             let state = accounts.get_or_create(&self.account_id);
-            state.instances.remove(physical_id)
+            let removed = state.instances.remove(physical_id);
+            if let Some(cid) = removed
+                .as_ref()
+                .and_then(|i| i.db_cluster_identifier.clone())
+            {
+                fakecloud_rds::detach_cluster_member(state, &cid, physical_id);
+            }
+            removed
         };
         // Queue the REAL container teardown when a runtime is wired, so the stack
         // delete drain stops + removes the Postgres/MySQL container and its data
@@ -843,31 +929,42 @@ impl ResourceProvisioner {
         let engine_version = props
             .get("EngineVersion")
             .and_then(|v| v.as_str())
-            .map(String::from);
+            .map(String::from)
+            .unwrap_or_else(|| fakecloud_rds::default_engine_version(&engine).to_string());
         let master_username = props
             .get("MasterUsername")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let port = props.get("Port").and_then(|v| v.as_i64()).unwrap_or(5432);
+        // Stored (never rendered) like CreateDBCluster does, so members and
+        // snapshots of the cluster start with the cluster's credentials.
+        let master_user_password = props
+            .get("MasterUserPassword")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fakecloud_rds::extras::DEFAULT_CLUSTER_MASTER_PASSWORD)
+            .to_string();
+        let port = props
+            .get("Port")
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            })
+            .unwrap_or_else(|| i64::from(fakecloud_rds::default_port_for_engine(&engine)));
         let kms_key_id = self.rds_cluster_storage_key(props);
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "cluster", &identifier);
         let cluster_resource_id = format!("cluster-{}", Uuid::new_v4().simple());
-        let endpoint = format!(
-            "{identifier}.cluster-fakecloud.{}.rds.amazonaws.com",
-            self.region
-        );
-        let reader_endpoint = format!(
-            "{identifier}.cluster-ro-fakecloud.{}.rds.amazonaws.com",
-            self.region
-        );
+        let endpoint =
+            fakecloud_rds::cluster_endpoint(&identifier, &self.account_id, &self.region);
+        let reader_endpoint =
+            fakecloud_rds::cluster_reader_endpoint(&identifier, &self.account_id, &self.region);
         let body = serde_json::json!({
             "DBClusterIdentifier": identifier,
             "DBClusterArn": arn,
             "Engine": engine,
             "EngineVersion": engine_version,
             "MasterUsername": master_username,
+            "MasterUserPassword": master_user_password,
             "Status": "available",
             "DbClusterResourceId": cluster_resource_id,
             "Endpoint": endpoint,
@@ -952,6 +1049,9 @@ impl ResourceProvisioner {
         if let Some(v) = props.get("DeletionProtection").and_then(|v| v.as_bool()) {
             obj.insert("DeletionProtection".to_string(), serde_json::json!(v));
         }
+        if let Some(v) = props.get("MasterUserPassword").and_then(|v| v.as_str()) {
+            obj.insert("MasterUserPassword".to_string(), serde_json::json!(v));
+        }
         if let Some(v) = props.get("StorageEncrypted").and_then(|v| v.as_bool()) {
             obj.insert("StorageEncrypted".to_string(), serde_json::json!(v));
             if !v {
@@ -1000,7 +1100,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let port = obj.get("Port").and_then(|v| v.as_i64()).unwrap_or(5432);
+        let port = obj.get("Port").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+            i64::from(fakecloud_rds::default_port_for_engine(
+                obj.get("Engine").and_then(|v| v.as_str()).unwrap_or_default(),
+            ))
+        });
         let resource_id = obj
             .get("DbClusterResourceId")
             .and_then(|v| v.as_str())

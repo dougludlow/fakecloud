@@ -1706,6 +1706,7 @@ async fn main() {
             amplify: amplify_state.clone(),
             iot: iot_state.clone(),
             appconfig: appconfig_state.clone(),
+            scheduler: scheduler_state.clone(),
             delivery: delivery_for_cf,
             lambda_runtime: container_runtime.clone(),
             iam_mode: cli.iam_mode(),

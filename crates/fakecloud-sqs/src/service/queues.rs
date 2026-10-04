@@ -619,6 +619,13 @@ impl SqsService {
                     }
                 }
             }
+            // LastModifiedTimestamp tracks the last attribute change.
+            if !attrs.is_empty() {
+                queue.attributes.insert(
+                    "LastModifiedTimestamp".to_string(),
+                    Utc::now().timestamp().to_string(),
+                );
+            }
         }
 
         Ok(sqs_response(

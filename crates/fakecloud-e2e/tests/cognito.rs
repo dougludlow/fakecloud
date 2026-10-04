@@ -683,6 +683,71 @@ async fn cognito_update_user_pool_client() {
 }
 
 #[tokio::test]
+async fn cognito_update_user_pool_client_resets_omitted_settings() {
+    let server = TestServer::start().await;
+    let client = server.cognito_client().await;
+    let pool_id = client
+        .create_user_pool()
+        .pool_name("reset-client-pool")
+        .send()
+        .await
+        .expect("create user pool")
+        .user_pool()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+    let client_id = client
+        .create_user_pool_client()
+        .user_pool_id(&pool_id)
+        .client_name("reset-client")
+        .callback_urls("https://example.com/cb")
+        .allowed_o_auth_flows(aws_sdk_cognitoidentityprovider::types::OAuthFlowType::Code)
+        .allowed_o_auth_scopes("openid")
+        .allowed_o_auth_flows_user_pool_client(true)
+        .supported_identity_providers("COGNITO")
+        .explicit_auth_flows(
+            aws_sdk_cognitoidentityprovider::types::ExplicitAuthFlowsType::AllowUserPasswordAuth,
+        )
+        .refresh_token_validity(5)
+        .send()
+        .await
+        .expect("create client")
+        .user_pool_client()
+        .unwrap()
+        .client_id()
+        .unwrap()
+        .to_string();
+
+    // An update that only renames the client resets every omitted setting,
+    // as AWS does -- it does not merge with the stored configuration.
+    client
+        .update_user_pool_client()
+        .user_pool_id(&pool_id)
+        .client_id(&client_id)
+        .client_name("renamed")
+        .send()
+        .await
+        .expect("update client");
+    let described = client
+        .describe_user_pool_client()
+        .user_pool_id(&pool_id)
+        .client_id(&client_id)
+        .send()
+        .await
+        .expect("describe client");
+    let c = described.user_pool_client().unwrap();
+    assert_eq!(c.client_name(), Some("renamed"));
+    assert!(c.callback_urls().is_empty());
+    assert!(c.allowed_o_auth_flows().is_empty());
+    assert!(c.allowed_o_auth_scopes().is_empty());
+    assert!(c.supported_identity_providers().is_empty());
+    assert!(c.explicit_auth_flows().is_empty());
+    assert_eq!(c.allowed_o_auth_flows_user_pool_client(), Some(false));
+    assert_eq!(c.refresh_token_validity(), 30);
+}
+
+#[tokio::test]
 async fn cognito_delete_user_pool_client() {
     let server = TestServer::start().await;
     let client = server.cognito_client().await;

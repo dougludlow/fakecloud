@@ -248,7 +248,7 @@ impl ResourceProvisioner {
 
     /// Dispatch one EC2 control-plane action through the real handler and
     /// return the response body as a string for id extraction.
-    fn ec2_dispatch(
+    pub(super) fn ec2_dispatch(
         &self,
         action: &str,
         params: HashMap<String, String>,

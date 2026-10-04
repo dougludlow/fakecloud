@@ -21,8 +21,12 @@ impl ResourceProvisioner {
     // --- SQS ---
 
     /// Apply a CFN property update to an existing queue in place, preserving
-    /// its enqueued messages. Re-applies the same property-to-attribute
-    /// mapping `create_sqs_queue` uses so a stack update isn't a no-op.
+    /// its enqueued messages. CloudFormation sends the full desired property
+    /// set, so the attribute map is rebuilt from the SQS defaults plus the new
+    /// properties: a property removed from the template goes back to its
+    /// default (as AWS does on a stack update), the typed redrive policy used
+    /// for DLQ routing is refreshed alongside the attribute string (the same
+    /// pairing SetQueueAttributes maintains), and LastModifiedTimestamp moves.
     pub(super) fn update_sqs_queue(
         &self,
         existing: &StackResource,
@@ -36,42 +40,27 @@ impl ResourceProvisioner {
             .queues
             .get_mut(url)
             .ok_or_else(|| format!("Queue {url} not yet provisioned"))?;
-        // Apply to a copy and validate it the way SetQueueAttributes does, so
-        // an out-of-range attribute fails the update instead of being stored.
-        let mut attributes = queue.attributes.clone();
-        if let Some(obj) = props.as_object() {
-            for (k, v) in obj {
-                if k == "QueueName" || k == "Tags" {
-                    continue;
-                }
-                let value = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        serde_json::to_string(v).unwrap_or_default()
-                    }
-                    serde_json::Value::Null => continue,
-                };
-                attributes.insert(k.clone(), value);
-            }
-        }
-        fakecloud_sqs::validate_create_queue_attributes(&attributes).map_err(|e| e.to_string())?;
-        queue.attributes = attributes;
-        if queue
+        let mut attributes = cfn_queue_attributes(props, queue.is_fifo);
+        let created = queue
             .attributes
-            .get("KmsMasterKeyId")
-            .is_some_and(|k| !k.is_empty())
-        {
-            queue
-                .attributes
-                .insert("SqsManagedSseEnabled".to_string(), "false".to_string());
-        }
-        // Apply a Tags update in place so a stack update that changes tags is
-        // reflected by ListQueueTags rather than being dropped.
-        if props.get("Tags").is_some() {
-            queue.tags = parse_cfn_queue_tags(props.get("Tags"));
-        }
+            .get("CreatedTimestamp")
+            .cloned()
+            .unwrap_or_else(|| queue.created_at.timestamp().to_string());
+        attributes.insert("CreatedTimestamp".to_string(), created);
+        attributes.insert(
+            "LastModifiedTimestamp".to_string(),
+            Utc::now().timestamp().to_string(),
+        );
+        // Validate the new set the way SetQueueAttributes does, so an
+        // out-of-range attribute fails the update instead of being stored.
+        fakecloud_sqs::validate_create_queue_attributes(&attributes).map_err(|e| e.to_string())?;
+        queue.redrive_policy = attributes
+            .get("RedrivePolicy")
+            .and_then(|s| fakecloud_sqs::parse_redrive_policy(s));
+        queue.attributes = attributes;
+        // Tags are part of the desired state too: an update that drops the
+        // Tags property clears them.
+        queue.tags = parse_cfn_queue_tags(props.get("Tags"));
         Ok(ProvisionResult::new(url.clone()))
     }
 
@@ -103,57 +92,13 @@ impl ResourceProvisioner {
         let arn = self.regional_arn("sqs", queue_name);
 
         let is_fifo = queue_name.ends_with(".fifo");
-        let mut attributes = std::collections::BTreeMap::new();
-        // Seed the real AWS SQS defaults so a CFN-created queue matches one
-        // created via the API (Terraform refreshes these on every plan and
-        // reports drift if they are absent).
-        attributes.insert("VisibilityTimeout".to_string(), "30".to_string());
-        attributes.insert("DelaySeconds".to_string(), "0".to_string());
-        attributes.insert("MaximumMessageSize".to_string(), "262144".to_string());
-        attributes.insert("MessageRetentionPeriod".to_string(), "345600".to_string());
-        attributes.insert("ReceiveMessageWaitTimeSeconds".to_string(), "0".to_string());
+        let now = Utc::now();
+        let mut attributes = cfn_queue_attributes(props, is_fifo);
+        attributes.insert("CreatedTimestamp".to_string(), now.timestamp().to_string());
         attributes.insert(
-            "KmsDataKeyReusePeriodSeconds".to_string(),
-            "300".to_string(),
+            "LastModifiedTimestamp".to_string(),
+            now.timestamp().to_string(),
         );
-        attributes.insert("SqsManagedSseEnabled".to_string(), "true".to_string());
-        if is_fifo {
-            attributes.insert("FifoQueue".to_string(), "true".to_string());
-            attributes.insert("ContentBasedDeduplication".to_string(), "false".to_string());
-            attributes.insert("DeduplicationScope".to_string(), "queue".to_string());
-            attributes.insert("FifoThroughputLimit".to_string(), "perQueue".to_string());
-        }
-        // Override with provided properties. Object-valued attributes
-        // (RedrivePolicy, RedriveAllowPolicy, Policy) are serialized to compact
-        // JSON and boolean attributes (ContentBasedDeduplication) to their
-        // string form — the previous copy kept only string/integer values, so
-        // these were silently dropped.
-        if let Some(obj) = props.as_object() {
-            for (k, v) in obj {
-                if k == "QueueName" || k == "Tags" {
-                    continue;
-                }
-                let value = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        serde_json::to_string(v).unwrap_or_default()
-                    }
-                    serde_json::Value::Null => continue,
-                };
-                attributes.insert(k.clone(), value);
-            }
-        }
-        fakecloud_sqs::validate_create_queue_attributes(&attributes).map_err(|e| e.to_string())?;
-        // A KMS key implies SSE-KMS, so managed SSE is off (mirrors the native
-        // create_queue mutual-exclusion).
-        if attributes
-            .get("KmsMasterKeyId")
-            .is_some_and(|k| !k.is_empty())
-        {
-            attributes.insert("SqsManagedSseEnabled".to_string(), "false".to_string());
-        }
 
         // Typed RedrivePolicy used for runtime DLQ routing — without it, CFN
         // queues never route to their dead-letter queue.
@@ -171,7 +116,7 @@ impl ResourceProvisioner {
             queue_name: queue_name.to_string(),
             queue_url: queue_url.clone(),
             arn: arn.clone(),
-            created_at: Utc::now(),
+            created_at: now,
             messages: std::collections::VecDeque::new(),
             inflight: Vec::new(),
             attributes,
@@ -288,6 +233,59 @@ impl ResourceProvisioner {
 /// map. CFN models tags as a list of `{ "Key": .., "Value": .. }` objects; a
 /// resolved intrinsic can also produce a plain `{key: value}` map, so both
 /// shapes are accepted.
+/// The queue attribute map a CFN `AWS::SQS::Queue` with `props` describes:
+/// the real SQS defaults overlaid with every provided property.
+/// Object-valued attributes (RedrivePolicy, RedriveAllowPolicy, Policy) are
+/// serialized to compact JSON and booleans to their string form. A KMS key
+/// implies SSE-KMS, so managed SSE is off (the native create_queue
+/// mutual-exclusion).
+fn cfn_queue_attributes(
+    props: &serde_json::Value,
+    is_fifo: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert("VisibilityTimeout".to_string(), "30".to_string());
+    attributes.insert("DelaySeconds".to_string(), "0".to_string());
+    attributes.insert("MaximumMessageSize".to_string(), "262144".to_string());
+    attributes.insert("MessageRetentionPeriod".to_string(), "345600".to_string());
+    attributes.insert("ReceiveMessageWaitTimeSeconds".to_string(), "0".to_string());
+    attributes.insert(
+        "KmsDataKeyReusePeriodSeconds".to_string(),
+        "300".to_string(),
+    );
+    attributes.insert("SqsManagedSseEnabled".to_string(), "true".to_string());
+    if is_fifo {
+        attributes.insert("FifoQueue".to_string(), "true".to_string());
+        attributes.insert("ContentBasedDeduplication".to_string(), "false".to_string());
+        attributes.insert("DeduplicationScope".to_string(), "queue".to_string());
+        attributes.insert("FifoThroughputLimit".to_string(), "perQueue".to_string());
+    }
+    if let Some(obj) = props.as_object() {
+        for (k, v) in obj {
+            if k == "QueueName" || k == "Tags" {
+                continue;
+            }
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                    serde_json::to_string(v).unwrap_or_default()
+                }
+                serde_json::Value::Null => continue,
+            };
+            attributes.insert(k.clone(), value);
+        }
+    }
+    if attributes
+        .get("KmsMasterKeyId")
+        .is_some_and(|k| !k.is_empty())
+    {
+        attributes.insert("SqsManagedSseEnabled".to_string(), "false".to_string());
+    }
+    attributes
+}
+
 fn parse_cfn_queue_tags(
     tags: Option<&serde_json::Value>,
 ) -> std::collections::BTreeMap<String, String> {

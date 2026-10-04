@@ -76,6 +76,7 @@ fakecloud-mwaa = { workspace = true }
 fakecloud-amplify = { workspace = true }
 fakecloud-iot = { workspace = true }
 fakecloud-appconfig = { workspace = true }
+fakecloud-scheduler = { workspace = true }
 rcgen = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

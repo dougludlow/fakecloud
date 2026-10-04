@@ -667,6 +667,9 @@ impl RdsService {
                     replica.read_replica_source_db_instance_identifier = None;
                 }
             }
+            if let Some(cluster_id) = &instance.db_cluster_identifier {
+                detach_cluster_member(state, cluster_id, &db_instance_identifier);
+            }
 
             let subnet_group = instance_subnet_group(state, &instance).cloned();
             (instance, subnet_group)

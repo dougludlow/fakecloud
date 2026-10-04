@@ -2521,7 +2521,7 @@ pub fn default_port_for_engine(engine: &str) -> i32 {
 /// (`validate_create_request`) -- a fixed postgres default like `16.3`
 /// would make every version-less mysql/mariadb/oracle/... create fail
 /// with "EngineVersion '16.3' is not available". See issue #2107.
-pub(crate) fn default_engine_version(engine: &str) -> &'static str {
+pub fn default_engine_version(engine: &str) -> &'static str {
     match engine {
         "postgres" => "16.3",
         "mysql" => "8.0",

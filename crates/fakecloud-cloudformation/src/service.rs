@@ -117,6 +117,7 @@ fn well_known_attributes_for(resource_type: &str) -> &'static [&'static str] {
         "AWS::SQS::Queue" => &["Arn", "QueueName", "QueueUrl"],
         "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
         "AWS::DynamoDB::Table" => &["Arn", "StreamArn"],
+        "AWS::DynamoDB::GlobalTable" => &["Arn", "StreamArn", "TableId"],
         "AWS::KMS::Key" => &["Arn", "KeyId"],
         "AWS::SecretsManager::Secret" => &["Arn", "Id"],
         "AWS::CloudFront::Distribution" => &["DomainName", "Id"],
@@ -126,6 +127,9 @@ fn well_known_attributes_for(resource_type: &str) -> &'static [&'static str] {
         "AWS::EC2::InternetGateway" => &["InternetGatewayId"],
         "AWS::EC2::RouteTable" => &["RouteTableId"],
         "AWS::EC2::Volume" => &["VolumeId"],
+        "AWS::EC2::SecurityGroupIngress" | "AWS::EC2::SecurityGroupEgress" => &["Id"],
+        "AWS::EC2::EIP" => &["AllocationId", "PublicIp"],
+        "AWS::EC2::NatGateway" => &["NatGatewayId"],
         "AWS::EC2::LaunchTemplate" => &[
             "LaunchTemplateId",
             "LatestVersionNumber",
@@ -635,6 +639,7 @@ pub struct CloudFormationDeps {
     pub amplify: fakecloud_amplify::SharedAmplifyState,
     pub iot: fakecloud_iot::SharedIotState,
     pub appconfig: fakecloud_appconfig::SharedAppConfigState,
+    pub scheduler: fakecloud_scheduler::SharedSchedulerState,
     pub delivery: Arc<DeliveryBus>,
     /// Lambda container runtime, when Docker/Podman is available. Used to
     /// pre-pull the runtime image of a CFN-provisioned `AWS::Lambda::Function`
@@ -831,6 +836,12 @@ pub(crate) struct ContainerBackingHandles {
     /// hooks itself once it has finished mutating (bug-hunt restart-dataloss).
     autoscaling_snapshot_hook: Option<SnapshotHook>,
     ec2_snapshot_hook: Option<SnapshotHook>,
+    /// Every service's snapshot hook, so each detached container-backing
+    /// task (RDS / EC2 / ElastiCache / ECS / MQ / MSK) persists the state it
+    /// mutates once the container is up -- the `available` status, endpoint
+    /// and container binding land after the stack op's persist pass, and
+    /// without this a restart restored the resource as `creating`.
+    snapshot_hooks: BTreeMap<&'static str, SnapshotHook>,
     /// KMS hook an Auto Scaling reconcile's EC2 launches resolve encrypted
     /// block-device volumes' keys through.
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
@@ -858,6 +869,7 @@ impl ContainerBackingHandles {
             kafka_runtime: p.kafka_runtime.clone(),
             autoscaling_snapshot_hook: None,
             ec2_snapshot_hook: None,
+            snapshot_hooks: BTreeMap::new(),
             kms_hook: p.kms_hook.clone(),
             quota_provider: p.quota_provider.clone(),
         }
@@ -875,7 +887,13 @@ impl ContainerBackingHandles {
     ) -> Self {
         self.autoscaling_snapshot_hook = hooks.get("autoscaling").cloned();
         self.ec2_snapshot_hook = hooks.get("ec2").cloned();
+        self.snapshot_hooks = hooks.clone();
         self
+    }
+
+    /// The snapshot hook of service `key`, when persistence is on.
+    fn persist_hook(&self, key: &str) -> Option<SnapshotHook> {
+        self.snapshot_hooks.get(key).cloned()
     }
 
     /// Back each freshly-inserted container resource with a REAL container in a
@@ -893,11 +911,15 @@ impl ContainerBackingHandles {
                         let rds_state = self.rds_state.clone();
                         let account = self.account_id.clone();
                         let region = self.region.clone();
+                        let persist = self.persist_hook("rds");
                         tokio::spawn(async move {
                             fakecloud_rds::cfn_provision::cfn_ensure_instance_container(
                                 rds_state, runtime, identifier, account, region,
                             )
                             .await;
+                            if let Some(hook) = persist {
+                                hook().await;
+                            }
                         });
                     }
                 }
@@ -933,6 +955,7 @@ impl ContainerBackingHandles {
                     let ec2_state = self.ec2_state.clone();
                     let ec2_runtime = self.ec2_runtime.clone();
                     let account = self.account_id.clone();
+                    let persist = self.persist_hook("ec2");
                     tokio::spawn(async move {
                         fakecloud_ec2::cfn_provision::cfn_back_instance(
                             ec2_state,
@@ -941,12 +964,16 @@ impl ContainerBackingHandles {
                             instance_id,
                         )
                         .await;
+                        if let Some(hook) = persist {
+                            hook().await;
+                        }
                     });
                 }
                 ContainerSpawnIntent::ElastiCacheCluster { cache_cluster_id } => {
                     if let Some(runtime) = self.elasticache_runtime.clone() {
                         let ec_state = self.elasticache_state.clone();
                         let account = self.account_id.clone();
+                        let persist = self.persist_hook("elasticache");
                         tokio::spawn(async move {
                             fakecloud_elasticache::cfn_provision::cfn_ensure_cluster_container(
                                 ec_state,
@@ -955,6 +982,9 @@ impl ContainerBackingHandles {
                                 account,
                             )
                             .await;
+                            if let Some(hook) = persist {
+                                hook().await;
+                            }
                         });
                     }
                 }
@@ -964,6 +994,7 @@ impl ContainerBackingHandles {
                     if let Some(runtime) = self.elasticache_runtime.clone() {
                         let ec_state = self.elasticache_state.clone();
                         let account = self.account_id.clone();
+                        let persist = self.persist_hook("elasticache");
                         tokio::spawn(async move {
                             fakecloud_elasticache::cfn_provision::cfn_ensure_replication_group_container(
                                 ec_state,
@@ -972,6 +1003,9 @@ impl ContainerBackingHandles {
                                 account,
                             )
                             .await;
+                            if let Some(hook) = persist {
+                                hook().await;
+                            }
                         });
                     }
                 }
@@ -982,6 +1016,7 @@ impl ContainerBackingHandles {
                     if let Some(runtime) = self.ecs_runtime.clone() {
                         let ecs_state = self.ecs_state.clone();
                         let account = self.account_id.clone();
+                        let persist = self.persist_hook("ecs");
                         tokio::spawn(async move {
                             fakecloud_ecs::cfn_provision::cfn_launch_service_tasks(
                                 ecs_state,
@@ -991,6 +1026,9 @@ impl ContainerBackingHandles {
                                 account,
                             )
                             .await;
+                            if let Some(hook) = persist {
+                                hook().await;
+                            }
                         });
                     }
                 }
@@ -998,11 +1036,15 @@ impl ContainerBackingHandles {
                     if let Some(runtime) = self.mq_runtime.clone() {
                         let mq_state = self.mq_state.clone();
                         let account = self.account_id.clone();
+                        let persist = self.persist_hook("mq");
                         tokio::spawn(async move {
                             fakecloud_mq::cfn_provision::cfn_ensure_broker_container(
                                 mq_state, runtime, broker_id, account,
                             )
                             .await;
+                            if let Some(hook) = persist {
+                                hook().await;
+                            }
                         });
                     }
                 }
@@ -1010,6 +1052,7 @@ impl ContainerBackingHandles {
                     if let Some(runtime) = self.kafka_runtime.clone() {
                         let kafka_state = self.kafka_state.clone();
                         let account = self.account_id.clone();
+                        let persist = self.persist_hook("kafka");
                         tokio::spawn(async move {
                             fakecloud_kafka::cfn_provision::cfn_ensure_cluster_container(
                                 kafka_state,
@@ -1018,6 +1061,9 @@ impl ContainerBackingHandles {
                                 account,
                             )
                             .await;
+                            if let Some(hook) = persist {
+                                hook().await;
+                            }
                         });
                     }
                 }
@@ -1330,6 +1376,7 @@ impl CloudFormationService {
             amplify_state: self.deps.amplify.clone(),
             iot_state: self.deps.iot.clone(),
             appconfig_state: self.deps.appconfig.clone(),
+            scheduler_state: self.deps.scheduler.clone(),
             cloudformation_state: self.state.clone(),
             delivery: self.deps.delivery.clone(),
             lambda_runtime: self.deps.lambda_runtime.clone(),
@@ -4584,6 +4631,7 @@ mod tests {
             amplify: mas(),
             iot: mas(),
             appconfig: mas(),
+            scheduler: mas(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
             iam_mode: Default::default(),
