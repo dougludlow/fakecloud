@@ -29,8 +29,8 @@ Every implemented service persists its control-plane state in this mode — a sn
 - **SNS** — topics, subscriptions, attributes, tags, platform applications and endpoints, SMS settings.
 - **EventBridge** — event buses, rules, targets, archives, replays, connections.
 - **IAM / STS** — users, groups, roles, policies, instance profiles, access keys.
-- **SSM Parameter Store** — parameters (String/SecureString/StringList), history, and the rest of the SSM control plane, per account and region. Snapshots written before SSM was region-partitioned load with each parameter in the region its ARN names.
-- **Secrets Manager** — secrets, versions, rotation settings, replicas, per account and region. Snapshots written before Secrets Manager was region-partitioned load with each secret in the region its ARN names.
+- **SSM Parameter Store** — parameters (String/SecureString/StringList), history, and the rest of the SSM control plane.
+- **Secrets Manager** — secrets, versions, rotation settings, replicas.
 - **CloudWatch Logs** — log groups, streams, and log events.
 - **KMS** — keys, aliases, key policies, grants.
 - **DynamoDB** — tables, items, indexes, streams metadata.
@@ -124,6 +124,8 @@ On load, such a snapshot is split once: every resource moves to the region its A
 - **EventBridge Pipes** - each pipe goes to the region of its ARN, and its tags and source checkpoints follow it.
 - **SNS** - topics, platform applications and data protection policies go to the region of their ARN; subscriptions, published messages and recorded email deliveries follow their topic. SMS settings, sandbox, origination and opted-out numbers stay in the server's region.
 - **CloudWatch Logs** - log groups (with their streams and events), destinations, deliveries, anomaly detectors, lookup tables and scheduled queries go to the region of their ARN; metric filters, queries, export tasks and syslog configurations follow their log group. Records with no ARN of their own (resource and account policies, query definitions, integrations, import tasks) stay in the server's region.
+- **SSM** - each parameter goes to the region of its parameter ARN, with the resource policies and policy events that name it; OpsMetadata and cloud connectors go to the region of their ARN. Records without an ARN (documents, maintenance windows, patch baselines, associations, OpsItems, inventory, managed instances, sessions, ...) stay in the server's `--region`, where every earlier request put them. The single registered default patch baseline becomes the default for its baseline's operating system. A region created by the split gets the AWS-owned `/aws/service/...` public parameters like any other region.
+- **Secrets Manager** - each secret goes to the region of its secret ARN.
 
 ## S3 object body handling
 

@@ -3036,7 +3036,9 @@ pub(crate) mod tests {
             dynamodb: shared::<fakecloud_core::multi_account::RegionalState<DynamoDbState>>(),
             logs: shared::<fakecloud_core::multi_account::RegionalState<LogsState>>(),
             lambda: shared::<LambdaState>(),
-            secretsmanager: shared::<fakecloud_core::multi_account::RegionalState<SecretsManagerState>>(),
+            secretsmanager: shared::<
+                fakecloud_core::multi_account::RegionalState<SecretsManagerState>,
+            >(),
             kinesis: shared::<KinesisState>(),
             kms: shared::<KmsState>(),
             ecr: shared::<EcrState>(),
