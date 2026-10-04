@@ -1132,7 +1132,7 @@ impl ResourceProvisioner {
             }
         };
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if !state.functions.contains_key(&function_name) {
             return Err(format!(
                 "ResourceNotFoundException: Function not found: {function_name}"
@@ -1176,7 +1176,7 @@ impl ResourceProvisioner {
         physical_id: &str,
     ) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.event_invoke_configs.remove(physical_id);
         Ok(())
     }
