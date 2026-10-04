@@ -46,10 +46,10 @@ impl ResourcePolicyProvider for LambdaResourcePolicyProvider {
             return None;
         }
         let function_name = parse_function_name(resource_arn)?;
-        // Extract account ID from ARN: arn:aws:lambda:REGION:ACCOUNT:function:NAME
-        let account_id = resource_arn.split(':').nth(4).unwrap_or("").to_string();
+        // The function lives in the account and region its ARN names:
+        // arn:aws:lambda:REGION:ACCOUNT:function:NAME
         let accounts = self.state.read();
-        let state = accounts.get(&account_id)?;
+        let state = accounts.by_arn(resource_arn)?;
         state
             .functions
             .get(function_name)
@@ -151,9 +151,9 @@ mod tests {
     }
 
     fn state_with(func: LambdaFunction) -> SharedLambdaState {
-        let mut mas: fakecloud_core::multi_account::MultiAccountState<LambdaState> =
+        let mut mas: fakecloud_core::multi_account::MultiRegionState<LambdaState> =
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", "");
-        mas.get_or_create("123456789012")
+        mas.regional_mut("123456789012", "us-east-1")
             .functions
             .insert(func.function_name.clone(), func);
         Arc::new(RwLock::new(mas))

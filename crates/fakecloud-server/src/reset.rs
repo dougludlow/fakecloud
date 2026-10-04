@@ -441,7 +441,8 @@ impl ResetState {
             "lambda" => {
                 let mut mas = self.lambda.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    // Every region of the account.
+                    state.clear();
                 }
             }
             "secretsmanager" => {
@@ -675,7 +676,7 @@ impl ResetState {
         }
         self.ssm.write().reset();
         self.dynamodb.write().reset();
-        self.lambda.write().default_mut().reset();
+        self.lambda.write().default_mut().clear();
         // Stop all Lambda containers on reset
         if let Some(ref rt) = self.container_runtime {
             let rt = rt.clone();

@@ -874,7 +874,10 @@ mod tests {
             .unwrap();
 
         let accounts = lambda_state.read();
-        let invocations = &accounts.default_ref().invocations;
+        let invocations = &accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .invocations;
         assert_eq!(invocations.len(), 1);
         assert_eq!(invocations[0].function_arn, fn_arn);
         assert_eq!(invocations[0].source, "aws:events");
@@ -897,7 +900,9 @@ mod tests {
         let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
-        lambda_state.write().get_or_create("999988887777");
+        lambda_state
+            .write()
+            .regional_mut("999988887777", "us-east-1");
         let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
             .with_target_wiring(EventTargetWiring {
                 lambda_state: Some(lambda_state.clone()),
@@ -909,8 +914,10 @@ mod tests {
             .unwrap();
 
         let accounts = lambda_state.read();
-        assert!(accounts.default_ref().invocations.is_empty());
-        let target = accounts.get("999988887777").expect("target account");
+        assert!(accounts.regional("123456789012", "us-east-1").is_none());
+        let target = accounts
+            .regional("999988887777", "us-east-1")
+            .expect("target account");
         assert_eq!(target.invocations.len(), 1);
         assert_eq!(target.invocations[0].function_arn, fn_arn);
     }
@@ -937,7 +944,14 @@ mod tests {
 
         let accounts = lambda_state.read();
         assert!(accounts.get("555555555555").is_none());
-        assert_eq!(accounts.default_ref().invocations.len(), 1);
+        assert_eq!(
+            accounts
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .invocations
+                .len(),
+            1
+        );
     }
 
     /// Lambda backend double: records which function each launch was for and
@@ -1062,11 +1076,11 @@ mod tests {
         {
             let mut accounts = lambda_state.write();
             accounts
-                .default_mut()
+                .regional_mut("123456789012", "us-east-1")
                 .functions
                 .insert("my-fn".to_string(), lambda_function(default_fn_arn));
             accounts
-                .get_or_create("999988887777")
+                .regional_mut("999988887777", "us-east-1")
                 .functions
                 .insert("my-fn".to_string(), lambda_function(fn_arn));
         }

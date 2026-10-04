@@ -82,8 +82,8 @@ impl DynamoDbStreamsLambdaPoller {
         let mappings: Vec<DdbMapping> = {
             let lambda_accounts = self.lambda_state.read();
             lambda_accounts
-                .iter()
-                .flat_map(|(_, lambda)| {
+                .iter_regional()
+                .flat_map(|(_, _, lambda)| {
                     lambda
                         .event_source_mappings
                         .values()
@@ -300,9 +300,16 @@ impl DynamoDbStreamsLambdaPoller {
             }
 
             if self.lambda_delivery.is_none() {
-                let fn_account = function_arn.split(':').nth(4).unwrap_or("");
+                // Recorded in the account and region the function ARN names.
                 let mut lambda_accounts = self.lambda_state.write();
-                let lambda = lambda_accounts.get_or_create(fn_account);
+                let default_account = lambda_accounts.default_account_id().to_string();
+                let default_region = lambda_accounts.region().to_string();
+                let (fn_account, fn_region, _) = fakecloud_lambda::function_location(
+                    &function_arn,
+                    &default_account,
+                    &default_region,
+                );
+                let lambda = lambda_accounts.regional_mut(fn_account, fn_region);
                 lambda.invocations.push(LambdaInvocation {
                     function_arn: function_arn.clone(),
                     payload: payload.clone(),
@@ -438,10 +445,10 @@ mod tests {
     }
 
     fn lambda_state_with(account: &str, mapping: EventSourceMapping) -> SharedLambdaState {
-        let mut lambda: MultiAccountState<LambdaState> =
-            MultiAccountState::new(DEFAULT_ACCOUNT, REGION, ENDPOINT);
+        let mut lambda: MultiRegionState<LambdaState> =
+            MultiRegionState::new(DEFAULT_ACCOUNT, REGION, ENDPOINT);
         lambda
-            .get_or_create(account)
+            .regional_mut(account, REGION)
             .event_source_mappings
             .insert(mapping.uuid.clone(), mapping);
         Arc::new(RwLock::new(lambda))
@@ -450,7 +457,7 @@ mod tests {
     fn invocation_count(lambda_state: &SharedLambdaState, account: &str) -> usize {
         lambda_state
             .read()
-            .get(account)
+            .regional(account, REGION)
             .map(|l| l.invocations.len())
             .unwrap_or(0)
     }

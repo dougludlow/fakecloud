@@ -103,8 +103,8 @@ impl KinesisLambdaPoller {
     fn collect_mappings(&self) -> Vec<Mapping> {
         let lambda_accounts = self.lambda_state.read();
         lambda_accounts
-            .iter()
-            .flat_map(|(_, lambda)| {
+            .iter_regional()
+            .flat_map(|(_, _, lambda)| {
                 lambda
                     .event_source_mappings
                     .values()
@@ -316,9 +316,16 @@ impl KinesisLambdaPoller {
             self.persist().await;
 
             if !used_real_delivery {
-                let fn_account = mapping.function_arn.split(':').nth(4).unwrap_or("");
+                // Recorded in the account and region the function ARN names.
                 let mut lambda_accounts = self.lambda_state.write();
-                let lambda = lambda_accounts.get_or_create(fn_account);
+                let default_account = lambda_accounts.default_account_id().to_string();
+                let default_region = lambda_accounts.region().to_string();
+                let (fn_account, fn_region, _) = fakecloud_lambda::function_location(
+                    &mapping.function_arn,
+                    &default_account,
+                    &default_region,
+                );
+                let lambda = lambda_accounts.regional_mut(fn_account, fn_region);
                 lambda.invocations.push(LambdaInvocation {
                     function_arn: mapping.function_arn.clone(),
                     payload,
@@ -494,7 +501,7 @@ mod tests {
     /// function's own account and partition, not a fixed placeholder.
     #[test]
     fn invoke_identity_arn_is_the_function_execution_role() {
-        use fakecloud_core::multi_account::MultiAccountState;
+        use fakecloud_core::multi_account::{MultiAccountState, MultiRegionState};
         use fakecloud_lambda::{LambdaFunction, LambdaState};
         use parking_lot::RwLock;
 
@@ -504,10 +511,10 @@ mod tests {
         let fn_arn = format!("arn:aws-cn:lambda:{region}:{account}:function:orders");
         let stream_arn = format!("arn:aws-cn:kinesis:{region}:{account}:stream/orders");
 
-        let mut lambda: MultiAccountState<LambdaState> =
-            MultiAccountState::new(account, region, "http://localhost:4566");
+        let mut lambda: MultiRegionState<LambdaState> =
+            MultiRegionState::new(account, region, "http://localhost:4566");
         {
-            let l = lambda.default_mut();
+            let l = lambda.regional_mut(account, region);
             l.functions.insert(
                 "orders".to_string(),
                 LambdaFunction {

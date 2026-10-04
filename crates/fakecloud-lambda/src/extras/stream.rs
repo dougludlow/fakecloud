@@ -30,8 +30,8 @@ impl LambdaService {
 
         let resolved_version: Option<String> = {
             let accounts = self.state.read();
-            let empty = LambdaState::new(account_id, "");
-            let state = accounts.get(account_id).unwrap_or(&empty);
+            let empty = LambdaState::new(account_id, &req.region);
+            let state = accounts.regional(account_id, &req.region).unwrap_or(&empty);
             crate::service::resolve_qualifier_to_version(state, function_name, qualifier)
         };
         let executed_version = resolved_version
@@ -40,8 +40,8 @@ impl LambdaService {
 
         let (func, layer_zips) = {
             let accounts = self.state.read();
-            let empty = LambdaState::new(account_id, "");
-            let state = accounts.get(account_id).unwrap_or(&empty);
+            let empty = LambdaState::new(account_id, &req.region);
+            let state = accounts.regional(account_id, &req.region).unwrap_or(&empty);
             let func = match resolved_version.as_deref() {
                 Some(v) => state
                     .function_version_snapshots
@@ -64,9 +64,9 @@ impl LambdaService {
             let mut zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
             for attached in &func.layers {
                 if let Some(b) =
-                    parse_layer_version_arn(&attached.arn).and_then(|(acct, name, ver)| {
+                    parse_layer_version_arn(&attached.arn).and_then(|(_acct, name, ver)| {
                         accounts
-                            .get(&acct)
+                            .by_arn(&attached.arn)
                             .and_then(|s| s.layers.get(&name))
                             .and_then(|l| l.versions.iter().find(|v| v.version == ver))
                             .and_then(|v| v.code_zip.clone())

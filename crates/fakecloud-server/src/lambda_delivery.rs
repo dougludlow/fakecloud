@@ -27,54 +27,26 @@ impl LambdaDelivery for LambdaDeliveryImpl {
         function_arn: &str,
         payload: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
-        // Extract function name from ARN: arn:aws:lambda:region:account:function:name[:qualifier]
-        let function_name = {
-            let parts: Vec<&str> = function_arn.split(':').collect();
-            if parts.len() >= 7 && parts[5] == "function" {
-                parts[6].to_string()
-            } else {
-                // Fallback: treat the whole thing as a function name
-                function_arn.to_string()
-            }
-        };
-
-        // Extract account ID from ARN, falling back to the default account
-        let account_id = {
-            let parts: Vec<&str> = function_arn.split(':').collect();
-            let parsed = if parts.len() >= 5 { parts[4] } else { "" };
-            if parsed.is_empty() {
-                self.lambda_state.read().default_account_id().to_string()
-            } else {
-                parsed.to_string()
-            }
-        };
-
-        let (func, layer_zips) = {
+        // The function lives in the account and region its ARN names; a bare
+        // name (no ARN) means the default account in the server's region.
+        let (account_id, region, function_name, resolved) = {
             let accounts = self.lambda_state.read();
-            match accounts
-                .get(&account_id)
-                .and_then(|state| state.functions.get(&function_name).cloned())
-            {
-                Some(func) => {
-                    let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
-                    for attached in &func.layers {
-                        if let Some(bytes) =
-                            fakecloud_lambda::extras::parse_layer_version_arn(&attached.arn)
-                                .and_then(|(acct, name, ver)| {
-                                    accounts
-                                        .get(&acct)
-                                        .and_then(|s| s.layers.get(&name))
-                                        .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                                        .and_then(|v| v.code_zip.clone())
-                                })
-                        {
-                            layer_zips.push(bytes);
-                        }
-                    }
-                    (Some(func), layer_zips)
-                }
-                None => (None, Vec::new()),
-            }
+            let (account, region, name) = fakecloud_lambda::function_location(
+                function_arn,
+                accounts.default_account_id(),
+                accounts.region(),
+            );
+            let resolved = fakecloud_lambda::resolve_invocable(&accounts, function_arn, account, region);
+            (
+                account.to_string(),
+                region.to_string(),
+                name.to_string(),
+                resolved,
+            )
+        };
+        let (func, layer_zips) = match resolved {
+            Some((func, zips)) => (Some(func), zips),
+            None => (None, Vec::new()),
         };
 
         let runtime = self.runtime.clone();
@@ -88,7 +60,7 @@ impl LambdaDelivery for LambdaDeliveryImpl {
             // Record invocation regardless of whether code exists
             {
                 let mut accounts = lambda_state.write();
-                let state = accounts.get_or_create(&account_id);
+                let state = accounts.regional_mut(&account_id, &region);
                 state.invocations.push(fakecloud_lambda::LambdaInvocation {
                     function_arn: function_arn.clone(),
                     payload: payload.clone(),

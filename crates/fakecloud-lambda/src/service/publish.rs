@@ -18,7 +18,7 @@ impl LambdaService {
         let description_override = body["Description"].as_str().map(String::from);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, &req.region);
         let func = state.functions.get(function_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,

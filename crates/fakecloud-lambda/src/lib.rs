@@ -15,3 +15,6 @@ pub use state::{
     LambdaSnapshot, LambdaState, Layer, LayerVersion, ProvisionedConcurrencyConfig,
     SharedLambdaState, LAMBDA_SNAPSHOT_SCHEMA_VERSION,
 };
+pub use state::{
+    attached_layer_zips, find_function, function_location, parse_lambda_snapshot, resolve_invocable,
+};

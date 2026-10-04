@@ -27,11 +27,11 @@ pub struct ArtifactRoutesContext {
 pub fn router(ctx: ArtifactRoutesContext) -> Router {
     Router::new()
         .route(
-            "/_fakecloud/lambda/_internal/code/{account_id}/{function_name}/{deploy}",
+            "/_fakecloud/lambda/_internal/code/{account_id}/{region}/{function_name}/{deploy}",
             get(serve_code),
         )
         .route(
-            "/_fakecloud/lambda/_internal/layers/{account_id}/{function_name}/{deploy}",
+            "/_fakecloud/lambda/_internal/layers/{account_id}/{region}/{function_name}/{deploy}",
             get(serve_layers),
         )
         .with_state(ctx)
@@ -70,7 +70,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn serve_code(
-    Path((account_id, function_name, _deploy)): Path<(String, String, String)>,
+    Path((account_id, region, function_name, _deploy)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     State(ctx): State<ArtifactRoutesContext>,
 ) -> impl IntoResponse {
@@ -80,7 +80,7 @@ async fn serve_code(
     let bytes = {
         let accounts = ctx.lambda_state.read();
         accounts
-            .get(&account_id)
+            .regional(&account_id, &region)
             .and_then(|s| s.functions.get(&function_name))
             .and_then(|f| f.code_zip.clone())
     };
@@ -100,7 +100,7 @@ async fn serve_code(
 }
 
 async fn serve_layers(
-    Path((account_id, function_name, deploy)): Path<(String, String, String)>,
+    Path((account_id, region, function_name, deploy)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     State(ctx): State<ArtifactRoutesContext>,
 ) -> impl IntoResponse {
@@ -117,7 +117,7 @@ async fn serve_layers(
     let layer_zips: Vec<Vec<u8>> = {
         let accounts = ctx.lambda_state.read();
         let func = match accounts
-            .get(&account_id)
+            .regional(&account_id, &region)
             .and_then(|s| s.functions.get(&function_name))
         {
             Some(f) => f.clone(),
@@ -127,9 +127,10 @@ async fn serve_layers(
         };
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
         for attached in &func.layers {
-            if let Some((acct, name, ver)) = parse_layer_version_arn(&attached.arn) {
+            // A layer version ARN names the account and region it lives in.
+            if let Some((_acct, name, ver)) = parse_layer_version_arn(&attached.arn) {
                 if let Some(bytes) = accounts
-                    .get(&acct)
+                    .by_arn(&attached.arn)
                     .and_then(|s| s.layers.get(&name))
                     .and_then(|l| l.versions.iter().find(|v| v.version == ver))
                     .and_then(|v| v.code_zip.clone())
@@ -181,14 +182,14 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::multi_account::MultiRegionState;
     use fakecloud_lambda::{LambdaFunction, LambdaState};
     use tower::ServiceExt; // for `.oneshot`
 
     fn mk_state(code: Option<Vec<u8>>) -> SharedLambdaState {
-        let mut mas: MultiAccountState<LambdaState> =
-            MultiAccountState::new("000000000000", "us-east-1", "");
-        let acct = mas.get_or_create("000000000000");
+        let mut mas: MultiRegionState<LambdaState> =
+            MultiRegionState::new("000000000000", "us-east-1", "");
+        let acct = mas.regional_mut("000000000000", "us-east-1");
         let mut f = LambdaFunction {
             function_name: "my-fn".into(),
             function_arn: "arn:aws:lambda:us-east-1:000000000000:function:my-fn".into(),
@@ -266,7 +267,7 @@ mod tests {
         let app = app(state, "tok");
         let (status, _) = get_with_auth(
             &app,
-            "/_fakecloud/lambda/_internal/code/000000000000/my-fn/d.zip",
+            "/_fakecloud/lambda/_internal/code/000000000000/us-east-1/my-fn/d.zip",
             None,
         )
         .await;
@@ -279,7 +280,7 @@ mod tests {
         let app = app(state, "tok");
         let (status, _) = get_with_auth(
             &app,
-            "/_fakecloud/lambda/_internal/code/000000000000/my-fn/d.zip",
+            "/_fakecloud/lambda/_internal/code/000000000000/us-east-1/my-fn/d.zip",
             Some("nope"),
         )
         .await;
@@ -292,7 +293,7 @@ mod tests {
         let app = app(state, "tok");
         let (status, body) = get_with_auth(
             &app,
-            "/_fakecloud/lambda/_internal/code/000000000000/my-fn/d.zip",
+            "/_fakecloud/lambda/_internal/code/000000000000/us-east-1/my-fn/d.zip",
             Some("tok"),
         )
         .await;
@@ -306,7 +307,7 @@ mod tests {
         let app = app(state, "tok");
         let (status, _) = get_with_auth(
             &app,
-            "/_fakecloud/lambda/_internal/code/000000000000/my-fn/d.zip",
+            "/_fakecloud/lambda/_internal/code/000000000000/us-east-1/my-fn/d.zip",
             Some("tok"),
         )
         .await;
@@ -319,7 +320,21 @@ mod tests {
         let app = app(state, "tok");
         let (status, _) = get_with_auth(
             &app,
-            "/_fakecloud/lambda/_internal/code/000000000000/missing/d.zip",
+            "/_fakecloud/lambda/_internal/code/000000000000/us-east-1/missing/d.zip",
+            Some("tok"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn code_endpoint_404_for_same_name_in_another_region() {
+        // Functions are regional: `my-fn` exists only in us-east-1.
+        let state = mk_state(Some(b"x".to_vec()));
+        let app = app(state, "tok");
+        let (status, _) = get_with_auth(
+            &app,
+            "/_fakecloud/lambda/_internal/code/000000000000/eu-west-1/my-fn/d.zip",
             Some("tok"),
         )
         .await;
@@ -332,7 +347,7 @@ mod tests {
         let app = app(state, "tok");
         let (status, body) = get_with_auth(
             &app,
-            "/_fakecloud/lambda/_internal/layers/000000000000/my-fn/d.tar",
+            "/_fakecloud/lambda/_internal/layers/000000000000/us-east-1/my-fn/d.tar",
             Some("tok"),
         )
         .await;

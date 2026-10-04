@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use fakecloud_core::multi_account::{
+    AccountState, MultiAccountState, MultiRegionState, RegionalState, SplitByRegion,
+};
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LambdaFunction {
     pub function_name: String,
@@ -563,24 +567,253 @@ impl LambdaState {
     }
 }
 
-pub type SharedLambdaState =
-    Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<LambdaState>>>;
+/// Lambda state partitioned by account and region: every function, layer,
+/// event source mapping, code signing config and account setting lives in
+/// exactly one (account, region), like on AWS.
+pub type SharedLambdaState = Arc<RwLock<MultiRegionState<LambdaState>>>;
 
-impl fakecloud_core::multi_account::AccountState for LambdaState {
+impl AccountState for LambdaState {
     fn new_for_account(account_id: &str, region: &str, _endpoint: &str) -> Self {
         Self::new(account_id, region)
     }
 }
 
-pub const LAMBDA_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+/// Where a function reference points: `(account, region, function name)`.
+/// A function ARN (`arn:<p>:lambda:REGION:ACCOUNT:function:NAME[:Q]`) names
+/// its own account and region; a partial ARN (`ACCOUNT:function:NAME`) its
+/// account; a bare name (optionally `NAME:QUALIFIER`) neither, so the
+/// caller's account and region apply. Cross-service callers (SNS, SQS
+/// pollers, EventBridge, Step Functions, API Gateway, ...) resolve every
+/// function through this so a target ARN reaches the region it names.
+pub fn function_location<'a>(
+    function_ref: &'a str,
+    default_account: &'a str,
+    default_region: &'a str,
+) -> (&'a str, &'a str, &'a str) {
+    if let Some(rest) = fakecloud_aws::arn::arn_resource(function_ref, "lambda") {
+        let parts: Vec<&str> = rest.splitn(5, ':').collect();
+        if parts.len() >= 4 && parts[2] == "function" && !parts[3].is_empty() {
+            let region = Some(parts[0])
+                .filter(|r| !r.is_empty())
+                .unwrap_or(default_region);
+            let account = Some(parts[1])
+                .filter(|a| !a.is_empty())
+                .unwrap_or(default_account);
+            return (account, region, parts[3]);
+        }
+        return (default_account, default_region, function_ref);
+    }
+    let parts: Vec<&str> = function_ref.splitn(4, ':').collect();
+    if parts.len() >= 3
+        && parts[1] == "function"
+        && !parts[0].is_empty()
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+        && !parts[2].is_empty()
+    {
+        return (parts[0], default_region, parts[2]);
+    }
+    let name = function_ref.split(':').next().unwrap_or(function_ref);
+    (default_account, default_region, name)
+}
+
+/// The `$LATEST` function a reference points at (see [`function_location`]).
+pub fn find_function<'a>(
+    accounts: &'a MultiRegionState<LambdaState>,
+    function_ref: &str,
+    default_account: &str,
+    default_region: &str,
+) -> Option<&'a LambdaFunction> {
+    let (account, region, name) = function_location(function_ref, default_account, default_region);
+    accounts.regional(account, region)?.functions.get(name)
+}
+
+/// The ZIP bytes of every layer attached to `func`, in attach order. Each
+/// layer version ARN names the account and region the layer lives in;
+/// unresolvable layers are skipped.
+pub fn attached_layer_zips(
+    accounts: &MultiRegionState<LambdaState>,
+    func: &LambdaFunction,
+) -> Vec<Vec<u8>> {
+    func.layers
+        .iter()
+        .filter_map(|attached| {
+            let (_, name, version) = crate::extras::parse_layer_version_arn(&attached.arn)?;
+            accounts
+                .by_arn(&attached.arn)?
+                .layers
+                .get(&name)?
+                .versions
+                .iter()
+                .find(|v| v.version == version)?
+                .code_zip
+                .clone()
+        })
+        .collect()
+}
+
+/// [`find_function`] plus its attached layers' ZIP bytes, cloned out of the
+/// state so the caller can drop the lock before invoking.
+pub fn resolve_invocable(
+    accounts: &MultiRegionState<LambdaState>,
+    function_ref: &str,
+    default_account: &str,
+    default_region: &str,
+) -> Option<(LambdaFunction, Vec<Vec<u8>>)> {
+    let func = find_function(accounts, function_ref, default_account, default_region)?.clone();
+    let layers = attached_layer_zips(accounts, &func);
+    Some((func, layers))
+}
+
+/// The region a Lambda ARN names, `None` for anything else.
+fn lambda_arn_region(arn: &str) -> Option<&str> {
+    fakecloud_aws::arn::arn_resource(arn, "lambda")?;
+    fakecloud_aws::arn::region_of(arn)
+}
+
+/// The function name a `{function}` or `{function}:{qualifier}` key names.
+fn key_function(key: &str) -> &str {
+    key.split(':').next().unwrap_or(key)
+}
+
+impl SplitByRegion for LambdaState {
+    /// Every function goes to the region its ARN names; the records keyed by
+    /// function (versions, aliases, URL configs, concurrency, event invoke /
+    /// runtime / scaling / recursion / code signing settings) follow their
+    /// function. Event source mappings follow their function ARN, layers,
+    /// code signing configs, capacity providers and durable executions their
+    /// own ARN, callbacks their execution. Anything naming no region (and the
+    /// account settings) lands in the server's default region.
+    fn split_by_region(self, into: &mut RegionalState<Self>) {
+        let default_region = into.default_region().to_string();
+        let mut function_regions: BTreeMap<String, String> = BTreeMap::new();
+        for (name, func) in self.functions {
+            let region = lambda_arn_region(&func.function_arn)
+                .unwrap_or(&default_region)
+                .to_string();
+            function_regions.insert(name.clone(), region.clone());
+            into.region_mut(&region).functions.insert(name, func);
+        }
+        let region_of_function = |key: &str| -> String {
+            function_regions
+                .get(key_function(key))
+                .cloned()
+                .unwrap_or_else(|| default_region.clone())
+        };
+        macro_rules! follow_function {
+            ($field:ident) => {
+                for (key, value) in self.$field {
+                    let region = region_of_function(&key);
+                    into.region_mut(&region).$field.insert(key, value);
+                }
+            };
+        }
+        follow_function!(aliases);
+        follow_function!(function_versions);
+        follow_function!(function_version_snapshots);
+        follow_function!(function_url_configs);
+        follow_function!(function_concurrency);
+        follow_function!(provisioned_concurrency);
+        follow_function!(function_code_signing);
+        follow_function!(event_invoke_configs);
+        follow_function!(runtime_management);
+        follow_function!(scaling_configs);
+        follow_function!(recursion_configs);
+
+        macro_rules! by_own_arn {
+            ($field:ident, $arn_field:ident) => {
+                for (key, value) in self.$field {
+                    let region = lambda_arn_region(&value.$arn_field)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| default_region.clone());
+                    into.region_mut(&region).$field.insert(key, value);
+                }
+            };
+        }
+        by_own_arn!(event_source_mappings, function_arn);
+        by_own_arn!(layers, layer_arn);
+        by_own_arn!(code_signing_configs, csc_arn);
+        by_own_arn!(capacity_providers, arn);
+
+        let mut execution_regions: BTreeMap<String, String> = BTreeMap::new();
+        for (arn, exec) in self.durable_executions {
+            let region = lambda_arn_region(&exec.arn)
+                .or_else(|| lambda_arn_region(&exec.function_arn))
+                .map(str::to_string)
+                .unwrap_or_else(|| default_region.clone());
+            execution_regions.insert(arn.clone(), region.clone());
+            into.region_mut(&region).durable_executions.insert(arn, exec);
+        }
+        for (id, callback) in self.durable_execution_callbacks {
+            let region = execution_regions
+                .get(&callback.execution_arn)
+                .cloned()
+                .or_else(|| lambda_arn_region(&callback.execution_arn).map(str::to_string))
+                .unwrap_or_else(|| default_region.clone());
+            into.region_mut(&region)
+                .durable_execution_callbacks
+                .insert(id, callback);
+        }
+        if let Some(settings) = self.account_settings {
+            into.region_mut(&default_region).account_settings = Some(settings);
+        }
+    }
+}
+
+/// v3: state partitioned by (account, region). v2 kept one account-wide
+/// state per account (every function in one map keyed by name); v1 a single
+/// account's state.
+pub const LAMBDA_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LambdaSnapshot {
     pub schema_version: u32,
     #[serde(default)]
-    pub accounts: Option<fakecloud_core::multi_account::MultiAccountState<LambdaState>>,
+    pub accounts: Option<MultiRegionState<LambdaState>>,
+    /// Only set when a v1 (single-account) snapshot is migrated: that one
+    /// account's state split by region, for the caller to merge into its own
+    /// container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RegionalState<LambdaState>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyLambdaSnapshot {
     #[serde(default)]
-    pub state: Option<LambdaState>,
+    accounts: Option<MultiAccountState<LambdaState>>,
+    #[serde(default)]
+    state: Option<LambdaState>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotVersion {
+    schema_version: u32,
+}
+
+/// Parse a persisted Lambda snapshot, migrating older schemas to the current
+/// one. A snapshot newer than this build comes back with its on-disk
+/// `schema_version` and no state, for the caller to refuse.
+pub fn parse_lambda_snapshot(bytes: &[u8]) -> Result<LambdaSnapshot, serde_json::Error> {
+    let SnapshotVersion { schema_version } = serde_json::from_slice(bytes)?;
+    if schema_version > LAMBDA_SNAPSHOT_SCHEMA_VERSION {
+        return Ok(LambdaSnapshot {
+            schema_version,
+            accounts: None,
+            state: None,
+        });
+    }
+    if schema_version == LAMBDA_SNAPSHOT_SCHEMA_VERSION {
+        return serde_json::from_slice(bytes);
+    }
+    let legacy: LegacyLambdaSnapshot = serde_json::from_slice(bytes)?;
+    Ok(LambdaSnapshot {
+        schema_version: LAMBDA_SNAPSHOT_SCHEMA_VERSION,
+        accounts: legacy.accounts.map(MultiAccountState::into_regional),
+        state: legacy.state.map(|state| {
+            let account_id = state.account_id.clone();
+            let region = state.region.clone();
+            RegionalState::from_legacy(&account_id, &region, "", state)
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -608,5 +841,164 @@ mod tests {
         });
         state.reset();
         assert!(state.invocations.is_empty());
+    }
+
+    fn function(name: &str, region: &str, account: &str) -> LambdaFunction {
+        LambdaFunction {
+            function_name: name.to_string(),
+            function_arn: function_arn(region, account, name),
+            ..Default::default()
+        }
+    }
+
+    /// A v2 snapshot kept every function of an account in one map, so a
+    /// function created in eu-west-1 sat next to the us-east-1 ones. Loading
+    /// it puts each resource in the region its ARN names, with the records
+    /// keyed by function following their function.
+    #[test]
+    fn v2_snapshot_is_split_by_region() {
+        let account = "111111111111";
+        let mut legacy = LambdaState::new(account, "us-east-1");
+        legacy
+            .functions
+            .insert("east".into(), function("east", "us-east-1", account));
+        legacy
+            .functions
+            .insert("west".into(), function("west", "eu-west-1", account));
+        legacy.aliases.insert(
+            "west:live".into(),
+            FunctionAlias {
+                alias_arn: qualified_function_arn("eu-west-1", account, "west", "live"),
+                name: "live".into(),
+                function_version: "1".into(),
+                description: String::new(),
+                revision_id: "r".into(),
+                routing_config: None,
+            },
+        );
+        legacy.function_concurrency.insert("west".into(), 5);
+        legacy.function_concurrency.insert("east".into(), 7);
+        legacy.event_source_mappings.insert(
+            "esm-west".into(),
+            EventSourceMapping {
+                uuid: "esm-west".into(),
+                function_arn: function_arn("eu-west-1", account, "west"),
+                event_source_arn: "arn:aws:sqs:eu-west-1:111111111111:q".into(),
+                batch_size: 10,
+                enabled: true,
+                state: "Enabled".into(),
+                last_modified: Utc::now(),
+                filter_patterns: Vec::new(),
+                maximum_batching_window_in_seconds: None,
+                starting_position: None,
+                starting_position_timestamp: None,
+                parallelization_factor: None,
+                function_response_types: Vec::new(),
+                kms_key_arn: None,
+                metrics_config: None,
+                destination_config: None,
+                maximum_retry_attempts: None,
+                maximum_record_age_in_seconds: None,
+                bisect_batch_on_function_error: None,
+                tumbling_window_in_seconds: None,
+                topics: Vec::new(),
+                queues: Vec::new(),
+                source_access_configurations: Vec::new(),
+                self_managed_event_source: None,
+                self_managed_kafka_event_source_config: None,
+                document_db_event_source_config: None,
+            },
+        );
+        legacy.layers.insert(
+            "west-layer".into(),
+            Layer::new("west-layer", layer_arn("eu-west-1", account, "west-layer")),
+        );
+        legacy.account_settings = Some(AccountSettings::default());
+
+        let mut accounts: MultiAccountState<LambdaState> =
+            MultiAccountState::new(account, "us-east-1", "");
+        *accounts.get_or_create(account) = legacy;
+        let v2 = serde_json::json!({
+            "schema_version": 2,
+            "accounts": accounts,
+        });
+
+        let parsed = parse_lambda_snapshot(&serde_json::to_vec(&v2).unwrap()).unwrap();
+        assert_eq!(parsed.schema_version, LAMBDA_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = parsed.accounts.expect("accounts");
+        let east = accounts.regional(account, "us-east-1").expect("us-east-1");
+        let west = accounts.regional(account, "eu-west-1").expect("eu-west-1");
+
+        assert!(east.functions.contains_key("east"));
+        assert!(!east.functions.contains_key("west"));
+        assert_eq!(east.function_concurrency.get("east"), Some(&7));
+        assert!(east.account_settings.is_some());
+
+        assert!(west.functions.contains_key("west"));
+        assert!(west.aliases.contains_key("west:live"));
+        assert_eq!(west.function_concurrency.get("west"), Some(&5));
+        assert!(west.event_source_mappings.contains_key("esm-west"));
+        assert!(west.layers.contains_key("west-layer"));
+        assert_eq!(west.region, "eu-west-1");
+        assert!(west.account_settings.is_none());
+
+        // The migrated container round-trips as the current schema.
+        let current = LambdaSnapshot {
+            schema_version: LAMBDA_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts),
+            state: None,
+        };
+        let reparsed = parse_lambda_snapshot(&serde_json::to_vec(&current).unwrap()).unwrap();
+        let accounts = reparsed.accounts.unwrap();
+        assert!(accounts
+            .regional(account, "eu-west-1")
+            .unwrap()
+            .functions
+            .contains_key("west"));
+    }
+
+    /// A v1 snapshot held one account's state; it is split by region too.
+    #[test]
+    fn v1_snapshot_is_split_by_region() {
+        let account = "222222222222";
+        let mut legacy = LambdaState::new(account, "us-east-1");
+        legacy
+            .functions
+            .insert("west".into(), function("west", "eu-west-1", account));
+        let v1 = serde_json::json!({"schema_version": 1, "state": legacy});
+        let parsed = parse_lambda_snapshot(&serde_json::to_vec(&v1).unwrap()).unwrap();
+        let state = parsed.state.expect("state");
+        assert_eq!(state.account_id(), account);
+        assert!(state
+            .region("eu-west-1")
+            .unwrap()
+            .functions
+            .contains_key("west"));
+        assert!(state.region("us-east-1").is_none());
+    }
+
+    #[test]
+    fn newer_snapshot_is_reported_without_state() {
+        let newer = serde_json::json!({"schema_version": LAMBDA_SNAPSHOT_SCHEMA_VERSION + 1});
+        let parsed = parse_lambda_snapshot(&serde_json::to_vec(&newer).unwrap()).unwrap();
+        assert_eq!(parsed.schema_version, LAMBDA_SNAPSHOT_SCHEMA_VERSION + 1);
+        assert!(parsed.accounts.is_none());
+    }
+
+    #[test]
+    fn function_location_reads_arn_account_and_region() {
+        let arn = "arn:aws:lambda:eu-west-1:111111111111:function:f:live";
+        assert_eq!(
+            function_location(arn, "000000000000", "us-east-1"),
+            ("111111111111", "eu-west-1", "f")
+        );
+        assert_eq!(
+            function_location("222222222222:function:f", "000000000000", "us-east-1"),
+            ("222222222222", "us-east-1", "f")
+        );
+        assert_eq!(
+            function_location("f:live", "000000000000", "us-east-1"),
+            ("000000000000", "us-east-1", "f")
+        );
     }
 }

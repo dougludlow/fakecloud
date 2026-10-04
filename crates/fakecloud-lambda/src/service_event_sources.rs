@@ -38,8 +38,23 @@ impl LambdaService {
             })?
             .to_string();
 
+        // An event source mapping invokes a function of its own region; a
+        // function ARN from another region is refused like on AWS.
+        if let Some(region) = crate::service::function_ref_scope(&function_name).1 {
+            if region != req.region {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterValueException",
+                    format!(
+                        "Functions from '{region}' are not reachable in this region ('{}')",
+                        req.region
+                    ),
+                ));
+            }
+        }
+
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Resolve function name to ARN
         let function_arn = if function_name.starts_with("arn:") {
@@ -258,7 +273,7 @@ impl LambdaService {
 
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, "");
-        let state = accounts.get(account_id).unwrap_or(&empty);
+        let state = accounts.regional(account_id, &req.region).unwrap_or(&empty);
         let mappings: Vec<crate::state::EventSourceMapping> = state
             .event_source_mappings
             .values()
@@ -294,11 +309,12 @@ impl LambdaService {
         &self,
         uuid: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = LambdaState::new(account_id, "");
-        let state = accounts.get(account_id).unwrap_or(&empty);
-        let mapping = state.event_source_mappings.get(uuid).ok_or_else(|| {
+        let mapping = accounts
+            .regional(account_id, region)
+            .and_then(|state| state.event_source_mappings.get(uuid)).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",
@@ -314,10 +330,13 @@ impl LambdaService {
         &self,
         uuid: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
-        let mapping = state.event_source_mappings.remove(uuid).ok_or_else(|| {
+        let mapping = accounts
+            .regional_get_mut(account_id, region)
+            .and_then(|state| state.event_source_mappings.remove(uuid))
+            .ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",

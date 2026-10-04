@@ -316,7 +316,8 @@ and accepts, or is created through `CreateAccount`. Naming an
 | `/_fakecloud/lambda/invocations` | GET | All recorded invocations (function, payload, response, duration). |
 | `/_fakecloud/lambda/warm-containers` | GET | Current warm execution environments. |
 | `/_fakecloud/lambda/{function_name}/evict-container` | POST | Force a cold start by evicting warm containers. |
-| `/_fakecloud/lambda/layer-content/{account_id}/{layer_name}/{file}` | GET | Serve a layer zip (used by the invoke runtime to mount `/opt`). |
+| `/_fakecloud/lambda/layer-content/{account_id}/{layer_name}/{file}` | GET | Serve a layer zip (used by the invoke runtime to mount `/opt`). Optional `?region=` names the layer's region (default: the server's region, then any region of the account). |
+| `/_fakecloud/lambda/function-code/{account_id}/{function_name}/{file}` | GET | Serve a function's deployment package (`latest.zip` or `<version>.zip`). Optional `?region=` as above. |
 
 ## Logs
 

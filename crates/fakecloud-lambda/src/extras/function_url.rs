@@ -64,7 +64,7 @@ impl LambdaService {
         }
         let now = Utc::now();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if !state.functions.contains_key(function_name) {
             return Err(not_found("Function", function_name));
         }
@@ -125,7 +125,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let account_id = req.account_id.as_str();
         let key = Self::function_url_key(function_name, req);
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         self.with_state_read(account_id, &region, |state| {
             state
                 .function_url_configs
@@ -142,7 +142,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = body(req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let key = Self::function_url_key(function_name, req);
         let cfg = state
             .function_url_configs
@@ -183,7 +183,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let key = Self::function_url_key(function_name, req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // A URL config that was never created is a not-found, the same way
         // AWS answers it.
         if state.function_url_configs.remove(&key).is_none() {
@@ -196,8 +196,9 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             // The operation is scoped to one function; listing every config in
             // the account leaks another function's URL to the caller.

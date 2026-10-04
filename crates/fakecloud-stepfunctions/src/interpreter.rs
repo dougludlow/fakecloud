@@ -1240,6 +1240,34 @@ fn apply_item_batcher(items: &[Value], batcher: &Value, _effective_input: &Value
         .collect()
 }
 
+/// The full function ARN a `lambda:invoke` task's `FunctionName` refers to.
+/// A full ARN is used as is; a partial ARN (`ACCOUNT:function:NAME[:Q]`) or a
+/// bare name (`NAME[:Q]`) names a function in the execution's region, and a
+/// bare name also in the execution's account, the way Lambda resolves it for
+/// the state machine's role.
+fn qualify_lambda_function_ref(function_ref: &str, execution_arn: &str) -> String {
+    if function_ref.starts_with("arn:") {
+        return function_ref.to_string();
+    }
+    let (Some(region), Some(exec_account)) = (
+        fakecloud_aws::arn::region_of(execution_arn),
+        fakecloud_aws::arn::account_of(execution_arn),
+    ) else {
+        return function_ref.to_string();
+    };
+    let parts: Vec<&str> = function_ref.splitn(3, ':').collect();
+    let (account, resource) = if parts.len() == 3
+        && parts[1] == "function"
+        && !parts[0].is_empty()
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+    {
+        (parts[0], format!("function:{}", parts[2]))
+    } else {
+        (exec_account, format!("function:{function_ref}"))
+    };
+    fakecloud_aws::arn::Arn::regional("lambda", region, account, &resource).to_string()
+}
+
 /// Invoke a resource (Lambda function or SDK integration).
 #[allow(clippy::too_many_arguments)]
 async fn invoke_resource(
@@ -1290,7 +1318,8 @@ async fn invoke_resource(
         // intentionally stays unwrapped — there real AWS returns the bare
         // payload. `SdkHttpMetadata`/`SdkResponseMetadata` are omitted; real
         // templates select `Payload`/`StatusCode`.
-        return invoke_lambda_direct(function_name, &payload, delivery, timeout_seconds)
+        let function_arn = qualify_lambda_function_ref(function_name, execution_arn);
+        return invoke_lambda_direct(&function_arn, &payload, delivery, timeout_seconds)
             .await
             .map(|payload| {
                 json!({

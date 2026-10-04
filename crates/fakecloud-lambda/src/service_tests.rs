@@ -179,15 +179,17 @@ async fn get_function_accepts_china_partition_arn() {
         "Code": {"ZipFile": ""},
     })
     .to_string();
-    let req = make_request(Method::POST, "/2015-03-31/functions", &create_body);
+    let mut req = make_request(Method::POST, "/2015-03-31/functions", &create_body);
+    req.region = "cn-north-1".to_string();
     svc.handle(req).await.expect("create function");
 
     // A China-partition ARN in the path must resolve the function.
-    let req = make_request(
+    let mut req = make_request(
         Method::GET,
         "/2015-03-31/functions/arn:aws-cn:lambda:cn-north-1:123456789012:function:MyFunc",
         "",
     );
+    req.region = "cn-north-1".to_string();
     let resp = svc.handle(req).await.expect("get function by aws-cn ARN");
     assert_eq!(resp.status, StatusCode::OK);
 }
@@ -1451,9 +1453,7 @@ async fn delete_function_unknown_errors() {
 async fn arns_derive_from_request_region_not_server_default() {
     // Regression for #2356. The server default region is us-east-1 (see
     // `make_state`), but a request signed for eu-central-1 must get
-    // eu-central-1 ARNs back. fakecloud's own lookups ignore the ARN region
-    // (see `normalize_function_name`), yet Terraform / cross-service IAM
-    // compare it, so a wrong-region ARN is a real break.
+    // eu-central-1 ARNs back (and the function lives in eu-central-1).
     let svc = LambdaService::new(make_state());
 
     // Build a request scoped to eu-central-1 (SigV4 credential-scope region).
@@ -1534,7 +1534,7 @@ async fn arns_derive_from_request_region_not_server_default() {
 async fn get_event_source_mapping_unknown_errors() {
     let svc = LambdaService::new(make_state());
     assert!(svc
-        .get_event_source_mapping("ghost", "123456789012")
+        .get_event_source_mapping("ghost", "123456789012", "us-east-1")
         .is_err());
 }
 
@@ -1542,7 +1542,7 @@ async fn get_event_source_mapping_unknown_errors() {
 async fn delete_event_source_mapping_unknown_errors() {
     let svc = LambdaService::new(make_state());
     assert!(svc
-        .delete_event_source_mapping("ghost", "123456789012")
+        .delete_event_source_mapping("ghost", "123456789012", "us-east-1")
         .is_err());
 }
 
@@ -1550,7 +1550,7 @@ async fn delete_event_source_mapping_unknown_errors() {
 async fn list_functions_empty_ok() {
     let svc = LambdaService::new(make_state());
     let resp = svc
-        .list_functions("123456789012", None, None, None)
+        .list_functions("123456789012", "us-east-1", None, None, None)
         .unwrap();
     assert_eq!(resp.status, http::StatusCode::OK);
 }
@@ -1580,7 +1580,7 @@ async fn list_functions_paginates_by_marker_and_max_items() {
 
     // First page of 2 -> fn-a, fn-b, with a NextMarker.
     let resp = svc
-        .list_functions("123456789012", None, None, Some(2))
+        .list_functions("123456789012", "us-east-1", None, None, Some(2))
         .unwrap();
     let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     let names: Vec<&str> = v["Functions"]
@@ -1595,7 +1595,7 @@ async fn list_functions_paginates_by_marker_and_max_items() {
 
     // Resume: next page of 2 -> fn-c, fn-d.
     let resp = svc
-        .list_functions("123456789012", None, Some(&marker), Some(2))
+        .list_functions("123456789012", "us-east-1", None, Some(&marker), Some(2))
         .unwrap();
     let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     let names: Vec<&str> = v["Functions"]
@@ -1609,7 +1609,7 @@ async fn list_functions_paginates_by_marker_and_max_items() {
     // Final page: fn-e, empty NextMarker.
     let marker2 = v["NextMarker"].as_str().unwrap().to_string();
     let resp = svc
-        .list_functions("123456789012", None, Some(&marker2), Some(2))
+        .list_functions("123456789012", "us-east-1", None, Some(&marker2), Some(2))
         .unwrap();
     let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     let names: Vec<&str> = v["Functions"]
@@ -1657,7 +1657,7 @@ async fn list_functions_all_versions_paginates_through_every_version_once() {
     // than hanging the test suite.
     for _ in 0..50 {
         let resp = svc
-            .list_functions("123456789012", Some("ALL"), marker.as_deref(), Some(1))
+            .list_functions("123456789012", "us-east-1", Some("ALL"), marker.as_deref(), Some(1))
             .unwrap();
         let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         let page = v["Functions"].as_array().unwrap();
@@ -1829,7 +1829,7 @@ async fn function_config_emits_state_reason_fields_when_populated() {
     // API path to set them. Confirm they round-trip into the response.
     {
         let mut accts = svc.state.write();
-        let acct = accts.get_or_create("123456789012");
+        let acct = accts.regional_mut("123456789012", "us-east-1");
         let f = acct.functions.get_mut("reason").unwrap();
         f.state_reason = Some("EFS access point unavailable".into());
         f.state_reason_code = Some("EFSMountFailure".into());
@@ -2723,7 +2723,7 @@ async fn tag_resource_writes_to_function_tags() {
 
     // Read func.tags directly to confirm it landed there.
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     let func = state.functions.get("tag-fn").unwrap();
     assert_eq!(func.tags.get("env").map(String::as_str), Some("prod"));
     assert_eq!(func.tags.get("team").map(String::as_str), Some("core"));
@@ -2773,7 +2773,7 @@ async fn untag_resource_with_multiple_keys() {
     svc.handle(req).await.unwrap();
 
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     let func = state.functions.get("tag-fn").unwrap();
     assert!(!func.tags.contains_key("A"));
     assert!(!func.tags.contains_key("B"));
@@ -2798,7 +2798,7 @@ async fn tag_state_unified_no_duplicate_state_tags() {
     svc.handle(req).await.unwrap();
 
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     let func = state.functions.get("tag-fn").unwrap();
     assert_eq!(func.tags.get("only").map(String::as_str), Some("here"));
     // The fact that this compiles is the structural assertion: there
@@ -2834,7 +2834,7 @@ async fn untag_resource_accepts_json_body_fallback() {
     svc.handle(req).await.unwrap();
 
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     let func = state.functions.get("tag-fn").unwrap();
     assert!(!func.tags.contains_key("A"));
     assert!(!func.tags.contains_key("B"));
@@ -2870,7 +2870,7 @@ async fn untag_resource_query_wins_over_json_body() {
     svc.handle(req).await.unwrap();
 
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     let func = state.functions.get("tag-fn").unwrap();
     assert!(!func.tags.contains_key("A"));
     assert_eq!(func.tags.get("B").map(String::as_str), Some("2"));
@@ -2899,7 +2899,7 @@ async fn reserved_concurrency_returns_429_when_inflight_at_cap() {
     // Pretend a sibling invoke is already running.
     svc.inflight_invocations
         .write()
-        .insert("123456789012:rcfn".to_string(), 1);
+        .insert("123456789012:us-east-1:rcfn".to_string(), 1);
 
     let req = make_request(
         Method::POST,
@@ -2926,7 +2926,7 @@ async fn reserved_concurrency_returns_429_when_inflight_at_cap() {
     assert_eq!(
         svc.inflight_invocations
             .read()
-            .get("123456789012:rcfn")
+            .get("123456789012:us-east-1:rcfn")
             .copied(),
         Some(1)
     );
@@ -2950,7 +2950,7 @@ async fn reserved_concurrency_under_cap_does_not_throttle() {
 
     svc.inflight_invocations
         .write()
-        .insert("123456789012:rcfn2".to_string(), 1);
+        .insert("123456789012:us-east-1:rcfn2".to_string(), 1);
 
     let req = make_request(
         Method::POST,
@@ -2967,7 +2967,7 @@ async fn reserved_concurrency_under_cap_does_not_throttle() {
     assert_eq!(
         svc.inflight_invocations
             .read()
-            .get("123456789012:rcfn2")
+            .get("123456789012:us-east-1:rcfn2")
             .copied(),
         Some(1)
     );
@@ -2991,7 +2991,7 @@ async fn reserved_concurrency_decrements_on_error_path() {
     assert!(svc
         .inflight_invocations
         .read()
-        .get("123456789012:decfn")
+        .get("123456789012:us-east-1:decfn")
         .is_none());
 }
 
@@ -3014,7 +3014,7 @@ async fn resolve_qualifier_alias_no_routing_config_picks_primary() {
     svc.handle(req).await.unwrap();
 
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     for _ in 0..50 {
         assert_eq!(
             resolve_qualifier_to_version(state, "afn1", Some("PROD")),
@@ -3059,7 +3059,7 @@ async fn resolve_qualifier_alias_50_50_weights_split_within_band() {
     svc.handle(req).await.unwrap();
 
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     let mut v1 = 0;
     let mut v2 = 0;
     for _ in 0..200 {
@@ -3086,7 +3086,7 @@ async fn resolve_qualifier_numeric_returns_self() {
     let svc = LambdaService::new(make_state());
     seed_function(&svc, "qfn").await;
     let accounts = svc.state.read();
-    let state = accounts.get("123456789012").unwrap();
+    let state = accounts.regional("123456789012", "us-east-1").unwrap();
     assert_eq!(resolve_qualifier_to_version(state, "qfn", None), None);
     assert_eq!(
         resolve_qualifier_to_version(state, "qfn", Some("$LATEST")),
@@ -4757,4 +4757,318 @@ async fn create_function_accepts_newly_modeled_runtimes() {
         let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         assert_eq!(out["Runtime"], *rt);
     }
+}
+
+// ── Region scoping ──
+
+fn regional_request(method: Method, path: &str, body: &str, region: &str) -> AwsRequest {
+    let mut req = make_request(method, path, body);
+    req.region = region.to_string();
+    req
+}
+
+async fn create_in_region(svc: &LambdaService, name: &str, region: &str, description: &str) {
+    let body = json!({
+        "FunctionName": name,
+        "Runtime": "python3.12",
+        "Role": "arn:aws:iam::123456789012:role/r",
+        "Handler": "index.handler",
+        "Description": description,
+        "Code": {"ZipFile": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"zip")},
+    });
+    let req = regional_request(
+        Method::POST,
+        "/2015-03-31/functions",
+        &body.to_string(),
+        region,
+    );
+    svc.handle(req).await.expect("create function");
+}
+
+fn json_body(resp: &AwsResponse) -> Value {
+    serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn same_function_name_coexists_across_regions() {
+    let svc = LambdaService::new(make_state());
+    create_in_region(&svc, "dup", "us-east-1", "east").await;
+    // The same name in another region is a different function, not a conflict.
+    create_in_region(&svc, "dup", "eu-west-1", "west").await;
+
+    for (region, description) in [("us-east-1", "east"), ("eu-west-1", "west")] {
+        let resp = svc
+            .handle(regional_request(
+                Method::GET,
+                "/2015-03-31/functions/dup",
+                "",
+                region,
+            ))
+            .await
+            .unwrap();
+        let v = json_body(&resp);
+        assert_eq!(v["Configuration"]["Description"], description);
+        assert_eq!(
+            v["Configuration"]["FunctionArn"],
+            format!("arn:aws:lambda:{region}:123456789012:function:dup")
+        );
+        // The code download URL names the function's region.
+        assert!(v["Code"]["Location"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("latest.zip?region={region}")));
+
+        let resp = svc
+            .handle(regional_request(
+                Method::GET,
+                "/2015-03-31/functions",
+                "",
+                region,
+            ))
+            .await
+            .unwrap();
+        let functions = json_body(&resp)["Functions"].as_array().unwrap().clone();
+        assert_eq!(functions.len(), 1, "{region}: {functions:?}");
+        assert_eq!(functions[0]["Description"], description);
+    }
+
+    // A region nothing was created in lists nothing, and the read leaves no
+    // empty region state behind.
+    let resp = svc
+        .handle(regional_request(
+            Method::GET,
+            "/2015-03-31/functions",
+            "",
+            "ap-south-1",
+        ))
+        .await
+        .unwrap();
+    assert!(json_body(&resp)["Functions"].as_array().unwrap().is_empty());
+    let err = svc
+        .handle(regional_request(
+            Method::GET,
+            "/2015-03-31/functions/dup",
+            "",
+            "ap-south-1",
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "ResourceNotFoundException");
+    assert!(svc
+        .state
+        .read()
+        .regional("123456789012", "ap-south-1")
+        .is_none());
+
+    // Deleting one region's function leaves the other region's alone.
+    svc.handle(regional_request(
+        Method::DELETE,
+        "/2015-03-31/functions/dup",
+        "",
+        "eu-west-1",
+    ))
+    .await
+    .unwrap();
+    let accounts = svc.state.read();
+    assert!(accounts
+        .regional("123456789012", "us-east-1")
+        .unwrap()
+        .functions
+        .contains_key("dup"));
+    assert!(!accounts
+        .regional("123456789012", "eu-west-1")
+        .unwrap()
+        .functions
+        .contains_key("dup"));
+}
+
+#[tokio::test]
+async fn function_arn_from_another_region_is_unreachable() {
+    let svc = LambdaService::new(make_state());
+    create_in_region(&svc, "west-only", "eu-west-1", "").await;
+    let arn = "arn:aws:lambda:eu-west-1:123456789012:function:west-only";
+
+    // Same-region ARN resolves.
+    svc.handle(regional_request(
+        Method::GET,
+        &format!("/2015-03-31/functions/{arn}"),
+        "",
+        "eu-west-1",
+    ))
+    .await
+    .expect("same-region ARN");
+
+    // Another region's ARN is refused the way AWS refuses it, for function
+    // operations, invocations and tagging alike.
+    for (method, path) in [
+        (Method::GET, format!("/2015-03-31/functions/{arn}")),
+        (Method::POST, format!("/2015-03-31/functions/{arn}/invocations")),
+        (Method::GET, format!("/2017-03-31/tags/{arn}")),
+    ] {
+        let err = svc
+            .handle(regional_request(method, &path, "{}", "us-east-1"))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{path} should fail"));
+        assert_eq!(err.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(err.code(), "ResourceNotFoundException", "{path}");
+        assert_eq!(
+            err.message(),
+            "Functions from 'eu-west-1' are not reachable in this region ('us-east-1')",
+            "{path}"
+        );
+    }
+
+    // An event source mapping must target a function of its own region.
+    let body = json!({
+        "EventSourceArn": "arn:aws:sqs:us-east-1:123456789012:q",
+        "FunctionName": arn,
+    });
+    let err = svc
+        .handle(regional_request(
+            Method::POST,
+            "/2015-03-31/event-source-mappings",
+            &body.to_string(),
+            "us-east-1",
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterValueException");
+}
+
+#[tokio::test]
+async fn invoke_by_arn_reaches_the_arn_account() {
+    let svc = LambdaService::new(make_state());
+    // A function owned by another account.
+    let body = json!({
+        "FunctionName": "shared-fn",
+        "Runtime": "python3.12",
+        "Role": "arn:aws:iam::210987654321:role/r",
+        "Handler": "index.handler",
+        "Code": {"ZipFile": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"zip")},
+    });
+    let mut req = make_request(Method::POST, "/2015-03-31/functions", &body.to_string());
+    req.account_id = "210987654321".to_string();
+    svc.handle(req).await.unwrap();
+
+    let dry_run = |path: &str| {
+        let mut req = make_request(Method::POST, path, "{}");
+        req.headers.insert(
+            "x-amz-invocation-type",
+            http::HeaderValue::from_static("DryRun"),
+        );
+        req
+    };
+    // By full ARN the invocation reaches the owning account's function.
+    let resp = svc
+        .handle(dry_run(
+            "/2015-03-31/functions/arn:aws:lambda:us-east-1:210987654321:function:shared-fn/invocations",
+        ))
+        .await
+        .expect("invoke by ARN");
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    // And by partial ARN.
+    let resp = svc
+        .handle(dry_run(
+            "/2015-03-31/functions/210987654321:function:shared-fn/invocations",
+        ))
+        .await
+        .expect("invoke by partial ARN");
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    // A bare name is the caller's own (nonexistent) function.
+    let err = svc
+        .handle(dry_run("/2015-03-31/functions/shared-fn/invocations"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "ResourceNotFoundException");
+}
+
+#[tokio::test]
+async fn account_settings_and_layers_are_per_region() {
+    let svc = LambdaService::new(make_state());
+    create_in_region(&svc, "conc", "us-east-1", "").await;
+    svc.handle(regional_request(
+        Method::PUT,
+        "/2017-10-31/functions/conc/concurrency",
+        &json!({"ReservedConcurrentExecutions": 100}).to_string(),
+        "us-east-1",
+    ))
+    .await
+    .unwrap();
+    let settings = |region: &'static str| {
+        let svc = &svc;
+        async move {
+            let resp = svc
+                .handle(regional_request(
+                    Method::GET,
+                    "/2016-08-19/account-settings",
+                    "",
+                    region,
+                ))
+                .await
+                .unwrap();
+            json_body(&resp)
+        }
+    };
+    let east = settings("us-east-1").await;
+    assert_eq!(east["AccountLimit"]["UnreservedConcurrentExecutions"], 900);
+    assert_eq!(east["AccountUsage"]["FunctionCount"], 1);
+    let west = settings("eu-west-1").await;
+    assert_eq!(west["AccountLimit"]["UnreservedConcurrentExecutions"], 1000);
+    assert_eq!(west["AccountUsage"]["FunctionCount"], 0);
+
+    // The same layer name in two regions numbers its versions independently.
+    for region in ["us-east-1", "eu-west-1"] {
+        let resp = svc
+            .handle(regional_request(
+                Method::POST,
+                "/2018-10-31/layers/shared-layer/versions",
+                &json!({"Content": {"ZipFile": ""}}).to_string(),
+                region,
+            ))
+            .await
+            .unwrap();
+        let v = json_body(&resp);
+        assert_eq!(v["Version"], 1, "{region}");
+        assert_eq!(
+            v["LayerVersionArn"],
+            format!("arn:aws:lambda:{region}:123456789012:layer:shared-layer:1")
+        );
+    }
+}
+
+#[test]
+fn resource_policy_provider_reads_the_arn_region() {
+    use fakecloud_core::auth::ResourcePolicyProvider;
+    let state = make_state();
+    {
+        let mut accounts = state.write();
+        for (region, policy) in [("us-east-1", "east"), ("eu-west-1", "west")] {
+            accounts.regional_mut("123456789012", region).functions.insert(
+                "f".to_string(),
+                crate::state::LambdaFunction {
+                    function_name: "f".to_string(),
+                    function_arn: function_arn(region, "123456789012", "f"),
+                    policy: Some(policy.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    let provider = crate::resource_policy::LambdaResourcePolicyProvider::new(state);
+    for (region, policy) in [("us-east-1", "east"), ("eu-west-1", "west")] {
+        assert_eq!(
+            provider
+                .resource_policy("lambda", &function_arn(region, "123456789012", "f"))
+                .as_deref(),
+            Some(policy)
+        );
+    }
+    assert_eq!(
+        provider.resource_policy("lambda", &function_arn("ap-south-1", "123456789012", "f")),
+        None
+    );
 }

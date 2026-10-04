@@ -27,7 +27,7 @@ impl LambdaService {
             if q != "$LATEST" && !q.chars().all(|c| c.is_ascii_digit()) {
                 let accounts = self.state.read();
                 let empty = LambdaState::new(account_id, "");
-                let state = accounts.get(account_id).unwrap_or(&empty);
+                let state = accounts.regional(account_id, region).unwrap_or(&empty);
                 if !state.aliases.contains_key(&format!("{function_name}:{q}")) {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::NOT_FOUND,
@@ -53,7 +53,7 @@ impl LambdaService {
         let resolved_version: Option<String> = {
             let accounts = self.state.read();
             let empty = LambdaState::new(account_id, "");
-            let state = accounts.get(account_id).unwrap_or(&empty);
+            let state = accounts.regional(account_id, region).unwrap_or(&empty);
             resolve_qualifier_to_version(state, function_name, qualifier)
         };
         // Tracks the version actually executed — diverges from the
@@ -65,7 +65,7 @@ impl LambdaService {
         let (func, layer_zips) = {
             let accounts = self.state.read();
             let empty = LambdaState::new(account_id, "");
-            let state = accounts.get(account_id).unwrap_or(&empty);
+            let state = accounts.regional(account_id, region).unwrap_or(&empty);
             // Resolve numbered versions to the immutable snapshot stored
             // by PublishVersion so an alias pinned to v1 runs the v1 code
             // even after $LATEST is mutated. Falls back to $LATEST when
@@ -105,10 +105,12 @@ impl LambdaService {
             // ARNs and warn — invoke proceeds without that layer.
             let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
             for attached in &func.layers {
+                // A layer version ARN names the account and region the
+                // layer lives in.
                 let bytes = crate::extras::parse_layer_version_arn(&attached.arn).and_then(
-                    |(acct, name, ver)| {
+                    |(_acct, name, ver)| {
                         accounts
-                            .get(&acct)
+                            .by_arn(&attached.arn)
                             .and_then(|s| s.layers.get(&name))
                             .and_then(|l| l.versions.iter().find(|v| v.version == ver))
                             .and_then(|v| v.code_zip.clone())
@@ -130,12 +132,12 @@ impl LambdaService {
         // checks: AWS returns 429 even for functions without a code
         // package as long as the cap is already hit, since throttling
         // is request-rate, not deployment-state.
-        let concurrency_key = format!("{account_id}:{function_name}");
+        let concurrency_key = format!("{account_id}:{region}:{function_name}");
         let _concurrency_guard = {
             let cap = {
                 let accounts = self.state.read();
                 accounts
-                    .get(account_id)
+                    .regional(account_id, region)
                     .and_then(|s| s.function_concurrency.get(function_name).copied())
             };
             let mut map = self.inflight_invocations.write();
@@ -205,7 +207,7 @@ impl LambdaService {
                     let payload_vec = payload.to_vec();
                     let bus = self.delivery_bus.clone();
                     let destination_config =
-                        self.lookup_destination_config(&func, account_id, qualifier);
+                        self.lookup_destination_config(&func, account_id, region, qualifier);
                     let function_arn = func.function_arn.clone();
                     let layer_zips_async = layer_zips.clone();
                     let async_guard = _concurrency_guard;
@@ -354,17 +356,9 @@ impl LambdaService {
                     .into_iter()
                     .collect();
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let region = {
-                let accounts = self.state.read();
-                let empty = LambdaState::new(account_id, "");
-                accounts
-                    .get(account_id)
-                    .map(|s| s.region.clone())
-                    .unwrap_or_else(|| empty.region)
-            };
             bus.put_cloudwatch_metric(
                 account_id,
-                &region,
+                region,
                 "AWS/Lambda",
                 "Invocations",
                 1.0,
@@ -374,7 +368,7 @@ impl LambdaService {
             );
             bus.put_cloudwatch_metric(
                 account_id,
-                &region,
+                region,
                 "AWS/Lambda",
                 "Duration",
                 invoke_start.elapsed().as_millis() as f64,
@@ -385,7 +379,7 @@ impl LambdaService {
             if result.is_err() {
                 bus.put_cloudwatch_metric(
                     account_id,
-                    &region,
+                    region,
                     "AWS/Lambda",
                     "Errors",
                     1.0,
@@ -407,10 +401,11 @@ impl LambdaService {
         &self,
         func: &crate::state::LambdaFunction,
         account_id: &str,
+        region: &str,
         qualifier: Option<&str>,
     ) -> Option<serde_json::Value> {
         let accounts = self.state.read();
-        let state = accounts.get(account_id)?;
+        let state = accounts.regional(account_id, region)?;
         // EventInvokeConfig is keyed per-qualifier on AWS — alias/version
         // can carry its own DestinationConfig. Walk qualifier-specific
         // first, then fall back to $LATEST so unqualified invokes still

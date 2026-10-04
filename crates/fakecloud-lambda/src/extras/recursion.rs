@@ -29,7 +29,7 @@ impl LambdaService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .recursion_configs
             .insert(function_name.to_string(), mode.clone());
@@ -40,8 +40,9 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             let mode = state
                 .recursion_configs

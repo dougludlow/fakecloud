@@ -46,7 +46,7 @@ impl LambdaService {
         // Layer ARNs may live in sibling accounts.
         let layer_attachments =
             crate::extras::resolve_layer_attachments(&accounts, input.layer_arns.clone());
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         if state.functions.contains_key(&input.function_name) {
             return Err(AwsServiceError::aws_error(
@@ -67,10 +67,8 @@ impl LambdaService {
 
         // Build the FunctionArn from the request's SigV4 credential-scope
         // region (`req.region`), not the server default (`state.region`).
-        // A CreateFunction signed for eu-central-1 must advertise an
-        // eu-central-1 ARN; fakecloud's own lookups are region-insensitive
-        // (see `normalize_function_name`), so follow-up calls still resolve,
-        // but Terraform / cross-service IAM compare the ARN region.
+        // A CreateFunction signed for eu-central-1 creates the function in
+        // eu-central-1 and must advertise an eu-central-1 ARN.
         let function_arn = function_arn(&req.region, &state.account_id, &input.function_name);
         let now = Utc::now();
 
@@ -166,7 +164,7 @@ impl LambdaService {
         }
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, region);
-        let state = accounts.get(account_id).unwrap_or(&empty);
+        let state = accounts.regional(account_id, region).unwrap_or(&empty);
         let live = state.functions.get(function_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -230,6 +228,7 @@ impl LambdaService {
                 "Location": crate::extras::function_code_url(
                     req,
                     &state.account_id,
+                    region,
                     function_name,
                     &version_label,
                 ),
@@ -253,7 +252,7 @@ impl LambdaService {
         qualifier: Option<&str>,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         let account_id_owned = state.account_id.clone();
 
         // Qualifier=N targets a single immutable version snapshot; the
@@ -395,6 +394,7 @@ impl LambdaService {
     pub(crate) fn list_functions(
         &self,
         account_id: &str,
+        region: &str,
         function_version: Option<&str>,
         marker: Option<&str>,
         max_items: Option<usize>,
@@ -412,7 +412,7 @@ impl LambdaService {
         }
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, "");
-        let state = accounts.get(account_id).unwrap_or(&empty);
+        let state = accounts.regional(account_id, region).unwrap_or(&empty);
         let all_versions = function_version == Some("ALL");
         let mut functions: Vec<Value> = if all_versions {
             // FunctionVersion=ALL qualifies the $LATEST row's FunctionArn with

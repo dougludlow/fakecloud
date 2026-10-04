@@ -10,6 +10,7 @@ fakecloud implements **73 of 73** Lambda operations at 100% Smithy conformance. 
 
 - **Function CRUD** — create, update, delete, list, get
 - **Real code execution** — functions run in Docker containers with the official AWS Lambda runtime images
+- **Regional, like AWS**: functions, versions, aliases, function URL configs, concurrency settings (and the account concurrency limit), event source mappings, layers, code signing configs and account settings live in one region. The same function name can exist in several regions with different code and configuration, `ListFunctions` returns the request region's functions only, and a function ARN from another region is refused with `ResourceNotFoundException: Functions from '<region>' are not reachable in this region ('<region>')`. An `Invoke` by ARN or partial ARN reaches the account the ARN names; cross-service triggers (SNS, SQS/Kinesis/DynamoDB Streams pollers, EventBridge, Step Functions, API Gateway, S3, Cognito, CloudFormation) resolve the function in the region and account of its ARN
 - **31 runtimes** — Node.js (16/18/20/22/24/26), Python (3.8 through 3.15), Java (`java8.al2`, `java8.al2023`, 11, `java11.al2023`, 17, `java17.al2023`, 21, 25), Go (1.x), Ruby (3.2/3.3/3.4/4.0), .NET (8/10), `provided.al2`, `provided.al2023`. Node.js 26 and Python 3.15 run on AWS's `-preview` base images, the only ones published for them so far
 - **Event source mappings** — SQS, Kinesis, DynamoDB Streams polling loops with **`FilterCriteria`** (the same pattern matcher as EventBridge rules, with SQS JSON body decode and base64 Kinesis `data` decode), **`StartingPosition`** (`TRIM_HORIZON` / `LATEST` / `AT_TIMESTAMP` for Kinesis, `TRIM_HORIZON` / `LATEST` for DDB Streams), **`MaximumBatchingWindowInSeconds`** (SQS), and **`FunctionResponseTypes=[ReportBatchItemFailures]`** for SQS partial-batch failure semantics
 - **Layers** — create, publish, attach to functions; layer ZIP content is extracted into `/opt` of the runtime container at invoke time, so Python `import`, Node `require`, and `LD_LIBRARY_PATH` lookups resolve against attached layers exactly as on real AWS
@@ -34,7 +35,8 @@ REST. Path-based routing for invoke operations, JSON for control plane.
 - `GET /_fakecloud/lambda/invocations` — list all Lambda invocations with input/output/errors
 - `GET /_fakecloud/lambda/warm-containers` — list currently warm containers
 - `POST /_fakecloud/lambda/{function-name}/evict-container` — force a cold start on the next invoke
-- `GET /_fakecloud/lambda/layer-content/{account-id}/{layer-name}/{version}.zip` — download the raw layer ZIP. Returned as the `Content.Location` from `PublishLayerVersion` and `GetLayerVersion`, so AWS SDK / Terraform clients that re-download a layer get the actual bytes
+- `GET /_fakecloud/lambda/layer-content/{account-id}/{layer-name}/{version}.zip[?region=<region>]` — download the raw layer ZIP. Returned as the `Content.Location` from `PublishLayerVersion` and `GetLayerVersion` (with the layer's `region`), so AWS SDK / Terraform clients that re-download a layer get the actual bytes. Without `region` the server's `--region` is tried first, then the account's other regions
+- `GET /_fakecloud/lambda/function-code/{account-id}/{function-name}/{latest|<version>}.zip[?region=<region>]`: download a function's deployment package, returned as `Code.Location` from `GetFunction`; the same `region` rule applies
 
 ## Event source mapping example: FilterCriteria + partial batch failure
 

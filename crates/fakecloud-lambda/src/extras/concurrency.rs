@@ -23,7 +23,7 @@ impl LambdaService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // AWS returns ResourceNotFoundException for a config-put against a
         // function that doesn't exist; get_or_create only makes the account,
         // so guard explicitly or we'd store a ghost config the function never
@@ -41,8 +41,9 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             // No reserved concurrency configured -> AWS returns an empty body,
             // not `ReservedConcurrentExecutions: 0` (which means "throttle to
@@ -58,9 +59,10 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         // Unlike the sub-resource deletes above, this one clears a *setting* on
         // the function rather than deleting an object, and AWS succeeds whether
         // or not a reserved concurrency was ever set. The model declares
@@ -92,7 +94,7 @@ impl LambdaService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if !state.functions.contains_key(function_name) {
             return Err(not_found("Function", function_name));
         }
@@ -120,7 +122,7 @@ impl LambdaService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let qualifier = require_qualifier(req)?;
-        let region = self.region_for(&req.account_id);
+        let region = req.region.clone();
         self.with_state_read(&req.account_id, &region, |state| {
             state
                 .provisioned_concurrency
@@ -143,7 +145,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let qualifier = require_qualifier(req)?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // A config that was never put is a not-found, the same way AWS
         // answers it.
         if state
@@ -162,7 +164,7 @@ impl LambdaService {
         account_id: &str,
         region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let state_region = self.region_for(account_id);
+        let state_region = region.to_string();
         self.with_state_read(account_id, &state_region, |state| {
             let prefix = format!("{function_name}:");
             let configs: Vec<Value> = state
@@ -203,7 +205,7 @@ impl LambdaService {
             max_execution_environments: inner["MaxExecutionEnvironments"].as_i64(),
         };
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if !state.functions.contains_key(function_name) {
             return Err(not_found("Function", function_name));
         }
@@ -225,7 +227,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let qualifier = require_qualifier(req)?;
         let account_id = &req.account_id;
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         let key = Self::pc_key(function_name, &qualifier);
         self.with_state_read(account_id, &region, |state| {
             let cfg = state.scaling_configs.get(&key).cloned().unwrap_or_default();
