@@ -670,7 +670,7 @@ impl CloudFormationService {
                 .deps
                 .secretsmanager
                 .read()
-                .get(aid)
+                .regional(aid, region)
                 .map(|s| s.secret_key(&resource.physical_id).is_some())
                 .unwrap_or(false),
             _ => return None,
@@ -3029,14 +3029,14 @@ pub(crate) mod tests {
         CloudFormationDeps {
             sqs: shared::<fakecloud_core::multi_account::RegionalState<SqsState>>(),
             sns: shared::<fakecloud_core::multi_account::RegionalState<SnsState>>(),
-            ssm: shared::<SsmState>(),
+            ssm: shared::<fakecloud_core::multi_account::RegionalState<SsmState>>(),
             iam: shared::<IamState>(),
             s3: shared::<S3State>(),
             eventbridge: shared::<EventBridgeState>(),
             dynamodb: shared::<fakecloud_core::multi_account::RegionalState<DynamoDbState>>(),
             logs: shared::<fakecloud_core::multi_account::RegionalState<LogsState>>(),
             lambda: shared::<LambdaState>(),
-            secretsmanager: shared::<SecretsManagerState>(),
+            secretsmanager: shared::<fakecloud_core::multi_account::RegionalState<SecretsManagerState>>(),
             kinesis: shared::<KinesisState>(),
             kms: shared::<KmsState>(),
             ecr: shared::<EcrState>(),
