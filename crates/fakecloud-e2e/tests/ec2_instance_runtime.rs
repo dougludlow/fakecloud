@@ -232,3 +232,77 @@ async fn run_instances_boots_real_container_with_user_data() {
         "container should be removed after TerminateInstances"
     );
 }
+
+/// A reset right after RunInstances answers promptly even while the
+/// instance is still booting (pulling its image): the reset doesn't wait on
+/// the boot, the teardown follows once the boot lets go.
+#[tokio::test]
+async fn reset_right_after_run_instances_is_prompt() {
+    if !require_docker_or_skip("reset_right_after_run_instances_is_prompt") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+    // Docker's event log, from before the launch, is what proves the boot's
+    // container both appeared and went away: a create + remove can land
+    // between two `ps` polls.
+    let since = chrono::Utc::now().timestamp().to_string();
+    let instance_id = c
+        .run_instances()
+        .image_id("ami-12345678")
+        .min_count(1)
+        .max_count(1)
+        .send()
+        .await
+        .unwrap()
+        .instances()[0]
+        .instance_id()
+        .unwrap()
+        .to_string();
+    // The boot task takes the lifecycle lock at once and starts on the image.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .post(format!("{}/_reset", server.endpoint()))
+        .send()
+        .await
+        .expect("reset timed out while the instance was booting");
+    assert!(resp.status().is_success(), "reset: {}", resp.status());
+
+    // The boot finishes (its container is created) and the reset's deferred
+    // teardown removes it: require both, not just "no container right now",
+    // which also holds while the image is still pulling.
+    let mut actions = Vec::new();
+    for _ in 0..240 {
+        let until = chrono::Utc::now().timestamp().to_string();
+        let out = docker(&[
+            "events",
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--filter",
+            "type=container",
+            "--filter",
+            &format!("label=fakecloud-ec2={instance_id}"),
+            "--format",
+            "{{.Action}}",
+        ]);
+        actions = out.lines().map(str::to_string).collect();
+        if actions.iter().any(|a| a == "create") && actions.iter().any(|a| a == "destroy") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        actions.iter().any(|a| a == "create"),
+        "the booting instance never created its container: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| a == "destroy"),
+        "the reset instance's container was left behind: {actions:?}"
+    );
+    assert!(container_for(&instance_id).is_empty());
+}

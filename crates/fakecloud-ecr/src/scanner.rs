@@ -65,7 +65,9 @@ fn cli_available(cli: &str) -> bool {
 /// `None` if Trivy isn't installed or the scan fails (caller logs +
 /// falls back to synthetic).
 pub async fn scan_layers(image_digest: &str, layers: &[Layer]) -> Option<ImageScanFindings> {
-    let trivy = detect_trivy()?;
+    // `trivy --version` is a blocking process call: keep it off the async
+    // workers serving requests.
+    let trivy = tokio::task::spawn_blocking(detect_trivy).await.ok()??;
     let tmp = tempfile::tempdir().ok()?;
     let tar_path = tmp.path().join("image.tar");
     if let Err(err) = build_image_tar(&tar_path, layers).await {
