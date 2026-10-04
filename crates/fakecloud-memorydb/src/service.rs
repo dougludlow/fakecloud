@@ -14,12 +14,13 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_core::multi_account::AccountState;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_snapshot;
 use crate::state::{
-    Acl, Cluster, Endpoint, MemoryDbState, MultiRegionCluster, Node, ParameterGroup, ReservedNode,
+    Acl, Cluster, Endpoint, MemoryDbAccountsExt, MemoryDbState, MultiRegionCluster, Node, ParameterGroup, ReservedNode,
     Shard, SharedMemoryDbState, Snapshot, SubnetGroup, User, UserAuthentication,
 };
 
@@ -142,13 +143,6 @@ impl AwsService for MemoryDbService {
 
     async fn handle(&self, request: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let mutates = is_mutating(request.action.as_str());
-        // Account state is shared across regions; re-point the AWS-provided
-        // defaults' ARNs at the region this request names before any handler
-        // reads them (bug-hunt 2026-08-22 §0.4).
-        self.state
-            .write()
-            .get_or_create(&request.account_id)
-            .retarget_default_arns(&request.region, &request.account_id);
         let result = dispatch(self, &request);
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save().await;
@@ -589,7 +583,7 @@ impl MemoryDbService {
         let node_type = req_str(&b, "NodeType")?.to_string();
         let acl_name = req_str(&b, "ACLName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         if st.clusters.contains_key(&name) {
             return Err(fault(
                 "ClusterAlreadyExistsFault",
@@ -708,7 +702,7 @@ impl MemoryDbService {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         // Lazy transition creating -> available. This mutates under a write lock
         // on a Describe (non-persisted) path, but the transition is idempotent
         // and self-healing: after a restart the next Describe re-applies it, and
@@ -746,7 +740,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ClusterName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(c) = st.clusters.get_mut(&name) else {
             return Err(fault(
                 "ClusterNotFoundFault",
@@ -857,7 +851,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ClusterName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(mut c) = st.clusters.remove(&name) else {
             return Err(fault(
                 "ClusterNotFoundFault",
@@ -877,7 +871,8 @@ impl MemoryDbService {
         let b = parse(req)?;
         let names = str_list(&b, "ClusterNames");
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
+        let view = accounts.region_state(&req.account_id, &req.region);
+        let st = Some(&*view);
         let mut processed = Vec::new();
         let mut unprocessed = Vec::new();
         for n in &names {
@@ -901,7 +896,8 @@ impl MemoryDbService {
         // ShardName is required by the model and must name an existing shard.
         let shard_name = req_str(&b, "ShardName")?.to_string();
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
+        let view = accounts.region_state(&req.account_id, &req.region);
+        let st = Some(&*view);
         let Some(c) = st.and_then(|s| s.clusters.get(&name)) else {
             return Err(fault(
                 "ClusterNotFoundFault",
@@ -921,7 +917,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ACLName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         if st.acls.contains_key(&name) {
             return Err(fault(
                 "ACLAlreadyExistsFault",
@@ -956,10 +952,8 @@ impl MemoryDbService {
     fn describe_acls(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "ACLs": [] }));
-        };
+        let st = accounts.region_state(&req.account_id, &req.region);
+        let st = &*st;
         if let Some(name) = opt_str(&b, "ACLName") {
             let Some(a) = st.acls.get(&name) else {
                 return Err(fault("ACLNotFoundFault", &format!("ACL {name} not found.")));
@@ -975,7 +969,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ACLName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(a) = st.acls.get_mut(&name) else {
             return Err(fault("ACLNotFoundFault", &format!("ACL {name} not found.")));
         };
@@ -1015,7 +1009,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ACLName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(mut a) = st.acls.remove(&name) else {
             return Err(fault("ACLNotFoundFault", &format!("ACL {name} not found.")));
         };
@@ -1074,7 +1068,7 @@ impl MemoryDbService {
             ));
         }
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         if st.users.contains_key(&name) {
             return Err(fault(
                 "UserAlreadyExistsFault",
@@ -1109,10 +1103,8 @@ impl MemoryDbService {
     fn describe_users(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "Users": [] }));
-        };
+        let st = accounts.region_state(&req.account_id, &req.region);
+        let st = &*st;
         if let Some(name) = opt_str(&b, "UserName") {
             let Some(u) = st.users.get(&name) else {
                 return Err(fault(
@@ -1131,7 +1123,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "UserName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(u) = st.users.get_mut(&name) else {
             return Err(fault(
                 "UserNotFoundFault",
@@ -1158,7 +1150,7 @@ impl MemoryDbService {
         let name = req_str(&b, "UserName")?.to_string();
         validate_user_name(&name)?;
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(mut u) = st.users.remove(&name) else {
             return Err(fault(
                 "UserNotFoundFault",
@@ -1175,7 +1167,7 @@ impl MemoryDbService {
         let name = req_str(&b, "ParameterGroupName")?.to_string();
         let family = req_str(&b, "Family")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         if st.parameter_groups.contains_key(&name) {
             return Err(fault(
                 "ParameterGroupAlreadyExistsFault",
@@ -1201,10 +1193,8 @@ impl MemoryDbService {
     fn describe_parameter_groups(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "ParameterGroups": [] }));
-        };
+        let st = accounts.region_state(&req.account_id, &req.region);
+        let st = &*st;
         if let Some(name) = opt_str(&b, "ParameterGroupName") {
             let Some(p) = st.parameter_groups.get(&name) else {
                 return Err(fault(
@@ -1223,7 +1213,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ParameterGroupName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(p) = st.parameter_groups.get_mut(&name) else {
             return Err(fault(
                 "ParameterGroupNotFoundFault",
@@ -1248,7 +1238,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ParameterGroupName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(p) = st.parameter_groups.get_mut(&name) else {
             return Err(fault(
                 "ParameterGroupNotFoundFault",
@@ -1281,7 +1271,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ParameterGroupName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(p) = st.parameter_groups.remove(&name) else {
             return Err(fault(
                 "ParameterGroupNotFoundFault",
@@ -1296,7 +1286,8 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ParameterGroupName")?.to_string();
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
+        let view = accounts.region_state(&req.account_id, &req.region);
+        let st = Some(&*view);
         let Some(p) = st.and_then(|s| s.parameter_groups.get(&name)) else {
             return Err(fault(
                 "ParameterGroupNotFoundFault",
@@ -1323,7 +1314,7 @@ impl MemoryDbService {
         let subnet_ids = str_list(&b, "SubnetIds");
         let (vpc_id, zones) = self.place_subnets(req, &subnet_ids)?;
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         if st.subnet_groups.contains_key(&name) {
             return Err(fault(
                 "SubnetGroupAlreadyExistsFault",
@@ -1351,10 +1342,8 @@ impl MemoryDbService {
     fn describe_subnet_groups(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "SubnetGroups": [] }));
-        };
+        let st = accounts.region_state(&req.account_id, &req.region);
+        let st = &*st;
         if let Some(name) = opt_str(&b, "SubnetGroupName") {
             let Some(g) = st.subnet_groups.get(&name) else {
                 return Err(fault(
@@ -1379,7 +1368,7 @@ impl MemoryDbService {
             Some(self.place_subnets(req, &ids)?)
         };
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(g) = st.subnet_groups.get_mut(&name) else {
             return Err(fault(
                 "SubnetGroupNotFoundFault",
@@ -1415,7 +1404,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "SubnetGroupName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(g) = st.subnet_groups.remove(&name) else {
             return Err(fault(
                 "SubnetGroupNotFoundFault",
@@ -1436,7 +1425,7 @@ impl MemoryDbService {
             .as_ref()
             .and_then(|ec2| fakecloud_ec2::vpc_lookup::default_vpc_id(ec2, &req.account_id));
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         if st.snapshots.contains_key(&snap_name) {
             return Err(fault(
                 "SnapshotAlreadyExistsFault",
@@ -1485,7 +1474,7 @@ impl MemoryDbService {
         let source = req_str(&b, "SourceSnapshotName")?.to_string();
         let target = req_str(&b, "TargetSnapshotName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(src) = st.snapshots.get(&source).cloned() else {
             return Err(fault(
                 "SnapshotNotFoundFault",
@@ -1519,10 +1508,8 @@ impl MemoryDbService {
     fn describe_snapshots(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "Snapshots": [] }));
-        };
+        let st = accounts.region_state(&req.account_id, &req.region);
+        let st = &*st;
         // ShowDetail defaults to true; false omits ClusterConfiguration.
         let show_detail = b.get("ShowDetail").and_then(Value::as_bool).unwrap_or(true);
         if let Some(name) = opt_str(&b, "SnapshotName") {
@@ -1556,7 +1543,7 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "SnapshotName")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let Some(mut s) = st.snapshots.remove(&name) else {
             return Err(fault(
                 "SnapshotNotFoundFault",
@@ -1601,7 +1588,7 @@ impl MemoryDbService {
         };
         let tags = parse_tags(&b);
         if !tags.is_empty() {
-            st.tags.insert(mrc_arn, tags);
+            st.multi_region_cluster_tags.insert(mrc_arn, tags);
         }
         st.multi_region_clusters.insert(name, mrc.clone());
         ok(json!({ "MultiRegionCluster": mrc_json(&mrc) }))
@@ -1675,7 +1662,7 @@ impl MemoryDbService {
             ));
         };
         m.status = "deleting".to_string();
-        st.tags.remove(&m.arn);
+        st.multi_region_cluster_tags.remove(&m.arn);
         ok(json!({ "MultiRegionCluster": mrc_json(&m) }))
     }
 
@@ -1712,18 +1699,53 @@ impl MemoryDbService {
         ok(json!({ "MultiRegionParameters": [], "NextToken": Value::Null }))
     }
 
+    /// The tag map `resource_arn` addresses: an account-wide multi-region
+    /// cluster's, or a resource's in the request region. `None` when the ARN
+    /// names no known resource there.
+    fn tags_for_arn_mut<'a>(
+        accounts: &'a mut fakecloud_core::multi_account::MultiAccountState<
+            crate::state::MemoryDbAccount,
+        >,
+        req: &AwsRequest,
+        resource_arn: &str,
+    ) -> Option<&'a mut crate::state::TagMap> {
+        let account = accounts.get_or_create(&req.account_id);
+        if !resource_arn.is_empty()
+            && account
+                .multi_region_clusters
+                .values()
+                .any(|m| m.arn == resource_arn)
+        {
+            return Some(
+                account
+                    .multi_region_cluster_tags
+                    .entry(resource_arn.to_string())
+                    .or_default(),
+            );
+        }
+        // Check against a read-only view first so an unknown ARN creates no
+        // region state; a region not yet written still holds the defaults.
+        let known = match account.regions.region(&req.region) {
+            Some(st) => arn_exists(st, resource_arn),
+            None => arn_exists(
+                &MemoryDbState::new_for_account(&req.account_id, &req.region, ""),
+                resource_arn,
+            ),
+        };
+        if !known {
+            return None;
+        }
+        let st = account.regions.region_mut(&req.region);
+        Some(st.tags.entry(resource_arn.to_string()).or_default())
+    }
+
     fn tag_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let resource_arn = req_str(&b, "ResourceArn")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
-        if !arn_exists(st, &resource_arn) {
-            return Err(fault(
-                "InvalidARNFault",
-                &format!("{resource_arn} does not refer to a known resource."),
-            ));
-        }
-        let entry = st.tags.entry(resource_arn).or_default();
+        let Some(entry) = Self::tags_for_arn_mut(&mut accounts, req, &resource_arn) else {
+            return Err(invalid_arn(&resource_arn));
+        };
         for (k, v) in parse_tags(&b) {
             entry.insert(k, v);
         }
@@ -1735,15 +1757,10 @@ impl MemoryDbService {
         let b = parse(req)?;
         let resource_arn = req_str(&b, "ResourceArn")?.to_string();
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
-        if !arn_exists(st, &resource_arn) {
-            return Err(fault(
-                "InvalidARNFault",
-                &format!("{resource_arn} does not refer to a known resource."),
-            ));
-        }
+        let Some(entry) = Self::tags_for_arn_mut(&mut accounts, req, &resource_arn) else {
+            return Err(invalid_arn(&resource_arn));
+        };
         let keys = str_list(&b, "TagKeys");
-        let entry = st.tags.entry(resource_arn).or_default();
         for k in &keys {
             entry.remove(k);
         }
@@ -1755,15 +1772,24 @@ impl MemoryDbService {
         let b = parse(req)?;
         let resource_arn = req_str(&b, "ResourceArn")?.to_string();
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "TagList": [] }));
-        };
-        if !arn_exists(st, &resource_arn) {
-            return Err(fault(
-                "InvalidARNFault",
-                &format!("{resource_arn} does not refer to a known resource."),
-            ));
+        if let Some(account) = accounts.get(&req.account_id) {
+            if !resource_arn.is_empty()
+                && account
+                    .multi_region_clusters
+                    .values()
+                    .any(|m| m.arn == resource_arn)
+            {
+                let tags = account
+                    .multi_region_cluster_tags
+                    .get(&resource_arn)
+                    .cloned()
+                    .unwrap_or_default();
+                return ok(json!({ "TagList": tags_json(&tags) }));
+            }
+        }
+        let st = accounts.region_state(&req.account_id, &req.region);
+        if !arn_exists(&st, &resource_arn) {
+            return Err(invalid_arn(&resource_arn));
         }
         let tags = st.tags.get(&resource_arn).cloned().unwrap_or_default();
         ok(json!({ "TagList": tags_json(&tags) }))
@@ -1809,10 +1835,8 @@ impl MemoryDbService {
     fn describe_reserved_nodes(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let accounts = self.state.read();
-        let st = accounts.get(&req.account_id);
-        let Some(st) = st else {
-            return ok(json!({ "ReservedNodes": [] }));
-        };
+        let st = accounts.region_state(&req.account_id, &req.region);
+        let st = &*st;
         let items: Vec<Value> = st.reserved_nodes.values().map(reserved_node_json).collect();
         let (page, next) = paginate(items, &b, 100);
         ok(json!({ "ReservedNodes": page, "NextToken": next }))
@@ -1843,7 +1867,7 @@ impl MemoryDbService {
             .unwrap_or_else(|| format!("ri-{}", uuid::Uuid::new_v4().simple()));
         let count = int_field(&b, "NodeCount", 1, 1, i32::MAX as i64)?;
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&req.account_id);
+        let st = accounts.region_state_mut(&req.account_id, &req.region);
         let node_arn = arn(
             "reservednode",
             &req.region,
@@ -1873,10 +1897,10 @@ impl MemoryDbService {
         let b = parse(req)?;
         let name = req_str(&b, "ClusterName")?.to_string();
         let accounts = self.state.read();
-        if accounts
-            .get(&req.account_id)
-            .and_then(|s| s.clusters.get(&name))
-            .is_none()
+        if !accounts
+            .region_state(&req.account_id, &req.region)
+            .clusters
+            .contains_key(&name)
         {
             return Err(fault(
                 "ClusterNotFoundFault",
@@ -1907,6 +1931,15 @@ fn validate_user_name(name: &str) -> Result<(), AwsServiceError> {
 }
 
 /// Whether a given ARN refers to any resource in this account's state.
+fn invalid_arn(resource_arn: &str) -> AwsServiceError {
+    fault(
+        "InvalidARNFault",
+        &format!("{resource_arn} does not refer to a known resource."),
+    )
+}
+
+/// Whether `resource_arn` names a regional resource in `st` (one region of
+/// one account). Multi-region clusters are checked separately, account-wide.
 fn arn_exists(st: &MemoryDbState, resource_arn: &str) -> bool {
     // An empty ARN never refers to a resource (guards against matching a
     // resource that happens to carry an empty ARN string).
@@ -1919,10 +1952,6 @@ fn arn_exists(st: &MemoryDbState, resource_arn: &str) -> bool {
         || st.parameter_groups.values().any(|p| p.arn == resource_arn)
         || st.subnet_groups.values().any(|g| g.arn == resource_arn)
         || st.snapshots.values().any(|s| s.arn == resource_arn)
-        || st
-            .multi_region_clusters
-            .values()
-            .any(|m| m.arn == resource_arn)
         || st.reserved_nodes.values().any(|r| r.arn == resource_arn)
 }
 
@@ -2227,24 +2256,105 @@ mod tests {
         assert_eq!(tags["TagList"][0]["Key"], "k");
     }
 
-    #[tokio::test]
-    async fn retargeting_defaults_leaves_created_resources_alone() {
+    fn call_in(
+        s: &MemoryDbService,
+        region: &str,
+        action: &str,
+        body: Value,
+    ) -> Result<Value, AwsServiceError> {
+        let mut r = req(action, body);
+        r.region = region.to_string();
+        let resp = dispatch(s, &r)?;
+        Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+    }
+
+    #[test]
+    fn resources_are_scoped_to_the_request_region() {
         let s = service();
         call(
             &s,
             "CreateUser",
-            json!({"UserName": "app", "AccessString": "on ~* +@all", "AuthenticationMode": {"Type": "password", "Passwords": ["averylongpassword123"]}}),
+            json!({"UserName": "app", "AccessString": "on ~* +@all", "AuthenticationMode": {"Type": "iam"}}),
         )
         .unwrap();
-        let mut r = req("DescribeUsers", json!({"UserName": "app"}));
-        r.region = "eu-west-1".to_string();
-        let resp = s.handle(r).await.unwrap();
-        let users: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-        // A user created in us-east-1 keeps its us-east-1 ARN.
+        // A user created in us-east-1 does not exist in eu-west-1.
+        let err = call_in(&s, "eu-west-1", "DescribeUsers", json!({"UserName": "app"})).unwrap_err();
+        assert_eq!(err.code(), "UserNotFoundFault");
+        let west_users = call_in(&s, "eu-west-1", "DescribeUsers", json!({})).unwrap();
+        let names: Vec<&str> = west_users["Users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["Name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["default"]);
+
+        // The same cluster name coexists in two regions with distinct ARNs.
+        for region in ["us-east-1", "eu-west-1"] {
+            call_in(
+                &s,
+                region,
+                "CreateCluster",
+                json!({"ClusterName": "app", "NodeType": "db.r6g.large", "ACLName": "open-access"}),
+            )
+            .unwrap();
+        }
+        let west = call_in(&s, "eu-west-1", "DescribeClusters", json!({})).unwrap();
+        assert_eq!(west["Clusters"].as_array().unwrap().len(), 1);
         assert_eq!(
-            users["Users"][0]["ARN"],
-            "arn:aws:memorydb:us-east-1:123456789012:user/app"
+            west["Clusters"][0]["ARN"],
+            "arn:aws:memorydb:eu-west-1:123456789012:cluster/app"
         );
+        call_in(&s, "eu-west-1", "DeleteCluster", json!({"ClusterName": "app"})).unwrap();
+        let east = call(&s, "DescribeClusters", json!({"ClusterName": "app"})).unwrap();
+        assert_eq!(east["Clusters"].as_array().unwrap().len(), 1);
+
+        // Another region's resource ARN is not taggable from here.
+        let east_arn = "arn:aws:memorydb:us-east-1:123456789012:user/app";
+        let err = call_in(
+            &s,
+            "eu-west-1",
+            "TagResource",
+            json!({"ResourceArn": east_arn, "Tags": [{"Key": "k", "Value": "v"}]}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "InvalidARNFault");
+    }
+
+    #[test]
+    fn multi_region_clusters_are_visible_from_every_region() {
+        let s = service();
+        let out = call(
+            &s,
+            "CreateMultiRegionCluster",
+            json!({"MultiRegionClusterNameSuffix": "global", "NodeType": "db.r7g.large",
+                   "Tags": [{"Key": "team", "Value": "a"}]}),
+        )
+        .unwrap();
+        let arn = out["MultiRegionCluster"]["ARN"].as_str().unwrap().to_string();
+        let west = call_in(&s, "eu-west-1", "DescribeMultiRegionClusters", json!({})).unwrap();
+        assert_eq!(west["MultiRegionClusters"].as_array().unwrap().len(), 1);
+        let tags = call_in(&s, "eu-west-1", "ListTags", json!({"ResourceArn": arn})).unwrap();
+        assert_eq!(tags["TagList"][0]["Key"], "team");
+    }
+
+    #[test]
+    fn reads_of_an_untouched_region_create_no_state() {
+        let s = service();
+        call_in(&s, "ap-south-1", "DescribeUsers", json!({})).unwrap();
+        let err = call_in(
+            &s,
+            "ap-south-1",
+            "TagResource",
+            json!({"ResourceArn": "arn:aws:memorydb:ap-south-1:123456789012:user/ghost",
+                   "Tags": [{"Key": "k", "Value": "v"}]}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "InvalidARNFault");
+        let accounts = s.state.read();
+        assert!(accounts
+            .get("123456789012")
+            .is_none_or(|a| a.regions.region("ap-south-1").is_none()));
     }
 
     #[test]
