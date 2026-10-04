@@ -48,7 +48,7 @@ fn sqs_update_refreshes_redrive_resets_dropped_properties_and_stamps_times() {
     );
     {
         let sqs = prov.sqs_state.read();
-        let queue = &sqs.get(ACCT).unwrap().queues[&q.physical_id];
+        let queue = &sqs.regional(ACCT, &prov.region).unwrap().queues[&q.physical_id];
         assert!(queue.attributes.contains_key("CreatedTimestamp"));
         assert!(queue.attributes.contains_key("LastModifiedTimestamp"));
         assert!(queue.redrive_policy.is_none());
@@ -63,7 +63,7 @@ fn sqs_update_refreshes_redrive_resets_dropped_properties_and_stamps_times() {
         }),
     );
     let sqs = prov.sqs_state.read();
-    let queue = &sqs.get(ACCT).unwrap().queues[&q.physical_id];
+    let queue = &sqs.regional(ACCT, &prov.region).unwrap().queues[&q.physical_id];
     // The typed policy DLQ routing reads is set, not just the attribute.
     let rp = queue.redrive_policy.as_ref().expect("typed redrive policy");
     assert_eq!(rp.dead_letter_target_arn, dlq_arn);
@@ -94,7 +94,7 @@ fn sqs_update_keeps_the_policy_a_queue_policy_resource_owns() {
     );
     update(&prov, &q, json!({"QueueName": "pq"}));
     let sqs = prov.sqs_state.read();
-    let queue = &sqs.get(ACCT).unwrap().queues[&q.physical_id];
+    let queue = &sqs.regional(ACCT, &prov.region).unwrap().queues[&q.physical_id];
     assert!(
         queue
             .attributes
