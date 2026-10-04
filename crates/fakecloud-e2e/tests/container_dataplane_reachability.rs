@@ -697,13 +697,22 @@ async fn reset_right_after_run_instances_is_prompt() {
     )])
     .await;
     let ec2 = server.ec2_client().await;
-    ec2.run_instances()
+    // Docker's event log, from before the launch, proves the instance's
+    // container both appeared and went away (a create + remove can land
+    // between two `ps` polls).
+    let since = chrono::Utc::now().timestamp().to_string();
+    let instance_id = ec2
+        .run_instances()
         .image_id("ami-12345678")
         .min_count(1)
         .max_count(1)
         .send()
         .await
-        .expect("run_instances");
+        .expect("run_instances")
+        .instances()[0]
+        .instance_id()
+        .unwrap()
+        .to_string();
     // Give the background boot a moment to take the lifecycle lock.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let resp = reqwest::Client::builder()
@@ -715,4 +724,41 @@ async fn reset_right_after_run_instances_is_prompt() {
         .await
         .expect("reset timed out right after RunInstances");
     assert!(resp.status().is_success(), "reset: {}", resp.status());
+
+    // Require the container to have been created and then removed, not just
+    // "no container right now" (which also holds while the image pulls).
+    let mut actions: Vec<String> = Vec::new();
+    for _ in 0..240 {
+        let until = chrono::Utc::now().timestamp().to_string();
+        let out = docker(&[
+            "events",
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--filter",
+            "type=container",
+            "--filter",
+            &format!("label=fakecloud-ec2={instance_id}"),
+            "--format",
+            "{{.Action}}",
+        ]);
+        actions = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if actions.iter().any(|a| a == "create") && actions.iter().any(|a| a == "destroy") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        actions.iter().any(|a| a == "create"),
+        "the booting instance never created its container: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| a == "destroy"),
+        "the reset instance's container was left behind: {actions:?}"
+    );
+    assert!(container_for(&instance_id).is_empty());
 }
