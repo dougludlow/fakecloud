@@ -821,6 +821,7 @@ async fn dispatch_inner(
                         &detected,
                         &request_id,
                         remote_addr,
+                        resolved.as_ref(),
                     ) {
                         return denied;
                     }
@@ -830,74 +831,16 @@ async fn dispatch_inner(
                     let iam_actions = service.iam_actions_for(&aws_request);
                     if !iam_actions.is_empty() {
                         for iam_action in &iam_actions {
-                            let mut condition_context = build_condition_context(
+                            let mut condition_context = principal_condition_context(
                                 principal,
+                                resolved.as_ref(),
+                                service.as_ref(),
+                                &aws_request,
+                                iam_action,
+                                &detected,
                                 remote_addr,
-                                &aws_request.region,
-                                is_secure_transport(&aws_request.headers),
                             );
-                            // F3 keys riding on the resolved credential. STS
-                            // populates these at mint time so subsequent
-                            // requests under the credential can be evaluated
-                            // against `aws:MultiFactorAuthPresent`,
-                            // `aws:MultiFactorAuthAge`, `aws:TokenIssueTime`,
-                            // and `aws:FederatedProvider`. IAM user access
-                            // keys carry none of these, matching AWS.
-                            if let Some(rc) = resolved.as_ref() {
-                                condition_context.aws_mfa_present = Some(rc.mfa_present);
-                                condition_context.aws_token_issue_time = rc.token_issued_at;
-                                condition_context.aws_federated_provider =
-                                    rc.federated_provider.clone();
-                                // `aws:MultiFactorAuthAge` is "seconds since
-                                // MFA was asserted" — computed at evaluation
-                                // time from the token issue moment so the
-                                // value increases monotonically as the session
-                                // ages. Only set when the session was actually
-                                // minted with MFA; otherwise the key is
-                                // absent, matching AWS.
-                                if rc.mfa_present {
-                                    if let Some(issued) = rc.token_issued_at {
-                                        let age = chrono::Utc::now()
-                                            .signed_duration_since(issued)
-                                            .num_seconds()
-                                            .max(0);
-                                        condition_context.aws_mfa_age_seconds = Some(age);
-                                    }
-                                }
-                            }
-                            condition_context.service_keys =
-                                service.iam_condition_keys_for(&aws_request, iam_action);
-
-                            // ABAC: populate tag-based condition keys.
-                            // aws:ResourceTag/*. An `iam:PassRole` resource is
-                            // an IAM role, not one of this service's resources,
-                            // so the service has no tags (or resource policy)
-                            // for it.
                             let service_resource = !iam_action.is_pass_role();
-                            match service_resource
-                                .then(|| service.resource_tags_for(&iam_action.resource))
-                                .flatten()
-                            {
-                                Some(tags) => condition_context.resource_tags = Some(tags),
-                                None => tracing::debug!(
-                                    target: "fakecloud::iam::audit",
-                                    service = %detected.service,
-                                    resource = %iam_action.resource,
-                                    "service does not expose resource tags for ABAC; skipping aws:ResourceTag/* evaluation"
-                                ),
-                            }
-                            // aws:RequestTag/* + aws:TagKeys
-                            match service.request_tags_from(&aws_request, iam_action.action) {
-                                Some(tags) => condition_context.request_tags = Some(tags),
-                                None => tracing::debug!(
-                                    target: "fakecloud::iam::audit",
-                                    service = %detected.service,
-                                    action = %iam_action.action_string(),
-                                    "service does not expose request tags for ABAC; skipping aws:RequestTag/* / aws:TagKeys evaluation"
-                                ),
-                            }
-                            // aws:PrincipalTag/*
-                            condition_context.principal_tags = principal.tags.clone();
 
                             // Phase 2: fetch the resource-based policy (if
                             // any) attached to the target resource and
@@ -1892,6 +1835,90 @@ fn sha256_hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// The condition context for evaluating `iam_action` as `principal`: the
+/// principal's global keys, the session keys its credential carries (MFA,
+/// token issue time, federated provider), the service's own condition keys,
+/// and the resource / request / principal tags for ABAC. Callers add the
+/// keys that depend on the resource's owner (see [`add_global_request_keys`]).
+#[allow(clippy::too_many_arguments)]
+fn principal_condition_context(
+    principal: &Principal,
+    resolved: Option<&crate::auth::ResolvedCredential>,
+    service: &dyn crate::service::AwsService,
+    aws_request: &AwsRequest,
+    iam_action: &crate::auth::IamAction,
+    detected: &protocol::DetectedRequest,
+    remote_addr: Option<SocketAddr>,
+) -> ConditionContext {
+    let mut ctx = build_condition_context(
+        principal,
+        remote_addr,
+        &aws_request.region,
+        is_secure_transport(&aws_request.headers),
+    );
+    // F3 keys riding on the resolved credential. STS
+    // populates these at mint time so subsequent
+    // requests under the credential can be evaluated
+    // against `aws:MultiFactorAuthPresent`,
+    // `aws:MultiFactorAuthAge`, `aws:TokenIssueTime`,
+    // and `aws:FederatedProvider`. IAM user access
+    // keys carry none of these, matching AWS.
+    if let Some(rc) = resolved {
+        ctx.aws_mfa_present = Some(rc.mfa_present);
+        ctx.aws_token_issue_time = rc.token_issued_at;
+        ctx.aws_federated_provider = rc.federated_provider.clone();
+        // `aws:MultiFactorAuthAge` is "seconds since
+        // MFA was asserted" — computed at evaluation
+        // time from the token issue moment so the
+        // value increases monotonically as the session
+        // ages. Only set when the session was actually
+        // minted with MFA; otherwise the key is
+        // absent, matching AWS.
+        if rc.mfa_present {
+            if let Some(issued) = rc.token_issued_at {
+                let age = chrono::Utc::now()
+                    .signed_duration_since(issued)
+                    .num_seconds()
+                    .max(0);
+                ctx.aws_mfa_age_seconds = Some(age);
+            }
+        }
+    }
+    ctx.service_keys = service.iam_condition_keys_for(aws_request, iam_action);
+
+    // ABAC: populate tag-based condition keys.
+    // aws:ResourceTag/*. An `iam:PassRole` resource is
+    // an IAM role, not one of this service's resources,
+    // so the service has no tags (or resource policy)
+    // for it.
+    let service_resource = !iam_action.is_pass_role();
+    match service_resource
+        .then(|| service.resource_tags_for(&iam_action.resource))
+        .flatten()
+    {
+        Some(tags) => ctx.resource_tags = Some(tags),
+        None => tracing::debug!(
+            target: "fakecloud::iam::audit",
+            service = %detected.service,
+            resource = %iam_action.resource,
+            "service does not expose resource tags for ABAC; skipping aws:ResourceTag/* evaluation"
+        ),
+    }
+    // aws:RequestTag/* + aws:TagKeys
+    match service.request_tags_from(aws_request, iam_action.action) {
+        Some(tags) => ctx.request_tags = Some(tags),
+        None => tracing::debug!(
+            target: "fakecloud::iam::audit",
+            service = %detected.service,
+            action = %iam_action.action_string(),
+            "service does not expose request tags for ABAC; skipping aws:RequestTag/* / aws:TagKeys evaluation"
+        ),
+    }
+    // aws:PrincipalTag/*
+    ctx.principal_tags = principal.tags.clone();
+    ctx
+}
+
 /// Populate `aws:ResourceAccount` (the account owning the target resource)
 /// and, when the principal's account is in an organization,
 /// `aws:PrincipalOrgID` / `aws:PrincipalOrgPaths`. A value the service
@@ -2101,6 +2128,7 @@ fn authorize_root_cross_account(
     detected: &protocol::DetectedRequest,
     request_id: &str,
     remote_addr: Option<SocketAddr>,
+    resolved: Option<&crate::auth::ResolvedCredential>,
 ) -> Option<Response<Body>> {
     if service.iam_resource_in_caller_account(aws_request) {
         return None;
@@ -2114,13 +2142,21 @@ fn authorize_root_cross_account(
         if owner == principal.account_id {
             continue;
         }
-        let mut context = build_condition_context(
+        let mut context = principal_condition_context(
             principal,
+            resolved,
+            service,
+            aws_request,
+            &iam_action,
+            detected,
             remote_addr,
-            &aws_request.region,
-            is_secure_transport(&aws_request.headers),
         );
-        context.service_keys = service.iam_condition_keys_for(aws_request, &iam_action);
+        add_global_request_keys(
+            &mut context,
+            principal,
+            &owner,
+            config.scp_resolver.as_deref(),
+        );
         let resource_policy_json =
             provider.resource_policy(&detected.service, &iam_action.resource);
         let decision = evaluator.evaluate_resource_policy_only(
@@ -3472,7 +3508,7 @@ mod tests {
                 }
             }
         }
-        struct PolicyEvaluator;
+        struct PolicyEvaluator(parking_lot::Mutex<Vec<ConditionContext>>);
         impl IamPolicyEvaluator for PolicyEvaluator {
             fn evaluate(
                 &self,
@@ -3500,9 +3536,10 @@ mod tests {
                 &self,
                 _: &Principal,
                 _: &IamAction,
-                _: &ConditionContext,
+                context: &ConditionContext,
                 policy: Option<&str>,
             ) -> crate::auth::IamDecision {
+                self.0.lock().push(context.clone());
                 if policy == Some("granting-policy") {
                     crate::auth::IamDecision::Allow
                 } else {
@@ -3561,19 +3598,41 @@ mod tests {
             access_key_id: Some("AKIAROOTB".to_string()),
             principal: Some(root.clone()),
         };
+        struct Org;
+        impl crate::auth::ScpResolver for Org {
+            fn scps_for(&self, _: &Principal) -> Option<Vec<String>> {
+                None
+            }
+            fn principal_org(&self, account: &str) -> Option<(String, String)> {
+                (account == "222222222222").then(|| ("o-abc".to_string(), "o-abc/r-1/".to_string()))
+            }
+        }
+        let issued = chrono::Utc::now();
+        let credential = crate::auth::ResolvedCredential {
+            secret_access_key: "secret".to_string(),
+            session_token: Some("token".to_string()),
+            principal: root.clone(),
+            session_policies: Vec::new(),
+            mfa_present: true,
+            token_issued_at: Some(issued),
+            federated_provider: None,
+        };
+        let evaluator = PolicyEvaluator(parking_lot::Mutex::new(Vec::new()));
         let run = |bucket: &str, mode: IamMode| {
             let mut cfg = DispatchConfig::new("us-east-1", "111111111111");
             cfg.iam_mode = mode;
             cfg.resource_policy_provider = Some(Arc::new(OwnerProvider));
+            cfg.scp_resolver = Some(Arc::new(Org));
             authorize_root_cross_account(
                 &root,
                 &BucketService,
                 &request(bucket),
-                &PolicyEvaluator,
+                &evaluator,
                 &cfg,
                 &detected,
                 "req",
                 None,
+                Some(&credential),
             )
         };
         let denied = run("denied", IamMode::Strict).expect("no grant must deny under strict");
@@ -3582,6 +3641,26 @@ mod tests {
         assert!(run("own", IamMode::Strict).is_none());
         assert!(run("unclaimed", IamMode::Strict).is_none());
         assert!(run("denied", IamMode::Soft).is_none());
+
+        // The root path evaluates with the same condition context as any
+        // other principal: the owner's account, the principal's organization
+        // and the session keys its credential carries.
+        let contexts = evaluator.0.lock();
+        assert!(!contexts.is_empty());
+        for ctx in contexts.iter() {
+            assert_eq!(
+                ctx.lookup("aws:ResourceAccount"),
+                Some(vec!["111111111111".into()])
+            );
+            assert_eq!(ctx.lookup("aws:PrincipalOrgID"), Some(vec!["o-abc".into()]));
+            assert_eq!(
+                ctx.lookup("aws:PrincipalOrgPaths"),
+                Some(vec!["o-abc/r-1/".into()])
+            );
+            assert_eq!(ctx.aws_mfa_present, Some(true));
+            assert_eq!(ctx.aws_token_issue_time, Some(issued));
+            assert_eq!(ctx.aws_principal_type.as_deref(), Some("Account"));
+        }
     }
 }
 

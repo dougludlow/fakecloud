@@ -322,27 +322,17 @@ impl S3Service {
                 )
             })?;
 
-        // Split on '?' BEFORE percent-decoding so keys containing literal '?' are preserved
-        let raw_source = copy_source.strip_prefix('/').unwrap_or(copy_source);
-
-        // Parse versionId from ?versionId=X
-        let (raw_path, source_version_id) = if let Some(idx) = raw_source.find("?versionId=") {
-            let vid = raw_source[idx + 11..].to_string();
-            (&raw_source[..idx], Some(vid))
-        } else {
-            (raw_source, None)
-        };
-        let decoded_path = percent_encoding::percent_decode_str(raw_path)
-            .decode_utf8_lossy()
-            .to_string();
-
-        let (src_bucket, src_key) = decoded_path.split_once('/').ok_or_else(|| {
+        // Parsed by the same function the source authorization uses, so the
+        // object copied is exactly the object authorized.
+        let source = super::parse_copy_source(copy_source).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidArgument",
                 "Invalid copy source format",
             )
         })?;
+        let source_version_id = source.version_id.clone();
+        let (src_bucket, src_key) = (source.bucket.as_str(), source.key.as_str());
 
         let copy_range = req
             .headers

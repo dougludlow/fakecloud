@@ -8293,3 +8293,182 @@ fn copy_requests_also_need_read_on_the_source_object() {
     let plain = make_request(Method::PUT, "/mine/plain.txt", &[], b"x");
     assert_eq!(svc.iam_actions_for(&plain).len(), 1);
 }
+
+// ── Cross-account SSE-KMS and copy-source parsing ───────────────
+
+/// [`service_with_foreign_bucket`] with a KMS hook over fresh KMS state.
+fn kms_service_with_foreign_bucket(
+    mode: fakecloud_core::auth::IamMode,
+) -> (S3Service, fakecloud_kms::SharedKmsState) {
+    let kms: fakecloud_kms::SharedKmsState = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let hook = fakecloud_kms::hook::KmsServiceHook::new(kms.clone(), Default::default());
+    let svc = service_with_foreign_bucket()
+        .with_kms(kms.clone())
+        .with_kms_hook(Arc::new(hook))
+        .with_iam_mode(mode);
+    (svc, kms)
+}
+
+fn sse_kms_put(path: &str, key_id: Option<&str>) -> AwsRequest {
+    let mut req = make_request(Method::PUT, path, &[], b"secret body");
+    req.headers
+        .insert("x-amz-server-side-encryption", "aws:kms".parse().unwrap());
+    if let Some(key_id) = key_id {
+        req.headers.insert(
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            key_id.parse().unwrap(),
+        );
+    }
+    req
+}
+
+#[tokio::test]
+async fn cross_account_put_with_the_callers_key_arn_encrypts_under_that_key() {
+    let (svc, kms) = kms_service_with_foreign_bucket(fakecloud_core::auth::IamMode::Strict);
+    // The caller's own key, named by ARN on a write into the owner's bucket.
+    let caller_key = fakecloud_kms::hook::KmsServiceHook::new(kms.clone(), Default::default())
+        .resolve_key_arn("123456789012", "us-east-1", "aws/s3", "s3.amazonaws.com")
+        .unwrap();
+    svc.handle(sse_kms_put("/theirs/enc.txt", Some(&caller_key)))
+        .await
+        .expect("the caller's key ARN is usable on another account's bucket");
+    {
+        let mas = svc.state.read();
+        let obj = &mas.get(OTHER_ACCOUNT).unwrap().buckets["theirs"].objects["enc.txt"];
+        assert_eq!(obj.sse_kms_key_id.as_deref(), Some(caller_key.as_str()));
+    }
+    let resp = svc
+        .handle(make_request(Method::GET, "/theirs/enc.txt", &[], b""))
+        .await
+        .expect("the caller decrypts under its own key");
+    assert_eq!(resp.body.expect_bytes(), b"secret body");
+}
+
+#[tokio::test]
+async fn cross_account_put_with_a_bare_alias_uses_the_bucket_owners_key() {
+    // Strict: the owner's aws/s3 key trusts only the owner's account, so the
+    // other account's write under it is AccessDenied -- not a 500.
+    let (svc, _) = kms_service_with_foreign_bucket(fakecloud_core::auth::IamMode::Strict);
+    let err = assert_aws_err(
+        svc.handle(sse_kms_put("/theirs/enc.txt", Some("alias/aws/s3")))
+            .await,
+        "AccessDenied",
+    );
+    assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+    // IAM off: the alias resolves -- and encrypts -- in the owner's account.
+    let (svc, kms) = kms_service_with_foreign_bucket(fakecloud_core::auth::IamMode::Off);
+    svc.handle(sse_kms_put("/theirs/enc.txt", Some("alias/aws/s3")))
+        .await
+        .expect("the owner's aws/s3 key encrypts the write");
+    let stored = {
+        let mas = svc.state.read();
+        mas.get(OTHER_ACCOUNT).unwrap().buckets["theirs"].objects["enc.txt"]
+            .sse_kms_key_id
+            .clone()
+            .unwrap()
+    };
+    assert!(
+        stored.contains(&format!(":{OTHER_ACCOUNT}:key/")),
+        "{stored} is not a key in the bucket owner's account"
+    );
+    assert!(kms.read().get(OTHER_ACCOUNT).is_some());
+    let resp = svc
+        .handle(make_request(Method::GET, "/theirs/enc.txt", &[], b""))
+        .await
+        .unwrap();
+    assert_eq!(resp.body.expect_bytes(), b"secret body");
+}
+
+#[tokio::test]
+async fn sse_kms_put_with_an_unknown_key_is_kms_not_found_not_a_500() {
+    let (svc, _) = kms_service_with_foreign_bucket(fakecloud_core::auth::IamMode::Off);
+    let err = assert_aws_err(
+        svc.handle(sse_kms_put(
+            "/theirs/enc.txt",
+            Some("1234abcd-12ab-34cd-56ef-1234567890ab"),
+        ))
+        .await,
+        "KMS.NotFoundException",
+    );
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn copy_source_parsing_is_shared_by_the_copy_and_its_authorization() {
+    // An encoded `?` stays in the key; the raw `?` starts the query.
+    let parsed = parse_copy_source("/src/a%3Fb?versionId=v1").unwrap();
+    assert_eq!(
+        parsed,
+        CopySource {
+            bucket: "src".into(),
+            key: "a?b".into(),
+            version_id: Some("v1".into()),
+        }
+    );
+    let raw = parse_copy_source("src/a?b").unwrap();
+    assert_eq!((raw.key.as_str(), raw.version_id), ("a", None));
+
+    let svc = make_service();
+    for header in [
+        "src/a%3Fb?versionId=v1",
+        "src/a?b",
+        "src/a?x=1&versionId=v2",
+    ] {
+        let mut req = make_request(Method::PUT, "/dst/k", &[], b"");
+        req.headers
+            .insert("x-amz-copy-source", header.parse().unwrap());
+        let source = parse_copy_source(header).unwrap();
+        let authorized = svc.iam_actions_for(&req).pop().unwrap();
+        assert_eq!(
+            authorized.resource,
+            format!("arn:aws:s3:::{}/{}", source.bucket, source.key),
+            "{header}"
+        );
+        assert_eq!(
+            authorized.action,
+            if source.version_id.is_some() {
+                "GetObjectVersion"
+            } else {
+                "GetObject"
+            },
+            "{header}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn upload_part_copy_reads_the_object_its_authorization_names() {
+    // A key with an encoded `?`: UploadPartCopy copies exactly the object the
+    // copy-source authorization checked, not a prefix of it.
+    let svc = make_service();
+    seed_bucket(&svc, "src");
+    seed_bucket(&svc, "dst");
+    seed_object(&svc, "src", "a?b", b"question");
+    seed_object(&svc, "src", "a", b"prefix");
+    let created = svc
+        .handle(make_request(
+            Method::POST,
+            "/dst/k",
+            &[("uploads", "")],
+            b"",
+        ))
+        .await
+        .expect("CreateMultipartUpload");
+    let xml = String::from_utf8(created.body.expect_bytes().to_vec()).unwrap();
+    let upload_id = extract_xml_value(&xml, "UploadId").unwrap();
+    let mut req = make_request(
+        Method::PUT,
+        "/dst/k",
+        &[("partNumber", "1"), ("uploadId", upload_id.as_str())],
+        b"",
+    );
+    req.headers
+        .insert("x-amz-copy-source", "src/a%3Fb".parse().unwrap());
+    svc.handle(req).await.expect("UploadPartCopy");
+    let mas = svc.state.read();
+    let part = &mas.default_ref().buckets["dst"].multipart_uploads[&upload_id].parts[&1];
+    assert_eq!(part.size, b"question".len() as u64);
+}

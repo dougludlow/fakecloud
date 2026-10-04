@@ -106,7 +106,13 @@ impl S3Service {
                 // assembly path.
                 let raw = run_blocking_io(|| state.read_body(&obj.body))
                     .map_err(crate::service::io_to_aws)?;
-                Some(self.decrypt_object_body(account_id, bucket, &raw)?)
+                Some(self.decrypt_object_body(
+                    req,
+                    account_id,
+                    bucket,
+                    &raw,
+                    obj.sse_kms_key_id.as_deref(),
+                )?)
             } else {
                 None
             };
