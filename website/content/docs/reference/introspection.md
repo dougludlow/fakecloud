@@ -428,9 +428,9 @@ and accepts, or is created through `CreateAccount`. Naming an
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
-| `/_fakecloud/sqs/messages` | GET | List messages across queues. |
+| `/_fakecloud/sqs/messages` | GET | List messages across queues in every account and region. Each entry carries `queueUrl`, `queueName`, `region` and `queueArn` (queue URLs carry no region, so `region` / `queueArn` tell same-named queues apart). |
 | `/_fakecloud/sqs/expiration-processor/tick` | POST | Expire messages whose retention window has passed. |
-| `/_fakecloud/sqs/{queue_name}/force-dlq` | POST | Force-move in-flight messages to the dead-letter queue. |
+| `/_fakecloud/sqs/{queue_name}/force-dlq` | POST | Force-move in-flight messages to the dead-letter queue. Optional `accountId` and `region` query parameters pick the queue (default: the server's account and region); same-named queues elsewhere are untouched. |
 
 ## SSM
 

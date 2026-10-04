@@ -522,9 +522,20 @@ export class SqsClient {
     return parse(resp);
   }
 
-  async forceDlq(queueName: string): Promise<ForceDlqResponse> {
+  /**
+   * Force a queue's messages to its DLQ. The queue is looked up in
+   * `scope.accountId` / `scope.region` (default: the server's).
+   */
+  async forceDlq(
+    queueName: string,
+    scope: { accountId?: string; region?: string } = {},
+  ): Promise<ForceDlqResponse> {
+    const params = new URLSearchParams();
+    if (scope.accountId) params.set("accountId", scope.accountId);
+    if (scope.region) params.set("region", scope.region);
+    const query = params.toString();
     const resp = await fetch(
-      `${this.baseUrl}/_fakecloud/sqs/${encodeURIComponent(queueName)}/force-dlq`,
+      `${this.baseUrl}/_fakecloud/sqs/${encodeURIComponent(queueName)}/force-dlq${query ? `?${query}` : ""}`,
       { method: "POST" },
     );
     return parse(resp);

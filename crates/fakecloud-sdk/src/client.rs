@@ -864,14 +864,28 @@ impl SqsClient<'_> {
         FakeCloud::parse(resp).await
     }
 
-    /// Force all messages in a queue to its DLQ.
+    /// Force all messages in a queue to its DLQ. The queue is looked up in
+    /// the server's default account and region.
     pub async fn force_dlq(&self, queue_name: &str) -> Result<ForceDlqResponse, Error> {
+        self.force_dlq_in(queue_name, None, None).await
+    }
+
+    /// [`Self::force_dlq`] for the queue of that name in `account_id` /
+    /// `region` (`None`: the server default). Queue names are unique only
+    /// within one account and region.
+    pub async fn force_dlq_in(
+        &self,
+        queue_name: &str,
+        account_id: Option<&str>,
+        region: Option<&str>,
+    ) -> Result<ForceDlqResponse, Error> {
+        let query = scope_query(account_id, region);
         let resp = self
             .fc
             .client
             .post(format!(
-                "{}/_fakecloud/sqs/{}/force-dlq",
-                self.fc.base_url, queue_name
+                "{}/_fakecloud/sqs/{}/force-dlq{}",
+                self.fc.base_url, queue_name, query
             ))
             .send()
             .await?;
@@ -2555,5 +2569,22 @@ impl Elbv2Client<'_> {
             .send()
             .await?;
         FakeCloud::parse(resp).await
+    }
+}
+
+/// `?accountId=..&region=..` naming an (account, region) scope; an omitted
+/// part defaults to the server's account or region. Empty when both are
+/// omitted.
+fn scope_query(account_id: Option<&str>, region: Option<&str>) -> String {
+    let parts: Vec<String> = [("accountId", account_id), ("region", region)]
+        .into_iter()
+        .filter_map(|(key, value)| {
+            value.map(|v| format!("{key}={}", utf8_percent_encode(v, NON_ALPHANUMERIC)))
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
     }
 }

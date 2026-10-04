@@ -27,9 +27,9 @@ Query protocol. Form-encoded body, `Action` parameter, XML responses.
 
 ## Introspection
 
-- `GET /_fakecloud/sqs/messages` — list all messages across all queues
+- `GET /_fakecloud/sqs/messages` — list all messages across all queues (each entry names its `region` and `queueArn`)
 - `POST /_fakecloud/sqs/expiration-processor/tick` — expire messages past retention
-- `POST /_fakecloud/sqs/{queue_name}/force-dlq` — force-move messages exceeding `maxReceiveCount` to DLQ
+- `POST /_fakecloud/sqs/{queue_name}/force-dlq` — force-move messages exceeding `maxReceiveCount` to DLQ (optional `?accountId=&region=`, default the server's)
 
 ## Cross-service delivery
 

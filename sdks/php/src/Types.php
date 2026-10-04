@@ -987,6 +987,10 @@ final class SqsQueueMessages
         public readonly string $queueName,
         /** @var SqsMessageInfo[] */
         public readonly array $messages,
+        /** The queue's region (queue URLs carry none). */
+        public readonly string $region = '',
+        /** The queue's ARN (names its region and account). */
+        public readonly string $queueArn = '',
     ) {}
 
     public static function fromArray(array $data): self
@@ -995,6 +999,8 @@ final class SqsQueueMessages
             $data['queueUrl'],
             $data['queueName'],
             array_map(SqsMessageInfo::fromArray(...), $data['messages']),
+            $data['region'] ?? '',
+            $data['queueArn'] ?? '',
         );
     }
 }

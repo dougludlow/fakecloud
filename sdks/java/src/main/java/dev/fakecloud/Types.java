@@ -344,8 +344,17 @@ public final class Types {
             String createdAt) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
+    /**
+     * Messages of one queue. {@code region} is the queue's region (queue URLs carry
+     * none, so same-named queues in different regions share a URL); {@code queueArn}
+     * names its region and account.
+     */
     public record SqsQueueMessages(
-            String queueUrl, String queueName, List<SqsMessageInfo> messages) {}
+            String queueUrl,
+            String queueName,
+            String region,
+            String queueArn,
+            List<SqsMessageInfo> messages) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record SqsMessagesResponse(List<SqsQueueMessages> queues) {}

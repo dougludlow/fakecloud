@@ -85,7 +85,7 @@ All methods are async and accept an optional trailing `CancellationToken`.
 | --------------------------- | ------------------------------------- |
 | `GetMessagesAsync()`        | List all messages across all queues   |
 | `TickExpirationAsync()`     | Tick the message expiration processor |
-| `ForceDlqAsync(queueName)`  | Force all messages to the queue's DLQ |
+| `ForceDlqAsync(queueName[, accountId, region])` | Force all messages to the queue's DLQ (default account/region: the server's) |
 
 ## `fc.Events`
 

@@ -67,7 +67,7 @@ Sub-clients are accessed via methods: `fc.SES()`, `fc.SNS()`, `fc.Lambda()`, etc
 |--------|-------------|
 | `GetMessages(ctx)` | List all messages across queues |
 | `TickExpiration(ctx)` | Tick the expiration processor |
-| `ForceDLQ(ctx, queueName)` | Force messages to DLQ |
+| `ForceDLQ(ctx, queueName)` / `ForceDLQIn(ctx, queueName, accountID, region)` | Force messages to DLQ (default account/region: the server's) |
 
 ## `fc.Events()`
 

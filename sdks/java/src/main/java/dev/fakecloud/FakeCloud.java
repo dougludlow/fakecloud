@@ -635,10 +635,27 @@ public final class FakeCloud {
                     "/_fakecloud/sqs/expiration-processor/tick", ExpirationTickResponse.class);
         }
 
+        /** Force a queue's messages to its DLQ, in the server's default account and region. */
         public ForceDlqResponse forceDlq(String queueName) {
-            return http.postEmpty(
-                    "/_fakecloud/sqs/" + encodePath(queueName) + "/force-dlq",
-                    ForceDlqResponse.class);
+            return forceDlq(queueName, null, null);
+        }
+
+        /**
+         * Force a queue's messages to its DLQ, for the queue of that name in {@code accountId} /
+         * {@code region} (null: the server default).
+         */
+        public ForceDlqResponse forceDlq(String queueName, String accountId, String region) {
+            StringBuilder path =
+                    new StringBuilder("/_fakecloud/sqs/" + encodePath(queueName) + "/force-dlq");
+            String sep = "?";
+            if (accountId != null && !accountId.isEmpty()) {
+                path.append(sep).append("accountId=").append(encodePath(accountId));
+                sep = "&";
+            }
+            if (region != null && !region.isEmpty()) {
+                path.append(sep).append("region=").append(encodePath(region));
+            }
+            return http.postEmpty(path.toString(), ForceDlqResponse.class);
         }
     }
 

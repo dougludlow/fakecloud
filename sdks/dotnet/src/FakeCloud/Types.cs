@@ -283,8 +283,12 @@ public sealed record SqsMessageInfo(
     bool InFlight,
     string? CreatedAt);
 
+/// <summary>Messages of one queue. <c>Region</c> is the queue's region (queue URLs
+/// carry none, so same-named queues in different regions share a URL);
+/// <c>QueueArn</c> names its region and account.</summary>
 public sealed record SqsQueueMessages(
-    string? QueueUrl, string? QueueName, IReadOnlyList<SqsMessageInfo>? Messages);
+    string? QueueUrl, string? QueueName, IReadOnlyList<SqsMessageInfo>? Messages,
+    string? Region = null, string? QueueArn = null);
 
 public sealed record SqsMessagesResponse(IReadOnlyList<SqsQueueMessages>? Queues);
 

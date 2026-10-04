@@ -379,6 +379,10 @@ export interface SqsMessageInfo {
 export interface SqsQueueMessages {
   queueUrl: string;
   queueName: string;
+  /** The queue's region. Queue URLs carry no region, so same-named queues in different regions share a URL. */
+  region: string;
+  /** The queue's ARN (names its region and account). */
+  queueArn: string;
   messages: SqsMessageInfo[];
 }
 

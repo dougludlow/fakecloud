@@ -8583,6 +8583,10 @@ async fn main() {
                                         &base,
                                     ),
                                     queue_name: queue.queue_name.clone(),
+                                    // QueueUrls carry no region: same-named
+                                    // queues of different regions share one.
+                                    region: state.region.clone(),
+                                    queue_arn: queue.arn.clone(),
                                     messages,
                                 }
                             })
@@ -8651,8 +8655,28 @@ async fn main() {
             "/_fakecloud/sqs/{queue_name}/force-dlq",
             axum::routing::post({
                 let ss = sqs_sim_force_dlq_state;
-                move |axum::extract::Path(queue_name): axum::extract::Path<String>| async move {
-                    let moved = fakecloud_sqs::simulation::force_dlq(&ss, &queue_name);
+                move |axum::extract::Path(queue_name): axum::extract::Path<String>,
+                      axum::extract::Query(scope): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    // The queue of that name in one account and region:
+                    // `accountId` / `region` query parameters, defaulting to
+                    // the server's account and region.
+                    let (account, region) = {
+                        let mas = ss.read();
+                        (
+                            scope
+                                .get("accountId")
+                                .cloned()
+                                .unwrap_or_else(|| mas.default_account_id().to_string()),
+                            scope
+                                .get("region")
+                                .cloned()
+                                .unwrap_or_else(|| mas.region().to_string()),
+                        )
+                    };
+                    let moved =
+                        fakecloud_sqs::simulation::force_dlq(&ss, &account, &region, &queue_name);
                     axum::Json(types::ForceDlqResponse {
                         moved_messages: moved,
                     })

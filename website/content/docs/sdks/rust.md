@@ -283,7 +283,7 @@ Every sub-client is constructed lazily via an accessor (`fc.lambda()`, `fc.sqs()
 | ------------------------------- | ------------------------------------------ |
 | `get_messages().await`          | List all messages across all queues        |
 | `tick_expiration().await`       | Tick the message expiration processor      |
-| `force_dlq(queue_name).await`   | Force all messages to the queue's DLQ      |
+| `force_dlq(queue_name).await` / `force_dlq_in(queue_name, account, region).await` | Force all messages to the queue's DLQ (default account/region: the server's) |
 
 ## `fc.ssm()`
 

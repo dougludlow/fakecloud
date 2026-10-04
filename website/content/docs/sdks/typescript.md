@@ -282,7 +282,7 @@ const fc = new FakeCloud("http://localhost:5000");
 | --------------------- | ------------------------------------- |
 | `getMessages()`       | List all messages across all queues   |
 | `tickExpiration()`    | Tick the message expiration processor |
-| `forceDlq(queueName)` | Force all messages to the queue's DLQ |
+| `forceDlq(queueName, { accountId?, region? })` | Force all messages to the queue's DLQ (default account/region: the server's) |
 
 ## `fc.ssm`
 

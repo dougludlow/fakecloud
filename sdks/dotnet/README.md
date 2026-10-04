@@ -114,7 +114,7 @@ var fc = new FakeCloudClient("http://localhost:4566"); // explicit base URL
 | --------------------------- | ------------------------------------- |
 | `GetMessagesAsync()`        | List all messages across all queues   |
 | `TickExpirationAsync()`     | Tick the message expiration processor |
-| `ForceDlqAsync(queueName)`  | Force all messages to the queue's DLQ |
+| `ForceDlqAsync(queueName[, accountId, region])` | Force all messages to the queue's DLQ (default account/region: the server's) |
 
 ### `fc.Events`
 

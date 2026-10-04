@@ -40,20 +40,19 @@ pub fn tick_expiration(state: &SharedSqsState) -> u64 {
 
 /// Force-move messages that have exceeded `maxReceiveCount` to the DLQ.
 ///
-/// Looks up the queue by name, checks its redrive policy, then moves any
-/// messages (pending or in-flight) whose `receive_count` exceeds
-/// `maxReceiveCount` to the configured dead-letter queue. Queue names are
-/// unique only within one account and region, so every queue of that name
-/// (in any account or region) is processed. Returns the number of messages
-/// moved.
+/// Looks up the queue by name in `account_id` / `region` (queue names are
+/// unique only within one account and region), checks its redrive policy,
+/// then moves any messages (pending or in-flight) whose `receive_count`
+/// exceeds `maxReceiveCount` to the configured dead-letter queue. Queues of
+/// that name in other accounts or regions are untouched. Returns the number
+/// of messages moved.
 ///
 /// If the queue has no redrive policy, or the DLQ does not exist, this
 /// is a no-op returning 0.
-pub fn force_dlq(state: &SharedSqsState, queue_name: &str) -> u64 {
+pub fn force_dlq(state: &SharedSqsState, account_id: &str, region: &str, queue_name: &str) -> u64 {
     let mut mas = state.write();
-    mas.iter_regional_mut()
-        .map(|(_, _, s)| force_dlq_in(s, queue_name))
-        .sum()
+    mas.regional_get_mut(account_id, region)
+        .map_or(0, |s| force_dlq_in(s, queue_name))
 }
 
 /// [`force_dlq`] for one account's queue in one region. A redrive target is
@@ -267,7 +266,7 @@ mod tests {
             q.messages.push_back(make_message("over", 5, 3));
         }
 
-        let moved = force_dlq(&state, "src-q");
+        let moved = force_dlq(&state, "123456789012", "us-east-1", "src-q");
         assert_eq!(moved, 1);
 
         let accts = state.read();
@@ -305,7 +304,7 @@ mod tests {
             q.messages.push_back(make_message("under", 5, 1));
         }
 
-        let moved = force_dlq(&state, "src-q");
+        let moved = force_dlq(&state, "123456789012", "us-east-1", "src-q");
         assert_eq!(moved, 0);
 
         let accts = state.read();
@@ -319,7 +318,45 @@ mod tests {
         let state = make_state();
         add_queue(&state, "no-policy-q", None);
 
-        let moved = force_dlq(&state, "no-policy-q");
+        let moved = force_dlq(&state, "123456789012", "us-east-1", "no-policy-q");
         assert_eq!(moved, 0);
+    }
+
+    #[test]
+    fn force_dlq_only_touches_the_named_account_and_region() {
+        let state = make_state();
+        let src_url = add_queue(&state, "src-q", None);
+        let dlq_url = add_queue(&state, "dlq", None);
+        {
+            let mut accts = state.write();
+            let east = accts.default_regional_mut();
+            let dlq_arn = east.queues[&dlq_url].arn.clone();
+            let q = east.queues.get_mut(&src_url).unwrap();
+            q.redrive_policy = Some(RedrivePolicy {
+                dead_letter_target_arn: dlq_arn,
+                max_receive_count: 1,
+            });
+            q.messages.push_back(make_message("over", 5, 3));
+            // The same queues, configured the same way, in another region and
+            // in another account.
+            let copy = east.clone();
+            let mut west = copy.clone();
+            west.region = "eu-west-1".to_string();
+            accts
+                .get_or_create("123456789012")
+                .insert_region("eu-west-1", west);
+            *accts.regional_mut("999999999999", "us-east-1") = copy;
+        }
+
+        assert_eq!(force_dlq(&state, "123456789012", "us-east-1", "src-q"), 1);
+        let accts = state.read();
+        for (account, region) in [("123456789012", "eu-west-1"), ("999999999999", "us-east-1")] {
+            let s = accts.regional(account, region).unwrap();
+            assert_eq!(s.queues[&src_url].messages.len(), 1, "{account}/{region}");
+            assert!(s.queues[&dlq_url].messages.is_empty(), "{account}/{region}");
+        }
+        drop(accts);
+        // An account or region with no such queue moves nothing.
+        assert_eq!(force_dlq(&state, "123456789012", "ap-south-1", "src-q"), 0);
     }
 }

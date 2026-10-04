@@ -102,7 +102,7 @@ func main() {
 |--------|-------------|
 | `GetMessages(ctx)` | List all messages across queues |
 | `TickExpiration(ctx)` | Tick the expiration processor |
-| `ForceDLQ(ctx, queueName)` | Force messages to DLQ |
+| `ForceDLQ(ctx, queueName)` / `ForceDLQIn(ctx, queueName, accountID, region)` | Force messages to DLQ (default account/region: the server's) |
 
 ### EventBridge - `fc.Events()`
 

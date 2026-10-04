@@ -434,6 +434,13 @@ pub struct SqsMessageInfo {
 pub struct SqsQueueMessages {
     pub queue_url: String,
     pub queue_name: String,
+    /// The queue's region. Queue URLs carry no region, so two same-named
+    /// queues in different regions share a URL.
+    #[serde(default)]
+    pub region: String,
+    /// The queue's ARN (names its region and account).
+    #[serde(default)]
+    pub queue_arn: String,
     pub messages: Vec<SqsMessageInfo>,
 }
 

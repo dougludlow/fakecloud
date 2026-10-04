@@ -284,3 +284,95 @@ async fn regional_queues_survive_restart() {
         ["q-ap-southeast-2"]
     );
 }
+
+/// Introspection tells same-named queues of different regions apart, and
+/// force-dlq acts on one account and region only.
+#[tokio::test]
+async fn introspection_and_force_dlq_are_region_aware() {
+    let server = TestServer::start().await;
+    let sdk = fakecloud_sdk::FakeCloud::new(server.endpoint());
+    let mut setups = Vec::new();
+    for region in ["us-east-1", "eu-west-1"] {
+        let sqs = sqs_in(&server, region).await;
+        let dlq_url = sqs
+            .create_queue()
+            .queue_name("dlq")
+            .send()
+            .await
+            .unwrap()
+            .queue_url
+            .unwrap();
+        let dlq_arn = queue_arn(&sqs, &dlq_url).await;
+        let src_url = sqs
+            .create_queue()
+            .queue_name("src")
+            .attributes(
+                QueueAttributeName::RedrivePolicy,
+                format!(r#"{{"deadLetterTargetArn":"{dlq_arn}","maxReceiveCount":"2"}}"#),
+            )
+            .send()
+            .await
+            .unwrap()
+            .queue_url
+            .unwrap();
+        sqs.send_message()
+            .queue_url(&src_url)
+            .message_body(format!("from-{region}"))
+            .send()
+            .await
+            .unwrap();
+        // Receive twice: the message reaches maxReceiveCount (force-dlq moves
+        // it) without exceeding it (no automatic redrive yet).
+        for _ in 0..2 {
+            sqs.receive_message()
+                .queue_url(&src_url)
+                .visibility_timeout(0)
+                .send()
+                .await
+                .unwrap();
+        }
+        setups.push((region, sqs, src_url, dlq_url));
+    }
+
+    let listing = sdk.sqs().get_messages().await.unwrap();
+    let src_entries: Vec<_> = listing
+        .queues
+        .iter()
+        .filter(|q| q.queue_name == "src")
+        .collect();
+    assert_eq!(src_entries.len(), 2);
+    for region in ["us-east-1", "eu-west-1"] {
+        let entry = src_entries
+            .iter()
+            .find(|q| q.region == region)
+            .expect("one entry per region");
+        assert_eq!(
+            entry.queue_arn,
+            format!("arn:aws:sqs:{region}:123456789012:src")
+        );
+        // (Bodies are stored SSE-SQS encrypted, so only count them.)
+        assert_eq!(entry.messages.len(), 1);
+    }
+
+    let moved = sdk
+        .sqs()
+        .force_dlq_in("src", None, Some("eu-west-1"))
+        .await
+        .unwrap();
+    assert_eq!(moved.moved_messages, 1);
+    for (region, sqs, _src_url, dlq_url) in &setups {
+        let in_dlq = sqs
+            .get_queue_attributes()
+            .queue_url(dlq_url)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+            .send()
+            .await
+            .unwrap()
+            .attributes
+            .unwrap()
+            .remove(&QueueAttributeName::ApproximateNumberOfMessages)
+            .unwrap();
+        let expected = if *region == "eu-west-1" { "1" } else { "0" };
+        assert_eq!(in_dlq, expected, "{region} DLQ");
+    }
+}

@@ -261,7 +261,7 @@ Called as a method on the main client: `fc.organizations()`.
 |---|---|
 | `get_messages()` | List all messages across queues |
 | `tick_expiration()` | Tick the message-expiration processor |
-| `force_dlq(queue_name)` | Force all messages to the queue's DLQ |
+| `force_dlq(queue_name, account_id=None, region=None)` | Force all messages to the queue's DLQ (default account/region: the server's) |
 
 ### `fc.events`
 

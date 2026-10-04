@@ -336,8 +336,37 @@ impl<T: AccountState> MultiAccountState<RegionalState<T>> {
     }
 
     /// The state of `account_id` in `region`, creating both on first use.
+    ///
+    /// A newly created region inherits shared resources (see
+    /// [`AccountState::inherit_from`]) from a region the account already has,
+    /// or, for an account's first region, from the default account's state in
+    /// that region (else any default-account region), the way a new account
+    /// inherits from the default account in [`MultiAccountState`].
     pub fn regional_mut(&mut self, account_id: &str, region: &str) -> &mut T {
-        self.get_or_create(account_id).region_mut(region)
+        let exists = self
+            .get(account_id)
+            .is_some_and(|a| a.region(region).is_some());
+        if !exists {
+            let mut state = T::new_for_account(account_id, region, &self.endpoint);
+            let sibling = self
+                .get(account_id)
+                .and_then(|a| a.regions.values().next())
+                .or_else(|| {
+                    let default = self.get(&self.default_account_id)?;
+                    default
+                        .region(region)
+                        .or_else(|| default.regions.values().next())
+                });
+            if let Some(sibling) = sibling {
+                state.inherit_from(sibling);
+            }
+            self.get_or_create(account_id)
+                .regions
+                .insert(region.to_string(), state);
+        }
+        self.get_mut(account_id)
+            .and_then(|a| a.regions.get_mut(region))
+            .expect("created above")
     }
 
     /// The state of `account_id` in `region` without creating either.
@@ -725,5 +754,55 @@ mod tests {
         .unwrap();
         assert_eq!(newer.schema_version, 9);
         assert!(newer.accounts.is_none());
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct SharedCacheState {
+        cache: Option<String>,
+    }
+
+    impl AccountState for SharedCacheState {
+        fn new_for_account(_account_id: &str, _region: &str, _endpoint: &str) -> Self {
+            Self { cache: None }
+        }
+
+        fn inherit_from(&mut self, sibling: &Self) {
+            self.cache = sibling.cache.clone();
+        }
+    }
+
+    #[test]
+    fn a_new_accounts_first_region_inherits_from_the_default_account() {
+        let mut mrs: MultiRegionState<SharedCacheState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        mrs.default_regional_mut().cache = Some("shared".into());
+        // Another account's first region, in the default region and elsewhere.
+        assert_eq!(
+            mrs.regional_mut("222222222222", "us-east-1")
+                .cache
+                .as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            mrs.regional_mut("333333333333", "eu-west-1")
+                .cache
+                .as_deref(),
+            Some("shared")
+        );
+        // A further region of an existing account inherits from that account.
+        mrs.regional_mut("222222222222", "us-east-1").cache = Some("own".into());
+        assert_eq!(
+            mrs.regional_mut("222222222222", "ap-south-1")
+                .cache
+                .as_deref(),
+            Some("own")
+        );
+        // An existing region is returned as is.
+        assert_eq!(
+            mrs.regional_mut("333333333333", "eu-west-1")
+                .cache
+                .as_deref(),
+            Some("shared")
+        );
     }
 }
