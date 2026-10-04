@@ -799,6 +799,88 @@ pub(crate) fn decode_offset_token(token: Option<&String>) -> usize {
         .unwrap_or(0)
 }
 
+/// Decode a client-supplied NextToken strictly: a token that
+/// [`encode_offset_token`] did not produce is rejected with CloudWatch's
+/// `InvalidNextToken`, which every paged list operation declares.
+pub(crate) fn decode_offset_token_checked(
+    token: Option<&String>,
+) -> Result<usize, AwsServiceError> {
+    use base64::Engine;
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Ok(0);
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.strip_prefix("offset:")?.parse::<usize>().ok())
+        .ok_or_else(|| {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidNextToken",
+                "The service returned an error. The NextToken is not valid.",
+            )
+        })
+}
+
+/// The top-level `<member>` elements of a rendered list body, in order.
+fn split_members(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut pos = 0usize;
+    while let Some(i) = body[pos..].find('<').map(|i| pos + i) {
+        let rest = &body[i..];
+        if rest.starts_with("<member>") {
+            if depth == 0 {
+                start = i;
+            }
+            depth += 1;
+            pos = i + "<member>".len();
+        } else if rest.starts_with("</member>") {
+            depth = depth.saturating_sub(1);
+            pos = i + "</member>".len();
+            if depth == 0 {
+                out.push(&body[start..pos]);
+            }
+        } else {
+            pos = i + 1;
+        }
+    }
+    out
+}
+
+/// Render one page of a list result: `members` is the concatenated
+/// `<member>` elements of the full listing in its stable order, paged by the
+/// request's `size_param` (`MaxResults` / `MaxRecords`; absent means the
+/// whole list) and `NextToken`, with a `NextToken` emitted only when items
+/// remain.
+pub(crate) fn paged_member_list(
+    req: &AwsRequest,
+    size_param: &str,
+    wrapper: &str,
+    members: &str,
+) -> Result<String, AwsServiceError> {
+    let offset = decode_offset_token_checked(req.query_params.get("NextToken"))?;
+    let all = split_members(members);
+    let size = req
+        .query_params
+        .get(size_param)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(usize::MAX);
+    let start = offset.min(all.len());
+    let end = start.saturating_add(size).min(all.len());
+    let mut out = format!("<{wrapper}>{}</{wrapper}>", all[start..end].concat());
+    if end < all.len() {
+        out.push_str(&format!(
+            "<NextToken>{}</NextToken>",
+            encode_offset_token(end)
+        ));
+    }
+    Ok(out)
+}
+
 /// Parse an input timestamp, accepting either RFC3339 (the query-protocol
 /// form) or a numeric epoch-seconds value (which JSON-protocol / X-Amz-Target
 /// callers send). Previously only RFC3339 was accepted, so an epoch-second

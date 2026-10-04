@@ -964,8 +964,18 @@ impl AwsService for OpenSearchService {
         };
 
         validate_input(api, action, &labels, &req)?;
+        let page = fakecloud_core::pagination::validate_json_page(
+            crate::pagination::paged_ops(api),
+            action,
+            &req,
+        )?;
 
-        let result = self.dispatch(action, api, &labels, &req);
+        let result = self
+            .dispatch(action, api, &labels, &req)
+            .map(|resp| match page {
+                Some(page) => fakecloud_core::pagination::apply_json_page(resp, page),
+                None => resp,
+            });
 
         if is_mutating(action) && matches!(result.as_ref(), Ok(r) if r.status.is_success()) {
             self.save_snapshot().await;
@@ -3126,7 +3136,7 @@ impl OpenSearchService {
             .and_then(|st| st.domains.get(&dom))
             .ok_or_else(|| not_found_domain(&dom))?;
         let list: Vec<Value> = d.maintenances.values().cloned().collect();
-        Ok(ok(json!({ "DomainMaintenanceList": list })))
+        Ok(ok(json!({ "DomainMaintenances": list })))
     }
 }
 

@@ -176,7 +176,7 @@ impl CloudWatchService {
     ) -> Result<AwsResponse, AwsServiceError> {
         validate_range_i64(req, "MaxResults", 1, 500)?;
         let state = self.state.read();
-        let mut inner = String::from("<Entries>");
+        let mut inner = String::new();
         if let Some(acct) = state.get(&req.account_id) {
             if let Some(streams) = acct.metric_streams_in(&req.region) {
                 for s in streams.values() {
@@ -206,7 +206,7 @@ impl CloudWatchService {
                 }
             }
         }
-        inner.push_str("</Entries>");
+        let inner = crate::service::paged_member_list(req, "MaxResults", "Entries", &inner)?;
         Ok(xml_response("ListMetricStreams", &inner, &req.request_id))
     }
 

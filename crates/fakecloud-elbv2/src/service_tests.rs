@@ -1198,3 +1198,87 @@ async fn restore_vpc_ids_re_derives_from_subnets() {
     );
     assert_eq!(crate::network::restore_vpc_ids(&mut accounts, &ec2), 0);
 }
+
+/// `PageSize` bounds a `Describe*` page and `NextMarker` walks the rest,
+/// appearing only while items remain; a marker this server never handed out
+/// is rejected.
+#[tokio::test]
+async fn describe_target_groups_pages_with_markers() {
+    let svc = svc();
+    for i in 0..5 {
+        let name = format!("tg-{i}");
+        svc.handle(req(
+            "CreateTargetGroup",
+            &[
+                ("Name", &name),
+                ("Protocol", "HTTP"),
+                ("Port", "80"),
+                ("VpcId", "vpc-1"),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    let names = |body: &str| -> Vec<String> {
+        body.split("<TargetGroupName>")
+            .skip(1)
+            .map(|s| s.split("</TargetGroupName>").next().unwrap().to_string())
+            .collect()
+    };
+    let marker = |body: &str| {
+        body.split("<NextMarker>")
+            .nth(1)
+            .map(|s| s.split("</NextMarker>").next().unwrap().to_string())
+    };
+    let all = names(&body_string(
+        &svc.handle(req("DescribeTargetGroups", &[])).await.unwrap(),
+    ));
+    assert_eq!(all.len(), 5);
+
+    let mut walked = Vec::new();
+    let mut next: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut params = vec![("PageSize", "2")];
+        if let Some(m) = &next {
+            params.push(("Marker", m.as_str()));
+        }
+        let body = body_string(
+            &svc.handle(req("DescribeTargetGroups", &params))
+                .await
+                .unwrap(),
+        );
+        let page = names(&body);
+        assert!(page.len() <= 2);
+        walked.extend(page);
+        pages += 1;
+        next = marker(&body);
+        if next.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(walked, all);
+
+    let err = match svc
+        .handle(req("DescribeTargetGroups", &[("Marker", "bogus")]))
+        .await
+    {
+        Ok(_) => panic!("a foreign marker must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "ValidationError");
+}
+
+/// The static catalogs page too: account limits at two per page.
+#[tokio::test]
+async fn describe_account_limits_pages() {
+    let svc = svc();
+    let body = body_string(
+        &svc.handle(req("DescribeAccountLimits", &[("PageSize", "2")]))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(body.matches("<member>").count(), 2, "{body}");
+    assert!(body.contains("<NextMarker>2</NextMarker>"), "{body}");
+}

@@ -319,6 +319,12 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             "MissingParameter",
         ],
         "elasticache" => &["InvalidParameterValue"],
+        // ELBv2 declares no invalid-marker error, yet every paged
+        // `Describe*` rejects a `Marker` it never handed out with the Query
+        // API's common `ValidationError`. Source: ELBv2 API Reference,
+        // "Common Errors"
+        // (https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/CommonErrors.html).
+        "elasticloadbalancing" => &["ValidationError"],
         "kms" => &["ValidationException"],
         "ssm" => &["InvalidNextToken", "ValidationException"],
         "eks" => &["ResourceNotFoundException", "ResourceInUseException"],

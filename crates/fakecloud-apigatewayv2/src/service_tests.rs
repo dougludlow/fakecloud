@@ -3754,3 +3754,38 @@ async fn china_region_aws_proxy_dispatches_to_aws_cn_queue_and_topic() {
         assert_eq!(body_json(&resp)["statusCode"], 200, "{uri}");
     }
 }
+
+/// GetApis pages by `maxResults` / `nextToken` through the management
+/// dispatch, and a foreign token is the declared `BadRequestException`.
+#[tokio::test]
+async fn get_apis_pages_by_next_token() {
+    let svc = ApiGatewayV2Service::new(make_state());
+    for _ in 0..3 {
+        create_api(&svc);
+    }
+    let list = |query: &[(&str, &str)]| {
+        let mut r = make_request(Method::GET, "/v2/apis", "");
+        r.query_params = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        r
+    };
+    let p1 = body_json(&svc.handle(list(&[("maxResults", "2")])).await.unwrap());
+    assert_eq!(p1["items"].as_array().unwrap().len(), 2);
+    let token = p1["nextToken"]
+        .as_str()
+        .expect("token on a partial page")
+        .to_string();
+    let p2 = body_json(
+        &svc.handle(list(&[("maxResults", "2"), ("nextToken", &token)]))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(p2["items"].as_array().unwrap().len(), 1);
+    assert!(p2.get("nextToken").is_none(), "{p2}");
+    assert_ne!(p1["items"][0]["apiId"], p2["items"][0]["apiId"]);
+
+    let err = expect_err(svc.handle(list(&[("nextToken", "bogus")])).await);
+    assert_eq!(err.code(), "BadRequestException");
+}

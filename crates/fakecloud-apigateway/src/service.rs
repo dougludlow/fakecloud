@@ -349,7 +349,20 @@ impl fakecloud_core::service::AwsService for ApiGatewayService {
         // Identify whether this is a control-plane request (matches one
         // of the known REST routes) or a data-plane execute call.
         if let Some(resolved) = resolve(&req.method, &req.path_segments, &req.query_params) {
-            let res = self.handle_control(&req, resolved).await;
+            // Every `position`-paginated `Get*` list pages its full listing
+            // by `limit` / `position` here.
+            let page = fakecloud_core::pagination::validate_json_page(
+                crate::pagination_gen::PAGED_OPS,
+                resolved.action,
+                &req,
+            )?;
+            let res = self
+                .handle_control(&req, resolved)
+                .await
+                .map(|resp| match page {
+                    Some(page) => fakecloud_core::pagination::apply_json_page(resp, page),
+                    None => resp,
+                });
             if res.is_ok() && is_mutating_method(&req.method) {
                 self.save_snapshot().await;
             }

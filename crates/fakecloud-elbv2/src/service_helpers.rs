@@ -149,6 +149,45 @@ pub(crate) fn invalid_param(msg: impl Into<String>) -> AwsServiceError {
     )
 }
 
+/// Render a `Describe*` result list (`members` are complete `<member>`
+/// elements, already in the listing's stable order) as one page of the
+/// request's `PageSize` / `Marker`, followed by the `NextMarker` that fetches
+/// the next page when items remain. No `PageSize` returns the whole list.
+///
+/// ELBv2 declares no invalid-marker error on any operation; a `Marker` it did
+/// not hand out is rejected with the Query API's common `ValidationError`
+/// (ELBv2 API Reference, "Common Errors"), rather than restarting the caller
+/// at page one.
+pub(crate) fn paged_members(
+    req: &AwsRequest,
+    wrapper: &str,
+    members: Vec<String>,
+) -> Result<String, AwsServiceError> {
+    let size = req
+        .query_params
+        .get("PageSize")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    let marker = req
+        .query_params
+        .get("Marker")
+        .map(String::as_str)
+        .filter(|m| !m.is_empty());
+    let (page, next) = fakecloud_core::pagination::paginate_checked(&members, marker, size)
+        .map_err(|_| {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                format!("Invalid value '{}' for Marker", marker.unwrap_or_default()),
+            )
+        })?;
+    let mut out = format!("<{wrapper}>{}</{wrapper}>", page.concat());
+    if let Some(next) = next {
+        out.push_str(&format!("<NextMarker>{next}</NextMarker>"));
+    }
+    Ok(out)
+}
+
 /// Reject when an integer query param falls outside `[min, max]`. Mirrors
 /// Smithy `@range` constraints — used by ops whose negative probes flip
 /// boundary fields and expect the same rejection AWS does up front.

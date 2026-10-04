@@ -1998,3 +1998,95 @@ async fn get_domain_maintenance_status_reflects_stored_entry() {
     assert_eq!(unknown["Status"], "COMPLETED");
     assert!(unknown.get("Action").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+
+/// A body-paged list (DescribePackages) and a query-paged one (ListVersions)
+/// both honor the page size, walk by `NextToken`, and omit the token on the
+/// last page.
+#[tokio::test]
+async fn paged_lists_walk_by_next_token() {
+    let svc = service();
+    for i in 0..5 {
+        call(
+            &svc,
+            req(
+                Method::POST,
+                &format!("{OS}/packages"),
+                json!({"PackageName": format!("pkg-{i}"), "PackageType": "TXT-DICTIONARY", "PackageSource": {"S3BucketName": "b", "S3Key": "k"}}),
+            ),
+        )
+        .await;
+    }
+    let mut seen = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut body = json!({"MaxResults": 2});
+        if let Some(t) = &token {
+            body["NextToken"] = json!(t);
+        }
+        let page = json_of(
+            &call(
+                &svc,
+                req(Method::POST, &format!("{OS}/packages/describe"), body),
+            )
+            .await,
+        );
+        let list = page["PackageDetailsList"].as_array().unwrap();
+        assert!(list.len() <= 2);
+        seen.extend(
+            list.iter()
+                .map(|p| p["PackageName"].as_str().unwrap().to_string()),
+        );
+        pages += 1;
+        token = page
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 3);
+    seen.sort();
+    assert_eq!(seen, (0..5).map(|i| format!("pkg-{i}")).collect::<Vec<_>>());
+
+    let all = json_of(
+        &call(
+            &svc,
+            req(Method::GET, &format!("{OS}/opensearch/versions"), json!({})),
+        )
+        .await,
+    );
+    let total = all["Versions"].as_array().unwrap().len();
+    assert!(total > 2);
+    assert!(all.get("NextToken").is_none(), "{all}");
+    let first = json_of(
+        &call(
+            &svc,
+            with_query(
+                req(Method::GET, &format!("{OS}/opensearch/versions"), json!({})),
+                "maxResults",
+                "2",
+            ),
+        )
+        .await,
+    );
+    assert_eq!(first["Versions"].as_array().unwrap().len(), 2);
+    assert_eq!(first["NextToken"], "2");
+
+    // ListVersions declares ValidationException for a foreign token.
+    let (status, code) = call_err(
+        &svc,
+        with_query(
+            req(Method::GET, &format!("{OS}/opensearch/versions"), json!({})),
+            "nextToken",
+            "bogus",
+        ),
+    )
+    .await;
+    assert_eq!((status, code.as_str()), (400, "ValidationException"));
+}

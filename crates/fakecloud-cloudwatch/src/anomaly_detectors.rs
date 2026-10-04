@@ -167,7 +167,7 @@ impl CloudWatchService {
         let want_single = types.is_empty() || types.iter().any(|t| t == "SINGLE_METRIC");
 
         let state = self.state.read();
-        let mut inner = String::from("<AnomalyDetectors>");
+        let mut inner = String::new();
         if let Some(acct) = state.get(&req.account_id) {
             if let Some(detectors) = acct.anomaly_detectors_in(&req.region) {
                 for d in detectors.values() {
@@ -194,7 +194,8 @@ impl CloudWatchService {
                 }
             }
         }
-        inner.push_str("</AnomalyDetectors>");
+        let inner =
+            crate::service::paged_member_list(req, "MaxResults", "AnomalyDetectors", &inner)?;
         Ok(xml_response(
             "DescribeAnomalyDetectors",
             &inner,

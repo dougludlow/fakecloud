@@ -49,7 +49,7 @@ impl CloudWatchService {
     ) -> Result<AwsResponse, AwsServiceError> {
         validate_range_i64(req, "MaxResults", 1, 500)?;
         let state = self.state.read();
-        let mut inner = String::from("<InsightRules>");
+        let mut inner = String::new();
         if let Some(acct) = state.get(&req.account_id) {
             if let Some(rules) = acct.insight_rules_in(&req.region) {
                 for rule in rules.values() {
@@ -57,7 +57,7 @@ impl CloudWatchService {
                 }
             }
         }
-        inner.push_str("</InsightRules>");
+        let inner = crate::service::paged_member_list(req, "MaxResults", "InsightRules", &inner)?;
         Ok(xml_response(
             "DescribeInsightRules",
             &inner,
@@ -248,7 +248,7 @@ impl CloudWatchService {
         validate_range_i64(req, "MaxResults", 1, 500)?;
         let resource_arn = required_query_param(req, "ResourceARN")?;
         let state = self.state.read();
-        let mut inner = String::from("<ManagedRules>");
+        let mut inner = String::new();
         if let Some(acct) = state.get(&req.account_id) {
             if let Some(map) = acct.managed_rules_in(&req.region) {
                 if let Some(rules) = map.get(&resource_arn) {
@@ -270,7 +270,7 @@ impl CloudWatchService {
                 }
             }
         }
-        inner.push_str("</ManagedRules>");
+        let inner = crate::service::paged_member_list(req, "MaxResults", "ManagedRules", &inner)?;
         Ok(xml_response(
             "ListManagedInsightRules",
             &inner,

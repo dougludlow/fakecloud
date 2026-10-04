@@ -388,7 +388,16 @@ impl AwsService for AppSyncService {
                 format!("Unknown operation: {} {}", req.method, req.raw_path),
             ));
         };
-        let result = self.dispatch(action, &labels, &req);
+        // Every `nextToken`-paginated operation pages its full listing here.
+        let page = fakecloud_core::pagination::validate_json_page(
+            crate::pagination_gen::PAGED_OPS,
+            action,
+            &req,
+        )?;
+        let result = self.dispatch(action, &labels, &req).map(|resp| match page {
+            Some(page) => fakecloud_core::pagination::apply_json_page(resp, page),
+            None => resp,
+        });
         let success = matches!(result.as_ref(), Ok(resp) if resp.status.is_success());
         if SAVE_AFTER.contains(&action) && success {
             self.save().await;
@@ -3027,5 +3036,51 @@ mod tests {
         d.migrate_inline_tags();
         assert_eq!(d.tags["arn:a1"]["k"], "v");
         assert!(d.graphql_apis["a1"].get("tags").is_none());
+    }
+
+    /// ListGraphqlApis pages by `maxResults` / `nextToken` and rejects a
+    /// foreign token with the declared `BadRequestException`.
+    #[tokio::test]
+    async fn list_graphql_apis_pages_by_next_token() {
+        let s = svc();
+        for i in 0..3 {
+            let mut r = req(Method::POST, "/v1/apis");
+            r.body = bytes::Bytes::from(
+                serde_json::to_vec(
+                    &json!({ "name": format!("api{i}"), "authenticationType": "API_KEY" }),
+                )
+                .unwrap(),
+            );
+            s.handle(r).await.unwrap();
+        }
+        let list = |query: &[(&str, &str)]| {
+            let mut r = req(Method::GET, "/v1/apis");
+            r.query_params = query
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            r.raw_query = query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            r
+        };
+        let p1 = body_json(&s.handle(list(&[("maxResults", "2")])).await.unwrap());
+        assert_eq!(p1["graphqlApis"].as_array().unwrap().len(), 2);
+        let token = p1["nextToken"]
+            .as_str()
+            .expect("token on a partial page")
+            .to_string();
+        let p2 = body_json(
+            &s.handle(list(&[("maxResults", "2"), ("nextToken", &token)]))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(p2["graphqlApis"].as_array().unwrap().len(), 1);
+        assert!(p2.get("nextToken").is_none(), "{p2}");
+
+        let err = err_of(s.handle(list(&[("nextToken", "bogus")])).await);
+        assert_eq!(err.code(), "BadRequestException");
     }
 }
