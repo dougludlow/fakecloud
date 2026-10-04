@@ -667,7 +667,7 @@ impl S3Service {
                 &crate::service::notifications::ObjectEvent {
                     event_name,
                     bucket_name: &bucket_name,
-                    requester_account: account_id,
+                    requester_account: &req.account_id,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,
@@ -826,10 +826,17 @@ impl S3Service {
         let accts_r = self.state.read();
         let empty_state = crate::state::S3State::new(account_id, "us-east-1");
         let state = accts_r.get(account_id).unwrap_or(&empty_state);
+        // The source bucket is read in the account that owns it, which is not
+        // the destination's when copying out of another account's bucket
+        // (authorized by s3:GetObject on the source at dispatch).
+        let src_account = accts_r
+            .find_account(|s| s.buckets.contains_key(src_bucket))
+            .map_or_else(|| account_id.to_string(), |a| a.to_string());
+        let src_state = accts_r.get(&src_account).unwrap_or(state);
 
         // Resolve source object, possibly a specific version
         let (src_obj, src_version_id_actual) = {
-            let sb = state
+            let sb = src_state
                 .buckets
                 .get(src_bucket)
                 .ok_or_else(|| no_such_bucket(src_bucket))?;
@@ -1084,7 +1091,7 @@ impl S3Service {
             super::run_blocking_io(|| src_handle.read_all()).map_err(crate::service::io_to_aws)?;
         let src_bytes =
             if src_obj.sse_algorithm.as_deref() == Some("aws:kms") && self.kms_hook.is_some() {
-                self.decrypt_object_body(account_id, src_bucket, &raw_src_bytes)?
+                self.decrypt_object_body(&src_account, src_bucket, &raw_src_bytes)?
             } else {
                 raw_src_bytes
             };
@@ -1336,7 +1343,7 @@ impl S3Service {
                 &crate::service::notifications::ObjectEvent {
                     event_name: "ObjectCreated:Copy",
                     bucket_name: &copy_bucket,
-                    requester_account: account_id,
+                    requester_account: &req.account_id,
                     key: &copy_key,
                     size: copy_size,
                     etag: &copy_etag,

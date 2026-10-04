@@ -213,7 +213,7 @@ impl S3Service {
                         &crate::service::notifications::ObjectEvent {
                             event_name: "ObjectRemoved:Delete",
                             bucket_name: &bucket_name,
-                            requester_account: account_id,
+                            requester_account: &req.account_id,
                             key: &obj_key,
                             size: 0,
                             etag: "",
@@ -326,7 +326,7 @@ impl S3Service {
                     &crate::service::notifications::ObjectEvent {
                         event_name: "ObjectRemoved:DeleteMarkerCreated",
                         bucket_name: &bucket_name,
-                        requester_account: account_id,
+                        requester_account: &req.account_id,
                         key: &obj_key,
                         size: 0,
                         etag: "",
@@ -367,7 +367,7 @@ impl S3Service {
                     &crate::service::notifications::ObjectEvent {
                         event_name: "ObjectRemoved:Delete",
                         bucket_name: &bucket_name,
-                        requester_account: account_id,
+                        requester_account: &req.account_id,
                         key: &obj_key,
                         size: 0,
                         etag: "",
@@ -713,7 +713,7 @@ impl S3Service {
                     |(event_name, key, version_id)| crate::service::notifications::ObjectEvent {
                         event_name,
                         bucket_name: bucket,
-                        requester_account: account_id,
+                        requester_account: &req.account_id,
                         key,
                         size: 0,
                         etag: "",

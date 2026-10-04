@@ -764,6 +764,17 @@ pub trait AwsService: Send + Sync {
         self.iam_action_for(request).into_iter().collect()
     }
 
+    /// Whether the request creates its resource in the CALLER's account, so
+    /// that whatever currently holds the resource's name elsewhere has no say
+    /// in authorizing it. S3's `CreateBucket` is the case: bucket names are
+    /// global, and creating a name another account owns is authorized against
+    /// the caller's own policies (then answered `BucketAlreadyExists`), never
+    /// against the other account's bucket policy. Dispatch then evaluates the
+    /// request as same-account with no resource policy. Default `false`.
+    fn iam_resource_in_caller_account(&self, _request: &AwsRequest) -> bool {
+        false
+    }
+
     /// Derive service-specific IAM condition keys for an incoming request.
     ///
     /// Called right after [`AwsService::iam_action_for`] when IAM

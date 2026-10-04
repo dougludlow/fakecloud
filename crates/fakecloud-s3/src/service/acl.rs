@@ -25,7 +25,7 @@ impl S3Service {
         let b = state.buckets.get(bucket).ok_or_else(|| no_such_key(key))?;
         let obj = b.objects.get(key).ok_or_else(|| no_such_key(key))?;
 
-        let owner_id = obj.acl_owner_id.as_deref().unwrap_or(&req.account_id);
+        let owner_id = obj.acl_owner_id.as_deref().unwrap_or(&b.acl_owner_id);
         let body = build_acl_xml(owner_id, &obj.acl_grants, &req.account_id);
         Ok(s3_xml(StatusCode::OK, body))
     }

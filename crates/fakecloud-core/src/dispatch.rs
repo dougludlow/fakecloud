@@ -811,7 +811,20 @@ async fn dispatch_inner(
                     return denied;
                 }
             } else if let Some(principal) = aws_request.principal.as_ref() {
-                if !principal.is_root() {
+                if principal.is_root() {
+                    if let Some(denied) = authorize_root_cross_account(
+                        principal,
+                        service.as_ref(),
+                        &aws_request,
+                        evaluator.as_ref(),
+                        &config,
+                        &detected,
+                        &request_id,
+                        remote_addr,
+                    ) {
+                        return denied;
+                    }
+                } else {
                     // A request can need several authorizations -- one per
                     // table in a batch, say -- and every one must allow it.
                     let iam_actions = service.iam_actions_for(&aws_request);
@@ -894,10 +907,15 @@ async fn dispatch_inner(
                             // multi-account alignment); S3 ARNs have an
                             // empty account field, so we fall back to the
                             // server's configured account ID in that case.
+                            // A request creating its resource in the caller's
+                            // account (S3 CreateBucket) is same-account, whatever
+                            // account holds that name today.
+                            let in_caller_account =
+                                service.iam_resource_in_caller_account(&aws_request);
                             let resource_policy_json = config
                                 .resource_policy_provider
                                 .as_ref()
-                                .filter(|_| service_resource)
+                                .filter(|_| service_resource && !in_caller_account)
                                 .and_then(|p| {
                                     p.resource_policy(&detected.service, &iam_action.resource)
                                 });
@@ -913,7 +931,7 @@ async fn dispatch_inner(
                             let resource_account_id = config
                                 .resource_policy_provider
                                 .as_ref()
-                                .filter(|_| service_resource)
+                                .filter(|_| service_resource && !in_caller_account)
                                 .and_then(|p| {
                                     p.resource_owner_account(
                                         &detected.service,
@@ -2053,6 +2071,101 @@ fn authorize_internal_caller(
             if let Some(resp) = denied() {
                 return Some(resp);
             }
+        }
+    }
+    None
+}
+
+/// Authorize an account root reaching a resource ANOTHER account owns.
+///
+/// Root needs no identity policy in its own account, which is why dispatch
+/// exempts it from identity evaluation. That exemption ends at the account
+/// boundary: on AWS, root of account B reaching account A's bucket (or table)
+/// is a cross-account request like any other, allowed only when A's resource
+/// policy grants it. This applies where the resource policy provider resolves
+/// the owner of a resource (S3 buckets, whose names are global and whose ARNs
+/// carry no account, and DynamoDB tables and streams) -- the resource-policy
+/// governed data services whose handlers serve a request in the owner's
+/// account. A same-account resource, or one no provider claims, keeps the
+/// root exemption.
+///
+/// Returns the error response to send when the request is denied under
+/// strict mode; soft mode only logs.
+#[allow(clippy::too_many_arguments)]
+fn authorize_root_cross_account(
+    principal: &Principal,
+    service: &dyn crate::service::AwsService,
+    aws_request: &AwsRequest,
+    evaluator: &dyn IamPolicyEvaluator,
+    config: &DispatchConfig,
+    detected: &protocol::DetectedRequest,
+    request_id: &str,
+    remote_addr: Option<SocketAddr>,
+) -> Option<Response<Body>> {
+    if service.iam_resource_in_caller_account(aws_request) {
+        return None;
+    }
+    let provider = config.resource_policy_provider.as_ref()?;
+    for iam_action in service.iam_actions_for(aws_request) {
+        let Some(owner) = provider.resource_owner_account(&detected.service, &iam_action.resource)
+        else {
+            continue;
+        };
+        if owner == principal.account_id {
+            continue;
+        }
+        let mut context = build_condition_context(
+            principal,
+            remote_addr,
+            &aws_request.region,
+            is_secure_transport(&aws_request.headers),
+        );
+        context.service_keys = service.iam_condition_keys_for(aws_request, &iam_action);
+        let resource_policy_json =
+            provider.resource_policy(&detected.service, &iam_action.resource);
+        let decision = evaluator.evaluate_resource_policy_only(
+            principal,
+            &iam_action,
+            &context,
+            resource_policy_json.as_deref(),
+        );
+        let explicit_deny = matches!(decision, crate::auth::IamDecision::ExplicitDeny);
+        let acl_allows = !explicit_deny
+            && provider.public_acl_allows(
+                &detected.service,
+                &iam_action.resource,
+                iam_action.action,
+            );
+        if decision.is_allow() || acl_allows {
+            continue;
+        }
+        tracing::warn!(
+            target: "fakecloud::iam::audit",
+            service = %detected.service,
+            action = %iam_action.action_string(),
+            resource = %iam_action.resource,
+            principal = %principal.arn,
+            resource_account = %owner,
+            resource_policy_present = resource_policy_json.is_some(),
+            decision = ?decision,
+            mode = %config.iam_mode,
+            request_id = %request_id,
+            "cross-account root request denied: the resource policy does not grant the action"
+        );
+        if config.iam_mode.is_strict() {
+            return Some(build_error_response(
+                StatusCode::FORBIDDEN,
+                "AccessDeniedException",
+                &format!(
+                    "User: {} is not authorized to perform: {} on resource: {} because no resource-based policy allows the {} action",
+                    principal.arn,
+                    iam_action.action_string(),
+                    iam_action.resource,
+                    iam_action.action_string(),
+                ),
+                request_id,
+                ErrorEnvelope::for_request(detected, &aws_request.headers),
+            ));
         }
     }
     None
@@ -3332,6 +3445,143 @@ mod tests {
             ),
             None,
         );
+    }
+
+    /// Root of account B reaching a bucket account A owns: allowed only when
+    /// A's resource policy grants it, as for any cross-account principal.
+    /// Root in its own account, and resources no provider claims, keep the
+    /// root exemption.
+    #[test]
+    fn root_cross_account_needs_the_resource_policy() {
+        use crate::auth::IamAction;
+        use crate::service::{AwsResponse, AwsServiceError};
+        struct OwnerProvider;
+        impl crate::auth::ResourcePolicyProvider for OwnerProvider {
+            fn resource_policy(&self, _service: &str, resource_arn: &str) -> Option<String> {
+                resource_arn
+                    .starts_with("arn:aws:s3:::granted")
+                    .then(|| "granting-policy".to_string())
+            }
+            fn resource_owner_account(&self, _service: &str, resource_arn: &str) -> Option<String> {
+                let bucket = resource_arn.strip_prefix("arn:aws:s3:::")?;
+                let bucket = bucket.split('/').next()?;
+                match bucket {
+                    "own" => Some("222222222222".to_string()),
+                    "granted" | "denied" => Some("111111111111".to_string()),
+                    _ => None,
+                }
+            }
+        }
+        struct PolicyEvaluator;
+        impl IamPolicyEvaluator for PolicyEvaluator {
+            fn evaluate(
+                &self,
+                _: &Principal,
+                _: &IamAction,
+                _: &ConditionContext,
+                _: &[String],
+                _: Option<&[String]>,
+            ) -> crate::auth::IamDecision {
+                crate::auth::IamDecision::ImplicitDeny
+            }
+            fn evaluate_with_resource_policy(
+                &self,
+                _: &Principal,
+                _: &IamAction,
+                _: &ConditionContext,
+                _: Option<&str>,
+                _: &str,
+                _: &[String],
+                _: Option<&[String]>,
+            ) -> crate::auth::IamDecision {
+                crate::auth::IamDecision::ImplicitDeny
+            }
+            fn evaluate_resource_policy_only(
+                &self,
+                _: &Principal,
+                _: &IamAction,
+                _: &ConditionContext,
+                policy: Option<&str>,
+            ) -> crate::auth::IamDecision {
+                if policy == Some("granting-policy") {
+                    crate::auth::IamDecision::Allow
+                } else {
+                    crate::auth::IamDecision::ImplicitDeny
+                }
+            }
+        }
+        struct BucketService;
+        #[async_trait::async_trait]
+        impl crate::service::AwsService for BucketService {
+            fn service_name(&self) -> &str {
+                "s3"
+            }
+            async fn handle(&self, _: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+                unreachable!()
+            }
+            fn supported_actions(&self) -> &[&str] {
+                &[]
+            }
+            fn iam_action_for(&self, request: &AwsRequest) -> Option<IamAction> {
+                Some(IamAction {
+                    service: "s3",
+                    action: "GetObject",
+                    resource: format!("arn:aws:s3:::{}", request.path_segments.join("/")),
+                })
+            }
+        }
+        let root = Principal {
+            arn: "arn:aws:iam::222222222222:root".to_string(),
+            user_id: "222222222222".to_string(),
+            account_id: "222222222222".to_string(),
+            principal_type: PrincipalType::Root,
+            source_identity: None,
+            tags: None,
+        };
+        let detected = protocol::DetectedRequest {
+            service: "s3".to_string(),
+            action: String::new(),
+            protocol: AwsProtocol::Rest,
+        };
+        let request = |bucket: &str| AwsRequest {
+            service: "s3".to_string(),
+            action: String::new(),
+            region: "us-east-1".to_string(),
+            account_id: "222222222222".to_string(),
+            request_id: "req".to_string(),
+            headers: http::HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: Bytes::new(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec![bucket.to_string(), "key".to_string()],
+            raw_path: format!("/{bucket}/key"),
+            raw_query: String::new(),
+            method: http::Method::GET,
+            is_query_protocol: false,
+            access_key_id: Some("AKIAROOTB".to_string()),
+            principal: Some(root.clone()),
+        };
+        let run = |bucket: &str, mode: IamMode| {
+            let mut cfg = DispatchConfig::new("us-east-1", "111111111111");
+            cfg.iam_mode = mode;
+            cfg.resource_policy_provider = Some(Arc::new(OwnerProvider));
+            authorize_root_cross_account(
+                &root,
+                &BucketService,
+                &request(bucket),
+                &PolicyEvaluator,
+                &cfg,
+                &detected,
+                "req",
+                None,
+            )
+        };
+        let denied = run("denied", IamMode::Strict).expect("no grant must deny under strict");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(run("granted", IamMode::Strict).is_none());
+        assert!(run("own", IamMode::Strict).is_none());
+        assert!(run("unclaimed", IamMode::Strict).is_none());
+        assert!(run("denied", IamMode::Soft).is_none());
     }
 }
 

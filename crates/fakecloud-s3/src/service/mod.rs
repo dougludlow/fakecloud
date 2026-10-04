@@ -380,6 +380,59 @@ pub(crate) fn io_to_aws(err: std::io::Error) -> AwsServiceError {
 }
 
 impl S3Service {
+    /// The read authorization a copy request needs on its source object:
+    /// `s3:GetObject` (or `s3:GetObjectVersion` when the source names a
+    /// version) on `arn:...:s3:::src-bucket/src-key`. `None` for a request
+    /// that is not a copy, or whose source is not a `bucket/key` path (an
+    /// access-point ARN source is authorized through the access point).
+    fn copy_source_read_action(
+        &self,
+        request: &AwsRequest,
+    ) -> Option<fakecloud_core::auth::IamAction> {
+        if request.method != Method::PUT
+            || request.path_segments.len() < 2
+            || fakecloud_core::protocol::is_s3_control_host(&request.headers)
+        {
+            return None;
+        }
+        let source = request.headers.get("x-amz-copy-source")?.to_str().ok()?;
+        let source = source.strip_prefix('/').unwrap_or(source);
+        if source.starts_with("arn:") {
+            return None;
+        }
+        let (path, query) = source.split_once('?').unwrap_or((source, ""));
+        let versioned = query
+            .split('&')
+            .any(|p| p.strip_prefix("versionId=").is_some_and(|v| !v.is_empty()));
+        let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+        let (src_bucket, src_key) = decoded.split_once('/')?;
+        if src_bucket.is_empty() || src_key.is_empty() {
+            return None;
+        }
+        let action = if versioned {
+            "GetObjectVersion"
+        } else {
+            "GetObject"
+        };
+        let region = self
+            .bucket_region(src_bucket)
+            .unwrap_or_else(|| request.region.clone());
+        Some(fakecloud_core::auth::IamAction {
+            service: "s3",
+            action,
+            resource: Arn::s3_in(&region, &format!("{src_bucket}/{src_key}")).to_string(),
+        })
+    }
+
+    /// The account that owns `bucket`, searched across accounts (bucket names
+    /// are global). `None` when no account holds a bucket by that name.
+    pub(crate) fn bucket_owner_account(&self, bucket: &str) -> Option<String> {
+        self.state
+            .read()
+            .find_account(|s| s.buckets.contains_key(bucket))
+            .map(|a| a.to_string())
+    }
+
     /// The region of an existing bucket, searched across accounts (bucket
     /// names are global).
     fn bucket_region(&self, bucket: &str) -> Option<String> {
@@ -625,6 +678,20 @@ impl AwsService for S3Service {
             })
         });
 
+        // Bucket names are one global namespace, so a bucket-addressed request
+        // is served in the account that OWNS the bucket, not the caller's: a
+        // principal in account B reading account A's bucket (authorized by A's
+        // bucket policy at dispatch, which resolves the same owner) must find
+        // A's bucket and objects, and anything it writes lands in A's bucket.
+        // A bucket no account holds keeps the caller's account, so the
+        // handlers answer NoSuchBucket from there. CreateBucket and
+        // ListBuckets stay in the caller's account (they are routed with
+        // `caller_account` below), and the requester recorded on events is
+        // always the caller.
+        let caller_account = req.account_id.as_str();
+        let owner_account = bucket.and_then(|b| self.bucket_owner_account(b));
+        let account_id = owner_account.as_deref().unwrap_or(caller_account);
+
         // Multipart upload operations (checked before main match). Held in an
         // Option rather than returned directly so these responses still reach
         // the shared tail below (CORS headers, access logging) — browser
@@ -789,8 +856,8 @@ impl AwsService for S3Service {
                 let origin = origin.unwrap_or("");
                 let cors_config = {
                     let accounts = self.state.read();
-                    let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
-                    let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                    let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                    let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                     state
                         .buckets
                         .get(b_name)
@@ -1028,9 +1095,9 @@ impl AwsService for S3Service {
                     if req.query_params.get("x-id").map(|s| s.as_str())
                         == Some("ListDirectoryBuckets")
                     {
-                        self.list_directory_buckets(account_id, &req)
+                        self.list_directory_buckets(caller_account, &req)
                     } else {
-                        self.list_buckets(account_id, &req)
+                        self.list_buckets(caller_account, &req)
                     }
                 }
 
@@ -1087,7 +1154,7 @@ impl AwsService for S3Service {
                     } else if req.query_params.contains_key("metadataJournalTable") {
                         self.update_bucket_metadata_journal_table(account_id, &req, b)
                     } else {
-                        self.create_bucket(account_id, &req, b)
+                        self.create_bucket(caller_account, &req, b)
                     }
                 }
                 (&Method::DELETE, Some(b), None) => {
@@ -1203,9 +1270,8 @@ impl AwsService for S3Service {
                         // If bucket has website config and no query params, serve index document
                         let website_config = {
                             let accounts = self.state.read();
-                            let _empty_s3 =
-                                crate::state::S3State::new(&req.account_id, &req.region);
-                            let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                            let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                            let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                             state
                                 .buckets
                                 .get(b)
@@ -1289,9 +1355,8 @@ impl AwsService for S3Service {
                         if is_not_found {
                             let website_config = {
                                 let accounts = self.state.read();
-                                let _empty_s3 =
-                                    crate::state::S3State::new(&req.account_id, &req.region);
-                                let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                                let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                                let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                                 state
                                     .buckets
                                     .get(b)
@@ -1391,8 +1456,8 @@ impl AwsService for S3Service {
         if let Some(b_name) = bucket.filter(|_| req.headers.contains_key("origin")) {
             let cors_config = {
                 let accounts = self.state.read();
-                let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
-                let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                 state
                     .buckets
                     .get(b_name)
@@ -1782,12 +1847,32 @@ impl AwsService for S3Service {
         }
         // A replication configuration names the role S3 assumes to copy
         // objects, so AWS also requires `iam:PassRole` on it.
-        if action.service == "s3" && action.action == "PutBucketReplication" {
-            if let Some(role) = replication_role_arn(&request.body) {
-                return vec![action, fakecloud_core::auth::IamAction::pass_role(role)];
-            }
+        let pass_role = if action.service == "s3" && action.action == "PutBucketReplication" {
+            replication_role_arn(&request.body)
+        } else {
+            None
+        };
+        let mut actions = vec![action];
+        if let Some(role) = pass_role {
+            actions.push(fakecloud_core::auth::IamAction::pass_role(role));
         }
-        vec![action]
+        // CopyObject and UploadPartCopy also read the source object, which AWS
+        // authorizes as s3:GetObject (s3:GetObjectVersion for a versioned
+        // source) on the SOURCE object -- evaluated against the source
+        // bucket's owner and bucket policy, so copying out of another
+        // account's bucket needs that bucket's grant.
+        if let Some(source) = self.copy_source_read_action(request) {
+            actions.push(source);
+        }
+        actions
+    }
+
+    /// CreateBucket creates in the caller's account: a name another account
+    /// owns is authorized against the caller's own policies and then answered
+    /// `BucketAlreadyExists`, not refused by that account's bucket policy.
+    fn iam_resource_in_caller_account(&self, request: &AwsRequest) -> bool {
+        self.iam_action_for(request)
+            .is_some_and(|a| a.service == "s3" && a.action == "CreateBucket")
     }
 
     fn iam_condition_keys_for(
@@ -4417,7 +4502,7 @@ mod partition_tests {
             path_segments: path
                 .split('/')
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
+                .map(|a| a.to_string())
                 .collect(),
             raw_path: path.to_string(),
             raw_query: String::new(),

@@ -8162,3 +8162,134 @@ async fn upload_part_copy_reads_only_the_range_and_persists_the_part() {
         "NoSuchUpload",
     );
 }
+
+// ── Cross-account bucket addressing ─────────────────────────────
+
+const OTHER_ACCOUNT: &str = "222222222222";
+
+/// A service whose `theirs` bucket (holding `doc.txt`) belongs to
+/// [`OTHER_ACCOUNT`], not to the caller account `make_request` uses.
+fn service_with_foreign_bucket() -> S3Service {
+    let svc = make_service();
+    {
+        let mut mas = svc.state.write();
+        let state = mas.get_or_create(OTHER_ACCOUNT);
+        let mut b = S3Bucket::new("theirs", "us-east-1", OTHER_ACCOUNT);
+        b.objects.insert(
+            "doc.txt".to_string(),
+            S3Object {
+                key: "doc.txt".to_string(),
+                body: fakecloud_persistence::BodyRef::Memory(Bytes::from_static(b"owned by b")),
+                content_type: "text/plain".to_string(),
+                etag: compute_md5(b"owned by b"),
+                size: 10,
+                last_modified: chrono::Utc::now(),
+                ..Default::default()
+            },
+        );
+        state.buckets.insert("theirs".to_string(), b);
+    }
+    svc
+}
+
+#[tokio::test]
+async fn object_requests_on_another_accounts_bucket_are_served_from_its_owner() {
+    let svc = service_with_foreign_bucket();
+    let resp = svc
+        .handle(make_request(Method::GET, "/theirs/doc.txt", &[], b""))
+        .await
+        .expect("GetObject on the owner's bucket");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.body.expect_bytes(), b"owned by b");
+
+    svc.handle(make_request(
+        Method::PUT,
+        "/theirs/new.txt",
+        &[],
+        b"written",
+    ))
+    .await
+    .expect("PutObject into the owner's bucket");
+    {
+        let mas = svc.state.read();
+        assert!(mas
+            .get(OTHER_ACCOUNT)
+            .unwrap()
+            .buckets
+            .get("theirs")
+            .unwrap()
+            .objects
+            .contains_key("new.txt"));
+        assert!(
+            !mas.default_ref().buckets.contains_key("theirs"),
+            "the write must not create a bucket in the caller's account"
+        );
+    }
+
+    assert_aws_err(
+        svc.handle(make_request(Method::GET, "/theirs/absent.txt", &[], b""))
+            .await,
+        "NoSuchKey",
+    );
+}
+
+#[tokio::test]
+async fn create_bucket_named_like_another_accounts_bucket_is_already_exists() {
+    let svc = service_with_foreign_bucket();
+    assert_aws_err(
+        svc.handle(make_request(Method::PUT, "/theirs", &[], b""))
+            .await,
+        "BucketAlreadyExists",
+    );
+    let resp = svc
+        .handle(make_request(Method::GET, "/", &[], b""))
+        .await
+        .unwrap();
+    let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        !body.contains("<Name>theirs</Name>"),
+        "ListBuckets is per account: {body}"
+    );
+}
+
+#[tokio::test]
+async fn copy_object_reads_a_source_bucket_owned_by_another_account() {
+    let svc = service_with_foreign_bucket();
+    seed_bucket(&svc, "mine");
+    let mut req = make_request(Method::PUT, "/mine/copy.txt", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "theirs/doc.txt".parse().unwrap());
+    svc.handle(req)
+        .await
+        .expect("CopyObject from the foreign source");
+    let mas = svc.state.read();
+    let copied = mas.default_ref().buckets["mine"].objects["copy.txt"].clone();
+    assert_eq!(
+        mas.default_ref().read_body(&copied.body).unwrap(),
+        Bytes::from_static(b"owned by b")
+    );
+}
+
+#[test]
+fn copy_requests_also_need_read_on_the_source_object() {
+    let svc = service_with_foreign_bucket();
+    let mut req = make_request(Method::PUT, "/mine/copy.txt", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "theirs/doc.txt".parse().unwrap());
+    let actions = svc.iam_actions_for(&req);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].action, "PutObject");
+    assert_eq!(actions[1].action, "GetObject");
+    assert_eq!(actions[1].resource, "arn:aws:s3:::theirs/doc.txt");
+
+    req.headers.insert(
+        "x-amz-copy-source",
+        "/theirs/doc.txt?versionId=v1".parse().unwrap(),
+    );
+    let actions = svc.iam_actions_for(&req);
+    assert_eq!(actions[1].action, "GetObjectVersion");
+    assert_eq!(actions[1].resource, "arn:aws:s3:::theirs/doc.txt");
+
+    let plain = make_request(Method::PUT, "/mine/plain.txt", &[], b"x");
+    assert_eq!(svc.iam_actions_for(&plain).len(), 1);
+}

@@ -380,7 +380,14 @@ impl S3Service {
             let accts = self.state.read();
             let empty_state = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&empty_state);
-            let sb = state
+            // The source bucket is read in the account that owns it, which is
+            // not the destination's when copying out of another account's
+            // bucket (authorized by s3:GetObject on the source at dispatch).
+            let src_state = accts
+                .find_account(|s| s.buckets.contains_key(src_bucket))
+                .and_then(|owner| accts.get(owner))
+                .unwrap_or(state);
+            let sb = src_state
                 .buckets
                 .get(src_bucket)
                 .ok_or_else(|| no_such_bucket(src_bucket))?;
@@ -958,7 +965,7 @@ impl S3Service {
                 &super::notifications::ObjectEvent {
                     event_name: "ObjectCreated:CompleteMultipartUpload",
                     bucket_name: &bucket_name,
-                    requester_account: account_id,
+                    requester_account: &req.account_id,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,
