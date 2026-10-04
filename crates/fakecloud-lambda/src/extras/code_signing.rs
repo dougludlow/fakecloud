@@ -11,7 +11,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = body(req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let id = id_from_time("csc-");
         let arn = fakecloud_aws::arn::Arn::regional(
             "lambda",
@@ -49,9 +49,10 @@ impl LambdaService {
         &self,
         csc_id: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = extract_csc_id(csc_id);
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             state
                 .code_signing_configs
@@ -68,7 +69,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = body(req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let id = extract_csc_id(csc_id);
         let csc = state
             .code_signing_configs
@@ -89,10 +90,11 @@ impl LambdaService {
         &self,
         csc_id: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = extract_csc_id(csc_id);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         state.code_signing_configs.remove(&id);
         empty()
     }
@@ -100,8 +102,9 @@ impl LambdaService {
     pub(super) fn list_code_signing_configs(
         &self,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             let cfgs: Vec<Value> = state
                 .code_signing_configs
@@ -132,7 +135,7 @@ impl LambdaService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .function_code_signing
             .insert(function_name.to_string(), csc_arn.clone());
@@ -146,8 +149,9 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             let arn = state
                 .function_code_signing
@@ -165,9 +169,10 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         state.function_code_signing.remove(function_name);
         empty()
     }
@@ -176,9 +181,10 @@ impl LambdaService {
         &self,
         csc_id: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = extract_csc_id(csc_id);
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             // Exact id match — substring matching would surface
             // functions bound to a different csc that happens to share

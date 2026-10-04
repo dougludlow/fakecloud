@@ -52,7 +52,7 @@ impl LambdaService {
             .unwrap_or("$LATEST")
             .to_string();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if !state.functions.contains_key(function_name) {
             return Err(not_found("Function", function_name));
         }
@@ -98,7 +98,7 @@ impl LambdaService {
                 "Alias name exceeds the 128-character maximum",
             ));
         }
-        let region = self.region_for(&req.account_id);
+        let region = req.region.clone();
         self.with_state_read(&req.account_id, &region, |state| {
             state
                 .aliases
@@ -116,7 +116,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let marker = req.query_params.get("Marker").map(String::as_str);
         let max_items = crate::service::marker_page_size(req);
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         self.with_state_read(account_id, &region, |state| {
             let prefix = format!("{function_name}:");
             let aliases: Vec<FunctionAlias> = state
@@ -140,7 +140,7 @@ impl LambdaService {
         let alias_name = req.path_segments.get(4).cloned().unwrap_or_default();
         let body = body(req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let key = Self::alias_key(function_name, &alias_name);
         let alias = state
             .aliases
@@ -186,7 +186,7 @@ impl LambdaService {
             ));
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // AWS answers a delete for an alias that was never created with
         // `ResourceNotFoundException` rather than succeeding. The model
         // declares that error here, but it declares it identically on every

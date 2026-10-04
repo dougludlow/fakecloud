@@ -475,7 +475,10 @@ fn event_source_mapping_keeps_alias_qualifier_and_self_managed_config() {
         }),
     );
     let lam = prov.lambda_state.read();
-    let esm = &lam.get(ACCT).unwrap().event_source_mappings[&sr.physical_id];
+    let esm = &lam
+        .regional(ACCT, "us-east-1")
+        .unwrap()
+        .event_source_mappings[&sr.physical_id];
     assert_eq!(esm.function_arn, alias_arn);
     assert_eq!(
         esm.self_managed_event_source,
@@ -583,7 +586,7 @@ fn sam_explicit_api_s3_event_and_auto_publish_alias_provision() {
     // AutoPublishAlias published version 1 and pointed the alias at it.
     {
         let lam = prov.lambda_state.read();
-        let lam = lam.get(ACCT).unwrap();
+        let lam = lam.regional(ACCT, "us-east-1").unwrap();
         assert_eq!(lam.aliases["sam-fn:live"].function_version, "1");
         assert!(lam.function_url_configs.contains_key("sam-fn:live"));
         let policy = lam.functions["sam-fn"].policy.clone().unwrap();
@@ -655,7 +658,10 @@ fn sam_cognito_logs_iot_and_kafka_events_provision() {
 
     let esm = by_logical(&resources, "FnKafkaEventSourceMapping");
     let lam = prov.lambda_state.read();
-    let mapping = &lam.get(ACCT).unwrap().event_source_mappings[&esm.physical_id];
+    let mapping = &lam
+        .regional(ACCT, "us-east-1")
+        .unwrap()
+        .event_source_mappings[&esm.physical_id];
     assert_eq!(mapping.topics, vec!["orders".to_string()]);
     assert_eq!(
         mapping.self_managed_event_source,
@@ -689,7 +695,7 @@ fn sam_deployment_preference_creates_codedeploy_group_and_alias() {
     by_logical(&resources, "ServerlessDeploymentApplication");
     by_logical(&resources, "FnDeploymentGroup");
     let lam = prov.lambda_state.read();
-    let lam = lam.get(ACCT).unwrap();
+    let lam = lam.regional(ACCT, "us-east-1").unwrap();
     assert!(lam.aliases.contains_key("dp-fn:live"));
     assert_eq!(lam.provisioned_concurrency["dp-fn:live"].requested, 2);
 }

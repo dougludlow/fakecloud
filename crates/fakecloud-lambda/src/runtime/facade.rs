@@ -88,11 +88,6 @@ fn pool_key_function_name(key: &str) -> &str {
     key.split(':').nth(6).unwrap_or(key)
 }
 
-/// Account inside a pool key.
-fn pool_key_account(key: &str) -> &str {
-    fakecloud_aws::arn::account_of(key).unwrap_or_default()
-}
-
 /// Whether `key` is a pool of the function whose unqualified ARN is
 /// `function_arn` (any version).
 fn pool_key_belongs_to(key: &str, function_arn: &str) -> bool {
@@ -158,7 +153,7 @@ struct Slot {
 ///
 /// Encoded with `URL_SAFE_NO_PAD` so the result never contains `/`, `+`,
 /// or `=`. The id is spliced raw into the init-container artifact URL
-/// (`.../_internal/code/{account}/{function}/{deploy}.zip`) and into the
+/// (`.../_internal/code/{account}/{region}/{function}/{deploy}.zip`) and into the
 /// `fakecloud-deploy-id` Pod label; standard base64's `/` would grow an
 /// extra URL path segment, break the axum route match, and wedge the Pod
 /// in a cold-start loop for ~49% of deploys (issue #1643).
@@ -940,8 +935,10 @@ impl LambdaRuntime {
         let mut rows = Vec::new();
         for (key, pool) in entries.iter() {
             let name = pool_key_function_name(key);
+            // A pool key is a qualified function ARN, so it names the
+            // function's account and region.
             let runtime = accounts
-                .get(pool_key_account(key))
+                .by_arn(key)
                 .and_then(|state| state.functions.get(name))
                 .map(|f| f.runtime.clone())
                 .unwrap_or_default();

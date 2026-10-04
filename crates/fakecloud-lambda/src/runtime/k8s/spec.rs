@@ -180,18 +180,18 @@ pub fn build_pod_spec(
         "set -eu; \
          wget -q --header=\"authorization: Bearer $FAKECLOUD_INTERNAL_TOKEN\" \
               -O /tmp/layers.tar \
-              \"$FAKECLOUD_SELF_URL/_fakecloud/lambda/_internal/layers/$ACCT/$FN/$DEPLOY_ID.tar\"; \
+              \"$FAKECLOUD_SELF_URL/_fakecloud/lambda/_internal/layers/$ACCT/$FN_REGION/$FN/$DEPLOY_ID.tar\"; \
          if [ -s /tmp/layers.tar ]; then tar -xf /tmp/layers.tar -C /opt; fi"
             .to_string()
     } else {
         "set -eu; \
          wget -q --header=\"authorization: Bearer $FAKECLOUD_INTERNAL_TOKEN\" \
               -O /tmp/code.zip \
-              \"$FAKECLOUD_SELF_URL/_fakecloud/lambda/_internal/code/$ACCT/$FN/$DEPLOY_ID.zip\"; \
+              \"$FAKECLOUD_SELF_URL/_fakecloud/lambda/_internal/code/$ACCT/$FN_REGION/$FN/$DEPLOY_ID.zip\"; \
          unzip -q /tmp/code.zip -d /var/task; \
          wget -q --header=\"authorization: Bearer $FAKECLOUD_INTERNAL_TOKEN\" \
               -O /tmp/layers.tar \
-              \"$FAKECLOUD_SELF_URL/_fakecloud/lambda/_internal/layers/$ACCT/$FN/$DEPLOY_ID.tar\"; \
+              \"$FAKECLOUD_SELF_URL/_fakecloud/lambda/_internal/layers/$ACCT/$FN_REGION/$FN/$DEPLOY_ID.tar\"; \
          if [ -s /tmp/layers.tar ]; then tar -xf /tmp/layers.tar -C /opt; fi"
             .to_string()
     };
@@ -210,6 +210,18 @@ pub fn build_pod_spec(
         EnvVar {
             name: "ACCT".into(),
             value: Some(ctx.account_id.into()),
+            value_from: None,
+        },
+        EnvVar {
+            // Functions are regional: the same name can exist in several
+            // regions of one account, so the artifact routes take the
+            // region the function's ARN names.
+            name: "FN_REGION".into(),
+            value: Some(
+                fakecloud_aws::arn::region_of(&func.function_arn)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
             value_from: None,
         },
         EnvVar {
@@ -432,11 +444,11 @@ mod tests {
         let init = &spec.init_containers.unwrap()[0];
         let script = init.command.as_ref().unwrap().last().unwrap();
         assert!(
-            script.contains("code/$ACCT/$FN/$DEPLOY_ID.zip"),
+            script.contains("code/$ACCT/$FN_REGION/$FN/$DEPLOY_ID.zip"),
             "init script must include code download for zip functions: {script}"
         );
         assert!(
-            script.contains("layers/$ACCT/$FN/$DEPLOY_ID.tar"),
+            script.contains("layers/$ACCT/$FN_REGION/$FN/$DEPLOY_ID.tar"),
             "init script must include layers download: {script}"
         );
         // Bearer header references env, not the literal token, so we

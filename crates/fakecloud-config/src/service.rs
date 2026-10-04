@@ -2041,20 +2041,19 @@ impl ConfigService {
             input_parameters,
             &result_token,
         );
-        // Resolve the Lambda in the rule's own account (not just the default
-        // account) so a custom rule in a non-default account finds its function.
+        // Resolve the Lambda in the account and region its ARN names; a bare
+        // name is the rule's own account and region.
         let resolved = {
             let accounts = lambda_state.read();
-            accounts
-                .get(account)
-                .and_then(|state| state.functions.get(&func_name).cloned())
+            let rule_region = fakecloud_aws::arn::region_of(rule_arn).unwrap_or(accounts.region());
+            fakecloud_lambda::resolve_invocable(&accounts, lambda_arn, account, rule_region)
         };
-        let Some(func) = resolved else {
+        let Some((func, layer_zips)) = resolved else {
             tracing::warn!(function = %func_name, account = %account, "Config custom rule Lambda not found");
             return;
         };
         let payload = event.to_string().into_bytes();
-        match runtime.invoke(&func, &payload, &[]).await {
+        match runtime.invoke(&func, &payload, &layer_zips).await {
             Ok(resp) => {
                 // If the function returned evaluations directly, record them.
                 if let Ok(v) = serde_json::from_slice::<Value>(&resp) {

@@ -54,7 +54,7 @@ impl LambdaService {
             last_modified: Utc::now(),
         };
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .event_invoke_configs
             .insert(Self::ev_key(function_name, &qualifier), cfg.clone());
@@ -95,7 +95,7 @@ impl LambdaService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let cfg = state
             .event_invoke_configs
             .get_mut(&key)
@@ -121,7 +121,7 @@ impl LambdaService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let qualifier = parse_qualifier(req);
-        let region = self.region_for(&req.account_id);
+        let region = req.region.clone();
         self.with_state_read(&req.account_id, &region, |state| {
             state
                 .event_invoke_configs
@@ -138,7 +138,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let qualifier = parse_qualifier(req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // A config that was never put is a not-found, the same way AWS
         // answers it.
         if state
@@ -155,8 +155,9 @@ impl LambdaService {
         &self,
         function_name: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             let prefix = format!("{function_name}:");
             let configs: Vec<Value> = state

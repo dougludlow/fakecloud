@@ -636,7 +636,7 @@ impl CloudFormationService {
                 .deps
                 .lambda
                 .read()
-                .get(aid)
+                .regional(aid, region)
                 .map(|s| s.functions.contains_key(&resource.physical_id))
                 .unwrap_or(false),
             "AWS::IAM::Role" => self
@@ -3035,7 +3035,7 @@ pub(crate) mod tests {
             eventbridge: shared::<EventBridgeState>(),
             dynamodb: shared::<fakecloud_core::multi_account::RegionalState<DynamoDbState>>(),
             logs: shared::<fakecloud_core::multi_account::RegionalState<LogsState>>(),
-            lambda: shared::<LambdaState>(),
+            lambda: shared::<fakecloud_core::multi_account::RegionalState<LambdaState>>(),
             secretsmanager: shared::<
                 fakecloud_core::multi_account::RegionalState<SecretsManagerState>,
             >(),

@@ -81,7 +81,7 @@ impl LambdaService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let account_id = state.account_id.clone();
         let layer = state
             .layers
@@ -129,7 +129,7 @@ impl LambdaService {
             compatible_architectures: architectures,
         };
         layer.versions.push(lv.clone());
-        let location = layer_content_url(req, &account_id, layer_name, next_version);
+        let location = layer_content_url(req, &account_id, &req.region, layer_name, next_version);
         ok(json!({
             "LayerArn": layer_arn,
             "LayerVersionArn": version_arn,
@@ -154,7 +154,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let marker = req.query_params.get("Marker").map(String::as_str);
         let max_items = crate::service::marker_page_size(req);
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         self.with_state_read(account_id, &region, |state| {
             let layers: Vec<Value> = state
                 .layers
@@ -190,7 +190,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let marker = req.query_params.get("Marker").map(String::as_str);
         let max_items = crate::service::marker_page_size(req);
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         self.with_state_read(account_id, &region, |state| {
             let versions: Vec<Value> = state
                 .layers
@@ -232,8 +232,8 @@ impl LambdaService {
             .get(4)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| missing("VersionNumber"))?;
-        let region = self.region_for(&req.account_id);
-        let location = layer_content_url(req, &req.account_id, &layer_name, version);
+        let region = req.region.clone();
+        let location = layer_content_url(req, &req.account_id, &req.region, &layer_name, version);
         self.with_state_read(&req.account_id, &region, |state| {
             state
                 .layers
@@ -277,8 +277,10 @@ impl LambdaService {
             .unwrap_or_default();
         let (account_id, layer_name, version) =
             parse_layer_version_arn(&arn).ok_or_else(|| missing("Arn"))?;
-        let region = self.region_for(&account_id);
-        let location = layer_content_url(req, &account_id, &layer_name, version);
+        let region = fakecloud_aws::arn::region_of(&arn)
+            .unwrap_or(&req.region)
+            .to_string();
+        let location = layer_content_url(req, &account_id, &region, &layer_name, version);
         self.with_state_read(&account_id, &region, |state| {
             state
                 .layers
@@ -342,7 +344,7 @@ impl LambdaService {
             )
         })?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if let Some(layer) = state.layers.get_mut(&layer_name) {
             layer.versions.retain(|v| v.version != version);
         }
@@ -359,7 +361,7 @@ impl LambdaService {
             .get(4)
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let region = self.region_for(&req.account_id);
+        let region = req.region.clone();
         self.with_state_read(&req.account_id, &region, |state| {
             let policy = state
                 .layers
@@ -383,7 +385,7 @@ impl LambdaService {
             .unwrap_or(0);
         let body = body(req);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if let Some(layer) = state.layers.get_mut(&layer_name) {
             if let Some(v) = layer.versions.iter_mut().find(|v| v.version == version) {
                 let policy = v.policy.clone().unwrap_or_else(|| "{}".to_string());
@@ -422,7 +424,7 @@ impl LambdaService {
             .unwrap_or(0);
         let sid = req.path_segments.get(6).cloned().unwrap_or_default();
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if let Some(layer) = state.layers.get_mut(&layer_name) {
             if let Some(v) = layer.versions.iter_mut().find(|v| v.version == version) {
                 if let Some(policy) = v.policy.clone() {

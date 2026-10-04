@@ -459,6 +459,7 @@ impl EventBridgeService {
                     &event_json,
                     &event_str,
                     &req.account_id,
+                    &req.region,
                 );
             }
         }
@@ -477,6 +478,7 @@ impl EventBridgeService {
         event_json: &Value,
         event_str: &str,
         account_id: &str,
+        region: &str,
     ) {
         let target_arn = &target.arn;
         let body_str = if let Some(ref transformer) = target.input_transformer {
@@ -530,6 +532,7 @@ impl EventBridgeService {
                     ls,
                     target_arn,
                     account_id,
+                    region,
                     &body_str,
                     Utc::now(),
                 );

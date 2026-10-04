@@ -13,7 +13,7 @@ impl ResourceProvisioner {
     ) -> Option<String> {
         let function_name = parse_lambda_function_name(physical_id);
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         match attribute {
             "Arn" => state
                 .functions
@@ -46,7 +46,7 @@ impl ResourceProvisioner {
         if self
             .lambda_state
             .read()
-            .get(&self.account_id)
+            .regional(&self.account_id, &self.region)
             .is_some_and(|s| s.functions.contains_key(&function_name))
         {
             return Err(resource_already_exists(
@@ -175,7 +175,7 @@ impl ResourceProvisioner {
         }
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         // An existing function under this name (e.g. one a deleted stack
         // retained) fails the create, as Lambda's ResourceConflictException
         // does, instead of being overwritten.
@@ -263,7 +263,7 @@ impl ResourceProvisioner {
             })
             .transpose()?;
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let func = state.functions.get_mut(&function_name).ok_or_else(|| {
             format!("Cannot update {function_name}: function does not exist in lambda state")
         })?;
@@ -322,7 +322,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_lambda_function(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.functions.remove(physical_id);
         state.function_concurrency.remove(physical_id);
         Ok(())
@@ -373,7 +373,7 @@ impl ResourceProvisioner {
         // sid in the policy doc.
         {
             let mut accounts = self.lambda_state.write();
-            let state = accounts.get_or_create(&self.account_id);
+            let state = accounts.regional_mut(&self.account_id, &self.region);
             if let Some(func) = state.functions.get_mut(function_name) {
                 if let Some(policy_str) = func.policy.as_deref() {
                     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(policy_str) {
@@ -396,7 +396,7 @@ impl ResourceProvisioner {
             return Ok(());
         };
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if let Some(func) = state.functions.get_mut(function_name) {
             if let Some(policy_str) = func.policy.as_deref() {
                 if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(policy_str) {
@@ -424,7 +424,7 @@ impl ResourceProvisioner {
         let cfg = parse_lambda_event_source_mapping_props(props)?;
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if !state.functions.contains_key(&function_name) {
             return Err(format!(
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
@@ -484,7 +484,7 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let cfg = parse_lambda_event_source_mapping_props(&resource.properties)?;
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let esm = state
             .event_source_mappings
             .get_mut(&existing.physical_id)
@@ -524,7 +524,7 @@ impl ResourceProvisioner {
         physical_id: &str,
     ) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.event_source_mappings.remove(physical_id);
         Ok(())
     }
@@ -606,7 +606,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let layer_arn = fakecloud_lambda::layer_arn(&self.region, &self.account_id, &layer_name);
         let layer = state
             .layers
@@ -645,7 +645,7 @@ impl ResourceProvisioner {
         // ARN form: arn:aws:lambda:<region>:<account>:layer:<name>
         let layer_name = layer_arn.rsplit(':').next().unwrap_or("").to_string();
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if let Some(layer) = state.layers.get_mut(&layer_name) {
             layer.versions.retain(|v| v.version != version);
         }
@@ -685,7 +685,7 @@ impl ResourceProvisioner {
         let cors = props.get("Cors").cloned();
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if !state.functions.contains_key(&function_name) {
             return Err(format!(
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
@@ -748,7 +748,7 @@ impl ResourceProvisioner {
         let cors = props.get("Cors").cloned();
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let cfg = state
             .function_url_configs
             .get_mut(&existing.physical_id)
@@ -771,7 +771,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_lambda_url(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.function_url_configs.remove(physical_id);
         Ok(())
     }
@@ -805,7 +805,7 @@ impl ResourceProvisioner {
         let routing_config = props.get("RoutingConfig").cloned();
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if !state.functions.contains_key(&function_name) {
             return Err(format!(
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
@@ -885,7 +885,7 @@ impl ResourceProvisioner {
         let key = alias_state_key(&existing.physical_id);
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let alias = state.aliases.get_mut(&key).ok_or_else(|| {
             format!(
                 "Alias {} does not exist in lambda state",
@@ -928,7 +928,7 @@ impl ResourceProvisioner {
         // `{function}:{alias}`.
         let key = alias_state_key(physical_id);
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.aliases.remove(&key);
         state.provisioned_concurrency.remove(&key);
         Ok(())
@@ -959,7 +959,7 @@ impl ResourceProvisioner {
             .map(|s| s.to_string());
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let func = state
             .functions
             .get(&function_name)
@@ -1014,7 +1014,7 @@ impl ResourceProvisioner {
         _resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let Some((function_name, version)) = existing.physical_id.split_once(':') else {
             return Err(format!(
                 "Version physical id `{}` is malformed; expected `{{function}}:{{version}}`",
@@ -1068,7 +1068,7 @@ impl ResourceProvisioner {
             return Ok(());
         };
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if let Some(versions) = state.function_versions.get_mut(function_name) {
             versions.retain(|v| v != version);
         }
@@ -1132,7 +1132,7 @@ impl ResourceProvisioner {
             }
         };
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         if !state.functions.contains_key(&function_name) {
             return Err(format!(
                 "ResourceNotFoundException: Function not found: {function_name}"
@@ -1176,7 +1176,7 @@ impl ResourceProvisioner {
         physical_id: &str,
     ) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         state.event_invoke_configs.remove(physical_id);
         Ok(())
     }

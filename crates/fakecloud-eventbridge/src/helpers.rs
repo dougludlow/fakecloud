@@ -722,11 +722,13 @@ pub(crate) fn lambda_arn_account(arn: &str) -> Option<&str> {
 /// Record an EventBridge-driven invocation in Lambda's invocation log (what
 /// `/_fakecloud/lambda/invocations` serves). It lands in the account the
 /// function ARN names when fakecloud knows that account, else in the bus's
-/// account -- never creating a Lambda account just to hold the record.
+/// account -- never creating a Lambda account just to hold the record -- and
+/// in the region the function ARN names (the bus's region for a bare name).
 pub(crate) fn record_lambda_invocation(
     lambda_state: &SharedLambdaState,
     function_arn: &str,
     bus_account: &str,
+    bus_region: &str,
     payload: &str,
     timestamp: chrono::DateTime<chrono::Utc>,
 ) {
@@ -735,8 +737,11 @@ pub(crate) fn record_lambda_invocation(
         .filter(|a| accounts.get(a).is_some())
         .unwrap_or(bus_account)
         .to_string();
+    let region = fakecloud_lambda::function_location(function_arn, bus_account, bus_region)
+        .1
+        .to_string();
     accounts
-        .get_or_create(&account)
+        .regional_mut(&account, &region)
         .invocations
         .push(fakecloud_lambda::LambdaInvocation {
             function_arn: function_arn.to_string(),
@@ -777,38 +782,21 @@ pub(crate) fn invoke_lambda_async(
         }
     };
     let func_name = function_name_from_arn(function_arn).to_string();
-    // Resolve the function in the account its ARN names (an event from another
-    // account's bus targets that account's function); only a bare name falls
-    // back to the default account.
-    let func_account = lambda_arn_account(function_arn).map(str::to_string);
+    let function_arn = function_arn.to_string();
     let payload = payload.as_bytes().to_vec();
 
     tokio::spawn(async move {
+        // Resolve the function in the account and region its ARN names (an
+        // event from another account's bus targets that account's function);
+        // only a bare name falls back to the default account and region.
         let resolved = {
             let accounts = lambda_state.read();
-            let state = match func_account.as_deref() {
-                Some(account) => accounts.get(account),
-                None => Some(accounts.default_ref()),
-            };
-            let func = state.and_then(|s| s.functions.get(&func_name).cloned());
-            func.map(|func| {
-                let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
-                for attached in &func.layers {
-                    if let Some(bytes) = fakecloud_lambda::extras::parse_layer_version_arn(
-                        &attached.arn,
-                    )
-                    .and_then(|(acct, name, ver)| {
-                        accounts
-                            .get(&acct)
-                            .and_then(|s| s.layers.get(&name))
-                            .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                            .and_then(|v| v.code_zip.clone())
-                    }) {
-                        layer_zips.push(bytes);
-                    }
-                }
-                (func, layer_zips)
-            })
+            fakecloud_lambda::resolve_invocable(
+                &accounts,
+                &function_arn,
+                accounts.default_account_id(),
+                accounts.region(),
+            )
         };
         let (func, layer_zips) = match resolved {
             Some(pair) => pair,
@@ -1100,7 +1088,7 @@ pub(crate) fn dispatch_event_target(
             });
         }
         if let Some(ls) = ctx.lambda_state {
-            record_lambda_invocation(ls, arn, ctx.account_id, &body_str, now);
+            record_lambda_invocation(ls, arn, ctx.account_id, ctx.region, &body_str, now);
         }
         invoke_lambda_async(
             ctx.container_runtime,

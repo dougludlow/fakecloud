@@ -70,7 +70,7 @@ impl LambdaService {
             runtime_version_arn,
         };
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         state
             .runtime_management
             .insert(format!("{function_name}:{qualifier}"), cfg.clone());
@@ -93,7 +93,7 @@ impl LambdaService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let qualifier = parse_qualifier(req);
-        let region = self.region_for(&req.account_id);
+        let region = req.region.clone();
         self.with_state_read(&req.account_id, &region, |state| {
             // The config only exists while the function does; once the function
             // is deleted GetRuntimeManagementConfig must 404 (the Terraform

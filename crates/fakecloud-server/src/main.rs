@@ -2166,7 +2166,10 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_lambda::LambdaSnapshot>(&bytes) {
+                    // Older schemas are migrated on parse: v2 kept one
+                    // account-wide function map, which is split into regions
+                    // by each resource's ARN.
+                    match fakecloud_lambda::parse_lambda_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_lambda::LAMBDA_SNAPSHOT_SCHEMA_VERSION
@@ -2185,8 +2188,9 @@ async fn main() {
                                     "loaded lambda persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let fn_count = single_state.functions.len();
-                                let account_id = single_state.account_id.clone();
+                                let fn_count: usize =
+                                    single_state.regions().map(|(_, s)| s.functions.len()).sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = lambda_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
                                 tracing::info!(
@@ -7667,8 +7671,8 @@ async fn main() {
                 move || async move {
                     let accounts = ls.read();
                     let invocations = accounts
-                        .iter()
-                        .flat_map(|(_, state)| state.invocations.iter())
+                        .iter_regional()
+                        .flat_map(|(_, _, state)| state.invocations.iter())
                         .map(|inv| types::LambdaInvocation {
                             function_arn: inv.function_arn.clone(),
                             payload: inv.payload.clone(),
@@ -11483,7 +11487,8 @@ async fn main() {
             "/_fakecloud/lambda/layer-content/{account_id}/{layer_name}/{file}",
             axum::routing::get({
                 let ls = lambda_layer_content_state;
-                move |axum::extract::Path((account_id, layer_name, file)): axum::extract::Path<(String, String, String)>| {
+                move |axum::extract::Path((account_id, layer_name, file)): axum::extract::Path<(String, String, String)>,
+                      axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
                     let ls = ls.clone();
                     async move {
                         let version: Option<i64> = file
@@ -11496,13 +11501,19 @@ async fn main() {
                                 axum::body::Bytes::from_static(b"layer version not found"),
                             );
                         };
+                        // Layers are regional. The `Content.Location` URL names
+                        // the layer's region; without one (an SDK download by
+                        // account + name) the server's region is tried first,
+                        // then any region holding that layer version.
                         let bytes_opt: Option<Vec<u8>> = {
                             let accounts = ls.read();
-                            accounts
-                                .get(&account_id)
-                                .and_then(|s| s.layers.get(&layer_name))
-                                .and_then(|l| l.versions.iter().find(|v| v.version == version))
-                                .and_then(|v| v.code_zip.clone())
+                            let version_zip = |s: &fakecloud_lambda::LambdaState| {
+                                s.layers
+                                    .get(&layer_name)
+                                    .and_then(|l| l.versions.iter().find(|v| v.version == version))
+                                    .and_then(|v| v.code_zip.clone())
+                            };
+                            lambda_artifact_region_lookup(&accounts, &account_id, query.get("region"), version_zip)
                         };
                         match bytes_opt {
                             Some(bytes) => (
@@ -11524,7 +11535,8 @@ async fn main() {
             "/_fakecloud/lambda/function-code/{account_id}/{function_name}/{file}",
             axum::routing::get({
                 let ls = lambda_state.clone();
-                move |axum::extract::Path((account_id, function_name, file)): axum::extract::Path<(String, String, String)>| {
+                move |axum::extract::Path((account_id, function_name, file)): axum::extract::Path<(String, String, String)>,
+                      axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
                     let ls = ls.clone();
                     async move {
                         let qualifier: Option<String> = file
@@ -11537,9 +11549,13 @@ async fn main() {
                                 axum::body::Bytes::from_static(b"function code not found"),
                             );
                         };
+                        // Functions are regional. `Code.Location` names the
+                        // function's region; without one (an SDK download by
+                        // account + name) the server's region is tried first,
+                        // then any region holding that function.
                         let bytes_opt: Option<Vec<u8>> = {
                             let accounts = ls.read();
-                            accounts.get(&account_id).and_then(|s| {
+                            let code_zip = |s: &fakecloud_lambda::LambdaState| {
                                 if qualifier == "latest" {
                                     s.functions
                                         .get(&function_name)
@@ -11550,7 +11566,8 @@ async fn main() {
                                         .and_then(|m| m.get(&qualifier))
                                         .and_then(|f| f.code_zip.clone())
                                 }
-                            })
+                            };
+                            lambda_artifact_region_lookup(&accounts, &account_id, query.get("region"), code_zip)
                         };
                         match bytes_opt {
                             Some(bytes) => (
@@ -12500,6 +12517,26 @@ async fn main() {
     if let Some(cli) = fakecloud_core::container_net::detect_container_cli() {
         fakecloud_core::data_volume::remove_process_volumes(&cli).await;
     }
+}
+
+/// Look up a Lambda artifact (function code, layer content) of `account_id`
+/// for the introspection download routes. An explicit `region` is
+/// authoritative; without one the server's region is tried first, then the
+/// account's other regions in name order.
+fn lambda_artifact_region_lookup<T>(
+    accounts: &fakecloud_core::multi_account::MultiRegionState<fakecloud_lambda::LambdaState>,
+    account_id: &str,
+    region: Option<&String>,
+    find: impl Fn(&fakecloud_lambda::LambdaState) -> Option<T>,
+) -> Option<T> {
+    if let Some(region) = region {
+        return accounts.regional(account_id, region).and_then(find);
+    }
+    let account = accounts.get(account_id)?;
+    account
+        .region(accounts.region())
+        .and_then(&find)
+        .or_else(|| account.regions().find_map(|(_, s)| find(s)))
 }
 
 #[cfg(test)]

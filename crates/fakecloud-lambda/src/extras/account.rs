@@ -48,6 +48,7 @@ impl LambdaService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let aid = req.account_id.as_str();
+        let rg = req.region.as_str();
         let res = resource.unwrap_or("");
         // Every operation scoped to a function declares
         // `ResourceNotFoundException`, and AWS raises it before touching the
@@ -61,7 +62,7 @@ impl LambdaService {
             let exists = self
                 .state
                 .read()
-                .get(aid)
+                .regional(aid, rg)
                 .is_some_and(|s| s.functions.contains_key(res));
             if !exists {
                 return Err(not_found("Function", res));
@@ -73,9 +74,18 @@ impl LambdaService {
             "UpdateFunctionConfiguration" => self.update_function_configuration(res, req),
             "UpdateFunctionCode" => self.update_function_code(res, req),
             "UpdateEventSourceMapping" => self.update_event_source_mapping_handler(res, req),
-            "GetAccountSettings" => self.get_account_settings(aid),
+            "GetAccountSettings" => self.get_account_settings(aid, rg),
             "InvokeAsync" => Ok(AwsResponse::json(StatusCode::ACCEPTED, "{}".to_string())),
-            "InvokeWithResponseStream" => self.invoke_with_response_stream(res, aid, req).await,
+            "InvokeWithResponseStream" => {
+                // The function ARN (or partial ARN) in the path names the
+                // account invoked; a bare name is the caller's own function.
+                let target = req
+                    .path_segments
+                    .get(2)
+                    .and_then(|raw| crate::service::function_ref_scope(raw).0)
+                    .unwrap_or(aid);
+                self.invoke_with_response_stream(res, target, req).await
+            }
 
             // Versions
             "ListVersionsByFunction" => self.list_versions_by_function(res, aid, req),
@@ -122,12 +132,12 @@ impl LambdaService {
             "GetFunctionUrlConfig" => self.get_function_url_config(res, req),
             "UpdateFunctionUrlConfig" => self.update_function_url_config(res, req),
             "DeleteFunctionUrlConfig" => self.delete_function_url_config(res, req),
-            "ListFunctionUrlConfigs" => self.list_function_url_configs(res, aid),
+            "ListFunctionUrlConfigs" => self.list_function_url_configs(res, aid, rg),
 
             // Concurrency
             "PutFunctionConcurrency" => self.put_function_concurrency(res, req),
-            "GetFunctionConcurrency" => self.get_function_concurrency(res, aid),
-            "DeleteFunctionConcurrency" => self.delete_function_concurrency(res, aid),
+            "GetFunctionConcurrency" => self.get_function_concurrency(res, aid, rg),
+            "DeleteFunctionConcurrency" => self.delete_function_concurrency(res, aid, rg),
             "PutProvisionedConcurrencyConfig" => self.put_provisioned_concurrency(res, req),
             "GetProvisionedConcurrencyConfig" => self.get_provisioned_concurrency(res, req),
             "DeleteProvisionedConcurrencyConfig" => self.delete_provisioned_concurrency(res, req),
@@ -137,21 +147,21 @@ impl LambdaService {
 
             // Code signing
             "CreateCodeSigningConfig" => self.create_code_signing_config(req),
-            "GetCodeSigningConfig" => self.get_code_signing_config(res, aid),
+            "GetCodeSigningConfig" => self.get_code_signing_config(res, aid, rg),
             "UpdateCodeSigningConfig" => self.update_code_signing_config(res, req),
-            "DeleteCodeSigningConfig" => self.delete_code_signing_config(res, aid),
-            "ListCodeSigningConfigs" => self.list_code_signing_configs(aid),
+            "DeleteCodeSigningConfig" => self.delete_code_signing_config(res, aid, rg),
+            "ListCodeSigningConfigs" => self.list_code_signing_configs(aid, rg),
             "PutFunctionCodeSigningConfig" => self.put_function_code_signing(res, req),
-            "GetFunctionCodeSigningConfig" => self.get_function_code_signing(res, aid),
-            "DeleteFunctionCodeSigningConfig" => self.delete_function_code_signing(res, aid),
-            "ListFunctionsByCodeSigningConfig" => self.list_functions_by_code_signing(res, aid),
+            "GetFunctionCodeSigningConfig" => self.get_function_code_signing(res, aid, rg),
+            "DeleteFunctionCodeSigningConfig" => self.delete_function_code_signing(res, aid, rg),
+            "ListFunctionsByCodeSigningConfig" => self.list_functions_by_code_signing(res, aid, rg),
 
             // Event invoke
             "PutFunctionEventInvokeConfig" => self.put_function_event_invoke(res, req),
             "UpdateFunctionEventInvokeConfig" => self.update_function_event_invoke(res, req),
             "GetFunctionEventInvokeConfig" => self.get_function_event_invoke(res, req),
             "DeleteFunctionEventInvokeConfig" => self.delete_function_event_invoke(res, req),
-            "ListFunctionEventInvokeConfigs" => self.list_function_event_invoke(res, aid),
+            "ListFunctionEventInvokeConfigs" => self.list_function_event_invoke(res, aid, rg),
 
             // Runtime management
             "PutRuntimeManagementConfig" => self.put_runtime_management(res, req),
@@ -163,12 +173,12 @@ impl LambdaService {
 
             // Recursion
             "PutFunctionRecursionConfig" => self.put_recursion_config(res, req),
-            "GetFunctionRecursionConfig" => self.get_recursion_config(res, aid),
+            "GetFunctionRecursionConfig" => self.get_recursion_config(res, aid, rg),
 
             // Tags
             "TagResource" => self.tag_resource(res, req),
             "UntagResource" => self.untag_resource(res, req),
-            "ListTags" => self.list_tags(res, aid),
+            "ListTags" => self.list_tags(res, aid, rg),
 
             _ => Err(AwsServiceError::action_not_implemented("lambda", action)),
         }
@@ -177,18 +187,20 @@ impl LambdaService {
     pub(super) fn get_account_settings(
         &self,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        // Account settings and usage are per region on AWS: the concurrency
+        // limit, code storage and function count of one region never count
+        // against another.
+        let accounts = self.state.read();
+        let empty = LambdaState::new(account_id, region);
+        let state = accounts.regional(account_id, region).unwrap_or(&empty);
         let settings = state.account_settings.clone().unwrap_or(AccountSettings {
             concurrent_executions: 1000,
             code_size_zipped: 52_428_800,
             code_size_unzipped: 262_144_000,
             total_code_size: 80_530_636_800,
         });
-        if state.account_settings.is_none() {
-            state.account_settings = Some(settings.clone());
-        }
         // Real AccountUsage so clients monitoring deployment quotas see
         // accurate numbers. AWS sums total code size across all functions.
         let function_count = state.functions.len() as i64;

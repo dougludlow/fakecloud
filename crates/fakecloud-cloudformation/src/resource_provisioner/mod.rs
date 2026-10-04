@@ -882,33 +882,17 @@ fn sha256_b64(bytes: &[u8]) -> String {
 /// unparseable or the layer/version is unknown — same fallback as the
 /// lambda service helper.
 fn layer_code_size(
-    accounts: &fakecloud_core::multi_account::MultiAccountState<fakecloud_lambda::LambdaState>,
+    accounts: &fakecloud_core::multi_account::MultiRegionState<fakecloud_lambda::LambdaState>,
     arn: &str,
 ) -> i64 {
-    // arn:aws:lambda:<region>:<account>:layer:<name>:<version>
-    let Some(rest) = arn_resource(arn, "lambda") else {
-        return 0;
-    };
-    let mut parts = rest.split(':');
-    let _region = parts.next();
-    let Some(account) = parts.next() else {
-        return 0;
-    };
-    if parts.next() != Some("layer") {
-        return 0;
-    }
-    let Some(name) = parts.next() else {
-        return 0;
-    };
-    let Some(ver_str) = parts.next() else {
-        return 0;
-    };
-    let Ok(ver) = ver_str.parse::<i64>() else {
+    // arn:aws:lambda:<region>:<account>:layer:<name>:<version>, which names
+    // the account and region the layer lives in.
+    let Some((_, name, ver)) = fakecloud_lambda::extras::parse_layer_version_arn(arn) else {
         return 0;
     };
     accounts
-        .get(account)
-        .and_then(|s| s.layers.get(name))
+        .by_arn(arn)
+        .and_then(|s| s.layers.get(&name))
         .and_then(|l| l.versions.iter().find(|v| v.version == ver))
         .map(|v| v.code_size)
         .unwrap_or(0)
@@ -3334,7 +3318,7 @@ impl ResourceProvisioner {
             .map(|s| s.to_string());
 
         let mut accounts = self.lambda_state.write();
-        let state = accounts.get_or_create(&self.account_id);
+        let state = accounts.regional_mut(&self.account_id, &self.region);
         let func = state.functions.get_mut(function_name).ok_or_else(|| {
             format!(
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
@@ -7174,7 +7158,7 @@ mod tests {
         // Verify it landed in lambda state
         {
             let lam = prov.lambda_state.read();
-            let st = lam.get("123456789012").unwrap();
+            let st = lam.regional("123456789012", "us-east-1").unwrap();
             let f = st.functions.get("my-fn").unwrap();
             assert_eq!(f.runtime, "nodejs20.x");
             assert_eq!(f.memory_size, 256);
@@ -7182,7 +7166,7 @@ mod tests {
         }
         prov.delete_resource(&sr).unwrap();
         let lam = prov.lambda_state.read();
-        let st = lam.get("123456789012").unwrap();
+        let st = lam.regional("123456789012", "us-east-1").unwrap();
         assert!(!st.functions.contains_key("my-fn"));
     }
 
@@ -7589,7 +7573,7 @@ mod tests {
         assert!(prov
             .lambda_state
             .read()
-            .get("222222222222")
+            .regional("222222222222", "us-east-1")
             .is_some_and(|s| s.functions.contains_key("fn-b")));
         assert!(prov
             .eventbridge_state
@@ -7619,7 +7603,7 @@ mod tests {
         assert!(!prov
             .lambda_state
             .read()
-            .get("222222222222")
+            .regional("222222222222", "us-east-1")
             .unwrap()
             .functions
             .contains_key("fn-b"));
@@ -7980,7 +7964,7 @@ mod tests {
         assert!(prov
             .lambda_state
             .read()
-            .get("123456789012")
+            .regional("123456789012", "cn-north-1")
             .unwrap()
             .aliases
             .contains_key("cn-fn:live"));
@@ -7988,7 +7972,7 @@ mod tests {
         assert!(!prov
             .lambda_state
             .read()
-            .get("123456789012")
+            .regional("123456789012", "cn-north-1")
             .unwrap()
             .aliases
             .contains_key("cn-fn:live"));

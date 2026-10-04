@@ -22,15 +22,15 @@ use crate::state::{
 /// referenced account/layer/version is unknown, or when the version was
 /// published without ZIP content (legacy snapshots).
 pub(crate) fn resolve_layer_attachments(
-    accounts: &fakecloud_core::multi_account::MultiAccountState<LambdaState>,
+    accounts: &fakecloud_core::multi_account::MultiRegionState<LambdaState>,
     arns: Vec<String>,
 ) -> Vec<AttachedLayer> {
     arns.into_iter()
         .map(|arn| {
             let code_size = parse_layer_version_arn(&arn)
-                .and_then(|(acct, name, ver)| {
+                .and_then(|(_acct, name, ver)| {
                     accounts
-                        .get(&acct)
+                        .by_arn(&arn)
                         .and_then(|s| s.layers.get(&name))
                         .and_then(|l| l.versions.iter().find(|v| v.version == ver))
                         .map(|v| v.code_size)
@@ -125,8 +125,15 @@ fn decode_query_segment(s: &str) -> String {
 /// Build a fakecloud-hosted download URL for a layer version's ZIP. The URL
 /// is reachable on the same authority the SDK used for the original
 /// request, so test harnesses get a working `Location` they can `GET`
-/// directly instead of the placeholder AWS clients otherwise see.
-fn layer_content_url(req: &AwsRequest, account_id: &str, layer_name: &str, version: i64) -> String {
+/// directly instead of the placeholder AWS clients otherwise see. Layers are
+/// regional, so the URL carries the layer's region as a query parameter.
+fn layer_content_url(
+    req: &AwsRequest,
+    account_id: &str,
+    region: &str,
+    layer_name: &str,
+    version: i64,
+) -> String {
     let host = req
         .headers
         .get(http::header::HOST)
@@ -138,17 +145,20 @@ fn layer_content_url(req: &AwsRequest, account_id: &str, layer_name: &str, versi
         .and_then(|h| h.to_str().ok())
         .unwrap_or("http");
     format!(
-        "{scheme}://{host}/_fakecloud/lambda/layer-content/{account_id}/{layer_name}/{version}.zip"
+        "{scheme}://{host}/_fakecloud/lambda/layer-content/{account_id}/{layer_name}/{version}.zip?region={region}"
     )
 }
 
 /// Build a fakecloud-hosted download URL for a function version's ZIP. AWS
 /// Toolkit (and `aws lambda get-function --query 'Code.Location'`) expects
 /// this to resolve to an actual ZIP body, so the URL points back at the
-/// running fakecloud instance on the same authority the SDK used.
+/// running fakecloud instance on the same authority the SDK used. Functions
+/// are regional, so the URL carries the function's region as a query
+/// parameter.
 pub(crate) fn function_code_url(
     req: &AwsRequest,
     account_id: &str,
+    region: &str,
     function_name: &str,
     version_label: &str,
 ) -> String {
@@ -167,7 +177,9 @@ pub(crate) fn function_code_url(
     } else {
         format!("{version_label}.zip")
     };
-    format!("{scheme}://{host}/_fakecloud/lambda/function-code/{account_id}/{function_name}/{file}")
+    format!(
+        "{scheme}://{host}/_fakecloud/lambda/function-code/{account_id}/{function_name}/{file}?region={region}"
+    )
 }
 
 /// AWS layer-version ARN: `arn:aws:lambda:<region>:<account>:layer:<name>:<version>`.
@@ -261,7 +273,7 @@ impl LambdaService {
     {
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, region);
-        let state = accounts.get(account_id).unwrap_or(&empty);
+        let state = accounts.regional(account_id, region).unwrap_or(&empty);
         f(state)
     }
 
@@ -273,7 +285,7 @@ impl LambdaService {
         account_id: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         let qualifier = req.query_params.get("Qualifier").cloned();
         self.with_state_read(account_id, &region, |state| {
             let live = state
@@ -354,7 +366,7 @@ impl LambdaService {
                 .collect();
             resolve_layer_attachments(&accounts, arns)
         });
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let func = state
             .functions
             .get_mut(function_name)
@@ -520,7 +532,7 @@ impl LambdaService {
         let publish = body["Publish"].as_bool().unwrap_or(false);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // Function existence is the first check so callers always see
         // ResourceNotFoundException 404 even when CSC / sig-profile
@@ -681,7 +693,7 @@ impl LambdaService {
         account_id: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let region = self.region_for(account_id);
+        let region = req.region.clone();
         // ListVersionsByFunction MaxItems range is 1..10000 in the Smithy model
         // (default 50), not capped at 50.
         let max_items: usize = req
@@ -786,7 +798,7 @@ impl LambdaService {
             )
         })?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let func = state.functions.get_mut(&name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -848,7 +860,7 @@ impl LambdaService {
             )
         })?;
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let func = state.functions.get_mut(&name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
@@ -866,6 +878,7 @@ impl LambdaService {
         &self,
         resource_arn: &str,
         account_id: &str,
+        region: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = function_name_from_arn(resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -874,7 +887,7 @@ impl LambdaService {
                 format!("Resource ARN is not a Lambda function: {resource_arn}"),
             )
         })?;
-        let region = self.region_for(account_id);
+        let region = region.to_string();
         self.with_state_read(account_id, &region, |state| {
             let func = state.functions.get(&name).ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -917,7 +930,7 @@ impl LambdaService {
             })?;
         }
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let esm = state
             .event_source_mappings
             .get_mut(uuid)
@@ -1010,14 +1023,6 @@ impl LambdaService {
         let response = self.event_source_mapping_json(esm);
         ok(response)
     }
-
-    fn region_for(&self, account_id: &str) -> String {
-        let accounts = self.state.read();
-        accounts
-            .get(account_id)
-            .map(|s| s.region.clone())
-            .unwrap_or_else(|| "us-east-1".to_string())
-    }
 }
 
 fn extract_csc_id(input: &str) -> String {
@@ -1089,7 +1094,7 @@ fn event_invoke_json(c: &EventInvokeConfig) -> Value {
 mod tests {
     use crate::service::LambdaService;
     use crate::state::{LambdaState, SharedLambdaState};
-    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::multi_account::MultiRegionState;
     use fakecloud_core::service::AwsRequest;
     use http::Method;
     use parking_lot::RwLock;
@@ -1097,9 +1102,11 @@ mod tests {
     use std::sync::Arc;
 
     fn svc() -> LambdaService {
-        let state: SharedLambdaState = Arc::new(RwLock::new(
-            MultiAccountState::<LambdaState>::new("000000000000", "us-east-1", ""),
-        ));
+        let state: SharedLambdaState = Arc::new(RwLock::new(MultiRegionState::<LambdaState>::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        )));
         LambdaService::new(state)
     }
 
@@ -1179,7 +1186,12 @@ mod tests {
         )
         .await;
         publish().await;
-        let versions: Vec<i64> = s.state.read().get("000000000000").unwrap().layers["layer1"]
+        let versions: Vec<i64> = s
+            .state
+            .read()
+            .regional("000000000000", "us-east-1")
+            .unwrap()
+            .layers["layer1"]
             .versions
             .iter()
             .map(|v| v.version)

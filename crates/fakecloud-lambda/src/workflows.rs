@@ -85,7 +85,7 @@ pub(crate) fn create_capacity_provider(
     let arn = arn_for_capacity_provider(&req.region, &req.account_id, &name);
 
     let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
+    let s = accts.regional_mut(&req.account_id, &req.region);
     if s.capacity_providers.contains_key(&name) {
         return Err(AwsServiceError::aws_error(
             StatusCode::CONFLICT,
@@ -132,7 +132,9 @@ pub(crate) fn get_capacity_provider(
     check_len("CapacityProviderName", name, 1, 140)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let cp = s
         .capacity_providers
         .get(name)
@@ -160,7 +162,9 @@ pub(crate) fn list_capacity_providers(
     }
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let providers: Vec<Value> = s
         .capacity_providers
         .values()
@@ -180,7 +184,7 @@ pub(crate) fn update_capacity_provider(
 ) -> Result<AwsResponse, AwsServiceError> {
     check_len("CapacityProviderName", name, 1, 140)?;
     let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
+    let s = accts.regional_mut(&req.account_id, &req.region);
     let cp = s
         .capacity_providers
         .get_mut(name)
@@ -216,7 +220,7 @@ pub(crate) fn delete_capacity_provider(
 ) -> Result<AwsResponse, AwsServiceError> {
     check_len("CapacityProviderName", name, 1, 140)?;
     let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
+    let s = accts.regional_mut(&req.account_id, &req.region);
     let cp = s
         .capacity_providers
         .remove(name)
@@ -238,7 +242,9 @@ pub(crate) fn list_function_versions_by_capacity_provider(
     check_len("CapacityProviderName", name, 1, 140)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let cp = s
         .capacity_providers
         .get(name)
@@ -278,7 +284,7 @@ pub(crate) fn list_durable_executions_by_function(
         // is for every other operation scoped to one function.
         let accts = state.read();
         let exists = accts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .is_some_and(|s| s.functions.contains_key(function_name));
         if !exists {
             return Err(AwsServiceError::aws_error(
@@ -299,7 +305,9 @@ pub(crate) fn list_durable_executions_by_function(
     }
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let executions: Vec<Value> = s
         .durable_executions
         .values()
@@ -333,7 +341,9 @@ pub(crate) fn get_durable_execution(
     check_len("DurableExecutionArn", arn, 1, 1024)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let exec = ensure_execution(s, arn)?;
     Ok(AwsResponse::ok_json(
         json!({ "DurableExecution": execution_json(exec) }),
@@ -348,7 +358,9 @@ pub(crate) fn get_durable_execution_history(
     check_len("DurableExecutionArn", arn, 1, 1024)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let exec = ensure_execution(s, arn)?;
     Ok(AwsResponse::ok_json(json!({
         "Events": exec.history.clone(),
@@ -365,7 +377,9 @@ pub(crate) fn get_durable_execution_state(
     // for client errors (no ResourceNotFoundException), so map missing arn there.
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.get(&req.account_id).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let exec = s
         .durable_executions
         .get(arn)
@@ -388,7 +402,7 @@ pub(crate) fn checkpoint_durable_execution(
     // CheckpointDurableExecution Smithy doesn't declare ResourceNotFoundException;
     // map missing arn to InvalidParameterValueException.
     let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
+    let s = accts.regional_mut(&req.account_id, &req.region);
     let exec = s
         .durable_executions
         .get_mut(arn)
@@ -417,7 +431,7 @@ pub(crate) fn stop_durable_execution(
 ) -> Result<AwsResponse, AwsServiceError> {
     check_len("DurableExecutionArn", arn, 1, 1024)?;
     let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
+    let s = accts.regional_mut(&req.account_id, &req.region);
     let exec = s
         .durable_executions
         .get_mut(arn)
@@ -456,7 +470,7 @@ fn record_callback(
 ) -> Result<AwsResponse, AwsServiceError> {
     check_len("CallbackId", callback_id, 1, 1024)?;
     let mut accts = state.write();
-    let s = accts.get_or_create(&req.account_id);
+    let s = accts.regional_mut(&req.account_id, &req.region);
     // AWS mints a callback token when a task suspends waiting on one, and
     // answers an id nobody handed out with ResourceNotFoundException. fakecloud
     // runs no suspending task, so it has no honest point at which to mint a
@@ -606,7 +620,12 @@ mod tests {
             "PermissionsConfig": {"RoleArn": "old"}
         });
         create_capacity_provider(&s, &req(), &body).unwrap();
-        let prev_mod = s.read().default_ref().capacity_providers["cp1"].last_modified;
+        let prev_mod = s
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .capacity_providers["cp1"]
+            .last_modified;
         std::thread::sleep(std::time::Duration::from_millis(2));
         update_capacity_provider(
             &s,
@@ -616,14 +635,17 @@ mod tests {
         )
         .unwrap();
         let state = s.read();
-        let cp = &state.default_ref().capacity_providers["cp1"];
+        let cp = &state
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .capacity_providers["cp1"];
         assert_eq!(cp.permissions_config["RoleArn"], "new");
         assert!(cp.last_modified > prev_mod);
     }
 
     fn seed_execution(s: &SharedLambdaState, arn: &str, function_name: &str, status: &str) {
         let mut accts = s.write();
-        let st = accts.get_or_create("123456789012");
+        let st = accts.regional_mut("123456789012", "us-east-1");
         // An execution belongs to a function, and listing by function name
         // 404s when that function does not exist, so seed it too.
         if !st.functions.contains_key(function_name) {
@@ -675,7 +697,12 @@ mod tests {
         seed_execution(&s, arn, "fn1", "Running");
         let body = json!({"State": {"step": 2}, "Event": {"type": "Tick"}});
         checkpoint_durable_execution(&s, &req(), arn, &body).unwrap();
-        let exec = s.read().default_ref().durable_executions[arn].clone();
+        let exec = s
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .durable_executions[arn]
+            .clone();
         assert_eq!(exec.state["step"], 2);
         assert_eq!(exec.history.len(), 1);
     }
@@ -725,7 +752,7 @@ mod tests {
     /// Seed a callback token as the service would when a task suspends.
     fn seed_callback(s: &SharedLambdaState, callback_id: &str) {
         let mut accts = s.write();
-        let st = accts.get_or_create("123456789012");
+        let st = accts.regional_mut("123456789012", "us-east-1");
         st.durable_execution_callbacks.insert(
             callback_id.to_string(),
             DurableExecutionCallback {
@@ -748,7 +775,10 @@ mod tests {
         send_callback_failure(&s, &req(), "cb2").unwrap();
         send_callback_heartbeat(&s, &req(), "cb3").unwrap();
         let st = s.read();
-        let cbs = &st.default_ref().durable_execution_callbacks;
+        let cbs = &st
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .durable_execution_callbacks;
         assert_eq!(cbs["cb1"].outcome, "Succeeded");
         assert_eq!(cbs["cb2"].outcome, "Failed");
         assert_eq!(cbs["cb3"].outcome, "Heartbeat");
@@ -771,7 +801,7 @@ mod tests {
             call.unwrap_or_else(|e| panic!("call {i} failed: {e:?}"));
         }
         let accts = s.read();
-        let st = accts.get("123456789012").unwrap();
+        let st = accts.regional("123456789012", "us-east-1").unwrap();
         for (id, outcome) in [
             ("never-issued-1", "Succeeded"),
             ("never-issued-2", "Failed"),

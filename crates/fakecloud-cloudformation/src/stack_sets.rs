@@ -3066,7 +3066,7 @@ impl CloudFormationService {
             .deps
             .lambda
             .read()
-            .get(account)
+            .regional(account, region)
             .is_some_and(|s| s.functions.contains_key(ACCOUNT_GATE_FUNCTION));
         if !exists {
             return GateResult {
@@ -8568,7 +8568,7 @@ mod tests {
             .deps
             .lambda
             .read()
-            .get(ACCT_B)
+            .regional(ACCT_B, "us-east-1")
             .is_some_and(|s| s.functions.contains_key(ACCOUNT_GATE_FUNCTION)));
 
         create_set(&svc, "gated", QUEUE_TEMPLATE).await;

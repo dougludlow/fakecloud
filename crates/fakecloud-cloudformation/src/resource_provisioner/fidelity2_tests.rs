@@ -146,7 +146,7 @@ fn lambda_image_config_reserved_concurrency_and_tags_follow_the_template() {
     );
     {
         let lambda = prov.lambda_state.read();
-        let st = lambda.get(ACCT).unwrap();
+        let st = lambda.regional(ACCT, "us-east-1").unwrap();
         let func = &st.functions["img"];
         assert_eq!(
             func.image_config.as_ref().unwrap()["Command"][0],
@@ -166,7 +166,7 @@ fn lambda_image_config_reserved_concurrency_and_tags_follow_the_template() {
         }),
     );
     let lambda = prov.lambda_state.read();
-    let st = lambda.get(ACCT).unwrap();
+    let st = lambda.regional(ACCT, "us-east-1").unwrap();
     let func = &st.functions["img"];
     assert!(func.image_config.is_none());
     assert!(func.tags.is_empty(), "an empty Tags list clears the tags");
@@ -197,7 +197,10 @@ fn lambda_event_invoke_config_is_stored_for_the_qualifier() {
     assert_eq!(cfg.physical_id, "fn-a:$LATEST");
     {
         let lambda = prov.lambda_state.read();
-        let c = &lambda.get(ACCT).unwrap().event_invoke_configs["fn-a:$LATEST"];
+        let c = &lambda
+            .regional(ACCT, "us-east-1")
+            .unwrap()
+            .event_invoke_configs["fn-a:$LATEST"];
         assert_eq!(c.maximum_retry_attempts, 0);
         assert_eq!(c.maximum_event_age, 120);
         assert!(c.destination_config.is_some());
@@ -214,7 +217,7 @@ fn lambda_event_invoke_config_is_stored_for_the_qualifier() {
     assert!(prov
         .lambda_state
         .read()
-        .get(ACCT)
+        .regional(ACCT, "us-east-1")
         .unwrap()
         .event_invoke_configs
         .is_empty());

@@ -81,7 +81,7 @@ impl LambdaService {
         let qualifier = req.query_params.get("Qualifier").cloned();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let func =
             resolve_policy_target_mut(state, function_name, &req.region, qualifier.as_deref())?;
 
@@ -208,7 +208,7 @@ impl LambdaService {
         qualifier: Option<&str>,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         let func = resolve_policy_target_mut(state, function_name, region, qualifier)?;
         let policy_str = func.policy.as_deref().ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -262,7 +262,7 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, "");
-        let state = accounts.get(account_id).unwrap_or(&empty);
+        let state = accounts.regional(account_id, region).unwrap_or(&empty);
         let func = resolve_policy_target_ref(state, function_name, region, qualifier)?;
         let policy = func.policy.as_deref().ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -347,7 +347,7 @@ impl LambdaService {
         let expected_revision = body.get("RevisionId").and_then(|v| v.as_str());
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         let func = resolve_policy_target_mut(state, function_name, region, qualifier)?;
         check_revision(expected_revision, &func.revision_id)?;
         func.policy = Some(policy.clone());
@@ -382,7 +382,7 @@ impl LambdaService {
         // `RevisionId` is an httpQuery member on this op, not a body member.
         let expected_revision = req.query_params.get("RevisionId").map(String::as_str);
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         let func = resolve_policy_target_mut(state, function_name, region, qualifier)?;
         if func.policy.is_none() {
             return Err(AwsServiceError::aws_error(

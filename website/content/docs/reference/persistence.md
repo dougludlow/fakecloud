@@ -39,7 +39,7 @@ Every implemented service persists its control-plane state in this mode — a sn
 - **API Gateway v2** — HTTP APIs, routes, integrations, stages, deployments, authorizers.
 - **CloudFormation** — stacks, templates, parameters, tags, resource listings, and notification ARNs.
 - **Cognito** — user pools, user pool clients, users, groups, identity providers, resource servers, domains, import jobs, tags, UI customization, log delivery, risk and branding configuration, terms, WebAuthn credentials, refresh/access tokens and sessions. The `/_fakecloud/cognito/auth-events` introspection buffer resets on restart.
-- **Lambda** — functions (code zips, configuration, resource policies), event source mappings. The `/_fakecloud/lambda/invocations` introspection buffer resets on restart; containers are rebuilt from the persisted code zip on first Invoke.
+- **Lambda** — functions (code zips, configuration, resource policies), event source mappings, layers, aliases, versions and the rest of the per-region control plane. Functions, layers and settings are kept per region (see the regional state migration below). The `/_fakecloud/lambda/invocations` introspection buffer resets on restart; containers are rebuilt from the persisted code zip on first Invoke.
 - **Step Functions** — state machines, definitions, executions, execution history events, tags.
 - **RDS** — DB instances (configuration, credentials, tags), DB snapshots (including dump data), subnet groups, parameter groups.
 - **ElastiCache** — cache clusters, replication groups, global replication groups, subnet groups, parameter groups, users, user groups, snapshots, serverless caches and snapshots, reserved cache nodes, tags.
@@ -130,6 +130,7 @@ On load, such a snapshot is split once: every resource moves to the region its A
 - **MemoryDB** - clusters, ACLs, users, parameter groups, subnet groups, snapshots, reserved nodes and their tags go to the region of their ARN, and every region gets its own default ACL, user and parameter groups. Multi-region clusters and their tags stay account-wide.
 - **X-Ray** - groups, sampling rules and tags go to the region of their ARN; traces, retrievals, resource policies, indexing rules, the encryption config and the trace-segment destination name no region and go to the server's `--region`. Every region gets its own built-in `Default` sampling rule.
 - **Route 53 Resolver** - endpoints, resolver rules, query-log configs, firewall rule groups, domain lists, associations and Outpost resolvers go to the region of their ARN; rule and query-log associations, firewall rules and domains follow their parent; per-VPC firewall, resolver and DNSSEC configs go to the server's `--region`.
+- **Lambda** - each function goes to the region of its function ARN; its versions, aliases, function URL config, concurrency, event invoke, runtime management, scaling, recursion and code signing settings follow it. Event source mappings follow their function ARN, layers, code signing configs, capacity providers and durable executions their own ARN, and the account settings go to the server's `--region`.
 
 ## S3 object body handling
 

@@ -2316,3 +2316,27 @@ fn aws_sdk_integration_calls_the_service_in_the_execution_region() {
         vec![("eu-west-1".to_string(), "123456789012".to_string())]
     );
 }
+
+#[test]
+fn lambda_invoke_function_name_resolves_in_the_execution_region() {
+    let exec = "arn:aws:states:eu-west-1:111122223333:execution:sm:run-1";
+    // A bare name (optionally qualified) is the execution's own function.
+    assert_eq!(
+        qualify_lambda_function_ref("my-fn", exec),
+        "arn:aws:lambda:eu-west-1:111122223333:function:my-fn"
+    );
+    assert_eq!(
+        qualify_lambda_function_ref("my-fn:live", exec),
+        "arn:aws:lambda:eu-west-1:111122223333:function:my-fn:live"
+    );
+    // A partial ARN keeps its account but lives in the execution's region.
+    assert_eq!(
+        qualify_lambda_function_ref("444455556666:function:other", exec),
+        "arn:aws:lambda:eu-west-1:444455556666:function:other"
+    );
+    // A full ARN names its own region.
+    assert_eq!(
+        qualify_lambda_function_ref("arn:aws:lambda:us-west-2:111122223333:function:f", exec),
+        "arn:aws:lambda:us-west-2:111122223333:function:f"
+    );
+}

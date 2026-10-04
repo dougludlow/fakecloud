@@ -116,8 +116,8 @@ impl SqsLambdaPoller {
         let mappings: Vec<Mapping> = {
             let lambda_accounts = self.lambda_state.read();
             lambda_accounts
-                .iter()
-                .flat_map(|(_, lambda)| {
+                .iter_regional()
+                .flat_map(|(_, _, lambda)| {
                     lambda
                         .event_source_mappings
                         .values()
@@ -409,9 +409,17 @@ impl SqsLambdaPoller {
             self.persist().await;
         }
 
-        let fn_account = mapping.function_arn.split(':').nth(4).unwrap_or("");
+        // The invocation is recorded in the account and region the mapped
+        // function's ARN names.
         let mut lambda_accounts = self.lambda_state.write();
-        let lambda = lambda_accounts.get_or_create(fn_account);
+        let default_account = lambda_accounts.default_account_id().to_string();
+        let default_region = lambda_accounts.region().to_string();
+        let (fn_account, fn_region, _) = fakecloud_lambda::function_location(
+            &mapping.function_arn,
+            &default_account,
+            &default_region,
+        );
+        let lambda = lambda_accounts.regional_mut(fn_account, fn_region);
         lambda.invocations.push(LambdaInvocation {
             function_arn: mapping.function_arn.clone(),
             payload,
@@ -484,7 +492,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
 
-    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::multi_account::{MultiAccountState, MultiRegionState};
     use fakecloud_lambda::{EventSourceMapping, LambdaState};
     use fakecloud_sqs::{SqsMessage, SqsQueue, SqsState};
     use parking_lot::RwLock;
@@ -587,10 +595,10 @@ mod tests {
         }
         let sqs_state = Arc::new(RwLock::new(sqs));
 
-        let mut lambda: MultiAccountState<LambdaState> =
-            MultiAccountState::new(ACCOUNT, REGION, "http://localhost:4566");
+        let mut lambda: MultiRegionState<LambdaState> =
+            MultiRegionState::new(ACCOUNT, REGION, "http://localhost:4566");
         {
-            let l = lambda.default_mut();
+            let l = lambda.regional_mut(ACCOUNT, REGION);
             let mapping = EventSourceMapping {
                 uuid: "esm-1".to_string(),
                 function_arn: format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:k2-fn"),

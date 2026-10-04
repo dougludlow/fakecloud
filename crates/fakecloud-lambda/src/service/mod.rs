@@ -460,6 +460,52 @@ pub(crate) fn normalize_function_name(input: &str) -> String {
     input.to_string()
 }
 
+/// The account and region a function reference names: a full ARN
+/// (`arn:<p>:lambda:REGION:ACCOUNT:function:NAME[:Q]`) names both, a partial
+/// ARN (`ACCOUNT:function:NAME[:Q]`) only the account, and a bare name
+/// neither (the caller's account and the request region apply).
+pub(crate) fn function_ref_scope(input: &str) -> (Option<&str>, Option<&str>) {
+    if let Some(rest) = strip_lambda_arn_prefix(input) {
+        let parts: Vec<&str> = rest.splitn(5, ':').collect();
+        if parts.len() >= 4 && parts[2] == "function" && !parts[3].is_empty() {
+            let region = Some(parts[0]).filter(|r| !r.is_empty());
+            let account = Some(parts[1]).filter(|a| !a.is_empty());
+            return (account, region);
+        }
+        return (None, None);
+    }
+    let parts: Vec<&str> = input.splitn(4, ':').collect();
+    if parts.len() >= 3
+        && parts[1] == "function"
+        && !parts[0].is_empty()
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+    {
+        return (Some(parts[0]), None);
+    }
+    (None, None)
+}
+
+/// A function ARN minted in another region than the one the request is sent
+/// to. Lambda functions are regional: AWS refuses to reach across regions
+/// with `Functions from '<arn region>' are not reachable in this region
+/// ('<request region>')`.
+pub(crate) fn cross_region_function_error(
+    function_ref: &str,
+    request_region: &str,
+) -> Option<AwsServiceError> {
+    let (_, region) = function_ref_scope(function_ref);
+    let region = region?;
+    (region != request_region).then(|| {
+        AwsServiceError::aws_error(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFoundException",
+            format!(
+                "Functions from '{region}' are not reachable in this region ('{request_region}')"
+            ),
+        )
+    })
+}
+
 fn is_function_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
@@ -1361,6 +1407,26 @@ impl AwsService for LambdaService {
         let arn_embedded_qualifier = resource_name
             .as_deref()
             .and_then(qualifier_from_function_ref);
+        // A function ARN addresses the region it names; one from another
+        // region is unreachable from this one. Tagging operations name the
+        // function by ARN too.
+        if action_takes_function_name(action)
+            || matches!(action, "TagResource" | "UntagResource" | "ListTags")
+        {
+            if let Some(err) = resource_name
+                .as_deref()
+                .and_then(|r| cross_region_function_error(r, &req.region))
+            {
+                return Err(err);
+            }
+        }
+        // Invocations address the account the function ARN (or partial ARN)
+        // names; a bare name is the caller's own function.
+        let invoke_account = resource_name
+            .as_deref()
+            .and_then(|r| function_ref_scope(r).0)
+            .unwrap_or(req.account_id.as_str())
+            .to_string();
         let resource_name = if action_takes_function_name(action) {
             // Enforce the Smithy length bound (`FunctionName.length 1..140`)
             // before normalization. Synthetic conformance variants drive
@@ -1553,6 +1619,7 @@ impl AwsService for LambdaService {
                 }
                 self.list_functions(
                     aid,
+                    req.region.as_str(),
                     req.query_params.get("FunctionVersion").map(String::as_str),
                     req.query_params.get("Marker").map(String::as_str),
                     marker_page_size(&req),
@@ -1592,7 +1659,7 @@ impl AwsService for LambdaService {
                 self.invoke(
                     resource_name.as_deref().unwrap_or(""),
                     &req.body,
-                    aid,
+                    &invoke_account,
                     req.region.as_str(),
                     invocation_type,
                     qualifier,
@@ -1609,7 +1676,7 @@ impl AwsService for LambdaService {
                 let name = resource_name.as_deref().unwrap_or("");
                 let accounts = self.state.read();
                 let exists = accounts
-                    .get(aid)
+                    .regional(&invoke_account, &req.region)
                     .map(|s| s.functions.contains_key(name))
                     .unwrap_or(false);
                 if !exists {
@@ -1683,12 +1750,16 @@ impl AwsService for LambdaService {
                 }
                 self.list_event_source_mappings(aid, &req)
             }
-            "GetEventSourceMapping" => {
-                self.get_event_source_mapping(resource_name.as_deref().unwrap_or(""), aid)
-            }
-            "DeleteEventSourceMapping" => {
-                self.delete_event_source_mapping(resource_name.as_deref().unwrap_or(""), aid)
-            }
+            "GetEventSourceMapping" => self.get_event_source_mapping(
+                resource_name.as_deref().unwrap_or(""),
+                aid,
+                req.region.as_str(),
+            ),
+            "DeleteEventSourceMapping" => self.delete_event_source_mapping(
+                resource_name.as_deref().unwrap_or(""),
+                aid,
+                req.region.as_str(),
+            ),
             "CreateCapacityProvider" => {
                 crate::workflows::create_capacity_provider(&self.state, &req, &req.json_body())
             }
@@ -1891,7 +1962,9 @@ impl AwsService for LambdaService {
         let action = iam_action_name_for(action_str)?;
         let accounts = self.state.read();
         let empty = LambdaState::new(&request.account_id, &request.region);
-        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let state = accounts
+            .regional(&request.account_id, &request.region)
+            .unwrap_or(&empty);
         let resource = match action_str {
             // Function-scoped ops: the path identifier is a function name
             // (or ARN/partial-ARN). Normalize it to a bare name and build
@@ -1955,7 +2028,16 @@ impl AwsService for LambdaService {
                     // caller spelled FunctionName, or policy evaluation
                     // mismatches the actual function.
                     let name = normalize_function_name(&raw);
-                    function_arn(&request.region, &state.account_id, &name)
+                    // An invocation of another account's function (named by
+                    // its ARN) is evaluated against that function, so its
+                    // resource policy decides cross-account access.
+                    let account = match action_str {
+                        "Invoke" | "InvokeAsync" | "InvokeWithResponseStream" => {
+                            function_ref_scope(&raw).0.unwrap_or(&state.account_id)
+                        }
+                        _ => &state.account_id,
+                    };
+                    function_arn(&request.region, account, &name)
                 }
             }
             "CreateFunction" => {
