@@ -319,7 +319,19 @@ async fn alb_routes_to_awsvpc_ecs_service_task() {
     let ip = detail("privateIPv4Address").expect("privateIPv4Address");
     assert!(ip_in_24(&ip, "10.42.7."), "ENI IP {ip} outside the subnet");
     assert_eq!(detail("subnetId").as_deref(), Some(subnet_id.as_str()));
-    assert!(detail("networkInterfaceId").is_some_and(|v| v.starts_with("eni-")));
+    let eni_id = detail("networkInterfaceId").expect("networkInterfaceId");
+    assert!(eni_id.starts_with("eni-"));
+    // The ENI is a real EC2 interface in the subnet, with that address.
+    let ifaces = ec2
+        .describe_network_interfaces()
+        .network_interface_ids(&eni_id)
+        .send()
+        .await
+        .expect("describe_network_interfaces");
+    let iface = &ifaces.network_interfaces()[0];
+    assert_eq!(iface.private_ip_address(), Some(ip.as_str()));
+    assert_eq!(iface.subnet_id(), Some(subnet_id.as_str()));
+    assert_eq!(iface.requester_managed(), Some(true));
     let health = elbv2
         .describe_target_health()
         .target_group_arn(&tg_arn)

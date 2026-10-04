@@ -289,19 +289,49 @@ impl fakecloud_core::delivery::Elbv2TargetRegistration for Elbv2TargetRegistrati
     }
 }
 
-/// EC2 subnet lookup for the ECS runtime (`awsvpc` ENI addressing).
+/// EC2 network interfaces for the ECS runtime's `awsvpc` task ENIs, through
+/// the same requester-managed ENI path other services use.
 pub(crate) struct Ec2NetworkLookupImpl {
     pub(crate) state: fakecloud_ec2::SharedEc2State,
 }
 
 impl fakecloud_core::delivery::Ec2NetworkLookup for Ec2NetworkLookupImpl {
-    fn subnet_cidr(&self, account_id: &str, subnet_id: &str) -> Option<String> {
-        let accounts = self.state.read();
-        accounts
-            .get(account_id)?
-            .subnets
-            .get(subnet_id)
-            .map(|s| s.cidr_block.clone())
+    fn create_task_eni(
+        &self,
+        account_id: &str,
+        subnet_id: &str,
+        group_ids: Vec<String>,
+        description: String,
+    ) -> Result<fakecloud_core::delivery::TaskEni, String> {
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(account_id);
+        let (eni_id, private_ip) = fakecloud_ec2::vpc_lookup::create_service_eni(
+            state,
+            fakecloud_ec2::vpc_lookup::ServiceEni {
+                subnet_id,
+                group_ids,
+                description,
+                private_ip: None,
+            },
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let mac_address = state
+            .network_interfaces
+            .get(&eni_id)
+            .map(|e| e.mac_address.clone())
+            .unwrap_or_default();
+        Ok(fakecloud_core::delivery::TaskEni {
+            eni_id,
+            private_ip,
+            mac_address,
+        })
+    }
+
+    fn delete_task_eni(&self, account_id: &str, eni_id: &str) {
+        let mut accounts = self.state.write();
+        if let Some(state) = accounts.get_mut(account_id) {
+            fakecloud_ec2::vpc_lookup::delete_service_eni(state, eni_id);
+        }
     }
 }
 
@@ -446,5 +476,63 @@ mod kms_hook_adapter_tests {
             )
             .unwrap();
         assert_eq!(store.saves.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod task_eni_tests {
+    use super::*;
+    use fakecloud_core::delivery::Ec2NetworkLookup;
+
+    #[test]
+    fn task_eni_is_a_real_ec2_interface_in_the_subnet() {
+        let ec2: fakecloud_ec2::SharedEc2State = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        // The default VPC's subnets stand in for the task's subnet.
+        let subnet = fakecloud_ec2::vpc_lookup::default_vpc_subnets(&ec2, "123456789012")
+            .into_iter()
+            .next()
+            .expect("default subnet");
+        let lookup = Ec2NetworkLookupImpl { state: ec2.clone() };
+        let eni = lookup
+            .create_task_eni(
+                "123456789012",
+                &subnet.subnet_id,
+                vec!["sg-1".into()],
+                "arn:aws:ecs:us-east-1:123456789012:attachment/a1".into(),
+            )
+            .expect("eni");
+        assert!(fakecloud_ec2::vpc_lookup::ip_in_cidr(
+            &eni.private_ip,
+            &subnet.cidr_block
+        ));
+        assert!(!fakecloud_ec2::vpc_lookup::ip_is_reserved(
+            &eni.private_ip,
+            &subnet.cidr_block
+        ));
+        {
+            let accounts = ec2.read();
+            let iface = &accounts.get("123456789012").unwrap().network_interfaces[&eni.eni_id];
+            assert!(iface.requester_managed);
+            assert_eq!(iface.mac_address, eni.mac_address);
+            assert_eq!(iface.group_ids, vec!["sg-1".to_string()]);
+        }
+        // A second task never gets the same address.
+        let other = lookup
+            .create_task_eni("123456789012", &subnet.subnet_id, Vec::new(), String::new())
+            .unwrap();
+        assert_ne!(other.private_ip, eni.private_ip);
+        // Unknown subnet: refused.
+        assert!(lookup
+            .create_task_eni("123456789012", "subnet-nope", Vec::new(), String::new())
+            .is_err());
+        lookup.delete_task_eni("123456789012", &eni.eni_id);
+        assert!(!ec2
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .network_interfaces
+            .contains_key(&eni.eni_id));
     }
 }

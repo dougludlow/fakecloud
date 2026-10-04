@@ -7,9 +7,11 @@
 //! addresses are not routable from fakecloud on Docker Desktop, podman machine
 //! or a containerized fakecloud, so the two concerns are split:
 //!
-//! - the reported IP is allocated from the subnet's real CIDR (via the EC2
-//!   lookup on the delivery bus), skipping the addresses AWS reserves and the
-//!   IPs other live tasks in the account already hold;
+//! - in a subnet EC2 knows, the ENI is a real requester-managed network
+//!   interface EC2 creates (`vpc_lookup::create_service_eni`, via the delivery
+//!   bus), so its private IP comes from EC2's own allocator and it shows up in
+//!   DescribeNetworkInterfaces until the task stops; otherwise a synthetic ENI
+//!   gets an address from a fallback block;
 //! - each container port is published on the host, and the ENI IP + container
 //!   port is registered with [`fakecloud_core::dataplane`] so the ELBv2 data
 //!   plane and health prober connect to the published port.
@@ -96,6 +98,56 @@ pub(crate) fn task_subnet(
         .and_then(first_subnet)
 }
 
+/// Security groups of an `awsvpc` task's service network configuration.
+pub(crate) fn task_security_groups(
+    st: &crate::state::EcsState,
+    task: &crate::state::Task,
+) -> Vec<String> {
+    let Some(service_name) = task
+        .group
+        .as_deref()
+        .and_then(|g| g.strip_prefix("service:"))
+    else {
+        return Vec::new();
+    };
+    let key = crate::state::EcsState::service_key(&task.cluster_name, service_name);
+    st.services
+        .get(&key)
+        .and_then(|s| s.network_configuration.as_ref())
+        .and_then(|nc| {
+            nc.get("awsvpcConfiguration")?
+                .get("securityGroups")?
+                .as_array()
+                .cloned()
+        })
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|g| g.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The task's ENI id, once attached.
+pub(crate) fn task_eni_id(task: &crate::state::Task) -> Option<String> {
+    task.attachments
+        .iter()
+        .filter(|a| a.attachment_type == "eni")
+        .flat_map(|a| a.details.iter())
+        .find(|d| d.name == "networkInterfaceId")
+        .map(|d| d.value.clone())
+}
+
+/// The description ECS gives a task ENI: the ARN of the task's ENI
+/// attachment (`arn:aws:ecs:<region>:<account>:attachment/<id>`).
+pub(crate) fn attachment_description(task_arn: &str, attachment_id: &str) -> String {
+    match task_arn.split_once(":task/") {
+        Some((prefix, _)) => format!("{prefix}:attachment/{attachment_id}"),
+        None => format!("attachment/{attachment_id}"),
+    }
+}
+
 /// First subnet of a `networkConfiguration` value.
 pub(crate) fn first_subnet(network_configuration: &serde_json::Value) -> Option<String> {
     network_configuration
@@ -135,6 +187,7 @@ pub(crate) fn task_eni_ip(task: &crate::state::Task) -> Option<String> {
 /// `privateDnsName` and `privateIPv4Address`.
 pub(crate) fn attach_eni(
     task: &mut crate::state::Task,
+    attachment_id: &str,
     eni_id: &str,
     subnet: &str,
     ip: Ipv4Addr,
@@ -172,7 +225,7 @@ pub(crate) fn attach_eni(
         existing.details = details;
     } else {
         task.attachments.push(crate::state::TaskAttachment {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: attachment_id.to_string(),
             attachment_type: "eni".into(),
             status: "ATTACHED".into(),
             details,
@@ -214,41 +267,67 @@ impl super::EcsRuntime {
         account_id: &str,
         task_id: &str,
     ) -> String {
-        let (subnet, in_use) = {
+        let (subnet, groups, description, attachment_id, in_use) = {
             let accounts = state.read();
             let Some(st) = accounts.get(account_id) else {
                 return String::new();
             };
-            let subnet = st.tasks.get(task_id).and_then(|t| task_subnet(st, t));
-            (subnet, eni_ips_in_use(st, task_id))
+            let Some(task) = st.tasks.get(task_id) else {
+                return String::new();
+            };
+            let attachment_id = task
+                .attachments
+                .iter()
+                .find(|a| a.attachment_type == "eni")
+                .map(|a| a.id.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            (
+                task_subnet(st, task),
+                task_security_groups(st, task),
+                attachment_description(&task.task_arn, &attachment_id),
+                attachment_id,
+                eni_ips_in_use(st, task_id),
+            )
         };
-        // Lock order: the ECS state lock is released before the EC2 lookup.
-        let cidr = subnet.as_deref().and_then(|s| {
-            self.delivery_bus
-                .as_ref()
-                .and_then(|bus| bus.ec2_subnet_cidr(account_id, s))
+        // A subnet EC2 knows gets a real requester-managed ENI from EC2's own
+        // allocator (lock order: the ECS state lock is released first).
+        let from_ec2 = subnet.as_deref().and_then(|s| {
+            let bus = self.delivery_bus.as_ref()?;
+            match bus.create_task_eni(account_id, s, groups.clone(), description.clone())? {
+                Ok(eni) => Some(eni),
+                Err(error) => {
+                    tracing::warn!(task = %task_id, subnet = %s, %error, "EC2 could not create the task ENI; using a synthetic one");
+                    None
+                }
+            }
         });
-        let ip = cidr
-            .as_deref()
-            .and_then(|c| allocate_eni_ip(c, task_id, &in_use))
-            .or_else(|| allocate_eni_ip(FALLBACK_CIDR, task_id, &in_use))
-            .unwrap_or(Ipv4Addr::new(10, 0, 0, 4));
-        let eni_id = format!("eni-{}", &uuid::Uuid::new_v4().simple().to_string()[..17]);
-        let mac = format!(
-            "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            rand::random::<u8>(),
-            rand::random::<u8>(),
-            rand::random::<u8>(),
-            rand::random::<u8>(),
-            rand::random::<u8>()
-        );
+        let (eni_id, ip, mac) = match from_ec2.and_then(|e| {
+            let ip: Ipv4Addr = e.private_ip.parse().ok()?;
+            Some((e.eni_id, ip, e.mac_address))
+        }) {
+            Some(found) => found,
+            // No EC2 subnet behind the name: a synthetic ENI.
+            None => (
+                format!("eni-{}", &uuid::Uuid::new_v4().simple().to_string()[..17]),
+                allocate_eni_ip(FALLBACK_CIDR, task_id, &in_use)
+                    .unwrap_or(Ipv4Addr::new(10, 0, 0, 4)),
+                format!(
+                    "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    rand::random::<u8>(),
+                    rand::random::<u8>(),
+                    rand::random::<u8>(),
+                    rand::random::<u8>(),
+                    rand::random::<u8>()
+                ),
+            ),
+        };
         let subnet = subnet.unwrap_or_else(|| FALLBACK_SUBNET.to_string());
         let mut accounts = state.write();
         if let Some(task) = accounts
             .get_mut(account_id)
             .and_then(|st| st.tasks.get_mut(task_id))
         {
-            attach_eni(task, &eni_id, &subnet, ip, &mac);
+            attach_eni(task, &attachment_id, &eni_id, &subnet, ip, &mac);
         }
         tracing::info!(task = %task_id, eni = %eni_id, ip = %ip, subnet = %subnet, "attached awsvpc ENI");
         ip.to_string()
@@ -335,6 +414,17 @@ mod tests {
         assert_eq!(allocate_eni_ip("10.1.0.0/28", "same-seed", &used), None);
         assert_eq!(allocate_eni_ip("10.1.0.0/30", "x", &HashSet::new()), None);
         assert_eq!(allocate_eni_ip("not-a-cidr", "x", &HashSet::new()), None);
+    }
+
+    #[test]
+    fn task_eni_is_described_by_its_attachment_arn() {
+        assert_eq!(
+            attachment_description(
+                "arn:aws:ecs:us-east-1:123456789012:task/default/abc",
+                "1f2e"
+            ),
+            "arn:aws:ecs:us-east-1:123456789012:attachment/1f2e"
+        );
     }
 
     #[test]

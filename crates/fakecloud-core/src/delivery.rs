@@ -339,11 +339,30 @@ pub trait Elbv2TargetRegistration: Send + Sync {
     );
 }
 
-/// Read EC2 VPC networking from outside the ec2 crate. Used by the ECS
-/// runtime to give an `awsvpc` task's ENI a private IP from its subnet.
+/// A requester-managed network interface EC2 created for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEni {
+    pub eni_id: String,
+    pub private_ip: String,
+    pub mac_address: String,
+}
+
+/// EC2 VPC networking from outside the ec2 crate. Used by the ECS runtime to
+/// give an `awsvpc` task a real ENI in its subnet (visible to
+/// DescribeNetworkInterfaces, its private IP allocated by EC2 like any other
+/// interface's) and to delete it when the task stops.
 pub trait Ec2NetworkLookup: Send + Sync {
-    /// The IPv4 CIDR block of `subnet_id` in `account_id`, if it exists.
-    fn subnet_cidr(&self, account_id: &str, subnet_id: &str) -> Option<String>;
+    /// Create a requester-managed ENI in `subnet_id`. `Err` when the subnet
+    /// doesn't exist or has no free address.
+    fn create_task_eni(
+        &self,
+        account_id: &str,
+        subnet_id: &str,
+        group_ids: Vec<String>,
+        description: String,
+    ) -> Result<TaskEni, String>;
+    /// Delete an ENI [`Self::create_task_eni`] created (no-op otherwise).
+    fn delete_task_eni(&self, account_id: &str, eni_id: &str);
 }
 
 /// Publish CloudWatch metric data points from outside the cloudwatch
@@ -742,12 +761,25 @@ impl DeliveryBus {
         self
     }
 
-    /// The IPv4 CIDR of an EC2 subnet. `None` when the subnet doesn't exist
-    /// or no EC2 lookup is wired.
-    pub fn ec2_subnet_cidr(&self, account_id: &str, subnet_id: &str) -> Option<String> {
+    /// Create a task ENI in an EC2 subnet. `None` when no EC2 lookup is
+    /// wired; `Some(Err)` when EC2 refused (unknown subnet, subnet full).
+    pub fn create_task_eni(
+        &self,
+        account_id: &str,
+        subnet_id: &str,
+        group_ids: Vec<String>,
+        description: String,
+    ) -> Option<Result<TaskEni, String>> {
         self.ec2_network_lookup
             .as_ref()
-            .and_then(|l| l.subnet_cidr(account_id, subnet_id))
+            .map(|l| l.create_task_eni(account_id, subnet_id, group_ids, description))
+    }
+
+    /// Delete a task ENI created with [`Self::create_task_eni`].
+    pub fn delete_task_eni(&self, account_id: &str, eni_id: &str) {
+        if let Some(l) = &self.ec2_network_lookup {
+            l.delete_task_eni(account_id, eni_id);
+        }
     }
 
     /// Register targets with an ELBv2 target group. Silently no-ops when
