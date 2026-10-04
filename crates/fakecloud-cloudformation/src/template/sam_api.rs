@@ -553,14 +553,14 @@ pub(super) fn build_rest_api(
                     ),
                 ));
             }
-            op.insert(
-                "x-amazon-apigateway-integration".to_string(),
+            let integration = route.integration.clone().unwrap_or_else(|| {
                 json!({
                     "type": "aws_proxy",
                     "httpMethod": "POST",
                     "uri": lambda_integration_uri(&route.target),
-                }),
-            );
+                })
+            });
+            op.insert("x-amazon-apigateway-integration".to_string(), integration);
             op.entry("responses").or_insert_with(|| json!({}));
             if let Some(security) = auth.security_for(id, route.auth.as_ref())? {
                 op.insert("security".to_string(), security);
@@ -651,7 +651,9 @@ pub(super) fn build_rest_api(
         stage_id.clone(),
         json!({ "Type": "AWS::ApiGateway::Stage", "Properties": stage_props }),
     ));
-    for route in routes {
+    // A service-integration route (state machine) is invoked through its
+    // role, not a Lambda permission.
+    for route in routes.iter().filter(|r| r.integration.is_none()) {
         out.push((
             format!("{}Permission", route.id_base),
             route_permission(id, route),

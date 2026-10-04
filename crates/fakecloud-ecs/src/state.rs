@@ -167,6 +167,23 @@ impl EcsState {
     /// Mint and store a new service revision for `service`, numbered by how
     /// many revisions already exist for that service (`{service_arn}:{n}`).
     /// Returns the new serviceRevisionArn.
+    /// Tasks a service has started that still count toward its desired
+    /// count (`PROVISIONING`, `PENDING` or `RUNNING`).
+    pub fn active_service_task_count(&self, cluster_name: &str, service_name: &str) -> i32 {
+        let service_tag = format!("ecs-svc/{service_name}");
+        self.tasks
+            .values()
+            .filter(|t| {
+                t.started_by.as_deref() == Some(service_tag.as_str())
+                    && t.cluster_name == cluster_name
+                    && matches!(
+                        t.last_status.as_str(),
+                        "RUNNING" | "PENDING" | "PROVISIONING"
+                    )
+            })
+            .count() as i32
+    }
+
     pub fn record_service_revision(&mut self, service: &Service) -> String {
         let n = self
             .service_revisions
@@ -699,6 +716,62 @@ pub struct Deployment {
     /// paused on a hook.
     #[serde(default)]
     pub lifecycle_stage: Option<String>,
+}
+
+impl Deployment {
+    /// A new `PRIMARY` deployment rolling out `task_definition_arn`, as
+    /// CreateService (and an UpdateService that changes the task definition)
+    /// starts one. A `PAUSE` lifecycle hook holds it at the hook's first stage
+    /// until ContinueServiceDeployment resolves the hook.
+    pub fn new_primary(
+        task_definition_arn: &str,
+        desired_count: i32,
+        launch_type: &str,
+        lifecycle_hooks: &[Value],
+    ) -> Self {
+        let pause_hook = lifecycle_hooks
+            .iter()
+            .find(|h| h.get("targetType").and_then(|v| v.as_str()) == Some("PAUSE"));
+        let (pending_hook_id, lifecycle_stage, rollout_reason) = match pause_hook {
+            Some(hook) => {
+                let hook_id = format!("hook-{}", uuid::Uuid::new_v4().simple());
+                let stage = hook
+                    .get("lifecycleStages")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                (
+                    Some(hook_id),
+                    stage,
+                    "Deployment paused at a lifecycle hook awaiting ContinueServiceDeployment."
+                        .to_string(),
+                )
+            }
+            None => (None, None, "ECS deployment in progress.".to_string()),
+        };
+        let now = Utc::now();
+        Deployment {
+            deployment_id: format!(
+                "ecs-svc/{}",
+                uuid::Uuid::new_v4().as_u128() & 0xffff_ffff_ffff_ffff
+            ),
+            status: "PRIMARY".into(),
+            task_definition_arn: task_definition_arn.to_string(),
+            desired_count,
+            pending_count: 0,
+            running_count: 0,
+            failed_tasks: 0,
+            created_at: now,
+            updated_at: now,
+            launch_type: launch_type.to_string(),
+            rollout_state: "IN_PROGRESS".into(),
+            rollout_state_reason: Some(rollout_reason),
+            lifecycle_hooks: lifecycle_hooks.to_vec(),
+            pending_hook_id,
+            lifecycle_stage,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

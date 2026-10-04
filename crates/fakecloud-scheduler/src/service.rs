@@ -73,6 +73,45 @@ impl SchedulerService {
         }))
     }
 
+    /// Run one schedule / schedule-group mutation synchronously through the
+    /// same handler the API dispatches to. `name` is the path's resource
+    /// name; the request carries the JSON body (and, for DeleteSchedule, the
+    /// `groupName` query param). Used by the CloudFormation provisioner, which
+    /// persists the touched state itself afterwards.
+    pub fn provision_sync(
+        &self,
+        action: &str,
+        name: &str,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        match action {
+            "CreateSchedule" => self.create_schedule(req, name),
+            "UpdateSchedule" => self.update_schedule(req, name),
+            "DeleteSchedule" => self.delete_schedule(req, name),
+            "CreateScheduleGroup" => self.create_schedule_group(req, name),
+            "DeleteScheduleGroup" => self.delete_schedule_group(req, name),
+            other => Err(AwsServiceError::action_not_implemented("scheduler", other)),
+        }
+    }
+
+    /// Replace a schedule group's tags (a CloudFormation `Tags` update).
+    pub fn replace_schedule_group_tags(
+        &self,
+        account_id: &str,
+        name: &str,
+        tags: BTreeMap<String, String>,
+    ) -> Result<(), AwsServiceError> {
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(account_id);
+        let group = state
+            .groups
+            .get_mut(name)
+            .ok_or_else(not_found_group(name))?;
+        group.tags = tags;
+        group.last_modification_date = Utc::now();
+        Ok(())
+    }
+
     fn resolve_action(req: &AwsRequest) -> Option<(&'static str, PathArgs)> {
         let segs = &req.path_segments;
         let first = segs.first().map(|s| s.as_str());

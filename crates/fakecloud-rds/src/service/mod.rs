@@ -1790,7 +1790,7 @@ pub(crate) struct PaginationResult<T> {
 /// Attach `instance_id` to the cluster's `DBClusterMembers` array,
 /// promoting it to writer when the cluster has none. Idempotent:
 /// re-attaching an existing member is a no-op.
-fn attach_cluster_member(state: &mut RdsState, cluster_id: &str, instance_id: &str) {
+pub fn attach_cluster_member(state: &mut RdsState, cluster_id: &str, instance_id: &str) {
     use serde_json::{json, Value};
     let Some(map) = state.extras.get_mut("clusters") else {
         return;
@@ -1828,6 +1828,53 @@ fn attach_cluster_member(state: &mut RdsState, cluster_id: &str, instance_id: &s
             "WriterDBInstanceIdentifier".to_string(),
             Value::String(instance_id.to_string()),
         );
+    }
+}
+
+/// Remove `instance_id` from the cluster's `DBClusterMembers` (the instance
+/// was deleted). When it was the writer, the remaining member with the lowest
+/// promotion tier becomes the writer, as an Aurora failover does; a cluster
+/// left with no members has no writer.
+pub fn detach_cluster_member(state: &mut RdsState, cluster_id: &str, instance_id: &str) {
+    use serde_json::Value;
+    let Some(obj) = state
+        .extras
+        .get_mut("clusters")
+        .and_then(|m| m.get_mut(cluster_id))
+        .and_then(|e| e.as_object_mut())
+    else {
+        return;
+    };
+    let Some(Value::Array(members)) = obj.get_mut("DBClusterMembers") else {
+        return;
+    };
+    let Some(pos) = members
+        .iter()
+        .position(|m| m["DBInstanceIdentifier"].as_str() == Some(instance_id))
+    else {
+        return;
+    };
+    let removed = members.remove(pos);
+    if removed["IsClusterWriter"].as_bool() != Some(true) {
+        return;
+    }
+    let next = members
+        .iter_mut()
+        .min_by_key(|m| m["PromotionTier"].as_i64().unwrap_or(i64::MAX));
+    let new_writer = next.map(|m| {
+        m["IsClusterWriter"] = Value::Bool(true);
+        m["DBInstanceIdentifier"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    match new_writer {
+        Some(id) => {
+            obj.insert("WriterDBInstanceIdentifier".to_string(), Value::String(id));
+        }
+        None => {
+            obj.remove("WriterDBInstanceIdentifier");
+        }
     }
 }
 

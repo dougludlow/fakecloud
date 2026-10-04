@@ -157,48 +157,12 @@ impl EcsService {
             let deployments = if is_code_deploy {
                 Vec::new()
             } else {
-                // A PAUSE lifecycle hook holds the deployment at its stage until
-                // ContinueServiceDeployment resolves the hook.
-                let pause_hook = lifecycle_hooks
-                    .iter()
-                    .find(|h| h.get("targetType").and_then(|v| v.as_str()) == Some("PAUSE"));
-                let (pending_hook_id, lifecycle_stage, rollout_reason) = match pause_hook {
-                    Some(hook) => {
-                        let hook_id = format!("hook-{}", uuid::Uuid::new_v4().simple());
-                        let stage = hook
-                            .get("lifecycleStages")
-                            .and_then(|v| v.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        (
-                            Some(hook_id),
-                            stage,
-                            "Deployment paused at a lifecycle hook awaiting ContinueServiceDeployment.".to_string(),
-                        )
-                    }
-                    None => (None, None, "ECS deployment in progress.".to_string()),
-                };
-                vec![Deployment {
-                    deployment_id: format!(
-                        "ecs-svc/{}",
-                        uuid::Uuid::new_v4().as_u128() & 0xffff_ffff_ffff_ffff
-                    ),
-                    status: "PRIMARY".into(),
-                    task_definition_arn: td_arn.clone(),
+                vec![Deployment::new_primary(
+                    &td_arn,
                     desired_count,
-                    pending_count: 0,
-                    running_count: 0,
-                    failed_tasks: 0,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    launch_type: launch_type.clone(),
-                    rollout_state: "IN_PROGRESS".into(),
-                    rollout_state_reason: Some(rollout_reason),
-                    lifecycle_hooks: lifecycle_hooks.clone(),
-                    pending_hook_id,
-                    lifecycle_stage,
-                }]
+                    &launch_type,
+                    &lifecycle_hooks,
+                )]
             };
             let service = Service {
                 service_name: service_name.clone(),
@@ -529,49 +493,13 @@ impl EcsService {
                                 old_deployments_drained.push(d.deployment_id.clone());
                             }
                         }
-                        let pause_hook = update_lifecycle_hooks.iter().find(|h| {
-                            h.get("targetType").and_then(|v| v.as_str()) == Some("PAUSE")
-                        });
-                        let (pending_hook_id, lifecycle_stage, rollout_reason) = match pause_hook {
-                            Some(hook) => {
-                                let hook_id = format!("hook-{}", uuid::Uuid::new_v4().simple());
-                                let stage = hook
-                                    .get("lifecycleStages")
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
-                                (
-                                    Some(hook_id),
-                                    stage,
-                                    "Deployment paused at a lifecycle hook awaiting ContinueServiceDeployment.".to_string(),
-                                )
-                            }
-                            None => (None, None, "ECS deployment in progress.".to_string()),
-                        };
-                        svc.deployments.insert(
-                            0,
-                            Deployment {
-                                deployment_id: format!(
-                                    "ecs-svc/{}",
-                                    uuid::Uuid::new_v4().as_u128() & 0xffff_ffff_ffff_ffff
-                                ),
-                                status: "PRIMARY".into(),
-                                task_definition_arn: svc.task_definition_arn.clone(),
-                                desired_count: svc.desired_count,
-                                pending_count: 0,
-                                running_count: 0,
-                                failed_tasks: 0,
-                                created_at: Utc::now(),
-                                updated_at: Utc::now(),
-                                launch_type: svc.launch_type.clone(),
-                                rollout_state: "IN_PROGRESS".into(),
-                                rollout_state_reason: Some(rollout_reason),
-                                lifecycle_hooks: update_lifecycle_hooks.clone(),
-                                pending_hook_id,
-                                lifecycle_stage,
-                            },
+                        let primary = Deployment::new_primary(
+                            &svc.task_definition_arn,
+                            svc.desired_count,
+                            &svc.launch_type,
+                            &update_lifecycle_hooks,
                         );
+                        svc.deployments.insert(0, primary);
                     }
                 }
 

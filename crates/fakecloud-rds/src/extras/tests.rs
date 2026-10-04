@@ -437,7 +437,10 @@ fn create_db_cluster_response_renders_computed_fields() {
         "{body}"
     );
     assert!(
-        body.contains("<Endpoint>c1.cluster-xxx.us-east-1.rds.amazonaws.com</Endpoint>"),
+        body.contains(&format!(
+            "<Endpoint>{}</Endpoint>",
+            crate::cluster_endpoint("c1", "000000000000", "us-east-1")
+        )),
         "{body}"
     );
     assert!(body.contains("<ReaderEndpoint>"), "{body}");

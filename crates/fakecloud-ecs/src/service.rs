@@ -336,19 +336,8 @@ impl EcsService {
                     .cloned()
                     .collect();
                 for service in scalable {
-                    let service_tag = format!("ecs-svc/{}", service.service_name);
-                    let mut active = 0i32;
-                    for t in state.tasks.values() {
-                        if t.started_by.as_deref() == Some(service_tag.as_str())
-                            && t.cluster_name == service.cluster_name
-                            && matches!(
-                                t.last_status.as_str(),
-                                "RUNNING" | "PENDING" | "PROVISIONING"
-                            )
-                        {
-                            active += 1;
-                        }
-                    }
+                    let active = state
+                        .active_service_task_count(&service.cluster_name, &service.service_name);
                     let shortfall = service.desired_count - active;
                     if shortfall <= 0 {
                         continue;

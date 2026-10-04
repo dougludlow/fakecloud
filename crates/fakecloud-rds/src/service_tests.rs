@@ -7837,3 +7837,35 @@ async fn cluster_restores_take_the_request_tags_not_the_source_tags() {
         vec![("pitr".to_string(), "p".to_string())]
     );
 }
+
+#[test]
+fn detaching_the_writer_promotes_the_next_member() {
+    use super::{attach_cluster_member, detach_cluster_member};
+    let mut state = crate::state::RdsState::new("123456789012", "us-east-1");
+    state
+        .extras
+        .entry("clusters".to_string())
+        .or_default()
+        .insert(
+            "c1".to_string(),
+            serde_json::json!({"DBClusterIdentifier": "c1"}),
+        );
+    attach_cluster_member(&mut state, "c1", "a");
+    attach_cluster_member(&mut state, "c1", "b");
+    let cluster = &state.extras["clusters"]["c1"];
+    assert_eq!(cluster["WriterDBInstanceIdentifier"], "a");
+    assert_eq!(cluster["DBClusterMembers"].as_array().unwrap().len(), 2);
+
+    detach_cluster_member(&mut state, "c1", "a");
+    let cluster = &state.extras["clusters"]["c1"];
+    let members = cluster["DBClusterMembers"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["DBInstanceIdentifier"], "b");
+    assert_eq!(members[0]["IsClusterWriter"], true);
+    assert_eq!(cluster["WriterDBInstanceIdentifier"], "b");
+
+    detach_cluster_member(&mut state, "c1", "b");
+    let cluster = &state.extras["clusters"]["c1"];
+    assert!(cluster["DBClusterMembers"].as_array().unwrap().is_empty());
+    assert!(cluster.get("WriterDBInstanceIdentifier").is_none());
+}

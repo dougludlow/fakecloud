@@ -366,6 +366,18 @@ impl ResourceProvisioner {
         let cluster_arn = state.clusters[&cluster_name].cluster_arn.clone();
         let service_arn = state.service_arn(&self.region, &cluster_name, &service_name);
         let key = format!("{cluster_name}/{service_name}");
+        // CreateService starts the service's first PRIMARY deployment (none
+        // for an external CODE_DEPLOY controller, which uses task sets).
+        let deployments = if deployment_controller == "CODE_DEPLOY" {
+            Vec::new()
+        } else {
+            vec![fakecloud_ecs::Deployment::new_primary(
+                &task_definition_arn,
+                desired_count,
+                &launch_type,
+                &cfn_ecs_lifecycle_hooks(props),
+            )]
+        };
         let service = EcsService {
             service_name: service_name.clone(),
             service_arn: service_arn.clone(),
@@ -391,8 +403,8 @@ impl ResourceProvisioner {
                 .and_then(|v| v.get("MaximumPercent"))
                 .and_then(cfn_as_i64)
                 .map(|n| n as i32),
-            circuit_breaker: None,
-            deployments: Vec::new(),
+            circuit_breaker: cfn_ecs_circuit_breaker(props),
+            deployments,
             load_balancers,
             service_registries,
             placement_constraints,
@@ -415,6 +427,7 @@ impl ResourceProvisioner {
                 .filter(|v| !v.is_null())
                 .cloned(),
         };
+        state.record_service_revision(&service);
         state.services.insert(key.clone(), service);
         if let Some(c) = state.clusters.get_mut(&cluster_name) {
             c.active_services_count += 1;
@@ -585,14 +598,39 @@ impl ResourceProvisioner {
             .services
             .get_mut(&key)
             .ok_or_else(|| format!("Service {service_arn} no longer exists"))?;
-        if let Some(td) = props.get("TaskDefinition").and_then(|v| v.as_str()) {
+        if let Some(n) = new_desired {
+            svc.desired_count = n;
+            if let Some(d) = svc.deployments.iter_mut().find(|d| d.status == "PRIMARY") {
+                d.desired_count = n;
+                d.updated_at = Utc::now();
+            }
+        }
+        let mut new_task_definition = false;
+        if let Some(td) = props
+            .get("TaskDefinition")
+            .and_then(|v| v.as_str())
+            .filter(|td| *td != svc.task_definition_arn)
+        {
             svc.task_definition_arn = td.to_string();
             let (family, revision) = parse_td_arn(td);
             svc.family = family;
             svc.revision = revision;
-        }
-        if let Some(n) = new_desired {
-            svc.desired_count = n;
+            new_task_definition = true;
+            // A new task definition rolls a new PRIMARY deployment and demotes
+            // the previous one to ACTIVE, as UpdateService does.
+            if svc.deployment_controller != "CODE_DEPLOY" {
+                for d in svc.deployments.iter_mut().filter(|d| d.status == "PRIMARY") {
+                    d.status = "ACTIVE".to_string();
+                    d.updated_at = Utc::now();
+                }
+                let primary = fakecloud_ecs::Deployment::new_primary(
+                    &svc.task_definition_arn,
+                    svc.desired_count,
+                    &svc.launch_type,
+                    &cfn_ecs_lifecycle_hooks(props),
+                );
+                svc.deployments.insert(0, primary);
+            }
         }
         if let Some(s) = props.get("LaunchType").and_then(|v| v.as_str()) {
             svc.launch_type = s.to_string();
@@ -636,6 +674,8 @@ impl ResourceProvisioner {
                 svc.maximum_percent = Some(n as i32);
             }
         }
+        // The circuit breaker is desired state: removing it turns it off.
+        svc.circuit_breaker = cfn_ecs_circuit_breaker(props);
         if let Some(arr) = props.get("LoadBalancers").and_then(|v| v.as_array()) {
             svc.load_balancers = arr.iter().cloned().map(lowercase_first_keys).collect();
         }
@@ -655,6 +695,10 @@ impl ResourceProvisioner {
             svc.tags = parse_ecs_tags(props.get("Tags"));
         }
         let name = svc.service_name.clone();
+        if new_task_definition {
+            let snapshot = svc.clone();
+            state.record_service_revision(&snapshot);
+        }
         Ok(ProvisionResult::new(service_arn.clone())
             .with("Name", name)
             .with("ServiceArn", service_arn))
@@ -750,4 +794,37 @@ fn cfn_desired_count(n: i64) -> Result<i32, String> {
             "Invalid request provided: CreateService error: DesiredCount {n} must be between 0 and {max}"
         ))
     }
+}
+
+/// `DeploymentConfiguration.DeploymentCircuitBreaker` as the service's
+/// circuit-breaker config.
+fn cfn_ecs_circuit_breaker(
+    props: &serde_json::Value,
+) -> Option<fakecloud_ecs::CircuitBreakerConfig> {
+    let cb = props
+        .get("DeploymentConfiguration")?
+        .get("DeploymentCircuitBreaker")
+        .filter(|v| v.is_object())?;
+    let flag = |k: &str| {
+        cb.get(k)
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false)
+    };
+    Some(fakecloud_ecs::CircuitBreakerConfig {
+        enable: flag("Enable"),
+        rollback: flag("Rollback"),
+    })
+}
+
+/// `DeploymentConfiguration.LifecycleHooks` in the ECS API's key casing.
+fn cfn_ecs_lifecycle_hooks(props: &serde_json::Value) -> Vec<serde_json::Value> {
+    props
+        .get("DeploymentConfiguration")
+        .and_then(|d| d.get("LifecycleHooks"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(lowercase_first_keys)
+        .collect()
 }

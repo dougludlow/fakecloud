@@ -54,16 +54,34 @@ pub async fn cfn_launch_service_tasks(
             fakecloud_aws::arn::Arn::global_in(&svc_region, "iam", &account_id, "root").to_string()
         });
         let launch_type = service.launch_type.clone();
-        let desired = service.desired_count;
-        crate::service::spawn_service_tasks(
+        // Launch only the shortfall: the scheduler ticker reconciles every
+        // ACTIVE service toward its desired count too, and may already have
+        // started some (or all) of these tasks before this drain ran.
+        // Spawning the full desired count regardless would double the
+        // service's tasks.
+        let shortfall =
+            service.desired_count - st.active_service_task_count(&cluster_name, &service_name);
+        if shortfall <= 0 {
+            return;
+        }
+        let ids = crate::service::spawn_service_tasks(
             st,
             &svc_region,
             &service,
-            desired,
+            shortfall,
             &principal_arn,
             &launch_type,
             None,
-        )
+        );
+        // Reflect the new PENDING tasks in the stored counts, as the
+        // scheduler ticker does.
+        if let Some(svc) = st.services.get_mut(&key) {
+            svc.pending_count = svc.pending_count.saturating_add(ids.len() as i32);
+            for d in svc.deployments.iter_mut().filter(|d| d.status == "PRIMARY") {
+                d.pending_count = d.pending_count.saturating_add(ids.len() as i32);
+            }
+        }
+        ids
     };
 
     for id in spawn_task_ids {

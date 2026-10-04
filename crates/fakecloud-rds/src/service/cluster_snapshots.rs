@@ -365,16 +365,18 @@ impl RdsService {
             obj.insert("Status".to_string(), json!("available"));
             obj.insert(
                 "Endpoint".to_string(),
-                json!(format!(
-                    "{target}.cluster-xxx.{}.rds.amazonaws.com",
-                    request.region
+                json!(crate::cluster_endpoint(
+                    &target,
+                    &request.account_id,
+                    &request.region
                 )),
             );
             obj.insert(
                 "ReaderEndpoint".to_string(),
-                json!(format!(
-                    "{target}.cluster-ro-xxx.{}.rds.amazonaws.com",
-                    request.region
+                json!(crate::cluster_reader_endpoint(
+                    &target,
+                    &request.account_id,
+                    &request.region
                 )),
             );
             obj.remove("ReplicationSourceIdentifier");
@@ -621,16 +623,18 @@ impl RdsService {
             obj.insert("Status".to_string(), json!("available"));
             obj.insert(
                 "Endpoint".to_string(),
-                json!(format!(
-                    "{target}.cluster-xxx.{}.rds.amazonaws.com",
-                    request.region
+                json!(crate::cluster_endpoint(
+                    &target,
+                    &request.account_id,
+                    &request.region
                 )),
             );
             obj.insert(
                 "ReaderEndpoint".to_string(),
-                json!(format!(
-                    "{target}.cluster-ro-xxx.{}.rds.amazonaws.com",
-                    request.region
+                json!(crate::cluster_reader_endpoint(
+                    &target,
+                    &request.account_id,
+                    &request.region
                 )),
             );
             obj.remove("DBClusterMembers");

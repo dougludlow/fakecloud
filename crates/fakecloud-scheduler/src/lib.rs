@@ -14,4 +14,4 @@ pub(crate) mod state;
 pub mod ticker;
 
 pub use service::SchedulerService;
-pub use state::SharedSchedulerState;
+pub use state::{SchedulerState, SharedSchedulerState};

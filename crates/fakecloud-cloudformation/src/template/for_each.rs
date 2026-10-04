@@ -243,29 +243,46 @@ pub(super) fn expand_sam(value: &Value) -> Result<Value, String> {
             }
             "AWS::Serverless::SimpleTable" => {
                 let mut table_props = merge_global_properties(&global_simple_table, &properties);
-                if let Some(pk) = table_props.get("PrimaryKey") {
-                    if let Some(pk_obj) = pk.as_object() {
-                        let name = pk_obj.get("Name").cloned().unwrap_or_else(|| json!("id"));
-                        let ty = match pk_obj.get("Type").and_then(|v| v.as_str()) {
-                            Some("String") => json!("S"),
-                            Some("Number") => json!("N"),
-                            Some("Binary") => json!("B"),
-                            Some(other) => json!(other),
-                            None => json!("S"),
-                        };
-                        table_props.remove("PrimaryKey");
-                        table_props.insert(
-                            "KeySchema".to_string(),
-                            json!([{"AttributeName": name.clone(), "KeyType": "HASH"}]),
-                        );
-                        table_props.insert(
-                            "AttributeDefinitions".to_string(),
-                            json!([{"AttributeName": name, "AttributeType": ty}]),
-                        );
-                    }
-                }
+                // PrimaryKey defaults to a String `id`, as in SAM.
+                let pk = table_props
+                    .remove("PrimaryKey")
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let name = pk.get("Name").cloned().unwrap_or_else(|| json!("id"));
+                let ty = match pk.get("Type").and_then(|v| v.as_str()) {
+                    Some("String") | None => json!("S"),
+                    Some("Number") => json!("N"),
+                    Some("Binary") => json!("B"),
+                    Some(other) => json!(other),
+                };
+                table_props.insert(
+                    "KeySchema".to_string(),
+                    json!([{"AttributeName": name.clone(), "KeyType": "HASH"}]),
+                );
+                table_props.insert(
+                    "AttributeDefinitions".to_string(),
+                    json!([{"AttributeName": name, "AttributeType": ty}]),
+                );
+                // SAM bills on demand unless ProvisionedThroughput is given,
+                // in which case the table is provisioned at that capacity.
                 if !table_props.contains_key("BillingMode") {
-                    table_props.insert("BillingMode".to_string(), json!("PAY_PER_REQUEST"));
+                    let mode = if table_props.contains_key("ProvisionedThroughput") {
+                        "PROVISIONED"
+                    } else {
+                        "PAY_PER_REQUEST"
+                    };
+                    table_props.insert("BillingMode".to_string(), json!(mode));
+                }
+                // SAM `Tags` is a map; the native table takes `[{Key, Value}]`.
+                if let Some(Value::Object(tags)) = table_props.remove("Tags") {
+                    table_props.insert(
+                        "Tags".to_string(),
+                        Value::Array(
+                            tags.into_iter()
+                                .map(|(k, v)| json!({"Key": k, "Value": v}))
+                                .collect(),
+                        ),
+                    );
                 }
                 let mut table_resource = serde_json::Map::new();
                 table_resource.insert("Type".to_string(), json!("AWS::DynamoDB::Table"));
@@ -360,7 +377,9 @@ pub(super) fn expand_sam(value: &Value) -> Result<Value, String> {
                     .remove("Events")
                     .and_then(|e| e.as_object().cloned())
                     .map(|events| {
-                        super::sam_events::expand_state_machine_events(logical_id, &events)
+                        super::sam_events::expand_state_machine_events(
+                            logical_id, &events, &mut ctx,
+                        )
                     })
                     .transpose()?
                     .unwrap_or_default();
@@ -936,6 +955,85 @@ mod tests {
             role["Properties"]["Policies"][0]["PolicyDocument"]["Statement"][0]["Action"],
             json!("states:StartExecution")
         );
+    }
+
+    #[test]
+    fn expand_sam_statemachine_api_event_joins_the_implicit_rest_api_with_a_stage() {
+        let template = json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "MySM": {
+                    "Type": "AWS::Serverless::StateMachine",
+                    "Properties": {
+                        "Definition": {"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}},
+                        "Events": {
+                            "Start": {
+                                "Type": "Api",
+                                "Properties": { "Path": "/orders", "Method": "post" }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
+        let api = &resources["ServerlessRestApi"];
+        assert_eq!(api["Type"], json!("AWS::ApiGateway::RestApi"));
+        let integration = &api["Properties"]["Body"]["paths"]["/orders"]["post"]
+            ["x-amazon-apigateway-integration"];
+        assert_eq!(integration["type"], json!("aws"));
+        assert_eq!(
+            integration["credentials"],
+            json!({"Fn::GetAtt": ["MySMStartRole", "Arn"]})
+        );
+        assert!(
+            integration["requestTemplates"]["application/json"]["Fn::Sub"]
+                .as_str()
+                .unwrap()
+                .contains("${MySM}")
+        );
+        // Deployed: a Deployment and the Prod stage, as SAM emits.
+        let (_, deployment) = resources
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.starts_with("ServerlessRestApiDeployment"))
+            .expect("deployment");
+        assert_eq!(deployment["Type"], json!("AWS::ApiGateway::Deployment"));
+        let stage = &resources["ServerlessRestApiProdStage"];
+        assert_eq!(stage["Type"], json!("AWS::ApiGateway::Stage"));
+        assert_eq!(stage["Properties"]["StageName"], json!("Prod"));
+        assert_eq!(resources["MySMStartRole"]["Type"], json!("AWS::IAM::Role"));
+        // No Lambda permission for a service integration.
+        assert!(resources.get("MySMStartPermission").is_none());
+    }
+
+    #[test]
+    fn expand_sam_simple_table_honors_provisioned_throughput() {
+        let template = json!({
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "Provisioned": {
+                    "Type": "AWS::Serverless::SimpleTable",
+                    "Properties": {
+                        "PrimaryKey": {"Name": "pk", "Type": "Number"},
+                        "ProvisionedThroughput": {"ReadCapacityUnits": 3, "WriteCapacityUnits": 4},
+                        "Tags": {"team": "a"}
+                    }
+                },
+                "Bare": { "Type": "AWS::Serverless::SimpleTable" }
+            }
+        });
+        let resources = expand_sam(&template).unwrap()["Resources"].clone();
+        let p = &resources["Provisioned"]["Properties"];
+        assert_eq!(p["BillingMode"], json!("PROVISIONED"));
+        assert_eq!(p["ProvisionedThroughput"]["WriteCapacityUnits"], json!(4));
+        assert_eq!(p["AttributeDefinitions"][0]["AttributeType"], json!("N"));
+        assert_eq!(p["Tags"], json!([{"Key": "team", "Value": "a"}]));
+        let b = &resources["Bare"]["Properties"];
+        assert_eq!(b["BillingMode"], json!("PAY_PER_REQUEST"));
+        assert_eq!(b["KeySchema"][0]["AttributeName"], json!("id"));
+        assert_eq!(b["AttributeDefinitions"][0]["AttributeType"], json!("S"));
     }
 
     // Fix 3: an EventBridgeRule state-machine event expands into an

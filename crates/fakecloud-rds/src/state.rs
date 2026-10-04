@@ -16,6 +16,64 @@ pub fn rds_arn(region: &str, account_id: &str, kind: &str, id: &str) -> String {
     Arn::regional("rds", region, account_id, &format!("{kind}:{id}")).to_string()
 }
 
+/// The per-account, per-region DNS label RDS puts in every endpoint host
+/// (`c9akciq32.us-east-1.rds.amazonaws.com`): 12 lowercase alphanumerics,
+/// stable for an account and region so every instance and cluster in it
+/// shares one, as on AWS.
+pub fn endpoint_hash(account_id: &str, region: &str) -> String {
+    // FNV-1a over "<account>:<region>", rendered in base 36.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in account_id
+        .bytes()
+        .chain(std::iter::once(b':'))
+        .chain(region.bytes())
+    {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(12);
+    for i in 0..12 {
+        // The first character is a letter, like AWS's.
+        let radix = if i == 0 { 26 } else { 36 };
+        out.push(ALPHABET[(h % radix) as usize] as char);
+        h /= radix;
+        if h == 0 {
+            h = 0x9e37_79b9_7f4a_7c15 ^ (i as u64);
+        }
+    }
+    out
+}
+
+/// A DB instance's endpoint host: `<id>.<hash>.<region>.rds.<dns suffix>`.
+pub fn instance_endpoint(id: &str, account_id: &str, region: &str) -> String {
+    format!(
+        "{id}.{}.{region}.rds.{}",
+        endpoint_hash(account_id, region),
+        fakecloud_aws::endpoint::dns_suffix_for_region(region)
+    )
+}
+
+/// A DB cluster's writer endpoint host:
+/// `<id>.cluster-<hash>.<region>.rds.<dns suffix>`.
+pub fn cluster_endpoint(id: &str, account_id: &str, region: &str) -> String {
+    format!(
+        "{id}.cluster-{}.{region}.rds.{}",
+        endpoint_hash(account_id, region),
+        fakecloud_aws::endpoint::dns_suffix_for_region(region)
+    )
+}
+
+/// A DB cluster's reader endpoint host:
+/// `<id>.cluster-ro-<hash>.<region>.rds.<dns suffix>`.
+pub fn cluster_reader_endpoint(id: &str, account_id: &str, region: &str) -> String {
+    format!(
+        "{id}.cluster-ro-{}.{region}.rds.{}",
+        endpoint_hash(account_id, region),
+        fakecloud_aws::endpoint::dns_suffix_for_region(region)
+    )
+}
+
 /// A global cluster's ARN: no region field, in the partition of `region`.
 pub fn global_cluster_arn(region: &str, account_id: &str, id: &str) -> String {
     Arn::global_in(region, "rds", account_id, &format!("global-cluster:{id}")).to_string()
@@ -1709,5 +1767,40 @@ mod tests {
         let a = state.next_dbi_resource_id();
         let b = state.next_dbi_resource_id();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod endpoint_host_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_hosts_share_a_stable_per_account_region_label() {
+        let h = endpoint_hash("123456789012", "us-east-1");
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().next().unwrap().is_ascii_lowercase());
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert_eq!(h, endpoint_hash("123456789012", "us-east-1"));
+        assert_ne!(h, endpoint_hash("123456789012", "eu-west-1"));
+        assert_ne!(h, endpoint_hash("210987654321", "us-east-1"));
+        assert_eq!(
+            instance_endpoint("db1", "123456789012", "us-east-1"),
+            format!("db1.{h}.us-east-1.rds.amazonaws.com")
+        );
+        assert_eq!(
+            cluster_endpoint("c1", "123456789012", "us-east-1"),
+            format!("c1.cluster-{h}.us-east-1.rds.amazonaws.com")
+        );
+        assert_eq!(
+            cluster_reader_endpoint("c1", "123456789012", "us-east-1"),
+            format!("c1.cluster-ro-{h}.us-east-1.rds.amazonaws.com")
+        );
+        let cn = endpoint_hash("123456789012", "cn-north-1");
+        assert_eq!(
+            instance_endpoint("db1", "123456789012", "cn-north-1"),
+            format!("db1.{cn}.cn-north-1.rds.amazonaws.com.cn")
+        );
     }
 }

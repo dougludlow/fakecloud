@@ -77,6 +77,10 @@ pub(super) struct ApiRoute {
     /// HttpApi `PayloadFormatVersion` / `TimeoutInMillis`.
     pub payload_format_version: Option<Value>,
     pub timeout_in_millis: Option<Value>,
+    /// The route's `x-amazon-apigateway-integration` when it is not a Lambda
+    /// proxy integration (a state machine `Api` event's StartExecution
+    /// service integration); such a route needs no invoke permission.
+    pub integration: Option<Value>,
 }
 
 /// Template-wide context the function pass reads and records into: which
@@ -426,6 +430,7 @@ pub(super) fn expand_function_extras(
                     auth: props.get("Auth").and_then(Value::as_object).cloned(),
                     payload_format_version: props.get("PayloadFormatVersion").cloned(),
                     timeout_in_millis: props.get("TimeoutInMillis").cloned(),
+                    integration: None,
                 });
             }
             other => {
@@ -1167,16 +1172,17 @@ pub(super) fn lambda_integration_uri(target: &FnTarget) -> Value {
 /// - `Schedule` / `ScheduleV2` and `EventBridgeRule` / `CloudWatchEvent`
 ///   become `AWS::Events::Rule`s whose target is the state machine's ARN, with
 ///   a shared execution role granting `states:StartExecution`.
-/// - `Api` / `HttpApi` become an `AWS::ApiGateway::RestApi` + `Resource` +
-///   `Method` with an AWS service integration that calls `StartExecution`,
-///   plus the role API Gateway assumes to do so.
+/// - `Api` adds its path + method to the API it names (`RestApiId`, else the
+///   implicit `ServerlessRestApi`, shared with function `Api` events and
+///   deployed to its stage) with an AWS service integration that calls
+///   `StartExecution`, plus the role API Gateway assumes to do so.
 ///
-/// Returns the extra native resources keyed by logical id. Previously the
-/// transform dropped `Events` entirely (`sfn_props.remove("Events")`), so an
-/// event-driven SAM state machine deployed with no trigger.
+/// Returns the extra native resources keyed by logical id; API routes are
+/// recorded in `ctx` for the API expansion.
 pub(super) fn expand_state_machine_events(
     state_machine_id: &str,
     events: &Map<String, Value>,
+    ctx: &mut SamContext,
 ) -> Result<Vec<(String, Value)>, String> {
     let mut extras: Vec<(String, Value)> = Vec::new();
     let start_role_id = format!("{state_machine_id}EventsRole");
@@ -1212,8 +1218,14 @@ pub(super) fn expand_state_machine_events(
                     &props,
                 ));
             }
-            "Api" | "HttpApi" => {
-                extras.extend(sfn_api_resources(state_machine_id, &id_base, &props));
+            "Api" => {
+                extras.push(sfn_api_route(
+                    state_machine_id,
+                    event_name,
+                    &id_base,
+                    &props,
+                    ctx,
+                )?);
             }
             other => {
                 return Err(invalid_event(
@@ -1330,88 +1342,77 @@ fn sfn_eventbridge_rule(
     )
 }
 
-/// `Api`/`HttpApi` state-machine event -> a dedicated REST API + resource +
-/// method whose integration is the AWS service action `states:StartExecution`,
-/// plus the API-Gateway role that performs it. Structural (matches what SAM
-/// synthesizes) so the state machine is reachable over HTTP.
-fn sfn_api_resources(
+/// A state machine `Api` event: a route on the API it names whose
+/// integration calls `StartExecution` with the request body as the input
+/// (SAM's request template), through a role API Gateway assumes. Returns the
+/// role; the route is recorded in `ctx` for the API expansion.
+fn sfn_api_route(
     state_machine_id: &str,
+    event_name: &str,
     id_base: &str,
     props: &Map<String, Value>,
-) -> Vec<(String, Value)> {
-    let path = props
-        .get("Path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/")
-        .to_string();
-    let method = props
-        .get("Method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("POST")
-        .to_uppercase();
-
-    let api_id = format!("{id_base}Api");
-    let role_id = format!("{id_base}ApiRole");
-    let mut out: Vec<(String, Value)> = Vec::new();
-
-    out.push((
-        api_id.clone(),
-        json!({
-            "Type": "AWS::ApiGateway::RestApi",
-            "Properties": { "Name": api_id, "EndpointConfiguration": { "Types": ["REGIONAL"] } }
-        }),
-    ));
-    out.push((
-        role_id.clone(),
-        start_execution_role(state_machine_id, "apigateway.amazonaws.com"),
-    ));
-
-    // Resolve (creating as needed) the resource tree for the path.
-    let mut parent_ref = json!({ "Fn::GetAtt": [api_id, "RootResourceId"] });
-    let mut prefix = String::new();
-    let mut leaf_resource_id: Option<String> = None;
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        prefix.push('/');
-        prefix.push_str(segment);
-        let res_id = format!("{api_id}Resource{}", sanitize(&prefix));
-        out.push((
-            res_id.clone(),
-            json!({
-                "Type": "AWS::ApiGateway::Resource",
-                "Properties": {
-                    "RestApiId": { "Ref": api_id },
-                    "ParentId": parent_ref,
-                    "PathPart": segment,
-                }
-            }),
-        ));
-        parent_ref = json!({ "Fn::GetAtt": [res_id, "ResourceId"] });
-        leaf_resource_id = Some(res_id);
-    }
-    let resource_ref = match &leaf_resource_id {
-        Some(id) => json!({ "Ref": id }),
-        None => json!({ "Fn::GetAtt": [api_id, "RootResourceId"] }),
+    ctx: &mut SamContext,
+) -> Result<(String, Value), String> {
+    let api_id = match props.get("RestApiId") {
+        None => "ServerlessRestApi".to_string(),
+        Some(v) => ref_id(Some(v))
+            .filter(|id| ctx.resource_type(id) == Some("AWS::Serverless::Api"))
+            .ok_or_else(|| {
+                invalid_event(
+                    state_machine_id,
+                    event_name,
+                    "RestApiId must be a valid reference to an 'AWS::Serverless::Api' resource in same template.",
+                )
+            })?
+            .to_string(),
     };
-
-    out.push((
-        format!("{api_id}Method"),
-        json!({
-            "Type": "AWS::ApiGateway::Method",
-            "Properties": {
-                "RestApiId": { "Ref": api_id },
-                "ResourceId": resource_ref,
-                "HttpMethod": method,
-                "AuthorizationType": "NONE",
-                "Integration": {
-                    "Type": "AWS",
-                    "IntegrationHttpMethod": "POST",
-                    "Uri": { "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution" },
-                    "Credentials": { "Fn::GetAtt": [role_id, "Arn"] },
-                }
-            }
-        }),
-    ));
-    out
+    let (Some(path), Some(method)) = (
+        props.get("Path").and_then(|v| v.as_str()),
+        props.get("Method").and_then(|v| v.as_str()),
+    ) else {
+        return Err(invalid_event(
+            state_machine_id,
+            event_name,
+            "Event is missing key 'Path' or 'Method'.",
+        ));
+    };
+    let role_id = format!("{id_base}Role");
+    let template = format!(
+        "{{\"input\": \"$util.escapeJavaScript($input.json('$'))\", \"stateMachineArn\": \"${{{state_machine_id}}}\"}}"
+    );
+    let integration = json!({
+        "type": "aws",
+        "httpMethod": "POST",
+        "uri": { "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution" },
+        "credentials": { "Fn::GetAtt": [role_id, "Arn"] },
+        "requestTemplates": { "application/json": { "Fn::Sub": template } },
+        "responses": {
+            "200": { "statusCode": "200" },
+            "400": { "statusCode": "400" }
+        }
+    });
+    let method = method.to_uppercase();
+    ctx.api_routes.push(ApiRoute {
+        target: FnTarget::function(state_machine_id),
+        id_base: id_base.to_string(),
+        event_name: event_name.to_string(),
+        api_id,
+        path: Some(path.to_string()),
+        method: if method == "X-AMAZON-APIGATEWAY-ANY-METHOD" {
+            "ANY".to_string()
+        } else {
+            method
+        },
+        http_api: false,
+        auth: props.get("Auth").and_then(Value::as_object).cloned(),
+        payload_format_version: None,
+        timeout_in_millis: None,
+        integration: Some(integration),
+    });
+    Ok((
+        role_id,
+        start_execution_role(state_machine_id, "apigateway.amazonaws.com"),
+    ))
 }
 
 // ============================================================================

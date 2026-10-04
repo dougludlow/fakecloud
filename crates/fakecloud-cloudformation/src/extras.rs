@@ -651,7 +651,12 @@ impl CloudFormationService {
                 .dynamodb
                 .read()
                 .get(aid)
-                .map(|s| s.tables.values().any(|t| t.arn == resource.physical_id))
+                // The physical id is the table name (an ARN on older stacks).
+                .map(|s| {
+                    s.tables
+                        .values()
+                        .any(|t| t.arn == resource.physical_id || t.name == resource.physical_id)
+                })
                 .unwrap_or(false),
             "AWS::KMS::Key" => self
                 .deps
@@ -3099,6 +3104,7 @@ pub(crate) mod tests {
             amplify: shared::<fakecloud_amplify::state::AmplifyData>(),
             iot: shared::<fakecloud_iot::IotData>(),
             appconfig: shared::<fakecloud_appconfig::AppConfigState>(),
+            scheduler: shared::<fakecloud_scheduler::SchedulerState>(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
             iam_mode: Default::default(),

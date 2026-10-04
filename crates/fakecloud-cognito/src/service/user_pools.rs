@@ -733,7 +733,11 @@ impl CognitoService {
             AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidParameterException", m)
         })?;
 
-        // Update fields that are present
+        // UpdateUserPoolClient replaces the client's configuration: every
+        // setting the request omits goes back to its default (what
+        // CreateUserPoolClient would give it), as AWS documents -- it is not
+        // a merge. Only the name (and the client's id and secret) carry over
+        // when not sent.
         if let Some(name) = body["ClientName"].as_str() {
             if name.is_empty() {
                 return Err(AwsServiceError::aws_error(
@@ -744,57 +748,36 @@ impl CognitoService {
             }
             client.client_name = name.to_string();
         }
-        if body["ExplicitAuthFlows"].is_array() {
-            client.explicit_auth_flows = parse_string_array(&body["ExplicitAuthFlows"]);
-        }
+        client.explicit_auth_flows = parse_string_array(&body["ExplicitAuthFlows"]);
         client.token_validity_units = validity.units;
         client.access_token_validity = validity.access;
         client.id_token_validity = validity.id;
         client.refresh_token_validity = Some(validity.refresh);
-        if body["CallbackURLs"].is_array() {
-            client.callback_urls = parse_string_array(&body["CallbackURLs"]);
-        }
-        if body["LogoutURLs"].is_array() {
-            client.logout_urls = parse_string_array(&body["LogoutURLs"]);
-        }
-        if body["SupportedIdentityProviders"].is_array() {
-            client.supported_identity_providers =
-                parse_string_array(&body["SupportedIdentityProviders"]);
-        }
-        if body["AllowedOAuthFlows"].is_array() {
-            client.allowed_o_auth_flows = parse_string_array(&body["AllowedOAuthFlows"]);
-        }
-        if body["AllowedOAuthScopes"].is_array() {
-            client.allowed_o_auth_scopes = parse_string_array(&body["AllowedOAuthScopes"]);
-        }
-        if let Some(v) = body["AllowedOAuthFlowsUserPoolClient"].as_bool() {
-            client.allowed_o_auth_flows_user_pool_client = v;
-        }
-        if let Some(v) = body["PreventUserExistenceErrors"].as_str() {
-            client.prevent_user_existence_errors = Some(v.to_string());
-        }
-        if body["ReadAttributes"].is_array() {
-            client.read_attributes = parse_string_array(&body["ReadAttributes"]);
-        }
-        if body["WriteAttributes"].is_array() {
-            client.write_attributes = parse_string_array(&body["WriteAttributes"]);
-        }
-        if let Some(v) = body["EnableTokenRevocation"].as_bool() {
-            client.enable_token_revocation = v;
-        }
-        if let Some(v) = body["AuthSessionValidity"].as_i64() {
-            client.auth_session_validity = Some(v);
-        }
-        if let Some(v) = body["EnablePropagateAdditionalUserContextData"].as_bool() {
-            client.enable_propagate_additional_user_context_data = v;
-        }
-        if body["RefreshTokenRotation"].is_object() {
-            client.refresh_token_rotation =
-                parse_refresh_token_rotation(&body["RefreshTokenRotation"]);
-        }
-        if let Some(analytics) = body.get("AnalyticsConfiguration").filter(|v| !v.is_null()) {
-            client.analytics_configuration = Some(analytics.clone());
-        }
+        client.callback_urls = parse_string_array(&body["CallbackURLs"]);
+        client.logout_urls = parse_string_array(&body["LogoutURLs"]);
+        client.supported_identity_providers =
+            parse_string_array(&body["SupportedIdentityProviders"]);
+        client.allowed_o_auth_flows = parse_string_array(&body["AllowedOAuthFlows"]);
+        client.allowed_o_auth_scopes = parse_string_array(&body["AllowedOAuthScopes"]);
+        client.allowed_o_auth_flows_user_pool_client = body["AllowedOAuthFlowsUserPoolClient"]
+            .as_bool()
+            .unwrap_or(false);
+        client.prevent_user_existence_errors = body["PreventUserExistenceErrors"]
+            .as_str()
+            .map(|s| s.to_string());
+        client.read_attributes = parse_string_array(&body["ReadAttributes"]);
+        client.write_attributes = parse_string_array(&body["WriteAttributes"]);
+        client.enable_token_revocation = body["EnableTokenRevocation"].as_bool().unwrap_or(true);
+        client.auth_session_validity = Some(body["AuthSessionValidity"].as_i64().unwrap_or(3));
+        client.enable_propagate_additional_user_context_data = body
+            ["EnablePropagateAdditionalUserContextData"]
+            .as_bool()
+            .unwrap_or(false);
+        client.refresh_token_rotation = parse_refresh_token_rotation(&body["RefreshTokenRotation"]);
+        client.analytics_configuration = body
+            .get("AnalyticsConfiguration")
+            .filter(|v| !v.is_null())
+            .cloned();
 
         client.last_modified_date = Utc::now();
 

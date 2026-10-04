@@ -939,8 +939,13 @@ impl SnsService {
         }
         let endpoint = param(req, "Endpoint").unwrap_or_default();
 
+        // A subscription lives with its topic, in the topic owner's account
+        // (that is where Publish fans out from); a cross-account subscriber
+        // stays its owner. Cross-account access itself is authorized by the
+        // topic policy at dispatch.
+        let topic_account = owning_account(&topic_arn, &req.account_id).to_string();
         let accts = self.state.read();
-        let state_r = match accts.get(&req.account_id) {
+        let state_r = match accts.get(&topic_account) {
             Some(s) => s,
             None => return Err(not_found("Topic")),
         };
@@ -1022,7 +1027,7 @@ impl SnsService {
 
         // Check for duplicate subscription (same topic, protocol, endpoint)
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.get_or_create(&topic_account);
         for sub in state.subscriptions.values() {
             if sub.topic_arn == topic_arn && sub.protocol == protocol && sub.endpoint == endpoint {
                 return Ok(xml_resp(
@@ -1150,7 +1155,7 @@ impl SnsService {
         let token = required(req, "Token")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.get_or_create(owning_account(&topic_arn, &req.account_id));
         // AWS accepts both the confirmation token and the subscription ARN as the Token parameter.
         // Confirming an already-confirmed subscription is a no-op (idempotent).
         let sub_arn = state
@@ -1197,7 +1202,8 @@ impl SnsService {
     fn unsubscribe(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let sub_arn = required(req, "SubscriptionArn")?;
         let mut accts = self.state.write();
-        let state = accts.get_or_create(&req.account_id);
+        let account = subscription_account(&accts, &sub_arn, &req.account_id);
+        let state = accts.get_or_create(&account);
         // Snapshot the parent topic ARN before removing the subscription
         // so we can bump SubscriptionsDeleted on the right topic. Real
         // SNS exposes this counter on GetTopicAttributes.
@@ -1228,10 +1234,17 @@ impl SnsService {
 
     fn list_subscriptions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let _accts = self.state.read();
-        let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
-
-        let all_subs: Vec<&SnsSubscription> = state.subscriptions.values().collect();
+        // ListSubscriptions returns the requester's subscriptions: the ones it
+        // owns, wherever the topic lives (a subscription to another
+        // account's topic is stored with that topic). Subscriptions other
+        // accounts own on the requester's topics are listed by
+        // ListSubscriptionsByTopic instead.
+        let mut all_subs: Vec<&SnsSubscription> = _accts
+            .iter()
+            .flat_map(|(_, st)| st.subscriptions.values())
+            .filter(|s| s.owner == req.account_id)
+            .collect();
+        all_subs.sort_by(|a, b| a.subscription_arn.cmp(&b.subscription_arn));
         let next_token = param(req, "NextToken")
             .and_then(|t| t.parse::<usize>().ok())
             .unwrap_or(0);
@@ -1285,7 +1298,10 @@ impl SnsService {
         let topic_arn = required(req, "TopicArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        // A topic's subscriptions live with the topic, in its owner's account.
+        let state = _accts
+            .get(owning_account(&topic_arn, &req.account_id))
+            .unwrap_or(&_empty);
 
         let all_subs: Vec<&SnsSubscription> = state
             .subscriptions
@@ -1346,7 +1362,8 @@ impl SnsService {
         let sub_arn = required(req, "SubscriptionArn")?;
         let _accts = self.state.read();
         let _empty = crate::state::SnsState::new(&req.account_id, &req.region, "");
-        let state = _accts.get(&req.account_id).unwrap_or(&_empty);
+        let account = subscription_account(&_accts, &sub_arn, &req.account_id);
+        let state = _accts.get(&account).unwrap_or(&_empty);
         let sub = state
             .subscriptions
             .get(&sub_arn)
@@ -1454,7 +1471,8 @@ impl SnsService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let account = subscription_account(&accounts, &sub_arn, &req.account_id);
+        let state = accounts.get_or_create(&account);
         let sub = state
             .subscriptions
             .get_mut(&sub_arn)
@@ -1966,6 +1984,35 @@ pub(crate) use helpers::*;
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod tests;
+
+/// The account a topic or subscription ARN belongs to (its topic owner's),
+/// or `caller` when the ARN carries none.
+fn owning_account<'a>(arn: &'a str, caller: &'a str) -> &'a str {
+    fakecloud_aws::arn::account_of(arn)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(caller)
+}
+
+/// The account whose state holds subscription `sub_arn`: its topic owner's
+/// (where subscriptions are stored), falling back to the caller's for a
+/// subscription recorded there by an older build.
+fn subscription_account(
+    accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::SnsState>,
+    sub_arn: &str,
+    caller: &str,
+) -> String {
+    let owner = owning_account(sub_arn, caller);
+    let held_by = |acct: &str| {
+        accounts
+            .get(acct)
+            .is_some_and(|s| s.subscriptions.contains_key(sub_arn))
+    };
+    if !held_by(owner) && held_by(caller) {
+        caller.to_string()
+    } else {
+        owner.to_string()
+    }
+}
 
 #[cfg(test)]
 mod effective_policy_tests {

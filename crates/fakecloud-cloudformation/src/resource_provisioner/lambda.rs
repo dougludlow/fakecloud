@@ -132,7 +132,7 @@ impl ResourceProvisioner {
             dead_letter_config_arn: cfg.dead_letter_config_arn,
             file_system_configs: cfg.file_system_configs,
             logging_config: cfg.logging_config,
-            image_config: None,
+            image_config: cfg.image_config,
             durable_config: None,
             signing_profile_version_arn: None,
             signing_job_arn: None,
@@ -186,6 +186,11 @@ impl ResourceProvisioner {
             ));
         }
         state.functions.insert(function_name.clone(), func);
+        if let Some(reserved) = cfg.reserved_concurrent_executions {
+            state
+                .function_concurrency
+                .insert(function_name.clone(), reserved);
+        }
 
         // Capture every GetAtt-resolvable attribute eagerly. Output
         // resolution happens after `provision_stack_resources` returns
@@ -284,9 +289,10 @@ impl ResourceProvisioner {
         if cfg.image_uri.is_some() {
             func.image_uri = cfg.image_uri;
         }
-        if !cfg.tags.is_empty() {
-            func.tags = cfg.tags;
-        }
+        func.image_config = cfg.image_config;
+        // Tags are desired state: an empty or absent Tags property clears
+        // them, as a stack update does in AWS.
+        func.tags = cfg.tags;
         if let Some(bytes) = new_code_zip {
             func.code_sha256 = sha256_b64(&bytes);
             func.code_size = bytes.len() as i64;
@@ -296,6 +302,18 @@ impl ResourceProvisioner {
         func.revision_id = Uuid::new_v4().to_string();
 
         let function_arn = func.function_arn.clone();
+        // Reserved concurrency follows the template: set it when present,
+        // remove it (DeleteFunctionConcurrency) when the property is dropped.
+        match cfg.reserved_concurrent_executions {
+            Some(reserved) => {
+                state
+                    .function_concurrency
+                    .insert(function_name.clone(), reserved);
+            }
+            None => {
+                state.function_concurrency.remove(&function_name);
+            }
+        }
         Ok(ProvisionResult::new(function_name.clone())
             .with("Arn", function_arn)
             .with("FunctionName", function_name)
@@ -306,6 +324,7 @@ impl ResourceProvisioner {
         let mut accounts = self.lambda_state.write();
         let state = accounts.get_or_create(&self.account_id);
         state.functions.remove(physical_id);
+        state.function_concurrency.remove(physical_id);
         Ok(())
     }
 
@@ -1056,6 +1075,109 @@ impl ResourceProvisioner {
         if let Some(snapshots) = state.function_version_snapshots.get_mut(function_name) {
             snapshots.remove(version);
         }
+        Ok(())
+    }
+}
+
+impl ResourceProvisioner {
+    /// `AWS::Lambda::EventInvokeConfig`: the asynchronous-invocation settings
+    /// (max event age, retries, destinations) for a function qualifier, as
+    /// PutFunctionEventInvokeConfig stores them -- the async invoke path reads
+    /// them to route results to OnSuccess / OnFailure destinations. The
+    /// physical id is `<function>:<qualifier>`.
+    pub(super) fn create_lambda_event_invoke_config(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let function_name = parse_lambda_function_name(
+            props
+                .get("FunctionName")
+                .and_then(|v| v.as_str())
+                .ok_or("EventInvokeConfig requires FunctionName")?,
+        );
+        let qualifier = props
+            .get("Qualifier")
+            .and_then(|v| v.as_str())
+            .ok_or("EventInvokeConfig requires Qualifier")?
+            .to_string();
+        let event_age = match props.get("MaximumEventAgeInSeconds") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(-1);
+                if !(60..=21600).contains(&n) {
+                    return Err(format!(
+                        "InvalidParameterValueException: MaximumEventAgeInSeconds must be 60..21600 (got {v})"
+                    ));
+                }
+                n
+            }
+        };
+        let retries = match props.get("MaximumRetryAttempts") {
+            None | Some(serde_json::Value::Null) => 2,
+            Some(v) => {
+                let n = v
+                    .as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(-1);
+                if !(0..=2).contains(&n) {
+                    return Err(format!(
+                        "InvalidParameterValueException: MaximumRetryAttempts must be 0..2 (got {v})"
+                    ));
+                }
+                n
+            }
+        };
+        let mut accounts = self.lambda_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        if !state.functions.contains_key(&function_name) {
+            return Err(format!(
+                "ResourceNotFoundException: Function not found: {function_name}"
+            ));
+        }
+        let cfg = fakecloud_lambda::EventInvokeConfig {
+            function_arn: fakecloud_lambda::function_arn(
+                &self.region,
+                &self.account_id,
+                &function_name,
+            ),
+            maximum_event_age: event_age,
+            maximum_retry_attempts: retries,
+            destination_config: props
+                .get("DestinationConfig")
+                .filter(|v| v.is_object())
+                .cloned(),
+            last_modified: Utc::now(),
+        };
+        let key = format!("{function_name}:{qualifier}");
+        state.event_invoke_configs.insert(key.clone(), cfg);
+        Ok(ProvisionResult::new(key))
+    }
+
+    /// Put again on update: the template is the whole config (Put
+    /// semantics, so dropped settings return to their defaults).
+    pub(super) fn update_lambda_event_invoke_config(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let result = self.create_lambda_event_invoke_config(resource)?;
+        if result.physical_id != existing.physical_id {
+            self.delete_lambda_event_invoke_config(&existing.physical_id)?;
+        }
+        Ok(result)
+    }
+
+    pub(super) fn delete_lambda_event_invoke_config(
+        &self,
+        physical_id: &str,
+    ) -> Result<(), String> {
+        let mut accounts = self.lambda_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        state.event_invoke_configs.remove(physical_id);
         Ok(())
     }
 }

@@ -226,77 +226,143 @@ impl ResourceProvisioner {
 
     // --- IAM Policy ---
 
+    /// `AWS::IAM::Policy`: an inline policy embedded, under `PolicyName`, in
+    /// every role, user and group the template lists -- what PutRolePolicy /
+    /// PutUserPolicy / PutGroupPolicy store, and what IAM evaluates for those
+    /// identities. (It is not a managed policy; that is
+    /// `AWS::IAM::ManagedPolicy`.) The physical id is a generated id, as on
+    /// AWS; the policy name and targets ride along for update and delete.
     pub(super) fn create_iam_policy(
         &self,
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
-        let props = &resource.properties;
-        let generated_name = self.physical_name(resource);
+        let physical_id = self.physical_name(resource);
+        self.put_iam_inline_policy(&physical_id, &resource.properties)
+    }
+
+    fn put_iam_inline_policy(
+        &self,
+        physical_id: &str,
+        props: &serde_json::Value,
+    ) -> Result<ProvisionResult, String> {
         let policy_name = props
             .get("PolicyName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&generated_name);
-
-        let policy_document = props
-            .get("PolicyDocument")
-            .map(|v| {
-                if v.is_string() {
-                    v.as_str().unwrap().to_string()
-                } else {
-                    serde_json::to_string(v).unwrap_or_default()
-                }
-            })
-            .unwrap_or_default();
-
-        let path = props.get("Path").and_then(|v| v.as_str()).unwrap_or("/");
-
+            .ok_or("Policy requires PolicyName")?
+            .to_string();
+        let document = match props.get("PolicyDocument") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_default(),
+            _ => return Err("Policy requires PolicyDocument".to_string()),
+        };
+        fakecloud_iam::policy_validation::validate_policy_document(&document)
+            .map_err(|e| format!("MalformedPolicyDocument: {e}"))?;
+        let targets = InlinePolicyTargets::from_props(props);
+        if targets.is_empty() {
+            return Err(
+                "Policy must be attached to at least one of Roles, Users or Groups".to_string(),
+            );
+        }
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let policy_id = format!(
-            "FSIA{}",
-            &Uuid::new_v4().to_string().replace('-', "").to_uppercase()[..16]
-        );
-        let arn = format!(
-            "arn:{}:iam::{}:policy{}{}",
-            fakecloud_aws::arn::partition_for(&self.region),
-            state.account_id,
-            if path == "/" { "/" } else { path },
-            policy_name
-        );
-
-        let now = Utc::now();
-        let policy = IamPolicy {
-            policy_name: policy_name.to_string(),
-            policy_id,
-            arn: arn.clone(),
-            path: path.to_string(),
-            description: props
-                .get("Description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            created_at: now,
-            tags: Vec::new(),
-            default_version_id: "v1".to_string(),
-            versions: vec![PolicyVersion {
-                version_id: "v1".to_string(),
-                document: policy_document,
-                is_default: true,
-                created_at: now,
-            }],
-            next_version_num: 2,
-            attachment_count: 0,
-        };
-
-        state.policies.insert(arn.clone(), policy);
-        Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
+        for role in &targets.roles {
+            if !state.roles.contains_key(role) {
+                return Err(format!(
+                    "NoSuchEntity: The role with name {role} cannot be found."
+                ));
+            }
+        }
+        for user in &targets.users {
+            if !state.users.contains_key(user) {
+                return Err(format!(
+                    "NoSuchEntity: The user with name {user} cannot be found."
+                ));
+            }
+        }
+        for group in &targets.groups {
+            if !state.groups.contains_key(group) {
+                return Err(format!(
+                    "NoSuchEntity: The group with name {group} cannot be found."
+                ));
+            }
+        }
+        for role in &targets.roles {
+            state
+                .role_inline_policies
+                .entry(role.clone())
+                .or_default()
+                .insert(policy_name.clone(), document.clone());
+        }
+        for user in &targets.users {
+            state
+                .user_inline_policies
+                .entry(user.clone())
+                .or_default()
+                .insert(policy_name.clone(), document.clone());
+        }
+        for group in &targets.groups {
+            if let Some(g) = state.groups.get_mut(group) {
+                g.inline_policies
+                    .insert(policy_name.clone(), document.clone());
+            }
+        }
+        Ok(ProvisionResult::new(physical_id.to_string())
+            .with("Id", physical_id)
+            .with(INLINE_POLICY_NAME_ATTR, policy_name)
+            .with(INLINE_POLICY_TARGETS_ATTR, targets.encode()))
     }
 
-    pub(super) fn delete_iam_policy(&self, physical_id: &str) -> Result<(), String> {
+    /// Remove the inline policy a stack's `AWS::IAM::Policy` embedded.
+    fn remove_iam_inline_policy(&self, resource: &StackResource) {
+        let Some(policy_name) = resource.attributes.get(INLINE_POLICY_NAME_ATTR) else {
+            return;
+        };
+        let targets = resource
+            .attributes
+            .get(INLINE_POLICY_TARGETS_ATTR)
+            .map(|t| InlinePolicyTargets::decode(t))
+            .unwrap_or_default();
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        state.policies.remove(physical_id);
+        for role in &targets.roles {
+            if let Some(p) = state.role_inline_policies.get_mut(role) {
+                p.remove(policy_name);
+            }
+        }
+        for user in &targets.users {
+            if let Some(p) = state.user_inline_policies.get_mut(user) {
+                p.remove(policy_name);
+            }
+        }
+        for group in &targets.groups {
+            if let Some(g) = state.groups.get_mut(group) {
+                g.inline_policies.remove(policy_name);
+            }
+        }
+    }
+
+    pub(super) fn delete_iam_policy(&self, resource: &StackResource) -> Result<(), String> {
+        self.remove_iam_inline_policy(resource);
+        // A stack recorded before AWS::IAM::Policy was modeled as an inline
+        // policy holds a managed-policy ARN instead.
+        if resource.physical_id.starts_with("arn:") {
+            let mut accounts = self.iam_state.write();
+            let state = accounts.get_or_create(&self.account_id);
+            state.policies.remove(&resource.physical_id);
+        }
         Ok(())
+    }
+
+    /// An `AWS::IAM::Policy` update re-embeds the policy: it comes off the
+    /// identities the old template listed and goes onto the new ones, with
+    /// the new name and document. The physical id stays.
+    pub(super) fn update_iam_inline_policy(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        self.remove_iam_inline_policy(existing);
+        self.put_iam_inline_policy(&existing.physical_id, &resource.properties)
     }
 
     /// Apply a CFN property update to an existing customer-managed policy
@@ -1309,4 +1375,111 @@ fn string_list(props: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Where an `AWS::IAM::RolePolicy`'s stack record keeps the role the inline
+/// policy is embedded in, so delete can find it. Not a real `GetAtt` name.
+const ROLE_POLICY_ROLE_ATTR: &str = "__fakecloud_role_name__";
+
+impl ResourceProvisioner {
+    /// `AWS::IAM::RolePolicy`: an inline policy embedded in a role, as
+    /// PutRolePolicy stores it. `Ref` returns the policy name.
+    pub(super) fn create_iam_role_policy(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let role_name = props
+            .get("RoleName")
+            .and_then(|v| v.as_str())
+            .ok_or("RolePolicy requires RoleName")?;
+        // RoleName may arrive as a role ARN from a GetAtt.
+        let role_name = role_name.rsplit('/').next().unwrap_or(role_name);
+        let policy_name = props
+            .get("PolicyName")
+            .and_then(|v| v.as_str())
+            .ok_or("RolePolicy requires PolicyName")?;
+        let document = match props.get("PolicyDocument") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_default(),
+            _ => return Err("RolePolicy requires PolicyDocument".to_string()),
+        };
+        fakecloud_iam::policy_validation::validate_policy_document(&document)
+            .map_err(|e| format!("MalformedPolicyDocument: {e}"))?;
+        let mut accounts = self.iam_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        if !state.roles.contains_key(role_name) {
+            return Err(format!("NoSuchEntity: Role {role_name} not found"));
+        }
+        state
+            .role_inline_policies
+            .entry(role_name.to_string())
+            .or_default()
+            .insert(policy_name.to_string(), document);
+        Ok(ProvisionResult::new(policy_name.to_string()).with(ROLE_POLICY_ROLE_ATTR, role_name))
+    }
+
+    /// Remove an `AWS::IAM::RolePolicy`'s inline policy from its role.
+    pub(super) fn delete_iam_role_policy(&self, resource: &StackResource) -> Result<(), String> {
+        let Some(role_name) = resource.attributes.get(ROLE_POLICY_ROLE_ATTR) else {
+            return Ok(());
+        };
+        let mut accounts = self.iam_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        if let Some(policies) = state.role_inline_policies.get_mut(role_name) {
+            policies.remove(&resource.physical_id);
+        }
+        Ok(())
+    }
+}
+
+/// Where an `AWS::IAM::Policy`'s stack record keeps its policy name and the
+/// identities it is embedded in (not real `GetAtt` names).
+const INLINE_POLICY_NAME_ATTR: &str = "__fakecloud_policy_name__";
+const INLINE_POLICY_TARGETS_ATTR: &str = "__fakecloud_policy_targets__";
+
+/// The roles, users and groups an `AWS::IAM::Policy` is embedded in.
+#[derive(Default)]
+struct InlinePolicyTargets {
+    roles: Vec<String>,
+    users: Vec<String>,
+    groups: Vec<String>,
+}
+
+impl InlinePolicyTargets {
+    fn from_props(props: &serde_json::Value) -> Self {
+        // An entry may be a name or (from a GetAtt) an ARN.
+        let names = |key: &str| -> Vec<String> {
+            props
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            roles: names("Roles"),
+            users: names("Users"),
+            groups: names("Groups"),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.roles.is_empty() && self.users.is_empty() && self.groups.is_empty()
+    }
+
+    fn encode(&self) -> String {
+        serde_json::json!({"Roles": self.roles, "Users": self.users, "Groups": self.groups})
+            .to_string()
+    }
+
+    fn decode(s: &str) -> Self {
+        serde_json::from_str::<serde_json::Value>(s)
+            .map(|v| Self::from_props(&v))
+            .unwrap_or_default()
+    }
 }

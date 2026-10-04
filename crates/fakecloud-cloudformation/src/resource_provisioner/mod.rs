@@ -496,6 +496,12 @@ struct LambdaFunctionProps {
     dead_letter_config_arn: Option<String>,
     file_system_configs: Vec<serde_json::Value>,
     logging_config: Option<serde_json::Value>,
+    /// `ImageConfig` (EntryPoint / Command / WorkingDirectory) overrides
+    /// for an image-package function.
+    image_config: Option<serde_json::Value>,
+    /// `ReservedConcurrentExecutions`, applied as the function's reserved
+    /// concurrency (PutFunctionConcurrency).
+    reserved_concurrent_executions: Option<i64>,
 }
 
 /// Parse the `Properties` value of an `AWS::Lambda::Function` resource
@@ -646,6 +652,20 @@ fn parse_lambda_function_props(props: &serde_json::Value) -> Result<LambdaFuncti
         .get("LoggingConfig")
         .filter(|v| v.is_object())
         .cloned();
+    let image_config = props.get("ImageConfig").filter(|v| v.is_object()).cloned();
+    let reserved_concurrent_executions = match props.get("ReservedConcurrentExecutions") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| {
+                    format!(
+                        "InvalidParameterValueException: ReservedConcurrentExecutions must be a non-negative integer, got {v}"
+                    )
+                })?,
+        ),
+    };
 
     Ok(LambdaFunctionProps {
         runtime,
@@ -671,6 +691,8 @@ fn parse_lambda_function_props(props: &serde_json::Value) -> Result<LambdaFuncti
         dead_letter_config_arn,
         file_system_configs,
         logging_config,
+        image_config,
+        reserved_concurrent_executions,
     })
 }
 
@@ -1042,6 +1064,7 @@ pub struct ResourceProvisioner {
     pub amplify_state: fakecloud_amplify::SharedAmplifyState,
     pub iot_state: fakecloud_iot::SharedIotState,
     pub appconfig_state: fakecloud_appconfig::SharedAppConfigState,
+    pub scheduler_state: fakecloud_scheduler::SharedSchedulerState,
     pub cloudformation_state: SharedCloudFormationState,
     pub delivery: Arc<DeliveryBus>,
     /// Lambda container runtime for pre-pulling CFN-provisioned function
@@ -1245,6 +1268,7 @@ mod config;
 mod cwlogs;
 mod dynamodb;
 mod ec2;
+mod ec2_network;
 mod ecr;
 mod ecs;
 mod efs;
@@ -1254,6 +1278,8 @@ mod elasticbeanstalk;
 mod elbv2;
 mod emr;
 mod eventbridge;
+#[cfg(test)]
+mod fidelity2_tests;
 #[cfg(test)]
 mod fidelity_tests;
 mod firehose;
@@ -1278,6 +1304,7 @@ mod route;
 mod route53resolver;
 mod s3;
 mod sagemaker;
+mod scheduler;
 mod secrets;
 mod servicediscovery;
 mod ses;
@@ -1348,6 +1375,7 @@ impl ResourceProvisioner {
             "AWS::SSM::Parameter" => self.create_ssm_parameter(resource),
             "AWS::IAM::Role" => self.create_iam_role(resource),
             "AWS::IAM::Policy" => self.create_iam_policy(resource),
+            "AWS::IAM::RolePolicy" => self.create_iam_role_policy(resource),
             "AWS::IAM::User" => self.create_iam_user(resource),
             "AWS::IAM::Group" => self.create_iam_group(resource),
             "AWS::IAM::ManagedPolicy" => self.create_iam_managed_policy(resource),
@@ -1368,6 +1396,7 @@ impl ResourceProvisioner {
             "AWS::Events::EventBusPolicy" => self.create_eventbridge_event_bus_policy(resource),
             "AWS::Events::Endpoint" => self.create_eventbridge_endpoint(resource),
             "AWS::DynamoDB::Table" => self.create_dynamodb_table(resource),
+            "AWS::DynamoDB::GlobalTable" => self.create_dynamodb_global_table(resource),
             "AWS::Logs::LogGroup" => self.create_log_group(resource),
             "AWS::Logs::LogStream" => self.create_log_stream(resource),
             "AWS::Logs::MetricFilter" => self.create_metric_filter(resource),
@@ -1383,6 +1412,9 @@ impl ResourceProvisioner {
             "AWS::Lambda::EventSourceMapping" => self.create_lambda_event_source_mapping(resource),
             "AWS::Lambda::LayerVersion" => self.create_lambda_layer_version(resource),
             "AWS::Lambda::Url" => self.create_lambda_url(resource),
+            "AWS::Lambda::EventInvokeConfig" => self.create_lambda_event_invoke_config(resource),
+            "AWS::Scheduler::Schedule" => self.create_scheduler_schedule(resource),
+            "AWS::Scheduler::ScheduleGroup" => self.create_scheduler_schedule_group(resource),
             "AWS::IoT::TopicRule" => self.create_iot_topic_rule(resource),
             "AWS::Lambda::Alias" => self.create_lambda_alias(resource),
             "AWS::Lambda::Version" => self.create_lambda_version(resource),
@@ -1453,6 +1485,9 @@ impl ResourceProvisioner {
             "AWS::Batch::JobQueue" => self.create_batch_job_queue(resource),
             "AWS::Batch::JobDefinition" => self.create_batch_job_definition(resource),
             "AWS::Batch::SchedulingPolicy" => self.create_batch_scheduling_policy(resource),
+            "AWS::Batch::ConsumableResource"
+            | "AWS::Batch::ServiceEnvironment"
+            | "AWS::Batch::QuotaShare" => self.create_batch_api_resource(resource),
             "AWS::Pipes::Pipe" => self.create_pipes_pipe(resource),
             "AWS::CodeArtifact::Domain" => self.create_codeartifact_domain(resource),
             "AWS::CodeArtifact::Repository" => self.create_codeartifact_repository(resource),
@@ -1498,6 +1533,12 @@ impl ResourceProvisioner {
             "AWS::EC2::RouteTable" => self.create_ec2_route_table(resource),
             "AWS::EC2::Volume" => self.create_ec2_volume(resource),
             "AWS::EC2::LaunchTemplate" => self.create_ec2_launch_template(resource),
+            "AWS::EC2::SecurityGroupIngress" => self.create_ec2_sg_rule(resource, false),
+            "AWS::EC2::SecurityGroupEgress" => self.create_ec2_sg_rule(resource, true),
+            "AWS::EC2::VPCGatewayAttachment" => self.create_ec2_vpc_gateway_attachment(resource),
+            "AWS::EC2::Route" => self.create_ec2_route(resource),
+            "AWS::EC2::EIP" => self.create_ec2_eip(resource),
+            "AWS::EC2::NatGateway" => self.create_ec2_nat_gateway(resource),
             "AWS::ECS::Cluster" => self.create_ecs_cluster(resource),
             "AWS::ECS::TaskDefinition" => self.create_ecs_task_definition(resource),
             "AWS::ECS::Service" => self.create_ecs_service(resource),
@@ -1773,11 +1814,21 @@ impl ResourceProvisioner {
                 Some(self.update_lambda_layer_version(existing, new_def)?)
             }
             "AWS::Lambda::Url" => Some(self.update_lambda_url(existing, new_def)?),
+            "AWS::Lambda::EventInvokeConfig" => {
+                Some(self.update_lambda_event_invoke_config(existing, new_def)?)
+            }
+            "AWS::Batch::ConsumableResource"
+            | "AWS::Batch::ServiceEnvironment"
+            | "AWS::Batch::QuotaShare" => Some(self.update_batch_api_resource(existing, new_def)?),
+            "AWS::Scheduler::Schedule" => Some(self.update_scheduler_schedule(existing, new_def)?),
+            "AWS::Scheduler::ScheduleGroup" => {
+                Some(self.update_scheduler_schedule_group(existing, new_def)?)
+            }
             "AWS::IoT::TopicRule" => Some(self.update_iot_topic_rule(existing, new_def)?),
             "AWS::Lambda::Alias" => Some(self.update_lambda_alias(existing, new_def)?),
             "AWS::Lambda::Version" => Some(self.update_lambda_version(existing, new_def)?),
             "AWS::IAM::Role" => Some(self.update_iam_role(existing, new_def)?),
-            "AWS::IAM::Policy" => Some(self.update_iam_policy(existing, new_def)?),
+            "AWS::IAM::Policy" => Some(self.update_iam_inline_policy(existing, new_def)?),
             "AWS::IAM::ManagedPolicy" => Some(self.update_iam_policy(existing, new_def)?),
             // In-place update: the reprovision fallback (delete + create) would
             // wipe the user's access keys / churn the user id (User) or drop
@@ -1901,6 +1952,9 @@ impl ResourceProvisioner {
             "AWS::Kinesis::Stream" => Some(self.update_kinesis_stream(existing, new_def)?),
             "AWS::Events::Rule" => Some(self.update_eventbridge_rule(existing, new_def)?),
             "AWS::DynamoDB::Table" => Some(self.update_dynamodb_table(existing, new_def)?),
+            "AWS::DynamoDB::GlobalTable" => {
+                Some(self.update_dynamodb_global_table(existing, new_def)?)
+            }
             "AWS::SecretsManager::Secret" => {
                 Some(self.update_secrets_manager_secret(existing, new_def)?)
             }
@@ -2171,6 +2225,14 @@ impl ResourceProvisioner {
             // In-place updates: reprovision would churn the vpc-/subnet-/rtb- id
             // and orphan every child/sibling that references it (subnets, SGs,
             // route tables, routes, associations, instances, ENIs).
+            "AWS::EC2::EIP" if self.eip_requires_replacement(existing, new_def) => {
+                self.reprovision_resource(existing, new_def)?
+            }
+            "AWS::EC2::EIP" => Some(self.update_ec2_eip(existing, new_def)?),
+            "AWS::EC2::NatGateway" if self.nat_gateway_requires_replacement(existing, new_def) => {
+                self.reprovision_resource(existing, new_def)?
+            }
+            "AWS::EC2::NatGateway" => Some(self.update_ec2_nat_gateway(existing, new_def)?),
             "AWS::EC2::VPC" => Some(self.update_ec2_vpc(existing, new_def)?),
             "AWS::EC2::Subnet" => Some(self.update_ec2_subnet(existing, new_def)?),
             "AWS::EC2::RouteTable" => Some(self.update_ec2_route_table(existing, new_def)?),
@@ -2288,6 +2350,22 @@ impl ResourceProvisioner {
                 return Some(v);
             }
         }
+        // Same for RDS endpoints: a container-backed instance's address and
+        // port are only known once the container is up, and a stack update
+        // can move a cluster's port.
+        match resource.resource_type.as_str() {
+            "AWS::RDS::DBInstance" => {
+                if let Some(v) = self.get_att_rds_db_instance(&resource.physical_id, attribute) {
+                    return Some(v);
+                }
+            }
+            "AWS::RDS::DBCluster" => {
+                if let Some(v) = self.get_att_rds_db_cluster(&resource.physical_id, attribute) {
+                    return Some(v);
+                }
+            }
+            _ => {}
+        }
         // Captured attributes are the source of truth — they were computed
         // at create time and never go stale for the resources we ship today.
         if let Some(v) = resource.attributes.get(attribute) {
@@ -2303,7 +2381,9 @@ impl ResourceProvisioner {
             "AWS::IAM::Role" => self.get_att_iam_role(&resource.physical_id, attribute),
             "AWS::SQS::Queue" => self.get_att_sqs_queue(&resource.physical_id, attribute),
             "AWS::SNS::Topic" => self.get_att_sns_topic(&resource.physical_id, attribute),
-            "AWS::DynamoDB::Table" => self.get_att_dynamodb_table(&resource.physical_id, attribute),
+            "AWS::DynamoDB::Table" | "AWS::DynamoDB::GlobalTable" => {
+                self.get_att_dynamodb_table(&resource.physical_id, attribute)
+            }
             "AWS::KMS::Key" => self.get_att_kms_key(&resource.physical_id, attribute),
             "AWS::SecretsManager::Secret" => {
                 self.get_att_secrets_manager_secret(&resource.physical_id, attribute)
@@ -2559,7 +2639,8 @@ impl ResourceProvisioner {
             "AWS::SNS::Subscription" => self.delete_sns_subscription(&resource.physical_id),
             "AWS::SSM::Parameter" => self.delete_ssm_parameter(&resource.physical_id),
             "AWS::IAM::Role" => self.delete_iam_role(&resource.physical_id),
-            "AWS::IAM::Policy" => self.delete_iam_policy(&resource.physical_id),
+            "AWS::IAM::Policy" => self.delete_iam_policy(resource),
+            "AWS::IAM::RolePolicy" => self.delete_iam_role_policy(resource),
             "AWS::IAM::User" => self.delete_iam_user(&resource.physical_id),
             "AWS::IAM::Group" => self.delete_iam_group(&resource.physical_id),
             "AWS::IAM::ManagedPolicy" => self.delete_iam_managed_policy(&resource.physical_id),
@@ -2590,6 +2671,9 @@ impl ResourceProvisioner {
             }
             "AWS::Events::Archive" => self.delete_eventbridge_archive(&resource.physical_id),
             "AWS::DynamoDB::Table" => self.delete_dynamodb_table(&resource.physical_id),
+            "AWS::DynamoDB::GlobalTable" => {
+                self.delete_dynamodb_global_table(&resource.physical_id)
+            }
             "AWS::Logs::LogGroup" => self.delete_log_group(&resource.physical_id),
             "AWS::Logs::LogStream" => self.delete_log_stream(&resource.physical_id),
             "AWS::Logs::MetricFilter" => self.delete_metric_filter(&resource.physical_id),
@@ -2608,6 +2692,16 @@ impl ResourceProvisioner {
             "AWS::Logs::DeliverySource" => self.delete_logs_delivery_source(&resource.physical_id),
             "AWS::Lambda::Function" => self.delete_lambda_function(&resource.physical_id),
             "AWS::Lambda::Permission" => self.delete_lambda_permission(&resource.physical_id),
+            "AWS::Lambda::EventInvokeConfig" => {
+                self.delete_lambda_event_invoke_config(&resource.physical_id)
+            }
+            "AWS::Batch::ConsumableResource"
+            | "AWS::Batch::ServiceEnvironment"
+            | "AWS::Batch::QuotaShare" => self.delete_batch_api_resource(resource),
+            "AWS::Scheduler::Schedule" => self.delete_scheduler_schedule(resource),
+            "AWS::Scheduler::ScheduleGroup" => {
+                self.delete_scheduler_schedule_group(&resource.physical_id)
+            }
             "AWS::Lambda::EventSourceMapping" => {
                 self.delete_lambda_event_source_mapping(&resource.physical_id)
             }
@@ -2719,6 +2813,12 @@ impl ResourceProvisioner {
             | "AWS::EC2::LaunchTemplate" => {
                 self.delete_ec2_resource(&resource.resource_type, &resource.physical_id)
             }
+            "AWS::EC2::SecurityGroupIngress"
+            | "AWS::EC2::SecurityGroupEgress"
+            | "AWS::EC2::VPCGatewayAttachment"
+            | "AWS::EC2::Route"
+            | "AWS::EC2::EIP"
+            | "AWS::EC2::NatGateway" => self.delete_ec2_network_resource(resource),
             "AWS::AutoScaling::LaunchConfiguration" | "AWS::AutoScaling::AutoScalingGroup" => {
                 self.delete_autoscaling(&resource.resource_type, &resource.physical_id);
                 Ok(())
@@ -4417,6 +4517,9 @@ mod tests {
                 fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
             )),
             appconfig_state: Arc::new(parking_lot::RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+            )),
+            scheduler_state: Arc::new(parking_lot::RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
             )),
             delivery: Arc::new(DeliveryBus::new()),
@@ -6626,12 +6729,12 @@ mod tests {
             }),
         );
         let result = prov.create_resource(&resource).unwrap();
-        // For default bus, ARN should be rule/<name> without /default/
+        // Ref is the rule name on the default bus; the ARN omits the bus.
+        assert_eq!(result.physical_id, "my-rule");
         assert_eq!(
-            result.physical_id,
+            result.attributes["Arn"],
             "arn:aws:events:us-east-1:123456789012:rule/my-rule"
         );
-        assert!(!result.physical_id.contains("rule/default/"));
     }
 
     #[test]
@@ -6666,8 +6769,10 @@ mod tests {
             }),
         );
         let result = prov.create_resource(&resource).unwrap();
+        // Ref is `<bus>|<rule>` off the default bus.
+        assert_eq!(result.physical_id, "custom-bus|my-rule");
         assert_eq!(
-            result.physical_id,
+            result.attributes["Arn"],
             "arn:aws:events:us-east-1:123456789012:rule/custom-bus/my-rule"
         );
     }
@@ -6822,17 +6927,42 @@ mod tests {
     #[test]
     fn iam_policy_create_and_delete() {
         let prov = make_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::IAM::Role",
+            "R",
+            serde_json::json!({
+                "RoleName": "attached-role",
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []}
+            }),
+        ))
+        .unwrap();
+        let doc = serde_json::json!({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+        ]});
         let res = make_resource(
             "AWS::IAM::Policy",
             "MyPolicy",
             serde_json::json!({
                 "PolicyName": "my-policy",
-                "PolicyDocument": {"Version": "2012-10-17", "Statement": []}
+                "PolicyDocument": doc,
+                "Roles": ["attached-role"]
             }),
         );
         let sr = prov.create_resource(&res).unwrap();
-        assert!(sr.physical_id.contains("my-policy"));
+        // An inline policy on the role, not a managed policy.
+        {
+            let iam = prov.iam_state.read();
+            let st = iam.get("123456789012").unwrap();
+            assert!(st.role_inline_policies["attached-role"].contains_key("my-policy"));
+            assert!(st.policies.values().all(|p| p.policy_name != "my-policy"));
+        }
         prov.delete_resource(&sr).unwrap();
+        let iam = prov.iam_state.read();
+        let st = iam.get("123456789012").unwrap();
+        assert!(!st
+            .role_inline_policies
+            .get("attached-role")
+            .is_some_and(|p| p.contains_key("my-policy")));
     }
 
     #[test]
@@ -7176,19 +7306,46 @@ mod tests {
     }
 
     #[test]
-    fn iam_managed_policy_auto_name() {
+    fn iam_policy_requires_an_identity_and_gets_a_generated_id() {
         let prov = make_provisioner();
-        let res = make_resource(
-            "AWS::IAM::Policy",
-            "AutoPol",
+        let props = |users: serde_json::Value| {
             serde_json::json!({
                 "PolicyName": "inline-pol",
-                "PolicyDocument": {"Version": "2012-10-17", "Statement": []},
-                "Users": []
-            }),
-        );
-        let sr = prov.create_resource(&res).unwrap();
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}
+                ]},
+                "Users": users
+            })
+        };
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::IAM::Policy",
+                "AutoPol",
+                props(serde_json::json!([])),
+            ))
+            .unwrap_err();
+        assert!(err.contains("at least one"), "{err}");
+        prov.create_resource(&make_resource(
+            "AWS::IAM::User",
+            "U",
+            serde_json::json!({"UserName": "u1"}),
+        ))
+        .unwrap();
+        let sr = prov
+            .create_resource(&make_resource(
+                "AWS::IAM::Policy",
+                "AutoPol",
+                props(serde_json::json!(["u1"])),
+            ))
+            .unwrap();
         assert!(!sr.physical_id.is_empty());
+        assert!(prov
+            .iam_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .user_inline_policies["u1"]
+            .contains_key("inline-pol"));
     }
 
     /// A provisioner acting for a stack in a non-default account.
@@ -7433,7 +7590,7 @@ mod tests {
             .eventbridge_state
             .read()
             .get("222222222222")
-            .is_some_and(|s| s.rules.values().any(|r| r.arn == rule.physical_id)));
+            .is_some_and(|s| s.rules.values().any(|r| r.arn == rule.attributes["Arn"])));
 
         prov.delete_resource(&group).unwrap();
         prov.delete_resource(&rule).unwrap();
@@ -10886,7 +11043,17 @@ mod tests {
         let stream = acct.streams.get("events").unwrap();
         assert_eq!(stream.retention_period_hours, 48);
         assert_eq!(stream.open_shard_count, 2);
-        assert_eq!(stream.shard_count, 2);
+        // UpdateShardCount semantics: the original shard is closed (kept,
+        // with its records) and is the parent of both new shards.
+        assert_eq!(stream.shard_count, 3);
+        let original = &stream.shards[0];
+        assert!(!original.is_open);
+        assert!(
+            stream.shards[1..]
+                .iter()
+                .all(|s| s.is_open
+                    && s.parent_shard_id.as_deref() == Some(original.shard_id.as_str()))
+        );
     }
 
     #[test]
