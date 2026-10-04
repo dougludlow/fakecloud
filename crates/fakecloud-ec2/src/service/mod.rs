@@ -1415,6 +1415,7 @@ impl AwsService for Ec2Service {
 
     async fn handle(&self, request: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let mutates = is_mutating_action(&request.action);
+        let page = crate::pagination::validate_request(&request)?;
         let result = match request.action.as_str() {
             "CreateTags" => tags::create_tags(self, &request),
             "DeleteTags" => tags::delete_tags(self, &request),
@@ -2932,7 +2933,10 @@ impl AwsService for Ec2Service {
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
         }
-        result
+        match page {
+            Some((page, op)) => result.map(|resp| crate::pagination::apply(resp, page, op)),
+            None => result,
+        }
     }
 }
 

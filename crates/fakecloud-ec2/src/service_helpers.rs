@@ -26,6 +26,20 @@ pub fn gen_id(prefix: &str) -> String {
     format!("{prefix}-{}", &hex[..17])
 }
 
+/// A stable id in the same `<prefix>-<17 hex>` shape as [`gen_id`], derived
+/// (FNV-1a) from `key`. For catalog entries the caller never creates (AWS
+/// managed endpoint services, reserved-instance offerings): their ids must be
+/// the same on every describe, or a paging client sees a different catalog on
+/// every page.
+pub fn stable_id(prefix: &str, key: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{prefix}-{hash:017x}")
+}
+
 /// `InvalidParameterValue` — the catch-all 400 for bad EC2 input.
 pub fn invalid_parameter_value(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(
@@ -193,30 +207,64 @@ fn glob_match(pat: &[u8], text: &[u8]) -> bool {
     p == pat.len()
 }
 
+/// Prefix inside every `NextToken` this server mints, so a token from
+/// elsewhere (or a hand-edited one) is recognised as foreign.
+const PAGE_TOKEN_PREFIX: &str = "fakecloud-ec2-page:";
+
+/// Mint the opaque `NextToken` that resumes a listing at `offset`.
+pub fn encode_page_token(offset: usize) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{PAGE_TOKEN_PREFIX}{offset}"))
+}
+
+/// Decode a `NextToken` minted by [`encode_page_token`]. Anything else is
+/// rejected with `InvalidParameterValue` (`Invalid value '<t>' for nextToken`)
+/// rather than silently restarting the caller at page one.
+pub fn decode_page_token(token: &str) -> Result<usize, AwsServiceError> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|s| s.strip_prefix(PAGE_TOKEN_PREFIX)?.parse::<usize>().ok())
+        .ok_or_else(|| invalid_parameter_value(format!("Invalid value '{token}' for nextToken")))
+}
+
+/// Read a request's `MaxResults`: absent or empty means "everything", and a
+/// value that is not a positive integer is rejected (taking it as "no limit"
+/// would hand back the whole set the caller asked to page).
+pub fn parse_page_size(params: &HashMap<String, String>) -> Result<Option<usize>, AwsServiceError> {
+    match params.get("MaxResults").filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => Err(invalid_parameter_value(format!(
+                "Invalid value '{v}' for maxResults"
+            ))),
+        },
+    }
+}
+
 /// Apply offset-based pagination to an already-sorted item list. Returns the
-/// page slice plus the opaque `NextToken` to return (the absolute next offset
-/// as a string), or `None` when the page reaches the end. `max_results` of
-/// `None` means "all remaining".
+/// page plus the opaque `NextToken` that fetches the rest, or `None` when the
+/// page reaches the end. `max_results` of `None` means "all remaining"; a
+/// `next_token` this server did not mint is an error.
 pub fn paginate<T: Clone>(
     items: &[T],
     next_token: Option<&str>,
     max_results: Option<usize>,
-) -> (Vec<T>, Option<String>) {
-    let start = next_token
-        .and_then(|t| t.parse::<usize>().ok())
-        .unwrap_or(0);
-    let start = start.min(items.len());
+) -> Result<(Vec<T>, Option<String>), AwsServiceError> {
+    let start = match next_token.filter(|t| !t.is_empty()) {
+        Some(t) => decode_page_token(t)?.min(items.len()),
+        None => 0,
+    };
     let end = match max_results {
         Some(n) => (start + n).min(items.len()),
         None => items.len(),
     };
     let page = items[start..end].to_vec();
-    let token = if end < items.len() {
-        Some(end.to_string())
-    } else {
-        None
-    };
-    (page, token)
+    let token = (end < items.len()).then(|| encode_page_token(end));
+    Ok((page, token))
 }
 
 /// Require a non-empty scalar parameter, else `MissingParameter`. Omitting a
@@ -531,13 +579,11 @@ mod tests {
     #[test]
     fn paginate_pages_and_round_trips_token() {
         let items: Vec<i32> = (0..10).collect();
-        let (page, token) = paginate(&items, None, Some(4));
+        let (page, token) = paginate(&items, None, Some(4)).unwrap();
         assert_eq!(page, vec![0, 1, 2, 3]);
-        assert_eq!(token.as_deref(), Some("4"));
-        let (page2, token2) = paginate(&items, token.as_deref(), Some(4));
+        let (page2, token2) = paginate(&items, token.as_deref(), Some(4)).unwrap();
         assert_eq!(page2, vec![4, 5, 6, 7]);
-        assert_eq!(token2.as_deref(), Some("8"));
-        let (page3, token3) = paginate(&items, token2.as_deref(), Some(4));
+        let (page3, token3) = paginate(&items, token2.as_deref(), Some(4)).unwrap();
         assert_eq!(page3, vec![8, 9]);
         assert_eq!(token3, None);
     }
@@ -545,9 +591,49 @@ mod tests {
     #[test]
     fn paginate_no_max_returns_all() {
         let items: Vec<i32> = (0..3).collect();
-        let (page, token) = paginate(&items, None, None);
+        let (page, token) = paginate(&items, None, None).unwrap();
         assert_eq!(page, items);
         assert_eq!(token, None);
+    }
+
+    #[test]
+    fn page_tokens_are_opaque_and_foreign_ones_are_rejected() {
+        let token = encode_page_token(42);
+        assert!(
+            !token.contains("42"),
+            "token should not expose the offset: {token}"
+        );
+        assert_eq!(decode_page_token(&token).unwrap(), 42);
+        for bad in ["42", "not-a-token", "Zm9v", "!!!"] {
+            let err = decode_page_token(bad).unwrap_err();
+            assert_eq!(err.code(), "InvalidParameterValue", "{bad}");
+        }
+        let items = [1, 2, 3];
+        assert!(paginate(&items, Some("garbage"), Some(1)).is_err());
+    }
+
+    #[test]
+    fn stable_ids_repeat_for_a_key_and_differ_across_keys() {
+        let a = stable_id("vpce-svc", "com.amazonaws.us-east-1.s3");
+        assert_eq!(a, stable_id("vpce-svc", "com.amazonaws.us-east-1.s3"));
+        assert_ne!(a, stable_id("vpce-svc", "com.amazonaws.us-east-1.ec2"));
+        assert_eq!(a.len(), "vpce-svc-".len() + 17, "{a}");
+    }
+
+    #[test]
+    fn page_size_must_be_a_positive_integer() {
+        assert_eq!(parse_page_size(&p(&[])).unwrap(), None);
+        assert_eq!(parse_page_size(&p(&[("MaxResults", "")])).unwrap(), None);
+        assert_eq!(
+            parse_page_size(&p(&[("MaxResults", "7")])).unwrap(),
+            Some(7)
+        );
+        for bad in ["0", "-1", "abc"] {
+            assert!(
+                parse_page_size(&p(&[("MaxResults", bad)])).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
