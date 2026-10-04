@@ -3067,7 +3067,11 @@ pub(crate) mod tests {
             elasticache: shared::<fakecloud_elasticache::ElastiCacheState>(),
             route53: Arc::new(RwLock::new(fakecloud_route53::Route53Accounts::new())),
             cloudfront: Arc::new(RwLock::new(fakecloud_cloudfront::CloudFrontAccounts::new())),
-            stepfunctions: shared::<fakecloud_stepfunctions::StepFunctionsState>(),
+            stepfunctions: shared::<
+                fakecloud_core::multi_account::RegionalState<
+                    fakecloud_stepfunctions::StepFunctionsState,
+                >,
+            >(),
             wafv2: Arc::new(RwLock::new(fakecloud_wafv2::Wafv2Accounts::default())),
             apigateway: shared::<fakecloud_apigateway::ApiGatewayState>(),
             apigatewayv2: shared::<fakecloud_apigatewayv2::ApiGatewayV2State>(),
@@ -4255,7 +4259,9 @@ pub(crate) mod tests {
         .expect("execute change set");
 
         let accounts = sfn.read();
-        let st = accounts.get("000000000000").expect("sfn account exists");
+        let st = accounts
+            .regional("000000000000", "us-east-1")
+            .expect("sfn account exists");
         let machine = st
             .state_machines
             .values()

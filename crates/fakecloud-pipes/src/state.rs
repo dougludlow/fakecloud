@@ -176,3 +176,58 @@ pub fn is_transient_state(state: &str) -> bool {
         STATE_CREATING | STATE_UPDATING | STATE_STARTING | STATE_STOPPING | STATE_DELETING
     )
 }
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    #[test]
+    fn same_pipe_name_coexists_in_two_regions() {
+        let mut accounts = PipesAccounts::new();
+        for region in ["us-east-1", "eu-west-1"] {
+            accounts
+                .get_or_create("123456789012", region)
+                .pipes
+                .insert("p".into(), serde_json::json!({ "Region": region }));
+        }
+        assert_eq!(
+            accounts.get("123456789012", "eu-west-1").unwrap().pipes["p"]["Region"],
+            "eu-west-1"
+        );
+        assert!(accounts.get("123456789012", "ap-south-1").is_none());
+        assert_eq!(accounts.iter_regional().count(), 2);
+    }
+
+    #[test]
+    fn v1_snapshot_splits_pipes_tags_and_checkpoints_by_pipe_arn_region() {
+        let west_arn = "arn:aws:pipes:eu-west-1:123456789012:pipe/w";
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "accounts": { "accounts": { "123456789012": {
+                "pipes": {
+                    "w": { "Arn": west_arn },
+                    "e": { "Arn": "arn:aws:pipes:us-east-1:123456789012:pipe/e" },
+                    "x": {}
+                },
+                "tags": { west_arn: { "k": "v" } },
+                "source_checkpoints": { format!("{west_arn}#shardId-0"): "42" }
+            }}}
+        }))
+        .unwrap();
+        let snap = parse_pipes_snapshot(&bytes, "us-east-1").unwrap();
+        assert_eq!(snap.schema_version, PIPES_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = snap.accounts.unwrap();
+        let west = accounts.get("123456789012", "eu-west-1").unwrap();
+        assert!(west.pipes.contains_key("w"));
+        assert_eq!(west.tags.len(), 1);
+        assert_eq!(west.source_checkpoints.len(), 1);
+        let east = accounts.get("123456789012", "us-east-1").unwrap();
+        // A pipe without an ARN lands in the server's default region.
+        assert!(east.pipes.contains_key("e") && east.pipes.contains_key("x"));
+        assert!(east.tags.is_empty());
+
+        let newer = parse_pipes_snapshot(br#"{"schema_version": 99}"#, "us-east-1").unwrap();
+        assert_eq!(newer.schema_version, 99);
+        assert!(newer.accounts.is_none());
+    }
+}

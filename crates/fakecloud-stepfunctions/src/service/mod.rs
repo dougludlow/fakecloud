@@ -1167,6 +1167,106 @@ mod tests {
     }
 
     #[test]
+    fn same_state_machine_name_coexists_in_two_regions() {
+        let svc = StepFunctionsService::new(make_state());
+        let in_region = |action: &str, body: Value, region: &str| {
+            let mut req = make_request(action, &body.to_string());
+            req.region = region.to_string();
+            req
+        };
+        let create = |region: &str| {
+            let body = json!({
+                "name": "orders",
+                "definition": VALID_DEF,
+                "roleArn": "arn:aws:iam::123456789012:role/test",
+            });
+            let resp = svc
+                .create_state_machine(&in_region("CreateStateMachine", body, region))
+                .unwrap();
+            body_json(&resp)["stateMachineArn"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let east = create("us-east-1");
+        let west = create("eu-west-1");
+        assert_eq!(
+            east,
+            "arn:aws:states:us-east-1:123456789012:stateMachine:orders"
+        );
+        assert_eq!(
+            west,
+            "arn:aws:states:eu-west-1:123456789012:stateMachine:orders"
+        );
+
+        // Each region lists only its own state machine.
+        for (region, arn) in [("us-east-1", &east), ("eu-west-1", &west)] {
+            let resp = svc
+                .list_state_machines(&in_region("ListStateMachines", json!({}), region))
+                .unwrap();
+            let listed: Vec<String> = body_json(&resp)["stateMachines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["stateMachineArn"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(listed, vec![arn.clone()]);
+        }
+
+        // A state machine ARN of another region is not found here.
+        let err = svc
+            .describe_state_machine(&in_region(
+                "DescribeStateMachine",
+                json!({ "stateMachineArn": west }),
+                "us-east-1",
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "StateMachineDoesNotExist");
+
+        // Deleting one region's state machine leaves the other's.
+        svc.delete_state_machine(&in_region(
+            "DeleteStateMachine",
+            json!({ "stateMachineArn": west }),
+            "eu-west-1",
+        ))
+        .unwrap();
+        assert!(svc
+            .describe_state_machine(&in_region(
+                "DescribeStateMachine",
+                json!({ "stateMachineArn": east }),
+                "us-east-1",
+            ))
+            .is_ok());
+    }
+
+    #[test]
+    fn v2_snapshot_migrates_resources_into_their_arn_region() {
+        let mut legacy: fakecloud_core::multi_account::MultiAccountState<StepFunctionsState> =
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", "");
+        {
+            let s = legacy.default_mut();
+            s.activities.insert(
+                "arn:aws:states:eu-west-1:123456789012:activity:work".into(),
+                crate::state::Activity {
+                    name: "work".into(),
+                    arn: "arn:aws:states:eu-west-1:123456789012:activity:work".into(),
+                    creation_date: Utc::now(),
+                    tags: Default::default(),
+                },
+            );
+        }
+        let bytes = serde_json::to_vec(&json!({"schema_version": 2, "accounts": legacy})).unwrap();
+        let snap = crate::state::parse_stepfunctions_snapshot(&bytes).unwrap();
+        assert_eq!(snap.schema_version, STEPFUNCTIONS_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = snap.accounts.unwrap();
+        let west = accounts.regional("123456789012", "eu-west-1").unwrap();
+        assert_eq!(west.region, "eu-west-1");
+        assert_eq!(west.activities.len(), 1);
+        assert!(accounts.regional("123456789012", "us-east-1").is_none());
+    }
+
+    #[test]
     fn china_region_arns_use_the_aws_cn_partition() {
         let svc = StepFunctionsService::new(make_state());
         let in_china = |action: &str, body: Value| {

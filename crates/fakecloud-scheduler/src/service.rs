@@ -1373,6 +1373,81 @@ mod tests {
         }
     }
 
+    fn in_region(mut req: AwsRequest, region: &str) -> AwsRequest {
+        req.region = region.to_string();
+        req
+    }
+
+    #[tokio::test]
+    async fn same_schedule_name_coexists_in_two_regions() {
+        let svc = SchedulerService::new(make_state());
+        let body = create_body("r");
+        for region in ["us-east-1", "eu-west-1"] {
+            svc.handle(in_region(
+                make_request(Method::POST, "/schedules/nightly", &body),
+                region,
+            ))
+            .await
+            .unwrap();
+        }
+        for region in ["us-east-1", "eu-west-1"] {
+            let resp = svc
+                .handle(in_region(
+                    make_request(Method::GET, "/schedules/nightly", ""),
+                    region,
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            assert_eq!(
+                v["Arn"],
+                format!("arn:aws:scheduler:{region}:111122223333:schedule/default/nightly")
+            );
+        }
+        // Deleting one region's schedule leaves the other's; a region nothing
+        // touched still lists its own default group and no schedules.
+        svc.handle(in_region(
+            make_request(Method::DELETE, "/schedules/nightly", ""),
+            "eu-west-1",
+        ))
+        .await
+        .unwrap();
+        assert!(svc
+            .handle(in_region(
+                make_request(Method::GET, "/schedules/nightly", ""),
+                "eu-west-1"
+            ))
+            .await
+            .is_err());
+        assert!(svc
+            .handle(make_request(Method::GET, "/schedules/nightly", ""))
+            .await
+            .is_ok());
+        let resp = svc
+            .handle(in_region(
+                make_request(Method::GET, "/schedule-groups", ""),
+                "ap-south-1",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let groups = v["ScheduleGroups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]["Arn"],
+            "arn:aws:scheduler:ap-south-1:111122223333:schedule-group/default"
+        );
+        let resp = svc
+            .handle(in_region(
+                make_request(Method::GET, "/schedules", ""),
+                "ap-south-1",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(v["Schedules"].as_array().unwrap().is_empty());
+    }
+
     fn create_body(name_hint: &str) -> String {
         json!({
             "ScheduleExpression": "rate(1 minute)",

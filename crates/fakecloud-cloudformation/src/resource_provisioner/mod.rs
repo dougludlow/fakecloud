@@ -6077,7 +6077,7 @@ mod tests {
         // The change is actually applied to the pipes service state.
         let pipes = prov.pipes_state.read();
         let pipe = pipes
-            .get("123456789012")
+            .get("123456789012", "us-east-1")
             .unwrap()
             .pipes
             .get("my-pipe")
@@ -6122,7 +6122,7 @@ mod tests {
         .expect("update succeeds")
         .expect("Pipes::Pipe is updatable");
         let pipes = prov.pipes_state.read();
-        let acct = pipes.get("123456789012").unwrap();
+        let acct = pipes.get("123456789012", "us-east-1").unwrap();
         // Exactly one pipe (the recreate reused the same Name after deleting).
         assert_eq!(acct.pipes.len(), 1);
         let pipe = acct.pipes.get("src-pipe").unwrap();
@@ -6157,7 +6157,12 @@ mod tests {
         .expect("update succeeds")
         .expect("updatable");
         let pipes = prov.pipes_state.read();
-        let pipe = pipes.get("123456789012").unwrap().pipes.get("p2").unwrap();
+        let pipe = pipes
+            .get("123456789012", "us-east-1")
+            .unwrap()
+            .pipes
+            .get("p2")
+            .unwrap();
         assert!(
             pipe.get("Description").is_none(),
             "an omitted updatable field is cleared (full-replace semantics)"

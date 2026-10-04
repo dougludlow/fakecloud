@@ -1539,7 +1539,7 @@ mod tests {
         // (delete) without needing a live target — exactly the durable mutation
         // that must be persisted.
         let mut pipes = fakecloud_pipes::PipesAccounts::new();
-        pipes.accounts.insert(ACCOUNT.to_string(), {
+        *pipes.get_or_create(ACCOUNT, REGION) = {
             let mut state = fakecloud_pipes::PipesState::default();
             state.pipes.insert(
                 "p1".to_string(),
@@ -1556,7 +1556,7 @@ mod tests {
                 }),
             );
             state
-        });
+        };
         let pipes_state = Arc::new(RwLock::new(pipes));
 
         let snapshot_calls = Arc::new(AtomicUsize::new(0));
