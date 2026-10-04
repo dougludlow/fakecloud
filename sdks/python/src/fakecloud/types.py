@@ -876,6 +876,9 @@ class SqsQueueMessages:
     queue_url: str
     queue_name: str
     messages: List[SqsMessageInfo]
+    # The queue's region (queue URLs carry none) and ARN.
+    region: str = ""
+    queue_arn: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> SqsQueueMessages:
@@ -884,6 +887,8 @@ class SqsQueueMessages:
             queue_url=d["queue_url"],
             queue_name=d["queue_name"],
             messages=[SqsMessageInfo.from_dict(m) for m in data.get("messages", [])],
+            region=d.get("region", ""),
+            queue_arn=d.get("queue_arn", ""),
         )
 
 

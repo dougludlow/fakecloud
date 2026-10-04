@@ -1748,7 +1748,10 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_sqs::SqsSnapshot>(&bytes) {
+                    // Older schemas are migrated on parse: v2 kept one
+                    // state per account, split into regions by each queue's
+                    // ARN.
+                    match fakecloud_sqs::parse_sqs_snapshot(&bytes) {
                         Ok(snapshot) => {
                             if snapshot.schema_version > fakecloud_sqs::SQS_SNAPSHOT_SCHEMA_VERSION
                             {
@@ -1766,8 +1769,9 @@ async fn main() {
                                     "loaded sqs persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let queue_count = single_state.queues.len();
-                                let account_id = single_state.account_id.clone();
+                                let queue_count: usize =
+                                    single_state.regions().map(|(_, s)| s.queues.len()).sum();
+                                let account_id = single_state.account_id().to_string();
                                 let mut mas = sqs_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
                                 tracing::info!(
@@ -8558,9 +8562,10 @@ async fn main() {
                 // API (host-aware, bug-hunt 1.10).
                 move |headers: axum::http::HeaderMap| async move {
                     let mas = ss.read();
+                    // Every account and region's queues.
                     let queues = mas
-                        .iter()
-                        .flat_map(|(_, state)| {
+                        .iter_regional()
+                        .flat_map(|(_, _, state)| {
                             let base =
                                 fakecloud_sqs::resolve_endpoint_base(&headers, &state.endpoint);
                             state.queues.values().map(move |queue| {
@@ -8593,6 +8598,10 @@ async fn main() {
                                         &base,
                                     ),
                                     queue_name: queue.queue_name.clone(),
+                                    // QueueUrls carry no region: same-named
+                                    // queues of different regions share one.
+                                    region: state.region.clone(),
+                                    queue_arn: queue.arn.clone(),
                                     messages,
                                 }
                             })
@@ -8661,8 +8670,28 @@ async fn main() {
             "/_fakecloud/sqs/{queue_name}/force-dlq",
             axum::routing::post({
                 let ss = sqs_sim_force_dlq_state;
-                move |axum::extract::Path(queue_name): axum::extract::Path<String>| async move {
-                    let moved = fakecloud_sqs::simulation::force_dlq(&ss, &queue_name);
+                move |axum::extract::Path(queue_name): axum::extract::Path<String>,
+                      axum::extract::Query(scope): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    // The queue of that name in one account and region:
+                    // `accountId` / `region` query parameters, defaulting to
+                    // the server's account and region.
+                    let (account, region) = {
+                        let mas = ss.read();
+                        (
+                            scope
+                                .get("accountId")
+                                .cloned()
+                                .unwrap_or_else(|| mas.default_account_id().to_string()),
+                            scope
+                                .get("region")
+                                .cloned()
+                                .unwrap_or_else(|| mas.region().to_string()),
+                        )
+                    };
+                    let moved =
+                        fakecloud_sqs::simulation::force_dlq(&ss, &account, &region, &queue_name);
                     axum::Json(types::ForceDlqResponse {
                         moved_messages: moved,
                     })

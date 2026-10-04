@@ -320,11 +320,11 @@ Top-level client. Defaults to `http://localhost:4566`.
 
 ### `fc.sqs`
 
-| Method                | Description                           |
-| --------------------- | ------------------------------------- |
-| `getMessages()`       | List all messages across all queues   |
-| `tickExpiration()`    | Tick the message expiration processor |
-| `forceDlq(queueName)` | Force all messages to the queue's DLQ |
+| Method                                         | Description                                                                  |
+| ---------------------------------------------- | ---------------------------------------------------------------------------- |
+| `getMessages()`                                | List all messages across all queues                                          |
+| `tickExpiration()`                             | Tick the message expiration processor                                        |
+| `forceDlq(queueName, { accountId?, region? })` | Force all messages to the queue's DLQ (default account/region: the server's) |
 
 ### `fc.ssm`
 

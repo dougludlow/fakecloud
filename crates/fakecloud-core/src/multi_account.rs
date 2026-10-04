@@ -5,7 +5,7 @@
 //! the first time a request targets them — matching the design in #381 where
 //! "an account exists because a credential resolves to it."
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,25 @@ impl<T: AccountState> MultiAccountState<T> {
                 .accounts
                 .iter()
                 .map(|(k, v)| (k.clone(), f(v)))
+                .collect(),
+        }
+    }
+
+    /// Consume the container, converting every account state while keeping
+    /// the container's routing defaults. Used by snapshot migrations that
+    /// change the per-account state type.
+    pub fn map_into<U>(self, mut f: impl FnMut(&str, T) -> U) -> MultiAccountState<U> {
+        MultiAccountState {
+            default_account_id: self.default_account_id,
+            region: self.region,
+            endpoint: self.endpoint,
+            accounts: self
+                .accounts
+                .into_iter()
+                .map(|(k, v)| {
+                    let mapped = f(&k, v);
+                    (k, mapped)
+                })
                 .collect(),
         }
     }
@@ -170,6 +189,348 @@ impl<T: AccountState> MultiAccountState<T> {
     }
 }
 
+/// One account's state for a regional service, partitioned by region.
+///
+/// Regional AWS services (SQS, DynamoDB, Lambda, ...) keep an independent set
+/// of resources in every region: the same queue, table or function name can
+/// exist in two regions at once, and a request only ever sees the resources of
+/// the region it is sent to. Wrapping a service's per-account state `T` in
+/// `RegionalState<T>` (and the container in [`MultiRegionState`]) gives every
+/// (account, region) pair its own `T`, created the first time a request
+/// targets it.
+///
+/// Global services (IAM, Route 53, CloudFront, Organizations, the S3 bucket
+/// namespace) stay account-scoped and do not use this wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionalState<T> {
+    account_id: String,
+    /// The server's configured region.
+    default_region: String,
+    endpoint: String,
+    /// Per-region state, keyed by region name.
+    #[serde(default = "BTreeMap::new")]
+    regions: BTreeMap<String, T>,
+}
+
+impl<T> RegionalState<T> {
+    /// An account with no regional state yet.
+    pub fn new(account_id: &str, default_region: &str, endpoint: &str) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            default_region: default_region.to_string(),
+            endpoint: endpoint.to_string(),
+            regions: BTreeMap::new(),
+        }
+    }
+
+    /// The account this state belongs to.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// The server's configured region.
+    pub fn default_region(&self) -> &str {
+        &self.default_region
+    }
+
+    /// The server endpoint.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The account's state in `region`, `None` when nothing has touched it.
+    pub fn region(&self, region: &str) -> Option<&T> {
+        self.regions.get(region)
+    }
+
+    /// The account's state in `region` without creating it.
+    pub fn get_region_mut(&mut self, region: &str) -> Option<&mut T> {
+        self.regions.get_mut(region)
+    }
+
+    /// Every region the account has state in.
+    pub fn regions(&self) -> impl Iterator<Item = (&str, &T)> {
+        self.regions.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Every region the account has state in (mutable).
+    pub fn regions_mut(&mut self) -> impl Iterator<Item = (&str, &mut T)> {
+        self.regions.iter_mut().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Replace (or add) the state of one region.
+    pub fn insert_region(&mut self, region: &str, state: T) -> Option<T> {
+        self.regions.insert(region.to_string(), state)
+    }
+
+    /// Drop every region's state.
+    pub fn clear(&mut self) {
+        self.regions.clear();
+    }
+
+    /// Project every region's state, keeping the account's routing defaults.
+    pub fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> RegionalState<U> {
+        RegionalState {
+            account_id: self.account_id.clone(),
+            default_region: self.default_region.clone(),
+            endpoint: self.endpoint.clone(),
+            regions: self
+                .regions
+                .iter()
+                .map(|(k, v)| (k.clone(), f(v)))
+                .collect(),
+        }
+    }
+}
+
+impl<T: AccountState> RegionalState<T> {
+    /// The account's state in `region`, created empty on first use. A new
+    /// region inherits shared resources (see [`AccountState::inherit_from`])
+    /// from a region the account already has.
+    pub fn region_mut(&mut self, region: &str) -> &mut T {
+        if !self.regions.contains_key(region) {
+            let mut state = T::new_for_account(&self.account_id, region, &self.endpoint);
+            if let Some(sibling) = self.regions.values().next() {
+                state.inherit_from(sibling);
+            }
+            self.regions.insert(region.to_string(), state);
+        }
+        self.regions.get_mut(region).expect("inserted above")
+    }
+
+    /// The state for `region` given as an optional ARN region: `None` (an ARN
+    /// without a region, or a record without an ARN) lands in the server's
+    /// default region. Used by snapshot migrations.
+    pub fn region_or_default_mut(&mut self, region: Option<&str>) -> &mut T {
+        let region = region
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_region.clone());
+        self.region_mut(&region)
+    }
+}
+
+impl<T: AccountState> AccountState for RegionalState<T> {
+    fn new_for_account(account_id: &str, region: &str, endpoint: &str) -> Self {
+        Self::new(account_id, region, endpoint)
+    }
+
+    fn inherit_from(&mut self, sibling: &Self) {
+        if let Some(shared) = sibling.regions.values().next() {
+            for state in self.regions.values_mut() {
+                state.inherit_from(shared);
+            }
+        }
+    }
+}
+
+/// Account- and region-partitioned state container for a regional service.
+pub type MultiRegionState<T> = MultiAccountState<RegionalState<T>>;
+
+impl<T: AccountState> MultiAccountState<RegionalState<T>> {
+    /// The state of `account_id` in `region`, `None` when either has never
+    /// been touched. Never creates anything, so reads and misses leave no
+    /// empty region behind.
+    pub fn regional(&self, account_id: &str, region: &str) -> Option<&T> {
+        self.get(account_id).and_then(|a| a.region(region))
+    }
+
+    /// The state of `account_id` in `region`, creating both on first use.
+    ///
+    /// A newly created region inherits shared resources (see
+    /// [`AccountState::inherit_from`]) from a region the account already has,
+    /// or, for an account's first region, from the default account's state in
+    /// that region (else any default-account region), the way a new account
+    /// inherits from the default account in [`MultiAccountState`].
+    pub fn regional_mut(&mut self, account_id: &str, region: &str) -> &mut T {
+        let exists = self
+            .get(account_id)
+            .is_some_and(|a| a.region(region).is_some());
+        if !exists {
+            let mut state = T::new_for_account(account_id, region, &self.endpoint);
+            let sibling = self
+                .get(account_id)
+                .and_then(|a| a.regions.values().next())
+                .or_else(|| {
+                    let default = self.get(&self.default_account_id)?;
+                    default
+                        .region(region)
+                        .or_else(|| default.regions.values().next())
+                });
+            if let Some(sibling) = sibling {
+                state.inherit_from(sibling);
+            }
+            self.get_or_create(account_id)
+                .regions
+                .insert(region.to_string(), state);
+        }
+        self.get_mut(account_id)
+            .and_then(|a| a.regions.get_mut(region))
+            .expect("created above")
+    }
+
+    /// The state of `account_id` in `region` without creating either.
+    pub fn regional_get_mut(&mut self, account_id: &str, region: &str) -> Option<&mut T> {
+        self.get_mut(account_id)
+            .and_then(|a| a.get_region_mut(region))
+    }
+
+    /// The state of the account and region an ARN names, without creating
+    /// either. `None` when the ARN carries no account or region.
+    pub fn by_arn(&self, arn: &str) -> Option<&T> {
+        let account = fakecloud_aws::arn::account_of(arn)?;
+        let region = fakecloud_aws::arn::region_of(arn)?;
+        self.regional(account, region)
+    }
+
+    /// Mutable [`Self::by_arn`].
+    pub fn by_arn_mut(&mut self, arn: &str) -> Option<&mut T> {
+        let account = fakecloud_aws::arn::account_of(arn)?.to_string();
+        let region = fakecloud_aws::arn::region_of(arn)?.to_string();
+        self.regional_get_mut(&account, &region)
+    }
+
+    /// The default account's state in the server's default region, created
+    /// on first use.
+    pub fn default_regional_mut(&mut self) -> &mut T {
+        let region = self.region().to_string();
+        self.default_mut().region_mut(&region)
+    }
+
+    /// The default account's state in the server's default region, `None`
+    /// until something creates it.
+    pub fn default_regional(&self) -> Option<&T> {
+        self.default_ref().region(self.region())
+    }
+
+    /// Every (account, region, state) triple.
+    pub fn iter_regional(&self) -> impl Iterator<Item = (&str, &str, &T)> {
+        self.iter()
+            .flat_map(|(account, a)| a.regions().map(move |(region, s)| (account, region, s)))
+    }
+
+    /// Every (account, region, state) triple (mutable).
+    pub fn iter_regional_mut(&mut self) -> impl Iterator<Item = (&str, &str, &mut T)> {
+        self.iter_mut()
+            .flat_map(|(account, a)| a.regions_mut().map(move |(region, s)| (account, region, s)))
+    }
+}
+
+/// Migration of a service's pre-regional, account-wide state into per-region
+/// states, for loading snapshots written before the service was
+/// region-partitioned.
+pub trait SplitByRegion: AccountState {
+    /// Move every resource of this account-wide state into the region it
+    /// belongs to in `into`: the region its ARN (or region-bearing URL) names,
+    /// and the server's default region for anything that names none (see
+    /// [`RegionalState::region_or_default_mut`]).
+    fn split_by_region(self, into: &mut RegionalState<Self>);
+}
+
+impl<T: SplitByRegion> RegionalState<T> {
+    /// Split one account's legacy, account-wide state into regions.
+    pub fn from_legacy(account_id: &str, default_region: &str, endpoint: &str, legacy: T) -> Self {
+        let mut regional = Self::new(account_id, default_region, endpoint);
+        legacy.split_by_region(&mut regional);
+        regional
+    }
+}
+
+impl<T: SplitByRegion> MultiAccountState<T> {
+    /// Convert a legacy account-partitioned container into an (account,
+    /// region)-partitioned one, splitting every account's state by region.
+    pub fn into_regional(self) -> MultiRegionState<T> {
+        let region = self.region.clone();
+        let endpoint = self.endpoint.clone();
+        self.map_into(|account, state| {
+            RegionalState::from_legacy(account, &region, &endpoint, state)
+        })
+    }
+}
+
+/// Versioned on-disk snapshot of a regional service's state.
+///
+/// `accounts` holds every account's per-region state. `state` is only set
+/// when a legacy single-account snapshot is migrated: that one account's
+/// state split by region, for the loader to merge into its own container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionalSnapshot<T> {
+    pub schema_version: u32,
+    #[serde(default = "none")]
+    pub accounts: Option<MultiRegionState<T>>,
+    #[serde(default = "none", skip_serializing_if = "Option::is_none")]
+    pub state: Option<RegionalState<T>>,
+}
+
+fn none<T>() -> Option<T> {
+    None
+}
+
+impl<T> RegionalSnapshot<T> {
+    /// A snapshot of the whole container at `schema_version`.
+    pub fn of(schema_version: u32, accounts: MultiRegionState<T>) -> Self {
+        Self {
+            schema_version,
+            accounts: Some(accounts),
+            state: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SnapshotVersionProbe {
+    schema_version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(bound = "T: serde::de::DeserializeOwned")]
+struct LegacySnapshot<T> {
+    #[serde(default = "none")]
+    accounts: Option<MultiAccountState<T>>,
+    #[serde(default = "none")]
+    state: Option<T>,
+}
+
+/// Parse a regional service's snapshot. `current` is the first schema
+/// version that stores per-region state: an older snapshot (one state per
+/// account, or one single-account `state`) is migrated with
+/// [`SplitByRegion`]; `legacy_single` splits a single-account state (it knows
+/// the state's own account, region and endpoint fields). A snapshot newer
+/// than `current` comes back with its on-disk `schema_version` and no state,
+/// for the caller to refuse.
+pub fn parse_regional_snapshot<T>(
+    bytes: &[u8],
+    current: u32,
+    legacy_single: impl FnOnce(T) -> RegionalState<T>,
+) -> Result<RegionalSnapshot<T>, serde_json::Error>
+where
+    T: SplitByRegion + serde::de::DeserializeOwned,
+{
+    let SnapshotVersionProbe { schema_version } = serde_json::from_slice(bytes)?;
+    if schema_version > current {
+        return Ok(RegionalSnapshot {
+            schema_version,
+            accounts: None,
+            state: None,
+        });
+    }
+    if schema_version == current {
+        return serde_json::from_slice(bytes);
+    }
+    let legacy: LegacySnapshot<T> = serde_json::from_slice(bytes)?;
+    Ok(RegionalSnapshot {
+        schema_version: current,
+        accounts: legacy.accounts.map(MultiAccountState::into_regional),
+        state: legacy.state.map(legacy_single),
+    })
+}
+
+/// The region an ARN names, or `default` when it names none. Convenience for
+/// [`SplitByRegion`] implementations.
+pub fn arn_region_or<'a>(arn: &'a str, default: &'a str) -> &'a str {
+    fakecloud_aws::arn::region_of(arn).unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +596,213 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"111111111111"));
         assert!(ids.contains(&"222222222222"));
+    }
+
+    impl SplitByRegion for TestState {
+        fn split_by_region(self, into: &mut RegionalState<Self>) {
+            for item in self.items {
+                // items are ARNs or plain names
+                let region = fakecloud_aws::arn::region_of(&item).map(str::to_string);
+                into.region_or_default_mut(region.as_deref())
+                    .items
+                    .push(item);
+            }
+        }
+    }
+
+    #[test]
+    fn regional_state_isolates_regions() {
+        let mut mrs: MultiRegionState<TestState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        mrs.regional_mut("111111111111", "us-east-1")
+            .items
+            .push("q".into());
+        mrs.regional_mut("111111111111", "eu-west-1")
+            .items
+            .push("q".into());
+        assert_eq!(
+            mrs.regional("111111111111", "us-east-1").unwrap().items,
+            ["q"]
+        );
+        assert_eq!(
+            mrs.regional("111111111111", "eu-west-1").unwrap().items,
+            ["q"]
+        );
+        assert!(mrs.regional("111111111111", "ap-south-1").is_none());
+        assert!(mrs.regional("222222222222", "us-east-1").is_none());
+        // Reads never create a region.
+        assert_eq!(mrs.iter_regional().count(), 2);
+    }
+
+    #[test]
+    fn by_arn_resolves_account_and_region() {
+        let mut mrs: MultiRegionState<TestState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        mrs.regional_mut("222222222222", "eu-west-1")
+            .items
+            .push("x".into());
+        let s = mrs
+            .by_arn("arn:aws:sqs:eu-west-1:222222222222:x")
+            .expect("state");
+        assert_eq!(s.account_id, "222222222222");
+        assert!(mrs.by_arn("arn:aws:sqs:us-east-1:222222222222:x").is_none());
+        assert!(mrs.by_arn("arn:aws:iam::222222222222:role/x").is_none());
+    }
+
+    #[test]
+    fn regional_state_round_trips_through_json() {
+        let mut mrs: MultiRegionState<TestState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        mrs.regional_mut("111111111111", "eu-west-1")
+            .items
+            .push("q".into());
+        let json = serde_json::to_string(&mrs).unwrap();
+        let back: MultiRegionState<TestState> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.regional("111111111111", "eu-west-1").unwrap().items,
+            ["q"]
+        );
+    }
+
+    #[test]
+    fn legacy_state_splits_by_arn_region() {
+        let mut legacy: MultiAccountState<TestState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        let acct = legacy.default_mut();
+        acct.items
+            .push("arn:aws:sqs:eu-west-1:111111111111:a".into());
+        acct.items
+            .push("arn:aws:sqs:us-east-1:111111111111:b".into());
+        acct.items.push("plain".into());
+        let regional = legacy.into_regional();
+        assert_eq!(
+            regional
+                .regional("111111111111", "eu-west-1")
+                .unwrap()
+                .items,
+            ["arn:aws:sqs:eu-west-1:111111111111:a"]
+        );
+        assert_eq!(
+            regional
+                .regional("111111111111", "us-east-1")
+                .unwrap()
+                .items,
+            ["arn:aws:sqs:us-east-1:111111111111:b", "plain"]
+        );
+        assert_eq!(regional.region(), "us-east-1");
+        assert_eq!(regional.default_account_id(), "111111111111");
+    }
+
+    #[test]
+    fn default_regional_mut_uses_server_region() {
+        let mut mrs: MultiRegionState<TestState> =
+            MultiAccountState::new("111111111111", "eu-central-1", "http://localhost:4566");
+        mrs.default_regional_mut().items.push("z".into());
+        assert!(mrs.regional("111111111111", "eu-central-1").is_some());
+    }
+
+    #[test]
+    fn parse_regional_snapshot_migrates_legacy_and_reports_newer() {
+        let mut legacy: MultiAccountState<TestState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        legacy
+            .default_mut()
+            .items
+            .push("arn:aws:sqs:eu-west-1:111111111111:a".into());
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"schema_version": 1, "accounts": legacy}))
+                .unwrap();
+        let snap = parse_regional_snapshot::<TestState>(&bytes, 2, |_| unreachable!()).unwrap();
+        assert_eq!(snap.schema_version, 2);
+        let accounts = snap.accounts.unwrap();
+        assert_eq!(
+            accounts
+                .regional("111111111111", "eu-west-1")
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let current = serde_json::to_vec(&RegionalSnapshot::of(2, accounts)).unwrap();
+        let again = parse_regional_snapshot::<TestState>(&current, 2, |_| unreachable!()).unwrap();
+        assert!(again
+            .accounts
+            .unwrap()
+            .regional("111111111111", "eu-west-1")
+            .is_some());
+
+        let single = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "state": {"account_id": "111111111111", "items": ["x"]}
+        }))
+        .unwrap();
+        let snap = parse_regional_snapshot::<TestState>(&single, 2, |s| {
+            RegionalState::from_legacy("111111111111", "us-east-1", "", s)
+        })
+        .unwrap();
+        assert_eq!(
+            snap.state.unwrap().region("us-east-1").unwrap().items,
+            ["x"]
+        );
+
+        let newer = parse_regional_snapshot::<TestState>(
+            br#"{"schema_version": 9}"#,
+            2,
+            |_| unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(newer.schema_version, 9);
+        assert!(newer.accounts.is_none());
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct SharedCacheState {
+        cache: Option<String>,
+    }
+
+    impl AccountState for SharedCacheState {
+        fn new_for_account(_account_id: &str, _region: &str, _endpoint: &str) -> Self {
+            Self { cache: None }
+        }
+
+        fn inherit_from(&mut self, sibling: &Self) {
+            self.cache = sibling.cache.clone();
+        }
+    }
+
+    #[test]
+    fn a_new_accounts_first_region_inherits_from_the_default_account() {
+        let mut mrs: MultiRegionState<SharedCacheState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        mrs.default_regional_mut().cache = Some("shared".into());
+        // Another account's first region, in the default region and elsewhere.
+        assert_eq!(
+            mrs.regional_mut("222222222222", "us-east-1")
+                .cache
+                .as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            mrs.regional_mut("333333333333", "eu-west-1")
+                .cache
+                .as_deref(),
+            Some("shared")
+        );
+        // A further region of an existing account inherits from that account.
+        mrs.regional_mut("222222222222", "us-east-1").cache = Some("own".into());
+        assert_eq!(
+            mrs.regional_mut("222222222222", "ap-south-1")
+                .cache
+                .as_deref(),
+            Some("own")
+        );
+        // An existing region is returned as is.
+        assert_eq!(
+            mrs.regional_mut("333333333333", "eu-west-1")
+                .cache
+                .as_deref(),
+            Some("shared")
+        );
     }
 }

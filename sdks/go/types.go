@@ -426,9 +426,14 @@ type SQSMessageInfo struct {
 
 // SQSQueueMessages contains messages for a single queue.
 type SQSQueueMessages struct {
-	QueueURL  string           `json:"queueUrl"`
-	QueueName string           `json:"queueName"`
-	Messages  []SQSMessageInfo `json:"messages"`
+	QueueURL  string `json:"queueUrl"`
+	QueueName string `json:"queueName"`
+	// Region is the queue's region. Queue URLs carry no region, so
+	// same-named queues in different regions share a URL.
+	Region string `json:"region"`
+	// QueueARN names the queue's region and account.
+	QueueARN string           `json:"queueArn"`
+	Messages []SQSMessageInfo `json:"messages"`
 }
 
 // SQSMessagesResponse contains messages across all queues.

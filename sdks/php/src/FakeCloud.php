@@ -598,11 +598,18 @@ final class SqsClient
         );
     }
 
-    public function forceDlq(string $queueName): ForceDlqResponse
+    /**
+     * Force a queue's messages to its DLQ. The queue is looked up in
+     * $accountId / $region (null: the server's default).
+     */
+    public function forceDlq(string $queueName, ?string $accountId = null, ?string $region = null): ForceDlqResponse
     {
-        return ForceDlqResponse::fromArray(
-            $this->http->postEmpty('/_fakecloud/sqs/' . HttpTransport::encodePath($queueName) . '/force-dlq')
-        );
+        $query = array_filter(['accountId' => $accountId, 'region' => $region], fn ($v) => $v !== null && $v !== '');
+        $path = '/_fakecloud/sqs/' . HttpTransport::encodePath($queueName) . '/force-dlq';
+        if ($query !== []) {
+            $path .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+        }
+        return ForceDlqResponse::fromArray($this->http->postEmpty($path));
     }
 }
 

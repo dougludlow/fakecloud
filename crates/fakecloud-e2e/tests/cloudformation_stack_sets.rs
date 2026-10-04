@@ -27,15 +27,24 @@ const TEMPLATE: &str = r#"{
     }
 }"#;
 
-async fn member_sqs(server: &TestServer) -> aws_sdk_sqs::Client {
+/// SQS clients for the member account in us-east-1 and eu-west-1. Queues
+/// are regional, so each region's stack instance queue is listed by that
+/// region's client.
+async fn member_sqs(server: &TestServer) -> (aws_sdk_sqs::Client, aws_sdk_sqs::Client) {
     let (akid, secret) = server.create_admin(MEMBER_ACCOUNT, "stackset-member").await;
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .endpoint_url(server.endpoint())
-        .region(aws_config::Region::new("us-east-1"))
-        .credentials_provider(Credentials::new(akid, secret, None, None, "member"))
-        .load()
-        .await;
-    aws_sdk_sqs::Client::new(&config)
+    let client_in = |region: &'static str| {
+        let (akid, secret) = (akid.clone(), secret.clone());
+        async move {
+            let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .endpoint_url(server.endpoint())
+                .region(aws_config::Region::new(region))
+                .credentials_provider(Credentials::new(akid, secret, None, None, "member"))
+                .load()
+                .await;
+            aws_sdk_sqs::Client::new(&config)
+        }
+    };
+    (client_in("us-east-1").await, client_in("eu-west-1").await)
 }
 
 async fn stack_set_queues(sqs: &aws_sdk_sqs::Client) -> Vec<String> {
@@ -90,7 +99,8 @@ async fn stack_set_instances_provision_stacks_across_accounts_and_regions() {
     let server = TestServer::start().await;
     let cfn = server.cloudformation_client().await;
     let default_sqs = server.sqs_client().await;
-    let member_sqs = member_sqs(&server).await;
+    let default_sqs_west = aws_sdk_sqs::Client::new(&server.aws_config_in("eu-west-1").await);
+    let (member_sqs, member_sqs_west) = member_sqs(&server).await;
 
     let stack_set_id = cfn
         .create_stack_set()
@@ -120,10 +130,22 @@ async fn stack_set_instances_provision_stacks_across_accounts_and_regions() {
         StackSetOperationStatus::Succeeded
     );
 
-    // One real queue per region, in each target account.
-    assert_eq!(stack_set_queues(&default_sqs).await.len(), 2);
+    // One real queue per region, in each target account: each region's
+    // client lists only that region's queue.
+    for (who, sqs) in [
+        ("default us-east-1", &default_sqs),
+        ("default eu-west-1", &default_sqs_west),
+        ("member eu-west-1", &member_sqs_west),
+    ] {
+        let queues = stack_set_queues(sqs).await;
+        assert_eq!(queues.len(), 1, "{who}: {queues:?}");
+    }
     let member_queues = stack_set_queues(&member_sqs).await;
-    assert_eq!(member_queues.len(), 2, "{member_queues:?}");
+    assert_eq!(
+        member_queues.len(),
+        1,
+        "member us-east-1: {member_queues:?}"
+    );
 
     let summaries = cfn
         .list_stack_instances()
@@ -262,8 +284,14 @@ async fn stack_set_instances_provision_stacks_across_accounts_and_regions() {
         operation_status(&cfn, delete.operation_id().unwrap()).await,
         StackSetOperationStatus::Succeeded
     );
-    assert!(stack_set_queues(&default_sqs).await.is_empty());
-    assert!(stack_set_queues(&member_sqs).await.is_empty());
+    for sqs in [
+        &default_sqs,
+        &default_sqs_west,
+        &member_sqs,
+        &member_sqs_west,
+    ] {
+        assert!(stack_set_queues(sqs).await.is_empty());
+    }
 
     let operations = cfn
         .list_stack_set_operations()

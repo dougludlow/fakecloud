@@ -4721,14 +4721,15 @@ impl CloudFormationService {
             };
             let mut drifted = false;
             for resource in &stack.resources {
-                let status = match self.resource_exists(&instance.account, resource) {
-                    Some(true) => "IN_SYNC",
-                    Some(false) => {
-                        drifted = true;
-                        "DELETED"
-                    }
-                    None => "NOT_CHECKED",
-                };
+                let status =
+                    match self.resource_exists(&instance.account, &instance.region, resource) {
+                        Some(true) => "IN_SYNC",
+                        Some(false) => {
+                            drifted = true;
+                            "DELETED"
+                        }
+                        None => "NOT_CHECKED",
+                    };
                 op.resource_drifts.push(InstanceResourceDrift {
                     account: instance.account.clone(),
                     region: instance.region.clone(),
@@ -4992,7 +4993,7 @@ mod tests {
             .sqs
             .read()
             .get(account)
-            .map_or(0, |s| s.queues.len())
+            .map_or(0, |s| s.regions().map(|(_, r)| r.queues.len()).sum())
     }
 
     async fn create_set(svc: &CloudFormationService, name: &str, template: &str) {
@@ -7669,8 +7670,8 @@ mod tests {
             .sqs
             .write()
             .get_or_create(ACCT_B)
-            .queues
-            .remove(&queue_url)
+            .regions_mut()
+            .find_map(|(_, r)| r.queues.remove(&queue_url))
             .expect("queue existed");
 
         let xml = ok(&svc, "DetectStackSetDrift", &[("StackSetName", "app")]).await;

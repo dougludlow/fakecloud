@@ -1296,9 +1296,17 @@ class SqsClient:
         _check(resp)
         return ExpirationTickResponse.from_dict(resp.json())
 
-    async def force_dlq(self, queue_name: str) -> ForceDlqResponse:
+    async def force_dlq(
+        self,
+        queue_name: str,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> ForceDlqResponse:
+        """Force a queue's messages to its DLQ. The queue is looked up in
+        ``account_id`` / ``region`` (default: the server's)."""
         resp = await self._client.post(
-            f"{self._base}/_fakecloud/sqs/{queue_name}/force-dlq"
+            f"{self._base}/_fakecloud/sqs/{queue_name}/force-dlq",
+            params=_scope_params(account_id, region),
         )
         _check(resp)
         return ForceDlqResponse.from_dict(resp.json())
@@ -2114,8 +2122,18 @@ class _SyncSqsClient:
         _check(resp)
         return ExpirationTickResponse.from_dict(resp.json())
 
-    def force_dlq(self, queue_name: str) -> ForceDlqResponse:
-        resp = self._client.post(f"{self._base}/_fakecloud/sqs/{queue_name}/force-dlq")
+    def force_dlq(
+        self,
+        queue_name: str,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> ForceDlqResponse:
+        """Force a queue's messages to its DLQ. The queue is looked up in
+        ``account_id`` / ``region`` (default: the server's)."""
+        resp = self._client.post(
+            f"{self._base}/_fakecloud/sqs/{queue_name}/force-dlq",
+            params=_scope_params(account_id, region),
+        )
         _check(resp)
         return ForceDlqResponse.from_dict(resp.json())
 
@@ -3013,3 +3031,14 @@ def _check(resp: httpx.Response) -> None:
     """Raise ``FakeCloudError`` on non-2xx responses."""
     if resp.status_code >= 400:
         raise FakeCloudError(resp.status_code, resp.text)
+
+
+def _scope_params(account_id: Optional[str], region: Optional[str]) -> Dict[str, str]:
+    """Query parameters naming an (account, region) scope; omitted ones
+    default to the server's account and region."""
+    params: Dict[str, str] = {}
+    if account_id:
+        params["accountId"] = account_id
+    if region:
+        params["region"] = region
+    return params

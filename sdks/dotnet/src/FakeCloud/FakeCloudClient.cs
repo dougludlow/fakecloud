@@ -430,8 +430,26 @@ public sealed class FakeCloudClient : IDisposable
             _http.PostEmptyAsync<ExpirationTickResponse>("/_fakecloud/sqs/expiration-processor/tick", ct);
 
         public Task<ForceDlqResponse> ForceDlqAsync(string queueName, CancellationToken ct = default) =>
-            _http.PostEmptyAsync<ForceDlqResponse>(
-                "/_fakecloud/sqs/" + HttpTransport.EncodePath(queueName) + "/force-dlq", ct);
+            ForceDlqAsync(queueName, null, null, ct);
+
+        /// <summary>Force a queue's messages to its DLQ, for the queue of that name in
+        /// <paramref name="accountId"/> / <paramref name="region"/> (null: the server default).</summary>
+        public Task<ForceDlqResponse> ForceDlqAsync(
+            string queueName, string? accountId, string? region, CancellationToken ct = default)
+        {
+            var path = "/_fakecloud/sqs/" + HttpTransport.EncodePath(queueName) + "/force-dlq";
+            var sep = "?";
+            if (!string.IsNullOrEmpty(accountId))
+            {
+                path += sep + "accountId=" + HttpTransport.EncodePath(accountId);
+                sep = "&";
+            }
+            if (!string.IsNullOrEmpty(region))
+            {
+                path += sep + "region=" + HttpTransport.EncodePath(region);
+            }
+            return _http.PostEmptyAsync<ForceDlqResponse>(path, ct);
+        }
     }
 
     public sealed class ApplicationAutoScalingClient
