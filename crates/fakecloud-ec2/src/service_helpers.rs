@@ -230,18 +230,17 @@ pub fn decode_page_token(token: &str) -> Result<usize, AwsServiceError> {
         .ok_or_else(|| invalid_parameter_value(format!("Invalid value '{token}' for nextToken")))
 }
 
-/// Read a request's `MaxResults`: absent or empty means "everything", and a
-/// value that is not a positive integer is rejected (taking it as "no limit"
-/// would hand back the whole set the caller asked to page).
-pub fn parse_page_size(params: &HashMap<String, String>) -> Result<Option<usize>, AwsServiceError> {
+/// Read a request's `MaxResults` as an integer: absent or empty is `None`,
+/// and a value that is not an integer is rejected (taking it as "no limit"
+/// would hand back the whole set the caller asked to page). Range checks are
+/// per operation.
+pub fn parse_page_size(params: &HashMap<String, String>) -> Result<Option<i64>, AwsServiceError> {
     match params.get("MaxResults").filter(|v| !v.is_empty()) {
         None => Ok(None),
-        Some(v) => match v.parse::<usize>() {
-            Ok(n) if n > 0 => Ok(Some(n)),
-            _ => Err(invalid_parameter_value(format!(
-                "Invalid value '{v}' for maxResults"
-            ))),
-        },
+        Some(v) => v
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| invalid_parameter_value(format!("Invalid value '{v}' for maxResults"))),
     }
 }
 
@@ -621,14 +620,23 @@ mod tests {
     }
 
     #[test]
-    fn page_size_must_be_a_positive_integer() {
+    fn page_size_must_be_an_integer() {
         assert_eq!(parse_page_size(&p(&[])).unwrap(), None);
         assert_eq!(parse_page_size(&p(&[("MaxResults", "")])).unwrap(), None);
         assert_eq!(
             parse_page_size(&p(&[("MaxResults", "7")])).unwrap(),
             Some(7)
         );
-        for bad in ["0", "-1", "abc"] {
+        // Range checks (including whether 0 is allowed) are per operation.
+        assert_eq!(
+            parse_page_size(&p(&[("MaxResults", "0")])).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            parse_page_size(&p(&[("MaxResults", "-1")])).unwrap(),
+            Some(-1)
+        );
+        for bad in ["abc", "1.5"] {
             assert!(
                 parse_page_size(&p(&[("MaxResults", bad)])).is_err(),
                 "{bad}"

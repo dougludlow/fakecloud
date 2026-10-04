@@ -98,17 +98,24 @@ pub(crate) fn validate_request(
     let Some(op) = paged_op(&req.action) else {
         return Ok(None);
     };
-    let size = parse_page_size(&req.query_params)?;
-    if let (Some(n), Some((min, max))) = (size, op.max_results) {
-        let n = n as i64;
-        if n < min || n > max {
+    // The model's `@range` bounds MaxResults; without one, a page must hold
+    // at least one item. A range that admits 0 (DescribeFastSnapshotRestores,
+    // DescribeFastLaunchImages, DescribeAwsNetworkPerformanceMetricSubscriptions)
+    // takes it as "no limit": a zero-item page could never advance its token.
+    let (min, max) = match op.max_results {
+        Some((min, max)) => (min.max(0), max),
+        None => (1, i64::MAX),
+    };
+    let size = match parse_page_size(&req.query_params)? {
+        Some(n) if n < min || n > max => {
             return Err(invalid_parameter_value(match (min, max) {
                 (_, i64::MAX) => format!("MaxResults must be at least {min}"),
-                (i64::MIN, _) => format!("MaxResults must be at most {max}"),
                 _ => format!("MaxResults must be between {min} and {max}"),
             }));
         }
-    }
+        Some(0) | None => None,
+        Some(n) => Some(n as usize),
+    };
     let token = req.query_params.get("NextToken").filter(|t| !t.is_empty());
     if CUSTOM_TOKEN.contains(&op.action) {
         return Ok(None);
@@ -710,7 +717,13 @@ mod dispatch_tests {
     async fn every_paginated_op_bounds_max_results() {
         let svc = Ec2Service::new();
         for op in PAGED_OPS {
-            for bad in ["0", "-3", "many"] {
+            let zero_allowed = op.max_results.is_some_and(|(min, _)| min <= 0);
+            let bad: &[&str] = if zero_allowed {
+                &["-3", "many"]
+            } else {
+                &["0", "-3", "many"]
+            };
+            for &bad in bad {
                 let err = call(&svc, op.action, &[("MaxResults", bad)])
                     .await
                     .err()
@@ -734,6 +747,48 @@ mod dispatch_tests {
                 }
             }
         }
+    }
+
+    /// Where the model admits `MaxResults=0` it means "no limit": the whole
+    /// listing, and never a token that cannot advance.
+    #[tokio::test]
+    async fn zero_max_results_is_unpaged_where_the_model_allows_it() {
+        let svc = Ec2Service::new();
+        let zero_ops: Vec<&PagedOp> = PAGED_OPS
+            .iter()
+            .filter(|op| op.max_results.is_some_and(|(min, _)| min <= 0))
+            .collect();
+        assert!(zero_ops.len() >= 3, "{}", zero_ops.len());
+        for op in zero_ops {
+            let full = call(&svc, op.action, &[]).await;
+            let zero = call(&svc, op.action, &[("MaxResults", "0")]).await;
+            match (full, zero) {
+                (Ok(full), Ok(zero)) => {
+                    assert!(next_token(&zero).is_none(), "{}: {zero}", op.action);
+                    assert_eq!(set_items(&zero, op), set_items(&full, op), "{}", op.action);
+                }
+                (Err(a), Err(b)) => assert_eq!(a.code(), b.code(), "{}", op.action),
+                (_, Err(e)) => panic!("{} rejected MaxResults=0: {}", op.action, e.message()),
+                (Err(e), _) => panic!("{} failed unpaged: {}", op.action, e.message()),
+            }
+        }
+        let window = PageRequest {
+            start: 0,
+            size: None,
+        };
+        let op = PagedOp {
+            action: "DescribeThings",
+            sets: &["thingSet"],
+            layout: SetLayout::Concat,
+            max_results: Some((0, 100)),
+        };
+        let xml = fakecloud_aws::ec2query::ec2_response(
+            "DescribeThings",
+            "rid",
+            &fakecloud_aws::ec2query::ec2_list("thingSet", &["<id>a</id>".to_string()]),
+        );
+        let out = page_xml(&xml, window, &op).unwrap();
+        assert!(next_token(&out).is_none(), "{out}");
     }
 
     /// Handler-paged listings are not paged a second time at dispatch: the
