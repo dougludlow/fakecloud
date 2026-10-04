@@ -1794,81 +1794,6 @@ mod volume_tests {
 }
 
 #[cfg(test)]
-mod reset_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    /// A reset must not wait for an instance's in-flight lifecycle task (a
-    /// boot pulling a large image holds the lock for as long as the pull
-    /// takes): `remove_instances` returns at once, and the teardown happens
-    /// once the task lets go.
-    #[tokio::test]
-    async fn reset_does_not_wait_for_an_in_flight_boot() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("calls");
-        let cli = dir.path().join("fakecli");
-        std::fs::write(
-            &cli,
-            format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let rt = Ec2Runtime {
-            backend: InstanceBackend::Docker(DockerInstances {
-                cli: cli.display().to_string(),
-                podman: false,
-                instance_id: "fakecloud-test".into(),
-            }),
-            instances: Arc::new(RwLock::new(HashMap::new())),
-            firewall: FirewallEnforcer::disabled(),
-            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
-            lifecycle_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        };
-        rt.instances.write().insert(
-            "i-booting".into(),
-            InstanceRecord {
-                handle: "cid-booting".into(),
-                image: "amazonlinux:2023".into(),
-                user_data: None,
-                tags: BTreeMap::new(),
-                network: None,
-            },
-        );
-        // The boot task holds the lifecycle lock while its image pulls.
-        let boot = rt.lock_lifecycle("i-booting").await;
-
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rt.remove_instances(vec![("123456789012".into(), "i-booting".into())]),
-        )
-        .await
-        .expect("reset waited on the in-flight boot");
-        assert!(rt.is_registered("i-booting"), "torn down under the boot");
-
-        // The boot finishes: the deferred teardown removes its container.
-        drop(boot);
-        for _ in 0..100 {
-            if !rt.is_registered("i-booting") {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(!rt.is_registered("i-booting"));
-        let mut removed = false;
-        for _ in 0..100 {
-            removed = std::fs::read_to_string(&log)
-                .unwrap_or_default()
-                .contains("rm -f cid-booting");
-            if removed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(removed, "deferred teardown never removed the container");
-    }
-}
-
-#[cfg(test)]
 mod reachability_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -1926,7 +1851,27 @@ mod reachability_tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_executable(&script);
         (script.display().to_string(), log)
+    }
+
+    /// Wait until a freshly written script can be exec'd. Another test
+    /// thread forking while the script was open for writing leaves its child
+    /// holding the write fd until that child execs, and exec meanwhile fails
+    /// with `ETXTBSY`; the runtime would read that as a failed CLI call.
+    fn wait_executable(script: &std::path::Path) {
+        for _ in 0..200 {
+            match std::process::Command::new(script).arg("noop").output() {
+                Err(e) if e.raw_os_error() == Some(libc_etxtbsy()) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn libc_etxtbsy() -> i32 {
+        26 // ETXTBSY on Linux and macOS
     }
 
     fn calls(log: &std::path::Path, verb: &str) -> usize {
@@ -2123,6 +2068,7 @@ mod reachability_tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_executable(&script);
         let rt = runtime_with_cli(&script.display().to_string());
         let started = std::time::Instant::now();
         let running = tokio::time::timeout(
@@ -2141,6 +2087,50 @@ mod reachability_tests {
         )
         .await
         .expect("terminate waited on the IMDS helper");
+    }
+
+    /// A reset must not wait for an instance's in-flight lifecycle task (a
+    /// boot pulling a large image holds the lock for as long as the pull
+    /// takes): `remove_instances` returns at once, and the teardown --
+    /// container, IMDS sidecar and forwarders included -- happens once the
+    /// task lets go.
+    #[tokio::test]
+    async fn reset_does_not_wait_for_an_in_flight_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path());
+        let rt = runtime_with_cli(&cli);
+        rt.instances
+            .write()
+            .insert("i-booting".into(), record("172.30.0.5", None));
+        // The boot task holds the lifecycle lock while its image pulls.
+        let boot = rt.lock_lifecycle("i-booting").await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rt.remove_instances(vec![("123456789012".into(), "i-booting".into())]),
+        )
+        .await
+        .expect("reset waited on the in-flight boot");
+        assert!(rt.is_registered("i-booting"), "torn down under the boot");
+
+        // The boot finishes: the deferred teardown removes what it left.
+        drop(boot);
+        let mut done = false;
+        for _ in 0..100 {
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            done = !rt.is_registered("i-booting")
+                && calls.contains("rm -f cid-instance")
+                && calls.contains("rm -f fakecloud-ec2-imds-i-booting");
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            done,
+            "deferred teardown incomplete: {:?}",
+            std::fs::read_to_string(&log)
+        );
     }
 
     impl Ec2Runtime {
