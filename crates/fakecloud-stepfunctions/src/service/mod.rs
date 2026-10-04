@@ -2315,7 +2315,7 @@ mod tests {
         let exec_arn = b["executionArn"].as_str().unwrap().to_string();
 
         let accounts = svc.state.read();
-        let state = accounts.get("123456789012").unwrap();
+        let state = accounts.regional("123456789012", "us-east-1").unwrap();
         let stored = state
             .executions
             .get(&exec_arn)
@@ -2398,7 +2398,7 @@ mod tests {
         let state = make_state();
         {
             let mut accounts = state.write();
-            let s = accounts.get_or_create("123456789012");
+            let s = accounts.regional_mut("123456789012", "us-east-1");
             s.executions.insert(
                 "running".into(),
                 make_execution("running", ExecutionStatus::Running),
@@ -2413,7 +2413,7 @@ mod tests {
         assert_eq!(n, 1, "only the RUNNING execution is reconciled");
 
         let accounts = state.read();
-        let s = accounts.get("123456789012").unwrap();
+        let s = accounts.regional("123456789012", "us-east-1").unwrap();
         let running = &s.executions["running"];
         assert_eq!(running.status, ExecutionStatus::Aborted);
         assert!(running.stop_date.is_some());

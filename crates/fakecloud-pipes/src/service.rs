@@ -196,31 +196,31 @@ impl PipesService {
     /// transient pipes and spawns exactly one settle task each, so no pipe ends
     /// up with two concurrent tickers.
     pub async fn recover_persisted_pipes(&self) {
-        let pending: Vec<(String, String)> = {
+        let pending: Vec<(String, String, String)> = {
             let accounts = self.state.read();
             let mut out = Vec::new();
-            for (account_id, st) in &accounts.accounts {
+            for (account_id, region, st) in accounts.iter_regional() {
                 for (name, pipe) in &st.pipes {
                     let cur = pipe
                         .get("CurrentState")
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     if is_transient_state(cur) {
-                        out.push((account_id.clone(), name.clone()));
+                        out.push((account_id.to_string(), region.to_string(), name.clone()));
                     }
                 }
             }
             out
         };
-        for (account_id, name) in pending {
-            self.spawn_settle(account_id, name);
+        for (account_id, region, name) in pending {
+            self.spawn_settle(account_id, region, name);
         }
     }
 
     /// Spawn the async tick that advances a transient pipe to its settled
     /// state (and re-saves the snapshot). Mirrors the elasticache cluster
     /// transition pattern.
-    fn spawn_settle(&self, account_id: String, name: String) {
+    fn spawn_settle(&self, account_id: String, region: String, name: String) {
         let state = self.state.clone();
         let store = self.snapshot_store.clone();
         let lock = self.snapshot_lock.clone();
@@ -228,7 +228,7 @@ impl PipesService {
             tokio::time::sleep(SETTLE_DELAY).await;
             {
                 let mut accounts = state.write();
-                if let Some(st) = accounts.accounts.get_mut(&account_id) {
+                if let Some(st) = accounts.get_mut(&account_id, &region) {
                     settle_pipe(st, &name);
                 }
             }
@@ -365,7 +365,7 @@ impl PipesService {
 
         {
             let mut accounts = self.state.write();
-            let st = accounts.get_or_create(&req.account_id);
+            let st = accounts.get_or_create(&req.account_id, &req.region);
             if st.pipes.contains_key(&name) {
                 return Err(conflict_error(
                     format!("Pipe with Name {name} already exists."),
@@ -384,7 +384,7 @@ impl PipesService {
             }
             st.pipes.insert(name.clone(), Value::Object(pipe));
         }
-        self.spawn_settle(req.account_id.clone(), name.clone());
+        self.spawn_settle(req.account_id.clone(), req.region.clone(), name.clone());
 
         Ok(AwsResponse::ok_json(json!({
             "Arn": arn,
@@ -414,7 +414,7 @@ impl PipesService {
         // sees NotFound must not resurrect it). Here we only read the result.
         let accounts = self.state.read();
         let pipe = accounts
-            .get(&req.account_id)
+            .get(&req.account_id, &req.region)
             .and_then(|st| st.pipes.get(&name))
             .ok_or_else(|| not_found(&name))?;
         Ok(AwsResponse::ok_json(pipe.clone()))
@@ -427,12 +427,12 @@ impl PipesService {
     /// Returns `true` when it actually settled the pipe, so the async caller can
     /// persist the change (settling a DELETING pipe removes it and purges its
     /// checkpoints; that must reach disk or a restart resurrects both).
-    fn settle_if_overdue(&self, account_id: &str, name: &str) -> bool {
+    fn settle_if_overdue(&self, account_id: &str, region: &str, name: &str) -> bool {
         let now = now_epoch_secs();
         let overdue = {
             let accounts = self.state.read();
             accounts
-                .get(account_id)
+                .get(account_id, region)
                 .and_then(|st| st.pipes.get(name))
                 .map(|pipe| {
                     let cur = pipe
@@ -451,7 +451,7 @@ impl PipesService {
             return false;
         }
         let mut accounts = self.state.write();
-        if let Some(st) = accounts.accounts.get_mut(account_id) {
+        if let Some(st) = accounts.get_mut(account_id, region) {
             settle_pipe(st, name);
         }
         true
@@ -504,7 +504,7 @@ impl PipesService {
 
         let accounts = self.state.read();
         let mut summaries: Vec<Value> = Vec::new();
-        if let Some(st) = accounts.get(&req.account_id) {
+        if let Some(st) = accounts.get(&req.account_id, &req.region) {
             // BTreeMap iterates names in sorted order, giving a stable page
             // boundary for the opaque NextToken (= last name returned).
             for (name, pipe) in &st.pipes {
@@ -583,7 +583,7 @@ impl PipesService {
 
         let response = {
             let mut accounts = self.state.write();
-            let st = accounts.get_or_create(&req.account_id);
+            let st = accounts.get_or_create(&req.account_id, &req.region);
             let pipe = st.pipes.get_mut(&name).ok_or_else(|| not_found(&name))?;
             let obj = pipe
                 .as_object_mut()
@@ -653,7 +653,7 @@ impl PipesService {
                 "LastModifiedTime": now,
             })
         };
-        self.spawn_settle(req.account_id.clone(), name.clone());
+        self.spawn_settle(req.account_id.clone(), req.region.clone(), name.clone());
         Ok(AwsResponse::ok_json(response))
     }
 
@@ -681,7 +681,7 @@ impl PipesService {
         let now = now_epoch_secs();
         let response = {
             let mut accounts = self.state.write();
-            let st = accounts.get_or_create(&req.account_id);
+            let st = accounts.get_or_create(&req.account_id, &req.region);
             let pipe = st.pipes.get_mut(&name).ok_or_else(|| not_found(&name))?;
             let obj = pipe
                 .as_object_mut()
@@ -714,7 +714,7 @@ impl PipesService {
                 "LastModifiedTime": now,
             })
         };
-        self.spawn_settle(req.account_id.clone(), name.clone());
+        self.spawn_settle(req.account_id.clone(), req.region.clone(), name.clone());
         Ok(AwsResponse::ok_json(response))
     }
 
@@ -723,7 +723,7 @@ impl PipesService {
         let now = now_epoch_secs();
         let response = {
             let mut accounts = self.state.write();
-            let st = accounts.get_or_create(&req.account_id);
+            let st = accounts.get_or_create(&req.account_id, &req.region);
             let pipe = st.pipes.get_mut(&name).ok_or_else(|| not_found(&name))?;
             let obj = pipe
                 .as_object_mut()
@@ -746,7 +746,7 @@ impl PipesService {
                 "LastModifiedTime": now,
             })
         };
-        self.spawn_settle(req.account_id.clone(), name.clone());
+        self.spawn_settle(req.account_id.clone(), req.region.clone(), name.clone());
         Ok(AwsResponse::ok_json(response))
     }
 
@@ -754,7 +754,7 @@ impl PipesService {
         let arn = resource_arn_from_path(req)?;
         let accounts = self.state.read();
         let tags = accounts
-            .get(&req.account_id)
+            .get(&req.account_id, &req.region)
             .and_then(|st| st.tags.get(&arn))
             .cloned()
             .unwrap_or_default();
@@ -771,7 +771,7 @@ impl PipesService {
         let new_tags = tag_map_from(body.get("tags"));
         {
             let mut accounts = self.state.write();
-            let st = accounts.get_or_create(&req.account_id);
+            let st = accounts.get_or_create(&req.account_id, &req.region);
             let entry = st.tags.entry(arn.clone()).or_default();
             for (k, v) in new_tags {
                 entry.insert(k, v);
@@ -792,7 +792,7 @@ impl PipesService {
             .collect();
         {
             let mut accounts = self.state.write();
-            let st = accounts.get_or_create(&req.account_id);
+            let st = accounts.get_or_create(&req.account_id, &req.region);
             if let Some(entry) = st.tags.get_mut(&arn) {
                 for k in &keys {
                     entry.remove(k);
@@ -840,7 +840,7 @@ impl AwsService for PipesService {
         };
         if settle_before_dispatch {
             if let Ok(name) = pipe_name_from_path(&req) {
-                if self.settle_if_overdue(&req.account_id, &name) {
+                if self.settle_if_overdue(&req.account_id, &req.region, &name) {
                     self.save_snapshot().await;
                 }
             }
@@ -992,10 +992,10 @@ pub fn drain_overdue_transient_pipes(state: &SharedPipesState, min_age_secs: f64
     // actually something to settle. The common case — no transient pipe past
     // the age gate — takes only the read lock, so the runner's per-tick drain
     // does not convoy against the provider's DescribePipe read flood.
-    let overdue: Vec<(String, String)> = {
+    let overdue: Vec<(String, String, String)> = {
         let accounts = state.read();
         let mut out = Vec::new();
-        for (account_id, st) in &accounts.accounts {
+        for (account_id, region, st) in accounts.iter_regional() {
             for (name, pipe) in &st.pipes {
                 let cur = pipe
                     .get("CurrentState")
@@ -1009,7 +1009,7 @@ pub fn drain_overdue_transient_pipes(state: &SharedPipesState, min_age_secs: f64
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
                 if now - last >= min_age_secs {
-                    out.push((account_id.clone(), name.clone()));
+                    out.push((account_id.to_string(), region.to_string(), name.clone()));
                 }
             }
         }
@@ -1021,8 +1021,8 @@ pub fn drain_overdue_transient_pipes(state: &SharedPipesState, min_age_secs: f64
 
     let mut count = 0;
     let mut accounts = state.write();
-    for (account_id, name) in overdue {
-        if let Some(st) = accounts.accounts.get_mut(&account_id) {
+    for (account_id, region, name) in overdue {
+        if let Some(st) = accounts.get_mut(&account_id, &region) {
             settle_pipe(st, &name);
             count += 1;
         }
@@ -1323,7 +1323,7 @@ mod tests {
         let state: SharedPipesState = Arc::new(RwLock::new(crate::state::PipesAccounts::new()));
         {
             let mut acc = state.write();
-            let st = acc.get_or_create("123456789012");
+            let st = acc.get_or_create("123456789012", "us-east-1");
             st.pipes.insert(
                 "p1".into(),
                 json!({
@@ -1343,8 +1343,13 @@ mod tests {
         // A DELETING pipe older than SETTLE_DELAY is removed by a describe-time
         // settle, so the provider's delete waiter converges on its own poll.
         let (svc, state) = service_with_pipe(STATE_DELETING, "STOPPED", 5.0);
-        svc.settle_if_overdue("123456789012", "p1");
-        assert!(state.read().get("123456789012").unwrap().pipes.is_empty());
+        svc.settle_if_overdue("123456789012", "us-east-1", "p1");
+        assert!(state
+            .read()
+            .get("123456789012", "us-east-1")
+            .unwrap()
+            .pipes
+            .is_empty());
     }
 
     #[test]
@@ -1355,7 +1360,7 @@ mod tests {
         let arn = "arn:aws:pipes:us-east-1:123456789012:pipe/p1";
         {
             let mut st = state.write();
-            let s = st.get_or_create("123456789012");
+            let s = st.get_or_create("123456789012", "us-east-1");
             s.source_checkpoints
                 .insert(format!("{arn}#shardId-000000000000"), "42".into());
             s.source_checkpoints.insert(arn.to_string(), "seq-9".into());
@@ -1367,9 +1372,12 @@ mod tests {
         }
         // Settling a DELETING pipe reports `true` so the caller persists the
         // removal + purge (durability, Cubic P2 on #2058).
-        assert!(svc.settle_if_overdue("123456789012", "p1"));
+        assert!(svc.settle_if_overdue("123456789012", "us-east-1", "p1"));
         let st = state.read();
-        let cps = &st.get("123456789012").unwrap().source_checkpoints;
+        let cps = &st
+            .get("123456789012", "us-east-1")
+            .unwrap()
+            .source_checkpoints;
         assert!(!cps.keys().any(|k| k.starts_with(arn)));
         assert!(cps.contains_key("arn:aws:pipes:us-east-1:123456789012:pipe/other"));
     }
@@ -1386,9 +1394,9 @@ mod tests {
     #[test]
     fn lazy_settle_advances_overdue_creating_pipe() {
         let (svc, state) = service_with_pipe(STATE_CREATING, STATE_RUNNING, 5.0);
-        svc.settle_if_overdue("123456789012", "p1");
+        svc.settle_if_overdue("123456789012", "us-east-1", "p1");
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_RUNNING
         );
     }
@@ -1397,9 +1405,9 @@ mod tests {
     fn lazy_settle_leaves_fresh_transient_pipe() {
         // Within SETTLE_DELAY the transient state is still observable.
         let (svc, state) = service_with_pipe(STATE_CREATING, STATE_RUNNING, 0.0);
-        svc.settle_if_overdue("123456789012", "p1");
+        svc.settle_if_overdue("123456789012", "us-east-1", "p1");
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_CREATING
         );
     }
@@ -1430,7 +1438,7 @@ mod tests {
         assert_eq!(err.code(), "ConflictException");
         // The pipe is untouched — still DELETING, not flipped back to UPDATING.
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_DELETING
         );
     }
@@ -1447,7 +1455,7 @@ mod tests {
             "StartPipe on a fresh CREATING pipe must succeed, not 409"
         );
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_STARTING
         );
     }
@@ -1461,7 +1469,7 @@ mod tests {
             "StopPipe on a fresh UPDATING pipe must succeed, not 409"
         );
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_STOPPING
         );
     }
@@ -1483,7 +1491,7 @@ mod tests {
             };
             assert_eq!(err.code(), "ConflictException", "{op} must conflict");
             assert_eq!(
-                state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+                state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
                 STATE_DELETING,
                 "{op} must not resurrect the DELETING pipe"
             );
@@ -1529,7 +1537,7 @@ mod tests {
         };
         assert_eq!(err.code(), "ValidationException");
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_CREATING,
             "a rejected UpdatePipe must not force-settle (state unchanged)"
         );
@@ -1547,7 +1555,7 @@ mod tests {
         };
         assert_eq!(err.code(), "ValidationException");
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_CREATING,
             "a rejected UpdatePipe must not settle an overdue pipe"
         );
@@ -1567,7 +1575,7 @@ mod tests {
         assert!(
             state
                 .read()
-                .get("123456789012")
+                .get("123456789012", "us-east-1")
                 .unwrap()
                 .pipes
                 .contains_key("p1"),
@@ -1586,7 +1594,7 @@ mod tests {
             "UpdatePipe on a RUNNING pipe must succeed"
         );
         assert_eq!(
-            state.read().get("123456789012").unwrap().pipes["p1"]["CurrentState"],
+            state.read().get("123456789012", "us-east-1").unwrap().pipes["p1"]["CurrentState"],
             STATE_UPDATING
         );
     }
@@ -1601,7 +1609,12 @@ mod tests {
             panic!("UpdatePipe on a removed pipe must error");
         };
         assert_eq!(err.code(), "NotFoundException");
-        assert!(state.read().get("123456789012").unwrap().pipes.is_empty());
+        assert!(state
+            .read()
+            .get("123456789012", "us-east-1")
+            .unwrap()
+            .pipes
+            .is_empty());
     }
 
     /// A test `SnapshotStore` that retains the last saved bytes so a test can
@@ -1643,7 +1656,7 @@ mod tests {
         let snapshot: PipesSnapshot = serde_json::from_slice(&bytes).unwrap();
         let accounts = snapshot.accounts.expect("snapshot carries account state");
         let still_present = accounts
-            .get("123456789012")
+            .get("123456789012", "us-east-1")
             .is_some_and(|st| st.pipes.contains_key("p1"));
         assert!(
             !still_present,

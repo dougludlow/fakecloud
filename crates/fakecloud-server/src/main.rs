@@ -4823,7 +4823,7 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_pipes::PipesSnapshot>(&bytes) {
+                    match fakecloud_pipes::parse_pipes_snapshot(&bytes, &cli.region) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_pipes::PIPES_SNAPSHOT_SCHEMA_VERSION

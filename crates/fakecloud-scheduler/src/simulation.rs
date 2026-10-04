@@ -20,14 +20,15 @@ pub fn fire_once(
     state: &SharedSchedulerState,
     delivery: &Arc<DeliveryBus>,
     account_id: &str,
+    region: &str,
     group_name: &str,
     schedule_name: &str,
 ) -> Result<String, String> {
     let (sched_snapshot, should_delete) = {
         let mut accounts = state.write();
         let account_state = accounts
-            .get_mut(account_id)
-            .ok_or_else(|| format!("account not found: {account_id}"))?;
+            .regional_get_mut(account_id, region)
+            .ok_or_else(|| format!("account not found: {account_id} in {region}"))?;
         let key = (group_name.to_string(), schedule_name.to_string());
         let sched = account_state
             .schedules
@@ -54,7 +55,7 @@ pub fn fire_once(
 
     if should_delete {
         let mut accounts = state.write();
-        if let Some(account_state) = accounts.get_mut(account_id) {
+        if let Some(account_state) = accounts.regional_get_mut(account_id, region) {
             account_state
                 .schedules
                 .remove(&(group_name.to_string(), schedule_name.to_string()));
@@ -98,7 +99,7 @@ pub fn fire_schedule_response(
     group: &str,
     name: &str,
 ) -> Result<FireScheduleResponse, String> {
-    let target_arn = fire_once(state, delivery, account_id, group, name)?;
+    let target_arn = fire_once(state, delivery, account_id, region, group, name)?;
     Ok(FireScheduleResponse {
         schedule_arn: crate::state::schedule_arn(region, account_id, group, name),
         target_arn,
@@ -108,8 +109,8 @@ pub fn fire_schedule_response(
 pub fn list_all_schedules(state: &SharedSchedulerState) -> Vec<ScheduleRow> {
     let accounts = state.read();
     let mut rows: Vec<ScheduleRow> = accounts
-        .iter()
-        .flat_map(|(account_id, s)| {
+        .iter_regional()
+        .flat_map(|(account_id, _region, s)| {
             let account_id = account_id.to_string();
             s.schedules.values().map(move |sched| ScheduleRow {
                 account_id: account_id.clone(),
@@ -144,14 +145,14 @@ mod tests {
 
     fn make_state() -> SharedSchedulerState {
         Arc::new(RwLock::new(
-            fakecloud_core::multi_account::MultiAccountState::new("000000000000", "us-east-1", ""),
+            fakecloud_core::multi_account::MultiRegionState::new("000000000000", "us-east-1", ""),
         ))
     }
 
     fn seed(state: &SharedSchedulerState, name: &str, expr: &str, action: &str) {
         let now = Utc::now();
         let mut accounts = state.write();
-        let s = accounts.get_or_create("000000000000");
+        let s = accounts.regional_mut("000000000000", "us-east-1");
         s.schedules.insert(
             ("default".to_string(), name.to_string()),
             Schedule {
@@ -221,11 +222,11 @@ mod tests {
         seed(&state, "s", "rate(1 day)", "NONE");
         let rec = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(rec.clone()));
-        fire_once(&state, &bus, "000000000000", "default", "s").unwrap();
+        fire_once(&state, &bus, "000000000000", "us-east-1", "default", "s").unwrap();
         assert_eq!(rec.calls.lock().unwrap().len(), 1);
         let accounts = state.read();
         let sched = accounts
-            .get("000000000000")
+            .regional("000000000000", "us-east-1")
             .unwrap()
             .schedules
             .get(&("default".to_string(), "s".to_string()))
@@ -239,10 +240,10 @@ mod tests {
         seed(&state, "once", "at(2020-01-01T00:00:00)", "DELETE");
         let rec = Arc::new(Recorder::default());
         let bus = Arc::new(DeliveryBus::new().with_sqs(rec.clone()));
-        fire_once(&state, &bus, "000000000000", "default", "once").unwrap();
+        fire_once(&state, &bus, "000000000000", "us-east-1", "default", "once").unwrap();
         let accounts = state.read();
         assert!(!accounts
-            .get("000000000000")
+            .regional("000000000000", "us-east-1")
             .unwrap()
             .schedules
             .contains_key(&("default".to_string(), "once".to_string())));
@@ -252,7 +253,7 @@ mod tests {
     fn fire_once_reports_missing_schedule() {
         let state = make_state();
         let bus = Arc::new(DeliveryBus::new());
-        let err = fire_once(&state, &bus, "000000000000", "default", "nope")
+        let err = fire_once(&state, &bus, "000000000000", "us-east-1", "default", "nope")
             .err()
             .unwrap();
         assert!(err.contains("not found"));

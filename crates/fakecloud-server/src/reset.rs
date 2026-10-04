@@ -544,7 +544,7 @@ impl ResetState {
             "scheduler" => {
                 let mut mas = self.scheduler.write();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.clear();
                 }
             }
             "apigateway" => {

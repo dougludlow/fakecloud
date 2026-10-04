@@ -241,7 +241,7 @@ impl PipesRunner {
     fn collect_running_pipes(&self) -> Vec<RunningPipe> {
         let accounts = self.pipes_state.read();
         let mut out = Vec::new();
-        for state in accounts.accounts.values() {
+        for (_, _, state) in accounts.iter_regional() {
             for pipe in state.pipes.values() {
                 if pipe.get("CurrentState").and_then(Value::as_str) != Some("RUNNING") {
                     continue;
@@ -958,17 +958,34 @@ impl PipesRunner {
 
     // --- Checkpoint helpers -------------------------------------------------
 
-    fn checkpoint(&self, account: &str, key: &str) -> Option<String> {
+    /// Checkpoints live with their pipe: the key starts with the pipe ARN
+    /// (`<pipeArn>` or `<pipeArn>#<shardId>`), whose account and region name
+    /// the state they are kept in (the source may be in another account).
+    fn checkpoint_scope(key: &str) -> (String, String) {
+        let pipe_arn = key.split('#').next().unwrap_or("");
+        (
+            fakecloud_aws::arn::account_of(pipe_arn)
+                .unwrap_or_default()
+                .to_string(),
+            fakecloud_aws::arn::region_of(pipe_arn)
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    fn checkpoint(&self, _source_account: &str, key: &str) -> Option<String> {
+        let (account, region) = Self::checkpoint_scope(key);
         self.pipes_state
             .read()
-            .get(account)
+            .get(&account, &region)
             .and_then(|s| s.source_checkpoints.get(key).cloned())
     }
 
-    fn set_checkpoint(&self, account: &str, key: &str, value: String) {
+    fn set_checkpoint(&self, _source_account: &str, key: &str, value: String) {
+        let (account, region) = Self::checkpoint_scope(key);
         self.pipes_state
             .write()
-            .get_or_create(account)
+            .get_or_create(&account, &region)
             .source_checkpoints
             .insert(key.to_string(), value);
         self.checkpoints_dirty.store(true, Ordering::Relaxed);

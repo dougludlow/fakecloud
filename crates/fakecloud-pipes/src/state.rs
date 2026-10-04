@@ -16,9 +16,12 @@ pub type SharedPipesState = Arc<RwLock<PipesAccounts>>;
 /// A JSON-backed pipe store: pipe name -> (raw input + generated fields).
 pub type PipeStore = BTreeMap<String, Value>;
 
+/// Pipes state partitioned by account and then region: pipes are regional,
+/// so the same pipe name can exist in two regions of one account.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PipesAccounts {
-    pub accounts: BTreeMap<String, PipesState>,
+    /// account id -> region -> state.
+    pub accounts: BTreeMap<String, BTreeMap<String, PipesState>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -45,13 +48,102 @@ impl PipesAccounts {
         Self::default()
     }
 
-    pub fn get_or_create(&mut self, account_id: &str) -> &mut PipesState {
-        self.accounts.entry(account_id.to_string()).or_default()
+    /// The state of `account_id` in `region`, created empty on first use.
+    pub fn get_or_create(&mut self, account_id: &str, region: &str) -> &mut PipesState {
+        self.accounts
+            .entry(account_id.to_string())
+            .or_default()
+            .entry(region.to_string())
+            .or_default()
     }
 
-    pub fn get(&self, account_id: &str) -> Option<&PipesState> {
-        self.accounts.get(account_id)
+    /// The state of `account_id` in `region`, `None` when never touched.
+    pub fn get(&self, account_id: &str, region: &str) -> Option<&PipesState> {
+        self.accounts.get(account_id)?.get(region)
     }
+
+    /// Mutable [`Self::get`]; never creates.
+    pub fn get_mut(&mut self, account_id: &str, region: &str) -> Option<&mut PipesState> {
+        self.accounts.get_mut(account_id)?.get_mut(region)
+    }
+
+    /// Every (account, region, state).
+    pub fn iter_regional(&self) -> impl Iterator<Item = (&str, &str, &PipesState)> {
+        self.accounts.iter().flat_map(|(a, regions)| {
+            regions
+                .iter()
+                .map(move |(r, s)| (a.as_str(), r.as_str(), s))
+        })
+    }
+}
+
+/// The shape v1 snapshots stored: one state per account.
+#[derive(Deserialize)]
+struct LegacyPipesAccounts {
+    #[serde(default)]
+    accounts: BTreeMap<String, PipesState>,
+}
+
+#[derive(Deserialize)]
+struct LegacyPipesSnapshot {
+    #[serde(default)]
+    accounts: Option<LegacyPipesAccounts>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotVersion {
+    schema_version: u32,
+}
+
+/// Parse a persisted Pipes snapshot. A v1 snapshot (one state per account)
+/// is split by region: each pipe goes to the region of its `Arn` (the
+/// server's `default_region` when it names none), and tags and source
+/// checkpoints follow the pipe ARN they are keyed by. A snapshot newer than
+/// this build comes back with its `schema_version` and no state.
+pub fn parse_pipes_snapshot(
+    bytes: &[u8],
+    default_region: &str,
+) -> Result<PipesSnapshot, serde_json::Error> {
+    let SnapshotVersion { schema_version } = serde_json::from_slice(bytes)?;
+    if schema_version >= PIPES_SNAPSHOT_SCHEMA_VERSION {
+        if schema_version > PIPES_SNAPSHOT_SCHEMA_VERSION {
+            return Ok(PipesSnapshot {
+                schema_version,
+                accounts: None,
+            });
+        }
+        return serde_json::from_slice(bytes);
+    }
+    let legacy: LegacyPipesSnapshot = serde_json::from_slice(bytes)?;
+    let mut out = PipesAccounts::new();
+    let region_of = |arn: &str| {
+        fakecloud_aws::arn::region_of(arn)
+            .unwrap_or(default_region)
+            .to_string()
+    };
+    for (account, st) in legacy.accounts.map(|a| a.accounts).unwrap_or_default() {
+        for (name, pipe) in st.pipes {
+            let region = region_of(pipe["Arn"].as_str().unwrap_or(""));
+            out.get_or_create(&account, &region)
+                .pipes
+                .insert(name, pipe);
+        }
+        for (arn, tags) in st.tags {
+            let region = region_of(&arn);
+            out.get_or_create(&account, &region).tags.insert(arn, tags);
+        }
+        for (key, cursor) in st.source_checkpoints {
+            let pipe_arn = key.split('#').next().unwrap_or("");
+            let region = region_of(pipe_arn);
+            out.get_or_create(&account, &region)
+                .source_checkpoints
+                .insert(key, cursor);
+        }
+    }
+    Ok(PipesSnapshot {
+        schema_version: PIPES_SNAPSHOT_SCHEMA_VERSION,
+        accounts: Some(out),
+    })
 }
 
 /// On-disk snapshot envelope; versioned so format changes fail loudly.
@@ -62,7 +154,8 @@ pub struct PipesSnapshot {
     pub accounts: Option<PipesAccounts>,
 }
 
-pub const PIPES_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// v2: state partitioned by (account, region); v1 kept one state per account.
+pub const PIPES_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// Pipe lifecycle states (subset of the AWS `PipeState` enum that this
 /// emulator transitions through).

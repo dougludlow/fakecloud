@@ -180,7 +180,7 @@ pub(crate) fn context_object(
     let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let accounts = shared_state.read();
     let exec = accounts
-        .get(account_id_from_arn(execution_arn))
+        .by_arn(execution_arn)
         .and_then(|s| s.executions.get(execution_arn));
     let (input, name, role_arn, start, sm_arn, sm_name, redrive_count) = match exec {
         Some(e) => (
