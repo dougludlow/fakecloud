@@ -997,6 +997,7 @@ impl Ec2Service {
             // the whole stack update with `action_not_implemented`.
             "ModifyInstanceAttribute" => instance::modify_instance_attribute(self, request),
             "CreateTags" => tags::create_tags(self, request),
+            "DeleteTags" => tags::delete_tags(self, request),
             "AssociateIamInstanceProfile" => rest::associate_iam_instance_profile(self, request),
             "ReplaceIamInstanceProfileAssociation" => {
                 rest::replace_iam_instance_profile_association(self, request)

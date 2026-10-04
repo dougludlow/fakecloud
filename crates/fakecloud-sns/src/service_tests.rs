@@ -3531,3 +3531,98 @@ fn iam_actions_for_role_attributes_include_pass_role() {
     );
     assert_eq!(svc.iam_actions_for(&req).len(), 1);
 }
+
+#[test]
+fn cross_account_subscription_is_listed_for_its_owner_and_the_topic() {
+    let (svc, _state) = make_sns();
+    let req = sns_request("CreateTopic", vec![("Name", "shared")]);
+    assert_ok(&svc.create_topic(&req));
+    let topic_arn = "arn:aws:sns:us-east-1:123456789012:shared";
+
+    // Account 210987654321 subscribes to account 123456789012's topic.
+    let mut sub = sns_request(
+        "Subscribe",
+        vec![
+            ("TopicArn", topic_arn),
+            ("Protocol", "sqs"),
+            ("Endpoint", "arn:aws:sqs:us-east-1:210987654321:mine"),
+        ],
+    );
+    sub.account_id = "210987654321".to_string();
+    let result = svc.subscribe(&sub);
+    assert_ok(&result);
+    let body = response_body(&result);
+    let start = body.find("<SubscriptionArn>").unwrap() + "<SubscriptionArn>".len();
+    let end = body[start..].find("</SubscriptionArn>").unwrap() + start;
+    let sub_arn = body[start..end].to_string();
+
+    // ListSubscriptions is the requester's own subscriptions.
+    let mut list = sns_request("ListSubscriptions", vec![]);
+    list.account_id = "210987654321".to_string();
+    assert!(response_body(&svc.list_subscriptions(&list)).contains(&sub_arn));
+    let owner_list = sns_request("ListSubscriptions", vec![]);
+    assert!(!response_body(&svc.list_subscriptions(&owner_list)).contains(&sub_arn));
+
+    // The topic owner sees it on the topic.
+    let by_topic = sns_request("ListSubscriptionsByTopic", vec![("TopicArn", topic_arn)]);
+    assert!(response_body(&svc.list_subscriptions_by_topic(&by_topic)).contains(&sub_arn));
+
+    // The subscriber can read and remove it.
+    let mut get = sns_request(
+        "GetSubscriptionAttributes",
+        vec![("SubscriptionArn", &sub_arn)],
+    );
+    get.account_id = "210987654321".to_string();
+    assert_ok(&svc.get_subscription_attributes(&get));
+    let mut unsub = sns_request("Unsubscribe", vec![("SubscriptionArn", &sub_arn)]);
+    unsub.account_id = "210987654321".to_string();
+    assert_ok(&svc.unsubscribe(&unsub));
+    assert!(!response_body(&svc.list_subscriptions_by_topic(&by_topic)).contains(&sub_arn));
+}
+
+#[test]
+fn subscription_recorded_in_the_callers_account_is_still_found() {
+    let (svc, state) = make_sns();
+    // An older build stored a subscription in the caller's own account even
+    // though its ARN names another account's topic.
+    let sub_arn = "arn:aws:sns:us-east-1:111111111111:other:legacy";
+    state
+        .write()
+        .get_or_create("123456789012")
+        .subscriptions
+        .insert(
+            sub_arn.to_string(),
+            crate::state::SnsSubscription {
+                subscription_arn: sub_arn.to_string(),
+                topic_arn: "arn:aws:sns:us-east-1:111111111111:other".to_string(),
+                protocol: "email".to_string(),
+                endpoint: "a@example.com".to_string(),
+                owner: "123456789012".to_string(),
+                attributes: std::collections::BTreeMap::new(),
+                confirmed: true,
+                confirmation_token: None,
+            },
+        );
+    let get = sns_request(
+        "GetSubscriptionAttributes",
+        vec![("SubscriptionArn", sub_arn)],
+    );
+    assert_ok(&svc.get_subscription_attributes(&get));
+    let set = sns_request(
+        "SetSubscriptionAttributes",
+        vec![
+            ("SubscriptionArn", sub_arn),
+            ("AttributeName", "RawMessageDelivery"),
+            ("AttributeValue", "true"),
+        ],
+    );
+    assert_ok(&svc.set_subscription_attributes(&set));
+    let unsub = sns_request("Unsubscribe", vec![("SubscriptionArn", sub_arn)]);
+    assert_ok(&svc.unsubscribe(&unsub));
+    assert!(state
+        .read()
+        .get("123456789012")
+        .unwrap()
+        .subscriptions
+        .is_empty());
+}

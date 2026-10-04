@@ -72,6 +72,41 @@ fn sqs_update_refreshes_redrive_resets_dropped_properties_and_stamps_times() {
     assert_eq!(queue.attributes["VisibilityTimeout"], "30");
 }
 
+#[test]
+fn sqs_update_keeps_the_policy_a_queue_policy_resource_owns() {
+    let prov = make_provisioner();
+    let q = create(
+        &prov,
+        "AWS::SQS::Queue",
+        "Q",
+        json!({"QueueName": "pq", "DelaySeconds": 5}),
+    );
+    create(
+        &prov,
+        "AWS::SQS::QueuePolicy",
+        "QP",
+        json!({
+            "Queues": [q.physical_id.clone()],
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": "*", "Action": "sqs:SendMessage", "Resource": "*"
+            }]}
+        }),
+    );
+    update(&prov, &q, json!({"QueueName": "pq"}));
+    let sqs = prov.sqs_state.read();
+    let queue = &sqs.get(ACCT).unwrap().queues[&q.physical_id];
+    assert!(
+        queue
+            .attributes
+            .get("Policy")
+            .is_some_and(|p| p.contains("sqs:SendMessage")),
+        "QueuePolicy's Policy must survive a Queue update: {:?}",
+        queue.attributes
+    );
+    // A Queue-owned property dropped from the template still resets.
+    assert_eq!(queue.attributes["DelaySeconds"], "0");
+}
+
 // ---------------------------------------------------------------------------
 // Lambda
 // ---------------------------------------------------------------------------
@@ -963,4 +998,83 @@ fn batch_consumable_resource_and_service_environment_go_through_batch() {
     let st = b.get(ACCT).unwrap();
     assert!(st.service_environments.is_empty());
     assert!(st.consumable_resources.is_empty());
+}
+
+#[test]
+fn ec2_eip_and_nat_gateway_tag_updates_are_in_place() {
+    let prov = make_provisioner();
+    let vpc = create(
+        &prov,
+        "AWS::EC2::VPC",
+        "V",
+        json!({"CidrBlock": "10.8.0.0/16"}),
+    );
+    let subnet = create(
+        &prov,
+        "AWS::EC2::Subnet",
+        "S",
+        json!({"VpcId": vpc.physical_id, "CidrBlock": "10.8.1.0/24"}),
+    );
+    let eip = create(
+        &prov,
+        "AWS::EC2::EIP",
+        "E",
+        json!({"Domain": "vpc", "Tags": [{"Key": "a", "Value": "1"}]}),
+    );
+    let alloc = eip.attributes["AllocationId"].clone();
+    let nat = create(
+        &prov,
+        "AWS::EC2::NatGateway",
+        "N",
+        json!({"SubnetId": subnet.physical_id, "AllocationId": alloc}),
+    );
+    let tags_of = |id: &str| -> Vec<(String, String)> {
+        prov.ec2_state
+            .read()
+            .get(ACCT)
+            .unwrap()
+            .tags_for(id)
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
+            .collect()
+    };
+
+    // A Tags-only change keeps the address and the NAT gateway.
+    let eip2 = update(
+        &prov,
+        &eip,
+        json!({"Domain": "vpc", "Tags": [{"Key": "b", "Value": "2"}]}),
+    );
+    assert_eq!(eip2.physical_id, eip.physical_id);
+    assert_eq!(eip2.attributes["AllocationId"], alloc);
+    assert_eq!(tags_of(&alloc), vec![("b".to_string(), "2".to_string())]);
+    let nat2 = update(
+        &prov,
+        &nat,
+        json!({
+            "SubnetId": subnet.physical_id,
+            "AllocationId": alloc,
+            "Tags": [{"Key": "env", "Value": "dev"}]
+        }),
+    );
+    assert_eq!(nat2.physical_id, nat.physical_id);
+    assert_eq!(
+        tags_of(&nat.physical_id),
+        vec![("env".to_string(), "dev".to_string())]
+    );
+
+    // A replacement-requiring change (Domain) releases the old address.
+    let standalone = create(&prov, "AWS::EC2::EIP", "E2", json!({"Domain": "vpc"}));
+    let replaced = update(&prov, &standalone, json!({"Domain": "standard"}));
+    assert_ne!(replaced.physical_id, standalone.physical_id);
+    let ec2 = prov.ec2_state.read();
+    let st = ec2.get(ACCT).unwrap();
+    assert!(!st
+        .elastic_ips
+        .values()
+        .any(|e| e.public_ip == standalone.physical_id));
+    assert!(st
+        .elastic_ips
+        .values()
+        .any(|e| e.public_ip == replaced.physical_id));
 }

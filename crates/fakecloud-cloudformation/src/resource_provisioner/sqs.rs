@@ -41,6 +41,15 @@ impl ResourceProvisioner {
             .get_mut(url)
             .ok_or_else(|| format!("Queue {url} not yet provisioned"))?;
         let mut attributes = cfn_queue_attributes(props, queue.is_fifo);
+        // Only the attributes the Queue resource owns follow its template.
+        // Everything else on the queue -- the `Policy` an
+        // AWS::SQS::QueuePolicy (or SetQueueAttributes) wrote, and any other
+        // attribute set outside this resource -- is carried over unchanged.
+        for (k, v) in &queue.attributes {
+            if !SQS_QUEUE_OWNED_ATTRIBUTES.contains(&k.as_str()) {
+                attributes.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
         let created = queue
             .attributes
             .get("CreatedTimestamp")
@@ -94,6 +103,9 @@ impl ResourceProvisioner {
         let is_fifo = queue_name.ends_with(".fifo");
         let now = Utc::now();
         let mut attributes = cfn_queue_attributes(props, is_fifo);
+        // Validated like CreateQueue, so an out-of-range attribute fails the
+        // create instead of being stored.
+        fakecloud_sqs::validate_create_queue_attributes(&attributes).map_err(|e| e.to_string())?;
         attributes.insert("CreatedTimestamp".to_string(), now.timestamp().to_string());
         attributes.insert(
             "LastModifiedTimestamp".to_string(),
@@ -239,6 +251,26 @@ impl ResourceProvisioner {
 /// serialized to compact JSON and booleans to their string form. A KMS key
 /// implies SSE-KMS, so managed SSE is off (the native create_queue
 /// mutual-exclusion).
+/// The queue attributes an `AWS::SQS::Queue` resource owns (its properties,
+/// plus `SqsManagedSseEnabled`, which its KMS setting determines). An update
+/// resets these to the SQS defaults when the template drops them.
+const SQS_QUEUE_OWNED_ATTRIBUTES: &[&str] = &[
+    "ContentBasedDeduplication",
+    "DeduplicationScope",
+    "DelaySeconds",
+    "FifoQueue",
+    "FifoThroughputLimit",
+    "KmsDataKeyReusePeriodSeconds",
+    "KmsMasterKeyId",
+    "MaximumMessageSize",
+    "MessageRetentionPeriod",
+    "ReceiveMessageWaitTimeSeconds",
+    "RedriveAllowPolicy",
+    "RedrivePolicy",
+    "SqsManagedSseEnabled",
+    "VisibilityTimeout",
+];
+
 fn cfn_queue_attributes(
     props: &serde_json::Value,
     is_fifo: bool,

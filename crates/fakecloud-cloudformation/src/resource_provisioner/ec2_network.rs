@@ -323,7 +323,7 @@ impl ResourceProvisioner {
             assoc.insert("AllocationId".to_string(), allocation_id.clone());
             assoc.insert("InstanceId".to_string(), instance.to_string());
             if let Err(e) = self.ec2_dispatch("AssociateAddress", assoc) {
-                self.release_eip(&allocation_id);
+                let _ = self.release_eip(&allocation_id);
                 return Err(e);
             }
         }
@@ -332,14 +332,16 @@ impl ResourceProvisioner {
             .with("AllocationId", allocation_id))
     }
 
-    fn release_eip(&self, allocation_id: &str) {
+    fn release_eip(&self, allocation_id: &str) -> Result<(), String> {
         let mut params = HashMap::new();
         params.insert("AllocationId".to_string(), allocation_id.to_string());
-        let _ = self.ec2_dispatch("ReleaseAddress", params);
+        self.ec2_dispatch("ReleaseAddress", params).map(|_| ())
     }
 
-    /// Disassociate (when associated) and release a stack's Elastic IP.
-    fn delete_ec2_eip(&self, public_ip: &str) {
+    /// Disassociate (when associated) and release a stack's Elastic IP. An
+    /// address that is already gone is not a failure; a disassociate or
+    /// release that fails is, so a replacement never leaks the old address.
+    fn delete_ec2_eip(&self, public_ip: &str) -> Result<(), String> {
         let found = {
             let accounts = self.ec2_state.read();
             accounts.get(&self.account_id).and_then(|s| {
@@ -350,14 +352,137 @@ impl ResourceProvisioner {
             })
         };
         let Some((allocation_id, association_id)) = found else {
-            return;
+            return Ok(());
         };
         if let Some(association_id) = association_id {
             let mut params = HashMap::new();
             params.insert("AssociationId".to_string(), association_id);
-            let _ = self.ec2_dispatch("DisassociateAddress", params);
+            self.ec2_dispatch("DisassociateAddress", params)?;
         }
-        self.release_eip(&allocation_id);
+        self.release_eip(&allocation_id)
+    }
+
+    /// The allocation behind a stack's EIP (physical id = public IP).
+    fn eip_record(&self, public_ip: &str) -> Option<fakecloud_ec2::state::ElasticIp> {
+        let accounts = self.ec2_state.read();
+        accounts.get(&self.account_id).and_then(|s| {
+            s.elastic_ips
+                .values()
+                .find(|e| e.public_ip == public_ip || e.allocation_id == public_ip)
+                .cloned()
+        })
+    }
+
+    /// Whether an `AWS::EC2::EIP` update changes a property that requires
+    /// replacement (`Domain`, `NetworkBorderGroup`, `PublicIpv4Pool`,
+    /// `Address`); `InstanceId` and `Tags` update in place.
+    pub(super) fn eip_requires_replacement(
+        &self,
+        existing: &StackResource,
+        new_def: &ResourceDefinition,
+    ) -> bool {
+        let Some(eip) = self.eip_record(&existing.physical_id) else {
+            return true;
+        };
+        let props = &new_def.properties;
+        let differs = |key: &str, current: &str, default: &str| {
+            prop_str(props, key).unwrap_or(default) != current
+        };
+        differs("Domain", &eip.domain, "vpc")
+            || prop_str(props, "NetworkBorderGroup").is_some_and(|v| v != eip.network_border_group)
+            || prop_str(props, "PublicIpv4Pool").is_some_and(|v| v != eip.public_ipv4_pool)
+            || prop_str(props, "Address").is_some_and(|v| v != eip.public_ip)
+    }
+
+    /// In-place `AWS::EC2::EIP` update: re-associate to a changed
+    /// `InstanceId` (or disassociate when dropped) and replace the tags.
+    pub(super) fn update_ec2_eip(
+        &self,
+        existing: &StackResource,
+        new_def: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &new_def.properties;
+        let eip = self
+            .eip_record(&existing.physical_id)
+            .ok_or_else(|| format!("Elastic IP {} not found", existing.physical_id))?;
+        let wanted = prop_str(props, "InstanceId");
+        if wanted != eip.instance_id.as_deref() {
+            if let Some(association_id) = &eip.association_id {
+                let mut params = HashMap::new();
+                params.insert("AssociationId".to_string(), association_id.clone());
+                self.ec2_dispatch("DisassociateAddress", params)?;
+            }
+            if let Some(instance) = wanted {
+                let mut params = HashMap::new();
+                params.insert("AllocationId".to_string(), eip.allocation_id.clone());
+                params.insert("InstanceId".to_string(), instance.to_string());
+                self.ec2_dispatch("AssociateAddress", params)?;
+            }
+        }
+        self.replace_ec2_tags(&eip.allocation_id, props)?;
+        Ok(ProvisionResult::new(existing.physical_id.clone())
+            .with("PublicIp", eip.public_ip)
+            .with("AllocationId", eip.allocation_id))
+    }
+
+    /// Whether an `AWS::EC2::NatGateway` update changes a property that
+    /// requires replacement (`SubnetId`, `AllocationId`, `ConnectivityType`);
+    /// `Tags` update in place.
+    pub(super) fn nat_gateway_requires_replacement(
+        &self,
+        existing: &StackResource,
+        new_def: &ResourceDefinition,
+    ) -> bool {
+        let nat = {
+            let accounts = self.ec2_state.read();
+            accounts
+                .get(&self.account_id)
+                .and_then(|s| s.nat_gateways.get(&existing.physical_id).cloned())
+        };
+        let Some(nat) = nat else {
+            return true;
+        };
+        let props = &new_def.properties;
+        prop_str(props, "SubnetId").unwrap_or_default() != nat.subnet_id
+            || prop_str(props, "ConnectivityType").unwrap_or("public") != nat.connectivity_type
+            || prop_str(props, "AllocationId") != nat.allocation_id.as_deref()
+    }
+
+    /// In-place `AWS::EC2::NatGateway` update: replace the tags.
+    pub(super) fn update_ec2_nat_gateway(
+        &self,
+        existing: &StackResource,
+        new_def: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        self.replace_ec2_tags(&existing.physical_id, &new_def.properties)?;
+        Ok(ProvisionResult::new(existing.physical_id.clone())
+            .with("NatGatewayId", existing.physical_id.clone()))
+    }
+
+    /// Make a resource's tags exactly the template's `Tags`.
+    fn replace_ec2_tags(&self, resource_id: &str, props: &Value) -> Result<(), String> {
+        let mut clear = HashMap::new();
+        clear.insert("ResourceId.1".to_string(), resource_id.to_string());
+        self.ec2_dispatch("DeleteTags", clear)?;
+        let mut params = HashMap::new();
+        params.insert("ResourceId.1".to_string(), resource_id.to_string());
+        let mut n = 0;
+        for t in props
+            .get("Tags")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(k), Some(v)) = (prop_str(t, "Key"), prop_str(t, "Value")) {
+                n += 1;
+                params.insert(format!("Tag.{n}.Key"), k.to_string());
+                params.insert(format!("Tag.{n}.Value"), v.to_string());
+            }
+        }
+        if n > 0 {
+            self.ec2_dispatch("CreateTags", params)?;
+        }
+        Ok(())
     }
 
     /// `AWS::EC2::NatGateway`: a NAT gateway in a subnet. `Ref` returns the
@@ -387,21 +512,34 @@ impl ResourceProvisioner {
         Ok(ProvisionResult::new(id.clone()).with("NatGatewayId", id))
     }
 
-    /// Delete the backing EC2 state of a standalone networking resource.
-    pub(super) fn delete_ec2_network_resource(&self, resource: &StackResource) {
+    /// Delete the backing EC2 state of a standalone networking resource. A
+    /// resource already gone is not a failure; a failed EIP release or NAT
+    /// gateway delete is, so a replacement never silently leaks it.
+    pub(super) fn delete_ec2_network_resource(
+        &self,
+        resource: &StackResource,
+    ) -> Result<(), String> {
         let id = resource.physical_id.as_str();
         match resource.resource_type.as_str() {
             "AWS::EC2::SecurityGroupIngress" => self.delete_ec2_sg_rule(id, false),
             "AWS::EC2::SecurityGroupEgress" => self.delete_ec2_sg_rule(id, true),
             "AWS::EC2::VPCGatewayAttachment" => self.delete_ec2_vpc_gateway_attachment(id),
             "AWS::EC2::Route" => self.delete_ec2_route(id),
-            "AWS::EC2::EIP" => self.delete_ec2_eip(id),
+            "AWS::EC2::EIP" => return self.delete_ec2_eip(id),
             "AWS::EC2::NatGateway" => {
-                let mut params = HashMap::new();
-                params.insert("NatGatewayId".to_string(), id.to_string());
-                let _ = self.ec2_dispatch("DeleteNatGateway", params);
+                let exists = self
+                    .ec2_state
+                    .read()
+                    .get(&self.account_id)
+                    .is_some_and(|s| s.nat_gateways.contains_key(id));
+                if exists {
+                    let mut params = HashMap::new();
+                    params.insert("NatGatewayId".to_string(), id.to_string());
+                    self.ec2_dispatch("DeleteNatGateway", params)?;
+                }
             }
             _ => {}
         }
+        Ok(())
     }
 }

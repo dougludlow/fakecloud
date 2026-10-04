@@ -2206,6 +2206,14 @@ impl ResourceProvisioner {
             // In-place updates: reprovision would churn the vpc-/subnet-/rtb- id
             // and orphan every child/sibling that references it (subnets, SGs,
             // route tables, routes, associations, instances, ENIs).
+            "AWS::EC2::EIP" if self.eip_requires_replacement(existing, new_def) => {
+                self.reprovision_resource(existing, new_def)?
+            }
+            "AWS::EC2::EIP" => Some(self.update_ec2_eip(existing, new_def)?),
+            "AWS::EC2::NatGateway" if self.nat_gateway_requires_replacement(existing, new_def) => {
+                self.reprovision_resource(existing, new_def)?
+            }
+            "AWS::EC2::NatGateway" => Some(self.update_ec2_nat_gateway(existing, new_def)?),
             "AWS::EC2::VPC" => Some(self.update_ec2_vpc(existing, new_def)?),
             "AWS::EC2::Subnet" => Some(self.update_ec2_subnet(existing, new_def)?),
             "AWS::EC2::RouteTable" => Some(self.update_ec2_route_table(existing, new_def)?),
@@ -2791,10 +2799,7 @@ impl ResourceProvisioner {
             | "AWS::EC2::VPCGatewayAttachment"
             | "AWS::EC2::Route"
             | "AWS::EC2::EIP"
-            | "AWS::EC2::NatGateway" => {
-                self.delete_ec2_network_resource(resource);
-                Ok(())
-            }
+            | "AWS::EC2::NatGateway" => self.delete_ec2_network_resource(resource),
             "AWS::AutoScaling::LaunchConfiguration" | "AWS::AutoScaling::AutoScalingGroup" => {
                 self.delete_autoscaling(&resource.resource_type, &resource.physical_id);
                 Ok(())
