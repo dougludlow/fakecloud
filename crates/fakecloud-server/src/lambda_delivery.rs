@@ -36,7 +36,8 @@ impl LambdaDelivery for LambdaDeliveryImpl {
                 accounts.default_account_id(),
                 accounts.region(),
             );
-            let resolved = fakecloud_lambda::resolve_invocable(&accounts, function_arn, account, region);
+            let resolved =
+                fakecloud_lambda::resolve_invocable(&accounts, function_arn, account, region);
             (
                 account.to_string(),
                 region.to_string(),

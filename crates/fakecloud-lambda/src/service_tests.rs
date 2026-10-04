@@ -1657,7 +1657,13 @@ async fn list_functions_all_versions_paginates_through_every_version_once() {
     // than hanging the test suite.
     for _ in 0..50 {
         let resp = svc
-            .list_functions("123456789012", "us-east-1", Some("ALL"), marker.as_deref(), Some(1))
+            .list_functions(
+                "123456789012",
+                "us-east-1",
+                Some("ALL"),
+                marker.as_deref(),
+                Some(1),
+            )
             .unwrap();
         let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         let page = v["Functions"].as_array().unwrap();
@@ -4903,7 +4909,10 @@ async fn function_arn_from_another_region_is_unreachable() {
     // operations, invocations and tagging alike.
     for (method, path) in [
         (Method::GET, format!("/2015-03-31/functions/{arn}")),
-        (Method::POST, format!("/2015-03-31/functions/{arn}/invocations")),
+        (
+            Method::POST,
+            format!("/2015-03-31/functions/{arn}/invocations"),
+        ),
         (Method::GET, format!("/2017-03-31/tags/{arn}")),
     ] {
         let err = svc
@@ -5047,15 +5056,18 @@ fn resource_policy_provider_reads_the_arn_region() {
     {
         let mut accounts = state.write();
         for (region, policy) in [("us-east-1", "east"), ("eu-west-1", "west")] {
-            accounts.regional_mut("123456789012", region).functions.insert(
-                "f".to_string(),
-                crate::state::LambdaFunction {
-                    function_name: "f".to_string(),
-                    function_arn: function_arn(region, "123456789012", "f"),
-                    policy: Some(policy.to_string()),
-                    ..Default::default()
-                },
-            );
+            accounts
+                .regional_mut("123456789012", region)
+                .functions
+                .insert(
+                    "f".to_string(),
+                    crate::state::LambdaFunction {
+                        function_name: "f".to_string(),
+                        function_arn: function_arn(region, "123456789012", "f"),
+                        policy: Some(policy.to_string()),
+                        ..Default::default()
+                    },
+                );
         }
     }
     let provider = crate::resource_policy::LambdaResourcePolicyProvider::new(state);

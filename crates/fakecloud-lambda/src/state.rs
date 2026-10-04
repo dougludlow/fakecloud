@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fakecloud_core::multi_account::{
-    AccountState, MultiAccountState, MultiRegionState, RegionalState, SplitByRegion,
+    parse_regional_snapshot, AccountState, MultiRegionState, RegionalSnapshot, RegionalState,
+    SplitByRegion,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -741,7 +742,9 @@ impl SplitByRegion for LambdaState {
                 .map(str::to_string)
                 .unwrap_or_else(|| default_region.clone());
             execution_regions.insert(arn.clone(), region.clone());
-            into.region_mut(&region).durable_executions.insert(arn, exec);
+            into.region_mut(&region)
+                .durable_executions
+                .insert(arn, exec);
         }
         for (id, callback) in self.durable_execution_callbacks {
             let region = execution_regions
@@ -764,61 +767,30 @@ impl SplitByRegion for LambdaState {
 /// account's state.
 pub const LAMBDA_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LambdaSnapshot {
-    pub schema_version: u32,
-    #[serde(default)]
-    pub accounts: Option<MultiRegionState<LambdaState>>,
-    /// Only set when a v1 (single-account) snapshot is migrated: that one
-    /// account's state split by region, for the caller to merge into its own
-    /// container.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<RegionalState<LambdaState>>,
-}
+/// A persisted Lambda snapshot: the (account, region)-partitioned state, or,
+/// for a migrated v1 snapshot, one account's state split by region.
+pub type LambdaSnapshot = RegionalSnapshot<LambdaState>;
 
-#[derive(Debug, Deserialize)]
-struct LegacyLambdaSnapshot {
-    #[serde(default)]
-    accounts: Option<MultiAccountState<LambdaState>>,
-    #[serde(default)]
-    state: Option<LambdaState>,
-}
-
-#[derive(Deserialize)]
-struct SnapshotVersion {
-    schema_version: u32,
-}
-
-/// Parse a persisted Lambda snapshot, migrating older schemas to the current
-/// one. A snapshot newer than this build comes back with its on-disk
-/// `schema_version` and no state, for the caller to refuse.
+/// Parse a persisted Lambda snapshot, migrating older schemas (v1: one
+/// account's state; v2: one account-wide state per account) by splitting each
+/// account by region. A snapshot newer than this build comes back with its
+/// on-disk `schema_version` and no state, for the caller to refuse.
 pub fn parse_lambda_snapshot(bytes: &[u8]) -> Result<LambdaSnapshot, serde_json::Error> {
-    let SnapshotVersion { schema_version } = serde_json::from_slice(bytes)?;
-    if schema_version > LAMBDA_SNAPSHOT_SCHEMA_VERSION {
-        return Ok(LambdaSnapshot {
-            schema_version,
-            accounts: None,
-            state: None,
-        });
-    }
-    if schema_version == LAMBDA_SNAPSHOT_SCHEMA_VERSION {
-        return serde_json::from_slice(bytes);
-    }
-    let legacy: LegacyLambdaSnapshot = serde_json::from_slice(bytes)?;
-    Ok(LambdaSnapshot {
-        schema_version: LAMBDA_SNAPSHOT_SCHEMA_VERSION,
-        accounts: legacy.accounts.map(MultiAccountState::into_regional),
-        state: legacy.state.map(|state| {
+    parse_regional_snapshot(
+        bytes,
+        LAMBDA_SNAPSHOT_SCHEMA_VERSION,
+        |state: LambdaState| {
             let account_id = state.account_id.clone();
             let region = state.region.clone();
             RegionalState::from_legacy(&account_id, &region, "", state)
-        }),
-    })
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fakecloud_core::multi_account::MultiAccountState;
 
     #[test]
     fn new_has_empty_collections() {

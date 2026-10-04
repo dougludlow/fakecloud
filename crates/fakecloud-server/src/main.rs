@@ -2188,10 +2188,8 @@ async fn main() {
                                     "loaded lambda persistence snapshot (multi-account)"
                                 );
                             } else if let Some(single_state) = snapshot.state {
-                                let fn_count: usize = single_state
-                                    .regions()
-                                    .map(|(_, s)| s.functions.len())
-                                    .sum();
+                                let fn_count: usize =
+                                    single_state.regions().map(|(_, s)| s.functions.len()).sum();
                                 let account_id = single_state.account_id().to_string();
                                 let mut mas = lambda_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
@@ -12792,4 +12790,3 @@ mod dns_introspection_tests {
         assert_eq!(json["status"], "ANSWERED");
     }
 }
-

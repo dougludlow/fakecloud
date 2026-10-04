@@ -2045,8 +2045,7 @@ impl ConfigService {
         // name is the rule's own account and region.
         let resolved = {
             let accounts = lambda_state.read();
-            let rule_region =
-                fakecloud_aws::arn::region_of(rule_arn).unwrap_or(accounts.region());
+            let rule_region = fakecloud_aws::arn::region_of(rule_arn).unwrap_or(accounts.region());
             fakecloud_lambda::resolve_invocable(&accounts, lambda_arn, account, rule_region)
         };
         let Some((func, layer_zips)) = resolved else {

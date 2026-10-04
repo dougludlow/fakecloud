@@ -277,7 +277,9 @@ impl LambdaService {
             .unwrap_or_default();
         let (account_id, layer_name, version) =
             parse_layer_version_arn(&arn).ok_or_else(|| missing("Arn"))?;
-        let region = fakecloud_aws::arn::region_of(&arn).unwrap_or(&req.region).to_string();
+        let region = fakecloud_aws::arn::region_of(&arn)
+            .unwrap_or(&req.region)
+            .to_string();
         let location = layer_content_url(req, &account_id, &region, &layer_name, version);
         self.with_state_read(&account_id, &region, |state| {
             state

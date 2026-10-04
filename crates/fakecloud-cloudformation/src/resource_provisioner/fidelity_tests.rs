@@ -475,7 +475,10 @@ fn event_source_mapping_keeps_alias_qualifier_and_self_managed_config() {
         }),
     );
     let lam = prov.lambda_state.read();
-    let esm = &lam.regional(ACCT, "us-east-1").unwrap().event_source_mappings[&sr.physical_id];
+    let esm = &lam
+        .regional(ACCT, "us-east-1")
+        .unwrap()
+        .event_source_mappings[&sr.physical_id];
     assert_eq!(esm.function_arn, alias_arn);
     assert_eq!(
         esm.self_managed_event_source,
@@ -655,7 +658,10 @@ fn sam_cognito_logs_iot_and_kafka_events_provision() {
 
     let esm = by_logical(&resources, "FnKafkaEventSourceMapping");
     let lam = prov.lambda_state.read();
-    let mapping = &lam.regional(ACCT, "us-east-1").unwrap().event_source_mappings[&esm.physical_id];
+    let mapping = &lam
+        .regional(ACCT, "us-east-1")
+        .unwrap()
+        .event_source_mappings[&esm.physical_id];
     assert_eq!(mapping.topics, vec!["orders".to_string()]);
     assert_eq!(
         mapping.self_managed_event_source,

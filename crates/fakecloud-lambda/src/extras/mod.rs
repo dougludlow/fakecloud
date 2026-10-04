@@ -1023,7 +1023,6 @@ impl LambdaService {
         let response = self.event_source_mapping_json(esm);
         ok(response)
     }
-
 }
 
 fn extract_csc_id(input: &str) -> String {
@@ -1103,9 +1102,11 @@ mod tests {
     use std::sync::Arc;
 
     fn svc() -> LambdaService {
-        let state: SharedLambdaState = Arc::new(RwLock::new(
-            MultiRegionState::<LambdaState>::new("000000000000", "us-east-1", ""),
-        ));
+        let state: SharedLambdaState = Arc::new(RwLock::new(MultiRegionState::<LambdaState>::new(
+            "000000000000",
+            "us-east-1",
+            "",
+        )));
         LambdaService::new(state)
     }
 
@@ -1185,7 +1186,12 @@ mod tests {
         )
         .await;
         publish().await;
-        let versions: Vec<i64> = s.state.read().regional("000000000000", "us-east-1").unwrap().layers["layer1"]
+        let versions: Vec<i64> = s
+            .state
+            .read()
+            .regional("000000000000", "us-east-1")
+            .unwrap()
+            .layers["layer1"]
             .versions
             .iter()
             .map(|v| v.version)

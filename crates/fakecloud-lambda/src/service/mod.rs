@@ -1750,12 +1750,16 @@ impl AwsService for LambdaService {
                 }
                 self.list_event_source_mappings(aid, &req)
             }
-            "GetEventSourceMapping" => {
-                self.get_event_source_mapping(resource_name.as_deref().unwrap_or(""), aid, req.region.as_str())
-            }
-            "DeleteEventSourceMapping" => {
-                self.delete_event_source_mapping(resource_name.as_deref().unwrap_or(""), aid, req.region.as_str())
-            }
+            "GetEventSourceMapping" => self.get_event_source_mapping(
+                resource_name.as_deref().unwrap_or(""),
+                aid,
+                req.region.as_str(),
+            ),
+            "DeleteEventSourceMapping" => self.delete_event_source_mapping(
+                resource_name.as_deref().unwrap_or(""),
+                aid,
+                req.region.as_str(),
+            ),
             "CreateCapacityProvider" => {
                 crate::workflows::create_capacity_provider(&self.state, &req, &req.json_body())
             }

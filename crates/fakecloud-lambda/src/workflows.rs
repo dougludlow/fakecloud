@@ -132,7 +132,9 @@ pub(crate) fn get_capacity_provider(
     check_len("CapacityProviderName", name, 1, 140)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let cp = s
         .capacity_providers
         .get(name)
@@ -160,7 +162,9 @@ pub(crate) fn list_capacity_providers(
     }
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let providers: Vec<Value> = s
         .capacity_providers
         .values()
@@ -238,7 +242,9 @@ pub(crate) fn list_function_versions_by_capacity_provider(
     check_len("CapacityProviderName", name, 1, 140)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let cp = s
         .capacity_providers
         .get(name)
@@ -299,7 +305,9 @@ pub(crate) fn list_durable_executions_by_function(
     }
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let executions: Vec<Value> = s
         .durable_executions
         .values()
@@ -333,7 +341,9 @@ pub(crate) fn get_durable_execution(
     check_len("DurableExecutionArn", arn, 1, 1024)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let exec = ensure_execution(s, arn)?;
     Ok(AwsResponse::ok_json(
         json!({ "DurableExecution": execution_json(exec) }),
@@ -348,7 +358,9 @@ pub(crate) fn get_durable_execution_history(
     check_len("DurableExecutionArn", arn, 1, 1024)?;
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let exec = ensure_execution(s, arn)?;
     Ok(AwsResponse::ok_json(json!({
         "Events": exec.history.clone(),
@@ -365,7 +377,9 @@ pub(crate) fn get_durable_execution_state(
     // for client errors (no ResourceNotFoundException), so map missing arn there.
     let accts = state.read();
     let empty = crate::state::LambdaState::new(&req.account_id, &req.region);
-    let s = accts.regional(&req.account_id, &req.region).unwrap_or(&empty);
+    let s = accts
+        .regional(&req.account_id, &req.region)
+        .unwrap_or(&empty);
     let exec = s
         .durable_executions
         .get(arn)
@@ -606,7 +620,12 @@ mod tests {
             "PermissionsConfig": {"RoleArn": "old"}
         });
         create_capacity_provider(&s, &req(), &body).unwrap();
-        let prev_mod = s.read().regional("123456789012", "us-east-1").unwrap().capacity_providers["cp1"].last_modified;
+        let prev_mod = s
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .capacity_providers["cp1"]
+            .last_modified;
         std::thread::sleep(std::time::Duration::from_millis(2));
         update_capacity_provider(
             &s,
@@ -616,7 +635,10 @@ mod tests {
         )
         .unwrap();
         let state = s.read();
-        let cp = &state.regional("123456789012", "us-east-1").unwrap().capacity_providers["cp1"];
+        let cp = &state
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .capacity_providers["cp1"];
         assert_eq!(cp.permissions_config["RoleArn"], "new");
         assert!(cp.last_modified > prev_mod);
     }
@@ -675,7 +697,12 @@ mod tests {
         seed_execution(&s, arn, "fn1", "Running");
         let body = json!({"State": {"step": 2}, "Event": {"type": "Tick"}});
         checkpoint_durable_execution(&s, &req(), arn, &body).unwrap();
-        let exec = s.read().regional("123456789012", "us-east-1").unwrap().durable_executions[arn].clone();
+        let exec = s
+            .read()
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .durable_executions[arn]
+            .clone();
         assert_eq!(exec.state["step"], 2);
         assert_eq!(exec.history.len(), 1);
     }
@@ -748,7 +775,10 @@ mod tests {
         send_callback_failure(&s, &req(), "cb2").unwrap();
         send_callback_heartbeat(&s, &req(), "cb3").unwrap();
         let st = s.read();
-        let cbs = &st.regional("123456789012", "us-east-1").unwrap().durable_execution_callbacks;
+        let cbs = &st
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .durable_execution_callbacks;
         assert_eq!(cbs["cb1"].outcome, "Succeeded");
         assert_eq!(cbs["cb2"].outcome, "Failed");
         assert_eq!(cbs["cb3"].outcome, "Heartbeat");
