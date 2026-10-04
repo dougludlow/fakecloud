@@ -744,7 +744,9 @@ impl XrayService {
         }
         let cfg = Value::Object(cfg);
         let mut guard = self.state.write();
-        guard.regional_mut(&ctx.account, &ctx.region).encryption_config = Some(cfg.clone());
+        guard
+            .regional_mut(&ctx.account, &ctx.region)
+            .encryption_config = Some(cfg.clone());
         Ok(ok(json!({ "EncryptionConfig": cfg })))
     }
 
@@ -945,7 +947,9 @@ impl XrayService {
             .unwrap_or("XRay")
             .to_string();
         let mut guard = self.state.write();
-        guard.regional_mut(&ctx.account, &ctx.region).trace_segment_destination = dest.clone();
+        guard
+            .regional_mut(&ctx.account, &ctx.region)
+            .trace_segment_destination = dest.clone();
         Ok(ok(json!({ "Destination": dest, "Status": "ACTIVE" })))
     }
 
@@ -1708,8 +1712,11 @@ mod tests {
         let west = ctx_in("eu-west-1");
         // Same group and rule names coexist in two regions.
         for c in [ctx(), ctx_in("eu-west-1")] {
-            s.create_group(&c, &json!({ "GroupName": "g", "FilterExpression": "fault" }))
-                .unwrap();
+            s.create_group(
+                &c,
+                &json!({ "GroupName": "g", "FilterExpression": "fault" }),
+            )
+            .unwrap();
             let rule = json!({ "SamplingRule": {
                 "RuleName": "r1", "ResourceARN": "*", "Priority": 5, "FixedRate": 0.1,
                 "ReservoirSize": 2, "ServiceName": "*", "ServiceType": "*", "Host": "*",
