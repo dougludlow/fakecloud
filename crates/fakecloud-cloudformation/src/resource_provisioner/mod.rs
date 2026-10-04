@@ -10167,18 +10167,82 @@ mod tests {
     #[test]
     fn wafv2_web_acl_association_lifecycle() {
         let prov = make_provisioner();
+        let acl = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACL",
+                "Acl",
+                serde_json::json!({
+                    "Name": "my-acl", "Scope": "REGIONAL",
+                    "DefaultAction": {"Allow": {}}, "Rules": [], "VisibilityConfig": {}
+                }),
+            ))
+            .expect("web acl provisions");
+        let alb = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/my-alb/50dc6c495c0c9188";
         let res = make_resource(
             "AWS::WAFv2::WebACLAssociation",
             "MyAssoc",
-            serde_json::json!({
-                "ResourceArn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/my-alb/50dc6c495c0c9188",
-                "WebACLArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/my-acl/abc",
-            }),
+            serde_json::json!({ "ResourceArn": alb, "WebACLArn": acl.physical_id }),
         );
         let sr = prov.create_resource(&res).unwrap();
-        assert_eq!(sr.physical_id, "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/my-alb/50dc6c495c0c9188");
+        assert_eq!(sr.physical_id, alb);
+        // The association lives with the resource, in the stack's region.
+        assert_eq!(
+            prov.wafv2_state
+                .read()
+                .region(&prov.account_id, &prov.region)
+                .unwrap()
+                .associations
+                .get(alb),
+            Some(&acl.physical_id)
+        );
 
         prov.delete_resource(&sr.clone()).unwrap();
+        assert!(prov
+            .wafv2_state
+            .read()
+            .region(&prov.account_id, &prov.region)
+            .unwrap()
+            .associations
+            .is_empty());
+    }
+
+    #[test]
+    fn wafv2_web_acl_association_rejects_other_regions() {
+        let prov = make_provisioner();
+        let acl = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACL",
+                "Acl",
+                serde_json::json!({
+                    "Name": "my-acl", "Scope": "REGIONAL",
+                    "DefaultAction": {"Allow": {}}, "Rules": [], "VisibilityConfig": {}
+                }),
+            ))
+            .expect("web acl provisions");
+        // A resource in another region than the stack (and the web ACL).
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACLAssociation",
+                "Assoc",
+                serde_json::json!({
+                    "ResourceArn": "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/a/1",
+                    "WebACLArn": acl.physical_id,
+                }),
+            ))
+            .unwrap_err();
+        assert!(err.contains("WAFNonexistentItemException"), "{err}");
+        // A web ACL of another region than the resource.
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACLAssociation",
+                "Assoc2",
+                serde_json::json!({
+                    "ResourceArn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/a/1",
+                    "WebACLArn": acl.physical_id.replace(":us-east-1:", ":eu-west-1:"),
+                }),
+            ))
+            .unwrap_err();
+        assert!(err.contains("WAFNonexistentItemException"), "{err}");
     }
 
     #[test]

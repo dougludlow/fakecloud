@@ -465,8 +465,23 @@ impl ResourceProvisioner {
             .ok_or("WebACLArn is required")?
             .to_string();
 
+        // As AssociateWebACL (which CloudFormation calls in the stack's
+        // region): the resource must be in that region, and so must the web
+        // ACL; the association lives with the resource.
+        let region = self.wafv2_arn_region(&resource_arn);
+        if region != self.region {
+            return Err(format!(
+                "WAFNonexistentItemException: resource {resource_arn} is not in {}",
+                self.region
+            ));
+        }
         let mut accounts = self.wafv2_state.write();
-        let state = accounts.region_mut(&self.account_id, &self.wafv2_arn_region(&web_acl_arn));
+        let state = accounts.region_mut(&self.account_id, &region);
+        if !state.web_acls.values().any(|a| a.arn == web_acl_arn) {
+            return Err(format!(
+                "WAFNonexistentItemException: web ACL {web_acl_arn} does not exist in {region}"
+            ));
+        }
         state.associations.insert(resource_arn.clone(), web_acl_arn);
 
         // Physical id encodes the resource arn so delete can find it.
