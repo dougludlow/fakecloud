@@ -189,7 +189,12 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
         SchedulerService::new(self.scheduler_state.clone())
-            .replace_schedule_group_tags(&self.account_id, &existing.physical_id, tags)
+            .replace_schedule_group_tags(
+                &self.account_id,
+                &self.region,
+                &existing.physical_id,
+                tags,
+            )
             .map_err(|e| format!("{}: {}", e.code(), e.message()))?;
         let mut result = ProvisionResult::new(existing.physical_id.clone());
         for (k, v) in &existing.attributes {

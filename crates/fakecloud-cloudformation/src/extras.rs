@@ -3115,7 +3115,9 @@ pub(crate) mod tests {
             amplify: shared::<fakecloud_amplify::state::AmplifyData>(),
             iot: shared::<fakecloud_iot::IotData>(),
             appconfig: shared::<fakecloud_appconfig::AppConfigState>(),
-            scheduler: shared::<fakecloud_scheduler::SchedulerState>(),
+            scheduler: shared::<
+                fakecloud_core::multi_account::RegionalState<fakecloud_scheduler::SchedulerState>,
+            >(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
             iam_mode: Default::default(),

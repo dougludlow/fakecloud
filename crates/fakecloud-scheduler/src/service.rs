@@ -98,11 +98,12 @@ impl SchedulerService {
     pub fn replace_schedule_group_tags(
         &self,
         account_id: &str,
+        region: &str,
         name: &str,
         tags: BTreeMap<String, String>,
     ) -> Result<(), AwsServiceError> {
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(account_id);
+        let state = accounts.regional_mut(account_id, region);
         let group = state
             .groups
             .get_mut(name)

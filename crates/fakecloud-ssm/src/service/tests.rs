@@ -5710,9 +5710,16 @@ async fn send_command_completion_persists_success() {
     let status = wait_for_command_status(&svc, &command_id, "Success").await;
     assert_eq!(status, "Success", "command should complete in-memory");
 
-    // The completed command must be on disk as Success, not stranded at Pending.
+    // The completed command must be on disk as Success, not stranded at
+    // Pending. The save follows the in-memory flip asynchronously, so poll.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut persisted = persisted_command_status(&store, &command_id);
+    while persisted.as_deref() != Some("Success") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        persisted = persisted_command_status(&store, &command_id);
+    }
     assert_eq!(
-        persisted_command_status(&store, &command_id).as_deref(),
+        persisted.as_deref(),
         Some("Success"),
         "background advance must persist the Success transition"
     );

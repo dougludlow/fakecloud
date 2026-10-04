@@ -3831,3 +3831,84 @@ fn confirm_and_unsubscribe_resolve_the_subscription_from_its_arn() {
         .subscriptions
         .is_empty());
 }
+
+#[test]
+fn cross_account_subscriptions_live_with_the_topic_in_its_region() {
+    let (svc, state) = make_sns();
+    let in_region = |action: &str, params: Vec<(&str, &str)>, region: &str, account: &str| {
+        let mut req = sns_request(action, params);
+        req.region = region.to_string();
+        req.account_id = account.to_string();
+        req
+    };
+    // Account 123456789012 owns a topic in eu-west-1.
+    assert_ok(&svc.create_topic(&in_region(
+        "CreateTopic",
+        vec![("Name", "shared")],
+        "eu-west-1",
+        "123456789012",
+    )));
+    let topic_arn = "arn:aws:sns:eu-west-1:123456789012:shared";
+    // Account 210987654321 subscribes from eu-west-1.
+    let result = svc.subscribe(&in_region(
+        "Subscribe",
+        vec![
+            ("TopicArn", topic_arn),
+            ("Protocol", "sqs"),
+            ("Endpoint", "arn:aws:sqs:eu-west-1:210987654321:mine"),
+        ],
+        "eu-west-1",
+        "210987654321",
+    ));
+    assert_ok(&result);
+    let body = response_body(&result);
+    let start = body.find("<SubscriptionArn>").unwrap() + "<SubscriptionArn>".len();
+    let end = body[start..].find("</SubscriptionArn>").unwrap() + start;
+    let sub_arn = body[start..end].to_string();
+    // Stored with the topic: owner account, topic region.
+    assert!(state
+        .read()
+        .regional("123456789012", "eu-west-1")
+        .unwrap()
+        .subscriptions
+        .contains_key(&sub_arn));
+
+    // The subscriber lists it in eu-west-1 only.
+    let list = |region: &str| {
+        response_body(&svc.list_subscriptions(&in_region(
+            "ListSubscriptions",
+            vec![],
+            region,
+            "210987654321",
+        )))
+    };
+    assert!(list("eu-west-1").contains(&sub_arn));
+    assert!(!list("us-east-1").contains(&sub_arn));
+    // A Subscribe sent to another region than the topic's finds no topic.
+    assert!(svc
+        .subscribe(&in_region(
+            "Subscribe",
+            vec![
+                ("TopicArn", topic_arn),
+                ("Protocol", "sqs"),
+                ("Endpoint", "arn:aws:sqs:us-east-1:210987654321:other"),
+            ],
+            "us-east-1",
+            "210987654321",
+        ))
+        .is_err());
+
+    // The subscriber unsubscribes via the link, opened from anywhere.
+    assert_ok(&svc.unsubscribe(&in_region(
+        "Unsubscribe",
+        vec![("SubscriptionArn", &sub_arn)],
+        "us-east-1",
+        "210987654321",
+    )));
+    assert!(state
+        .read()
+        .regional("123456789012", "eu-west-1")
+        .unwrap()
+        .subscriptions
+        .is_empty());
+}
