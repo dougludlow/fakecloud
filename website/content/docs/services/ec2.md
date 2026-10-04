@@ -21,7 +21,7 @@ fakecloud implements **802 of 802** AWS EC2 operations at 100% Smithy conformanc
 - **Network Insights** — reachability paths + analyses and access scopes + scope analyses (content, findings).
 - **Outpost / hybrid** — carrier gateways, CoIP pools + CIDRs, local-gateway route tables, routes, VPC + virtual-interface-group associations, virtual interfaces, and groups.
 - **Access & diagnostics** — EC2 Instance Connect endpoints, fast launch, serial-console access, console output / screenshot, and password data. `GetConsoleOutput` returns the instance container's real console log (its combined stdout/stderr, including anything user-data printed at boot), base64-encoded as on AWS.
-- **Cross-cutting** — tag specifications on create, `CreateTags` / `DeleteTags` / `DescribeTags`, `Filter.N` filtering, and `MaxResults` / `NextToken` pagination across every `Describe*`.
+- **Cross-cutting** — tag specifications on create, `CreateTags` / `DeleteTags` / `DescribeTags`, `Filter.N` filtering, and `MaxResults` / `NextToken` pagination on every operation the model paginates (all 215 `Describe*` / `Get*` / `Search*` / `List*` operations with a `NextToken` input): `MaxResults` is checked against the model's range, `nextToken` is opaque and returned only when items remain, and a token fakecloud did not mint is rejected with `InvalidParameterValue`.
 
 ## Protocol
 

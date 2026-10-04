@@ -2112,7 +2112,7 @@ pub(crate) fn describe_instances(
             .cmp(&b.reservation_id)
             .then(a.instance_id.cmp(&b.instance_id))
     });
-    let (page, token) = crate::service_helpers::paginate(&matching, next_token, max_results);
+    let (page, token) = crate::service_helpers::paginate(&matching, next_token, max_results)?;
 
     // Group the page back into reservations, preserving the sorted order.
     let mut by_res: HashMap<String, Vec<String>> = HashMap::new();
@@ -2313,7 +2313,7 @@ pub(crate) fn describe_instance_status(
         })
         .collect();
     matching.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
-    let (page, token) = crate::service_helpers::paginate(&matching, next_token, max_results);
+    let (page, token) = crate::service_helpers::paginate(&matching, next_token, max_results)?;
     let items: Vec<String> = page
         .iter()
         .map(|i| {

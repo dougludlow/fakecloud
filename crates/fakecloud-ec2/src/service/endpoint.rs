@@ -282,7 +282,7 @@ pub(crate) fn describe_vpc_endpoint_services(
                 "{}{}<serviceType><item><serviceType>Gateway</serviceType></item></serviceType><acceptanceRequired>false</acceptanceRequired>{}",
                 ec2_elem("serviceName", n),
                 ec2_elem("owner", "amazon"),
-                ec2_elem("serviceId", &gen_id("vpce-svc")),
+                ec2_elem("serviceId", &crate::service_helpers::stable_id("vpce-svc", n)),
             )
         })
         .collect();

@@ -271,7 +271,7 @@ pub(crate) fn describe_vpcs(
         .filter(|v| !v.is_empty())
         .and_then(|v| v.parse::<usize>().ok());
     let next_token = req.query_params.get("NextToken").map(String::as_str);
-    let (page, token) = paginate(&items, next_token, max_results);
+    let (page, token) = paginate(&items, next_token, max_results)?;
     let body = format!(
         "{}{}",
         ec2_list("vpcSet", &page),

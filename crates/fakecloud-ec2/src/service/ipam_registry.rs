@@ -67,10 +67,8 @@ fn page_params(req: &AwsRequest) -> Result<(Option<usize>, Option<String>), AwsS
 /// rather than silently restarting the caller from the top.
 fn validate_offset_token(token: Option<&str>) -> Result<(), AwsServiceError> {
     match token {
-        Some(t) if t.parse::<usize>().is_err() => Err(invalid_parameter_value(format!(
-            "Invalid value '{t}' for NextToken"
-        ))),
-        _ => Ok(()),
+        Some(t) => crate::service_helpers::decode_page_token(t).map(|_| ()),
+        None => Ok(()),
     }
 }
 
@@ -89,10 +87,10 @@ fn paged_response(
     wrapper: &str,
     items: &[String],
     page: (Option<usize>, Option<String>),
-) -> AwsResponse {
+) -> Result<AwsResponse, AwsServiceError> {
     let (max_results, next_token) = page;
-    let (items, token) = paginate(items, next_token.as_deref(), max_results);
-    page_response(action, req, wrapper, &items, token)
+    let (items, token) = paginate(items, next_token.as_deref(), max_results)?;
+    Ok(page_response(action, req, wrapper, &items, token))
 }
 
 /// One already-paged set of rendered items, plus the `nextToken` that fetches
@@ -765,13 +763,13 @@ pub(crate) fn describe_ipam_internet_registry_associations(
             items.push(association_xml(a, &owner, &tags, &req.region));
         }
     }
-    Ok(paged_response(
+    paged_response(
         "DescribeIpamInternetRegistryAssociations",
         req,
         "ipamInternetRegistryAssociationSet",
         &items,
         page,
-    ))
+    )
 }
 
 // ---- routing policy registrations ----
@@ -1295,13 +1293,13 @@ pub(crate) fn get_ipam_routing_policy_registrations(
         .filter(|r| cidr.is_none_or(|c| &r.cidr == c))
         .map(registration_xml)
         .collect();
-    Ok(paged_response(
+    paged_response(
         "GetIpamRoutingPolicyRegistrations",
         req,
         "ipamRoutingPolicyRegistrationSet",
         &items,
         page,
-    ))
+    )
 }
 
 pub(crate) fn get_ipam_routing_policy_registration_deltas(
@@ -1356,17 +1354,14 @@ pub(crate) fn get_ipam_routing_policy_registration_deltas(
             .iter()
             .position(|d| d.delta_id == t)
             .ok_or_else(|| invalid_parameter_value(format!("Invalid value '{t}' for NextToken")))?,
-        Some(t) => {
-            validate_offset_token(Some(t))?;
-            t.parse::<usize>().unwrap_or(0).min(deltas.len())
-        }
+        Some(t) => crate::service_helpers::decode_page_token(t)?.min(deltas.len()),
     };
     let page_end = max_results.map_or(deltas.len(), |n| (page_start + n).min(deltas.len()));
     let token = (page_end < deltas.len()).then(|| {
         if reverse {
             deltas[page_end].delta_id.clone()
         } else {
-            page_end.to_string()
+            crate::service_helpers::encode_page_token(page_end)
         }
     });
     let items: Vec<String> = deltas.into_iter().map(delta_xml).collect();
@@ -1407,13 +1402,13 @@ pub(crate) fn get_ipam_route_origin_authorizations(
             items.push(s);
         }
     }
-    Ok(paged_response(
+    paged_response(
         "GetIpamRouteOriginAuthorizations",
         req,
         "ipamRouteOriginAuthorizationSet",
         &items,
         page,
-    ))
+    )
 }
 
 /// Per-ASN and per-CIDR views of what the registry has observed for an
@@ -1445,13 +1440,13 @@ pub(crate) fn get_ipam_internet_registry_association_asns(
         })
         .map(|asn| ec2_elem("asn", asn) + &ec2_elem("lastObservedAt", &now))
         .collect();
-    Ok(paged_response(
+    paged_response(
         "GetIpamInternetRegistryAssociationAsns",
         req,
         "ipamInternetRegistryAssociationAsnSet",
         &items,
         page,
-    ))
+    )
 }
 
 pub(crate) fn get_ipam_internet_registry_association_cidrs(
@@ -1479,13 +1474,13 @@ pub(crate) fn get_ipam_internet_registry_association_cidrs(
         })
         .map(|cidr| ec2_elem("cidr", cidr) + &ec2_elem("lastObservedAt", &now))
         .collect();
-    Ok(paged_response(
+    paged_response(
         "GetIpamInternetRegistryAssociationCidrs",
         req,
         "ipamInternetRegistryAssociationCidrSet",
         &items,
         page,
-    ))
+    )
 }
 
 /// Routes a resource discovery has seen in a region. fakecloud runs no BGP
@@ -1543,13 +1538,13 @@ pub(crate) fn get_ipam_discovered_routes(
             ));
         }
     }
-    Ok(paged_response(
+    paged_response(
         "GetIpamDiscoveredRoutes",
         req,
         "ipamDiscoveredRouteSet",
         &items,
         page,
-    ))
+    )
 }
 
 /// Route protection findings: a registration whose CIDR is authorized for its
@@ -1631,7 +1626,7 @@ pub(crate) fn get_ipam_route_protection_findings(
             items.push(finding);
         }
     }
-    let (page, token) = paginate(&items, next_token.as_deref(), max_results);
+    let (page, token) = paginate(&items, next_token.as_deref(), max_results)?;
     Ok(Ec2Service::respond(
         "GetIpamRouteProtectionFindings",
         &req.request_id,

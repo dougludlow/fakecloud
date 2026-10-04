@@ -273,11 +273,7 @@ fn pagination(req: &AwsRequest) -> Result<(Option<usize>, Option<String>), AwsSe
         .filter(|v| !v.is_empty())
         .cloned();
     if let Some(t) = &next_token {
-        if t.parse::<usize>().is_err() {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{t}' for NextToken"
-            )));
-        }
+        crate::service_helpers::decode_page_token(t)?;
     }
     Ok((max_results, next_token))
 }
@@ -599,7 +595,7 @@ pub(crate) fn describe_application_status_checks(
         .transpose()?
         .unwrap_or_default();
     let (page, token) =
-        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
+        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results)?;
     Ok(Ec2Service::respond(
         "DescribeApplicationStatusChecks",
         &req.request_id,
@@ -901,7 +897,7 @@ pub(crate) fn describe_application_status_check_associations(
         }
     }
     let (page, token) =
-        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
+        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results)?;
     Ok(Ec2Service::respond(
         "DescribeApplicationStatusCheckAssociations",
         &req.request_id,
@@ -1030,7 +1026,7 @@ pub(crate) fn describe_application_status(
         ));
     }
     let (page, token) =
-        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
+        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results)?;
     Ok(Ec2Service::respond(
         "DescribeApplicationStatus",
         &req.request_id,

@@ -138,7 +138,10 @@ pub(crate) fn describe_reserved_instances_offerings(
     );
     let item = format!(
         "{}{}{}<duration>31536000</duration><fixedPrice>0.0</fixedPrice><usagePrice>0.02</usagePrice>{}{}{}{}{}{}",
-        ec2_elem("reservedInstancesOfferingId", &gen_id("offering")),
+        ec2_elem("reservedInstancesOfferingId", &crate::service_helpers::stable_id(
+                "offering",
+                &format!("{az}|t3.micro|Linux/UNIX|standard|No Upfront|default"),
+            )),
         ec2_elem("instanceType", "t3.micro"),
         ec2_elem("availabilityZone", &az),
         ec2_elem("productDescription", "Linux/UNIX"),
