@@ -594,12 +594,21 @@ export class SchedulerClient {
     return parse(resp);
   }
 
+  /**
+   * Fire a schedule now. It is looked up in `scope.accountId` /
+   * `scope.region` (default: the server's).
+   */
   async fireSchedule(
     group: string,
     name: string,
+    scope: { accountId?: string; region?: string } = {},
   ): Promise<FireScheduleResponse> {
+    const params = new URLSearchParams();
+    if (scope.accountId) params.set("accountId", scope.accountId);
+    if (scope.region) params.set("region", scope.region);
+    const query = params.toString();
     const resp = await fetch(
-      `${this.baseUrl}/_fakecloud/scheduler/fire/${encodeURIComponent(group)}/${encodeURIComponent(name)}`,
+      `${this.baseUrl}/_fakecloud/scheduler/fire/${encodeURIComponent(group)}/${encodeURIComponent(name)}${query ? `?${query}` : ""}`,
       { method: "POST" },
     );
     return parse(resp);

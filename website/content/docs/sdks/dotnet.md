@@ -99,7 +99,7 @@ All methods are async and accept an optional trailing `CancellationToken`.
 | Method                              | Description                                  |
 | ----------------------------------- | -------------------------------------------- |
 | `GetSchedulesAsync()`               | List EventBridge Scheduler schedules         |
-| `FireScheduleAsync(group, name)`    | Fire a single schedule immediately           |
+| `FireScheduleAsync(group, name[, accountId, region])` | Fire a single schedule immediately (default account/region: the server's) |
 
 ## `fc.Glue`
 

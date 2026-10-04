@@ -1364,6 +1364,8 @@ class SchedulerSchedule:
     schedule_expression: str
     target_arn: str
     last_fired: Optional[str] = None
+    # The schedule's region (schedules are regional).
+    region: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> SchedulerSchedule:
@@ -1376,6 +1378,7 @@ class SchedulerSchedule:
             schedule_expression=data.get("scheduleExpression", ""),
             target_arn=data.get("targetArn", ""),
             last_fired=data.get("lastFired"),
+            region=data.get("region", ""),
         )
 
 

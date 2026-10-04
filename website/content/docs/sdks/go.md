@@ -81,7 +81,7 @@ Sub-clients are accessed via methods: `fc.SES()`, `fc.SNS()`, `fc.Lambda()`, etc
 | Method | Description |
 |--------|-------------|
 | `GetSchedules(ctx)` | List EventBridge Scheduler schedules with next-fire metadata |
-| `FireSchedule(ctx, req)` | Manually fire a schedule once |
+| `FireSchedule(ctx, group, name)` / `FireScheduleIn(ctx, group, name, accountID, region)` | Manually fire a schedule once (default account/region: the server's) |
 
 ## `fc.Glue()`
 

@@ -390,8 +390,8 @@ and accepts, or is created through `CreateAccount`. Naming an
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
-| `/_fakecloud/scheduler/schedules` | GET | List all schedules across groups. |
-| `/_fakecloud/scheduler/fire/{group}/{name}` | POST | Manually fire a schedule's target. |
+| `/_fakecloud/scheduler/schedules` | GET | List all schedules across groups, accounts and regions; each entry carries its `accountId` and `region`. |
+| `/_fakecloud/scheduler/fire/{group}/{name}` | POST | Manually fire a schedule's target. Optional `accountId` and `region` query parameters pick the schedule (default: the server's account and region). |
 
 ## Secrets Manager
 

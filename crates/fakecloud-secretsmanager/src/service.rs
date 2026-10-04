@@ -2666,6 +2666,29 @@ pub(crate) fn encrypt_secret_string(
     }
 }
 
+/// Bring every replicated secret's replicas in line with their primary (see
+/// [`sync_replicas`]). Run once after loading a snapshot: a pre-regional
+/// snapshot recorded a secret's replica regions but held no replica secret in
+/// them, so this creates those replicas.
+pub fn sync_all_replicas(
+    accounts: &mut fakecloud_core::multi_account::MultiRegionState<SecretsManagerState>,
+    kms_hook: Option<&dyn fakecloud_core::delivery::KmsHook>,
+) {
+    let primaries: Vec<(String, String, String)> = accounts
+        .iter_regional()
+        .flat_map(|(account, region, state)| {
+            state
+                .secrets
+                .iter()
+                .filter(|(_, s)| s.primary_region.is_none() && !s.replica_regions.is_empty())
+                .map(move |(name, _)| (account.to_string(), region.to_string(), name.clone()))
+        })
+        .collect();
+    for (account, region, name) in primaries {
+        sync_replicas(accounts, kms_hook, &account, &region, &name);
+    }
+}
+
 /// Bring every replica of the primary secret `name` in (`account`,
 /// `region`) in line with it: create missing replicas, refresh existing
 /// ones (values, staging labels, description, tags, resource policy,

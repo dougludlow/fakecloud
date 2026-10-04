@@ -133,9 +133,15 @@ pub fn parse_pipes_snapshot(
             out.get_or_create(&account, &region).tags.insert(arn, tags);
         }
         for (key, cursor) in st.source_checkpoints {
+            // Older builds filed a checkpoint under the SOURCE stream's
+            // account; the runner reads it from the pipe's own account and
+            // region, which the key's pipe ARN names.
             let pipe_arn = key.split('#').next().unwrap_or("");
             let region = region_of(pipe_arn);
-            out.get_or_create(&account, &region)
+            let owner = fakecloud_aws::arn::account_of(pipe_arn)
+                .unwrap_or(&account)
+                .to_string();
+            out.get_or_create(&owner, &region)
                 .source_checkpoints
                 .insert(key, cursor);
         }
@@ -229,5 +235,35 @@ mod region_tests {
         let newer = parse_pipes_snapshot(br#"{"schema_version": 99}"#, "us-east-1").unwrap();
         assert_eq!(newer.schema_version, 99);
         assert!(newer.accounts.is_none());
+    }
+
+    #[test]
+    fn v1_checkpoint_filed_under_the_source_account_moves_to_the_pipe_account() {
+        let pipe_arn = "arn:aws:pipes:eu-west-1:111111111111:pipe/p";
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "accounts": { "accounts": {
+                "111111111111": { "pipes": { "p": { "Arn": pipe_arn } } },
+                // The Kinesis source lives in another account; older builds
+                // kept the pipe's checkpoint there.
+                "222222222222": {
+                    "source_checkpoints": { format!("{pipe_arn}#shardId-0"): "7" }
+                }
+            }}
+        }))
+        .unwrap();
+        let accounts = parse_pipes_snapshot(&bytes, "us-east-1")
+            .unwrap()
+            .accounts
+            .unwrap();
+        let pipe_state = accounts.get("111111111111", "eu-west-1").unwrap();
+        assert_eq!(
+            pipe_state.source_checkpoints[&format!("{pipe_arn}#shardId-0")],
+            "7"
+        );
+        assert!(accounts
+            .accounts
+            .get("222222222222")
+            .is_none_or(|r| r.values().all(|s| s.source_checkpoints.is_empty())));
     }
 }

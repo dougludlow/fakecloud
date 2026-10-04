@@ -70,6 +70,7 @@ pub fn fire_once(
 #[derive(Debug, Clone)]
 pub struct ScheduleRow {
     pub account_id: String,
+    pub region: String,
     pub group_name: String,
     pub name: String,
     pub arn: String,
@@ -110,10 +111,12 @@ pub fn list_all_schedules(state: &SharedSchedulerState) -> Vec<ScheduleRow> {
     let accounts = state.read();
     let mut rows: Vec<ScheduleRow> = accounts
         .iter_regional()
-        .flat_map(|(account_id, _region, s)| {
+        .flat_map(|(account_id, region, s)| {
             let account_id = account_id.to_string();
+            let region = region.to_string();
             s.schedules.values().map(move |sched| ScheduleRow {
                 account_id: account_id.clone(),
+                region: region.clone(),
                 group_name: sched.group_name.clone(),
                 name: sched.name.clone(),
                 arn: sched.arn.clone(),

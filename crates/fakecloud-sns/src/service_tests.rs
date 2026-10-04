@@ -3778,3 +3778,56 @@ fn topics_subscriptions_and_platform_apps_are_region_scoped() {
     );
     assert!(east_topics.contains(&arns[0]));
 }
+
+#[test]
+fn confirm_and_unsubscribe_resolve_the_subscription_from_its_arn() {
+    let (svc, state) = make_sns();
+    let mut create = sns_request("CreateTopic", vec![("Name", "west")]);
+    create.region = "eu-west-1".to_string();
+    svc.create_topic(&create).unwrap();
+    let topic_arn = "arn:aws:sns:eu-west-1:123456789012:west";
+    let mut subscribe = sns_request(
+        "Subscribe",
+        vec![
+            ("TopicArn", topic_arn),
+            ("Protocol", "http"),
+            ("Endpoint", "http://example.invalid/hook"),
+        ],
+    );
+    subscribe.region = "eu-west-1".to_string();
+    svc.subscribe(&subscribe).unwrap();
+    let (sub_arn, token) = {
+        let guard = state.read();
+        let sub = guard
+            .by_arn(topic_arn)
+            .unwrap()
+            .subscriptions
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        (sub.subscription_arn, sub.confirmation_token.unwrap())
+    };
+
+    // The confirmation link is followed from another region (and account).
+    let mut confirm = sns_request(
+        "ConfirmSubscription",
+        vec![("TopicArn", topic_arn), ("Token", &token)],
+    );
+    confirm.region = "us-east-1".to_string();
+    confirm.account_id = "999999999999".to_string();
+    svc.confirm_subscription(&confirm).unwrap();
+    assert!(state.read().by_arn(topic_arn).unwrap().subscriptions[&sub_arn].confirmed);
+    // Nothing was created in the caller's region.
+    assert!(state.read().regional("999999999999", "us-east-1").is_none());
+
+    let mut unsubscribe = sns_request("Unsubscribe", vec![("SubscriptionArn", &sub_arn)]);
+    unsubscribe.region = "us-east-1".to_string();
+    svc.unsubscribe(&unsubscribe).unwrap();
+    assert!(state
+        .read()
+        .by_arn(topic_arn)
+        .unwrap()
+        .subscriptions
+        .is_empty());
+}

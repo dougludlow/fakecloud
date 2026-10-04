@@ -24,8 +24,8 @@ REST-JSON protocol over `scheduler.<region>.amazonaws.com` endpoint. SigV4 crede
 
 ## Introspection
 
-- `GET /_fakecloud/scheduler/schedules` — list every schedule across all accounts
-- `POST /_fakecloud/scheduler/fire/{group}/{name}` — fire a specific schedule immediately (bypasses the wall-clock tick)
+- `GET /_fakecloud/scheduler/schedules` — list every schedule across all accounts and regions (each entry names its `accountId` and `region`)
+- `POST /_fakecloud/scheduler/fire/{group}/{name}` — fire a specific schedule immediately (bypasses the wall-clock tick); optional `?accountId=&region=`, default the server's
 
 ## Cross-service delivery
 

@@ -1158,7 +1158,17 @@ impl SnsService {
         let token = required(req, "Token")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.regional_mut(owning_account(&topic_arn, &req.account_id), &req.region);
+        // The subscription lives with its topic: in the account and region
+        // the topic ARN names (the confirmation link the subscriber follows
+        // may be opened from anywhere).
+        let invalid_token = || {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameter",
+                format!("Invalid token: {token}"),
+            )
+        };
+        let state = accounts.by_arn_mut(&topic_arn).ok_or_else(invalid_token)?;
         // AWS accepts both the confirmation token and the subscription ARN as the Token parameter.
         // Confirming an already-confirmed subscription is a no-op (idempotent).
         let sub_arn = state
@@ -1170,16 +1180,10 @@ impl SnsService {
                         || s.subscription_arn == token)
             })
             .map(|s| s.subscription_arn.clone())
-            .ok_or_else(|| {
-                // AWS returns InvalidParameterException for unknown or
-                // expired confirmation tokens; matching the wire format
-                // lets client SDKs surface the right error type.
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidParameter",
-                    format!("Invalid token: {token}"),
-                )
-            })?;
+            // AWS returns InvalidParameterException for unknown or expired
+            // confirmation tokens; matching the wire format lets client SDKs
+            // surface the right error type.
+            .ok_or_else(invalid_token)?;
 
         // Mark the subscription as confirmed
         if let Some(sub) = state.subscriptions.get_mut(&sub_arn) {
@@ -1205,8 +1209,28 @@ impl SnsService {
     fn unsubscribe(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let sub_arn = required(req, "SubscriptionArn")?;
         let mut accts = self.state.write();
-        let account = subscription_account(&accts, &sub_arn, &req.account_id, &req.region);
-        let state = accts.regional_mut(&account, &req.region);
+        // A subscription ARN (`<topic ARN>:<id>`) names the region it lives
+        // in and its topic owner's account, where it is stored (an older
+        // build may have stored it under the caller's account instead). An
+        // unsubscribe link may be opened from anywhere; unknown subscriptions
+        // are a no-op, as on AWS.
+        let region = fakecloud_aws::arn::region_of(&sub_arn)
+            .unwrap_or(&req.region)
+            .to_string();
+        let account = subscription_account(&accts, &sub_arn, &req.account_id, &region);
+        let Some(state) = accts.regional_get_mut(&account, &region) else {
+            return Ok(xml_resp(
+                &format!(
+                    r#"<UnsubscribeResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">
+  <ResponseMetadata>
+    <RequestId>{}</RequestId>
+  </ResponseMetadata>
+</UnsubscribeResponse>"#,
+                    req.request_id
+                ),
+                &req.request_id,
+            ));
+        };
         // Snapshot the parent topic ARN before removing the subscription
         // so we can bump SubscriptionsDeleted on the right topic. Real
         // SNS exposes this counter on GetTopicAttributes.

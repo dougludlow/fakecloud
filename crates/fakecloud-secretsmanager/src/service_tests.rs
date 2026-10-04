@@ -3997,3 +3997,39 @@ fn test_secret(name: &str) -> Secret {
         primary_region: None,
     }
 }
+
+#[tokio::test]
+async fn a_migrated_pre_regional_snapshot_gets_its_replica_secrets() {
+    let state = make_state();
+    let svc = SecretsManagerService::new(state.clone());
+    call_in(
+        &svc,
+        "CreateSecret",
+        "us-east-1",
+        json!({"Name": "rep", "SecretString": "v1",
+               "AddReplicaRegions": [{"Region": "eu-west-1"}]}),
+    )
+    .await;
+    // A v2 snapshot held one state per account: the primary, recording its
+    // replica region, and no replica secret.
+    let legacy = state.read().map(|account| {
+        account
+            .region("us-east-1")
+            .cloned()
+            .expect("primary region")
+    });
+    let bytes = serde_json::to_vec(&json!({"schema_version": 2, "accounts": legacy})).unwrap();
+    let mut accounts = crate::state::parse_secretsmanager_snapshot(&bytes)
+        .unwrap()
+        .accounts
+        .unwrap();
+    let account = accounts.default_account_id().to_string();
+    assert!(accounts
+        .regional(&account, "eu-west-1")
+        .is_none_or(|s| !s.secrets.contains_key("rep")));
+
+    crate::sync_all_replicas(&mut accounts, None);
+    let replica = &accounts.regional(&account, "eu-west-1").unwrap().secrets["rep"];
+    assert_eq!(replica.primary_region.as_deref(), Some("us-east-1"));
+    assert!(replica.arn.contains(":eu-west-1:"));
+}

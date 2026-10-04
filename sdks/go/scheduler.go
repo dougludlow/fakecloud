@@ -1,6 +1,9 @@
 package fakecloud
 
-import "context"
+import (
+	"context"
+	"net/url"
+)
 
 // SchedulerClient provides access to EventBridge Scheduler
 // introspection endpoints. Exposes the two hooks integration tests
@@ -23,9 +26,28 @@ func (c *SchedulerClient) GetSchedules(ctx context.Context) (*SchedulerSchedules
 // FireSchedule triggers the named schedule immediately, bypassing the
 // wall-clock tick. Applies the same post-fire handling as the normal
 // loop (last_fired update, ActionAfterCompletion=DELETE cleanup).
+// The schedule is looked up in the server's default account and region.
 func (c *SchedulerClient) FireSchedule(ctx context.Context, group, name string) (*FireScheduleResponse, error) {
+	return c.FireScheduleIn(ctx, group, name, "", "")
+}
+
+// FireScheduleIn is FireSchedule for the schedule in a specific account and
+// region (schedules are regional). An empty accountID or region means the
+// server default.
+func (c *SchedulerClient) FireScheduleIn(ctx context.Context, group, name, accountID, region string) (*FireScheduleResponse, error) {
+	path := "/_fakecloud/scheduler/fire/" + url.PathEscape(group) + "/" + url.PathEscape(name)
+	q := url.Values{}
+	if accountID != "" {
+		q.Set("accountId", accountID)
+	}
+	if region != "" {
+		q.Set("region", region)
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
 	var out FireScheduleResponse
-	if err := c.fc.doPost(ctx, "/_fakecloud/scheduler/fire/"+group+"/"+name, nil, &out); err != nil {
+	if err := c.fc.doPost(ctx, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -128,7 +128,7 @@ var fc = new FakeCloudClient("http://localhost:4566"); // explicit base URL
 | Method                              | Description                                  |
 | ----------------------------------- | -------------------------------------------- |
 | `GetSchedulesAsync()`               | List EventBridge Scheduler schedules         |
-| `FireScheduleAsync(group, name)`    | Fire a single schedule immediately           |
+| `FireScheduleAsync(group, name[, accountId, region])` | Fire a single schedule immediately (default account/region: the server's) |
 
 ### `fc.Glue`
 

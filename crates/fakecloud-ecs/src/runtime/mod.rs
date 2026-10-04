@@ -2178,6 +2178,41 @@ mod tests {
     }
 
     #[test]
+    fn awslogs_forwarding_writes_to_the_awslogs_region() {
+        let mut accounts: MultiAccountState<EcsState> =
+            MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+        let mut task = make_task("t1");
+        task.awslogs = Some(crate::state::AwsLogsConfig {
+            group: "/ecs/app".into(),
+            stream_prefix: None,
+            region: "eu-west-1".into(),
+            container_name: "app".into(),
+        });
+        accounts
+            .get_or_create("000000000000")
+            .tasks
+            .insert("t1".into(), task);
+        let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+        let logs: fakecloud_logs::SharedLogsState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiRegionState::new(
+                "000000000000",
+                "us-east-1",
+                "http://localhost:4566",
+            ),
+        ));
+        let runtime = EcsRuntime::bare_for_tests().with_logs(logs.clone());
+        runtime.forward_awslogs_if_configured(&state, "000000000000", "t1", "hello\nworld");
+
+        let guard = logs.read();
+        let west = guard
+            .regional("000000000000", "eu-west-1")
+            .expect("awslogs-region holds the group");
+        let events = &west.log_groups["/ecs/app"].log_streams["app/t1"].events;
+        assert_eq!(events.len(), 2);
+        assert!(guard.regional("000000000000", "us-east-1").is_none());
+    }
+
+    #[test]
     fn finalize_failure_writes_reason_into_captured_logs() {
         let mut accounts: MultiAccountState<EcsState> =
             MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");

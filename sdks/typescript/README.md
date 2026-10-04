@@ -282,10 +282,10 @@ Top-level client. Defaults to `http://localhost:4566`.
 
 ### `fc.scheduler`
 
-| Method                      | Description                                       |
-| --------------------------- | ------------------------------------------------- |
-| `getSchedules()`            | List every EventBridge Scheduler schedule         |
-| `fireSchedule(group, name)` | Fire a schedule manually, bypassing the cron tick |
+| Method                                               | Description                                                                              |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `getSchedules()`                                     | List every EventBridge Scheduler schedule                                                |
+| `fireSchedule(group, name, { accountId?, region? })` | Fire a schedule manually, bypassing the cron tick (default account/region: the server's) |
 
 ### `fc.secretsmanager`
 

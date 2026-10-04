@@ -2239,3 +2239,80 @@ fn task_parameters_reevaluated_per_retry_attempt() {
         assert_eq!(retries, vec![0, 1, 2]);
     });
 }
+
+/// Records the region and account of every request it receives.
+struct RegionRecorder {
+    seen: parking_lot::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl fakecloud_core::service::AwsService for RegionRecorder {
+    fn service_name(&self) -> &str {
+        "sqs"
+    }
+
+    async fn handle(
+        &self,
+        request: fakecloud_core::service::AwsRequest,
+    ) -> Result<fakecloud_core::service::AwsResponse, fakecloud_core::service::AwsServiceError>
+    {
+        self.seen
+            .lock()
+            .push((request.region.clone(), request.account_id.clone()));
+        Ok(fakecloud_core::service::AwsResponse::json(
+            http::StatusCode::OK,
+            "{}".to_string(),
+        ))
+    }
+
+    fn supported_actions(&self) -> &[&str] {
+        &["ListQueues"]
+    }
+}
+
+#[test]
+fn aws_sdk_integration_calls_the_service_in_the_execution_region() {
+    let recorder = Arc::new(RegionRecorder {
+        seen: parking_lot::Mutex::new(Vec::new()),
+    });
+    let mut registry = fakecloud_core::registry::ServiceRegistry::new();
+    registry.register(recorder.clone());
+    let handle: crate::service::SharedServiceRegistry = Arc::new(std::sync::OnceLock::new());
+    let _ = handle.set(Arc::new(registry));
+
+    let state = make_state();
+    let arn = "arn:aws:states:eu-west-1:123456789012:execution:test:sdk-region";
+    create_execution(&state, arn, Some("{}".to_string()));
+    let def = json!({
+        "StartAt": "T",
+        "States": {
+            "T": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sqs:listQueues",
+                "End": true
+            }
+        }
+    });
+    let fut = execute_state_machine(
+        state.clone(),
+        arn.to_string(),
+        def.to_string(),
+        Some("{}".to_string()),
+        None,
+        None,
+        Some(handle),
+        None,
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(fut);
+    read_exec(&state, arn, |exec| {
+        assert_eq!(exec.status, ExecutionStatus::Succeeded, "{:?}", exec.cause);
+    });
+    assert_eq!(
+        *recorder.seen.lock(),
+        vec![("eu-west-1".to_string(), "123456789012".to_string())]
+    );
+}

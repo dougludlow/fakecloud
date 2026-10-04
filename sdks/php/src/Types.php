@@ -1569,6 +1569,8 @@ final class SchedulerSchedule
         public readonly string $scheduleExpression,
         public readonly string $targetArn,
         public readonly ?string $lastFired,
+        /** The schedule's region (schedules are regional). */
+        public readonly string $region = '',
     ) {}
 
     public static function fromArray(array $data): self
@@ -1582,6 +1584,7 @@ final class SchedulerSchedule
             $data['scheduleExpression'] ?? '',
             $data['targetArn'] ?? '',
             $data['lastFired'] ?? null,
+            $data['region'] ?? '',
         );
     }
 }

@@ -2254,8 +2254,14 @@ async fn main() {
                                     fakecloud_secretsmanager::SECRETSMANAGER_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            if let Some(accounts) = snapshot.accounts {
+                            if let Some(mut accounts) = snapshot.accounts {
                                 let account_count = accounts.account_count();
+                                // A migrated pre-regional snapshot names replica
+                                // regions with no replica secret in them yet.
+                                fakecloud_secretsmanager::sync_all_replicas(
+                                    &mut accounts,
+                                    Some(kms_hook_for_services.as_ref()),
+                                );
                                 *secretsmanager_state.write() = accounts;
                                 tracing::info!(
                                     accounts = account_count,
@@ -2267,6 +2273,10 @@ async fn main() {
                                 let account_id = single_state.account_id().to_string();
                                 let mut mas = secretsmanager_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
+                                fakecloud_secretsmanager::sync_all_replicas(
+                                    &mut mas,
+                                    Some(kms_hook_for_services.as_ref()),
+                                );
                                 tracing::info!(
                                     secrets = secret_count,
                                     "loaded secretsmanager persistence snapshot (migrated from v1)"
@@ -8987,6 +8997,7 @@ async fn main() {
                         .into_iter()
                         .map(|r| types::SchedulerSchedule {
                             account_id: r.account_id,
+                            region: r.region,
                             group_name: r.group_name,
                             name: r.name,
                             arn: r.arn,
@@ -9190,17 +9201,29 @@ async fn main() {
                 let delivery = delivery_for_scheduler_fire;
                 let default_account = default_account_for_scheduler_fire;
                 let default_region = default_region_for_scheduler_fire;
-                move |axum::extract::Path((group, name)): axum::extract::Path<(String, String)>| {
+                move |axum::extract::Path((group, name)): axum::extract::Path<(String, String)>,
+                      axum::extract::Query(scope): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
                     let state = state.clone();
                     let delivery = delivery.clone();
-                    let default_account = default_account.clone();
-                    let default_region = default_region.clone();
+                    // The schedule of that group and name in one account and
+                    // region: `accountId` / `region` query parameters,
+                    // defaulting to the server's.
+                    let account = scope
+                        .get("accountId")
+                        .cloned()
+                        .unwrap_or_else(|| default_account.clone());
+                    let region = scope
+                        .get("region")
+                        .cloned()
+                        .unwrap_or_else(|| default_region.clone());
                     async move {
                         match fakecloud_scheduler::simulation::fire_schedule_response(
                             &state,
                             &delivery,
-                            &default_region,
-                            &default_account,
+                            &region,
+                            &account,
                             &group,
                             &name,
                         ) {

@@ -1378,9 +1378,18 @@ class SchedulerClient:
         _check(resp)
         return SchedulerSchedulesResponse.from_dict(resp.json())
 
-    async def fire_schedule(self, group: str, name: str) -> FireScheduleResponse:
+    async def fire_schedule(
+        self,
+        group: str,
+        name: str,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> FireScheduleResponse:
+        """Fire a schedule now. It is looked up in ``account_id`` /
+        ``region`` (default: the server's)."""
         resp = await self._client.post(
-            f"{self._base}/_fakecloud/scheduler/fire/{group}/{name}"
+            f"{self._base}/_fakecloud/scheduler/fire/{group}/{name}",
+            params=_scope_params(account_id, region),
         )
         _check(resp)
         return FireScheduleResponse.from_dict(resp.json())
@@ -2186,9 +2195,18 @@ class _SyncSchedulerClient:
         _check(resp)
         return SchedulerSchedulesResponse.from_dict(resp.json())
 
-    def fire_schedule(self, group: str, name: str) -> FireScheduleResponse:
+    def fire_schedule(
+        self,
+        group: str,
+        name: str,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> FireScheduleResponse:
+        """Fire a schedule now. It is looked up in ``account_id`` /
+        ``region`` (default: the server's)."""
         resp = self._client.post(
-            f"{self._base}/_fakecloud/scheduler/fire/{group}/{name}"
+            f"{self._base}/_fakecloud/scheduler/fire/{group}/{name}",
+            params=_scope_params(account_id, region),
         )
         _check(resp)
         return FireScheduleResponse.from_dict(resp.json())

@@ -479,7 +479,7 @@ async fn execute_task_state(
             entered_event_id,
             json!({
                 "resource": resource,
-                "region": "us-east-1",
+                "region": region_from_execution_arn(execution_arn),
                 "parameters": serde_json::to_string(&task_input).expect("serde_json::Value serialization is infallible"),
             }),
         );
@@ -1090,6 +1090,7 @@ async fn read_items_from_s3(
 
     let registry_arc = resolve_registry(registry)?;
     let account_id = account_from_execution_arn(execution_arn);
+    let region = &region_from_execution_arn(execution_arn);
 
     let body = call_sdk_action_raw_bytes(
         &registry_arc,
@@ -1097,6 +1098,7 @@ async fn read_items_from_s3(
         "GetObject",
         &json!({ "Bucket": bucket, "Key": key }),
         &account_id,
+        region,
     )
     .await?;
 
@@ -1166,7 +1168,7 @@ async fn write_map_results_to_s3(
     let req = AwsRequest {
         service: "s3".to_string(),
         action: "PutObject".to_string(),
-        region: "us-east-1".to_string(),
+        region: region_from_execution_arn(execution_arn),
         account_id: account_id.to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         headers: HeaderMap::new(),
@@ -1359,9 +1361,16 @@ async fn invoke_resource(
     if let Some(tail) = integration {
         if tail.starts_with("states:startExecution") {
             let account_id = account_from_execution_arn(execution_arn);
-            let result =
-                invoke_aws_sdk_integration(tail, input, registry, &account_id, timeout_seconds)
-                    .await;
+            let region = &region_from_execution_arn(execution_arn);
+            let result = invoke_aws_sdk_integration(
+                tail,
+                input,
+                registry,
+                &account_id,
+                region,
+                timeout_seconds,
+            )
+            .await;
             // Patch the inner execution's parent_execution_arn so the
             // `/execution-tree` introspection can walk back-references.
             // For `.sync`, the result is the DescribeExecution shape
@@ -1392,8 +1401,16 @@ async fn invoke_resource(
     // real Step Functions.
     if let Some(rest) = integration.and_then(|t| t.strip_prefix("aws-sdk:")) {
         let account_id = account_from_execution_arn(execution_arn);
-        return invoke_aws_sdk_integration(rest, input, registry, &account_id, timeout_seconds)
-            .await;
+        let region = &region_from_execution_arn(execution_arn);
+        return invoke_aws_sdk_integration(
+            rest,
+            input,
+            registry,
+            &account_id,
+            region,
+            timeout_seconds,
+        )
+        .await;
     }
 
     // Optimized service integrations expose `.sync` variants for ECS,
@@ -1402,8 +1419,16 @@ async fn invoke_resource(
     if let Some(tail) = integration {
         if tail.contains(".sync") {
             let account_id = account_from_execution_arn(execution_arn);
-            return invoke_aws_sdk_integration(tail, input, registry, &account_id, timeout_seconds)
-                .await;
+            let region = &region_from_execution_arn(execution_arn);
+            return invoke_aws_sdk_integration(
+                tail,
+                input,
+                registry,
+                &account_id,
+                region,
+                timeout_seconds,
+            )
+            .await;
         }
     }
 
@@ -1457,6 +1482,15 @@ fn arn_region(arn: &str, fallback: &str) -> String {
         .to_string()
 }
 
+/// The region of a Step Functions execution ARN: an execution's
+/// `aws-sdk:` and optimized integrations call services in its own region.
+/// Falls back to the AWS-conventional default for a malformed ARN.
+fn region_from_execution_arn(execution_arn: &str) -> String {
+    fakecloud_aws::arn::region_of(execution_arn)
+        .unwrap_or("us-east-1")
+        .to_string()
+}
+
 /// Extract the AWS account id from a Step Functions execution ARN
 /// (`arn:aws:states:<region>:<account>:execution:...`). Falls back to
 /// the AWS-conventional fixture id if the ARN is malformed.
@@ -1478,6 +1512,7 @@ async fn invoke_aws_sdk_integration(
     input: &Value,
     registry: &Option<SharedServiceRegistry>,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let registry_arc = resolve_registry(registry)?;
@@ -1531,6 +1566,7 @@ async fn invoke_aws_sdk_integration(
         &action_pascal,
         &translated_input,
         account_id,
+        region,
     )
     .await?;
 
@@ -1549,6 +1585,7 @@ async fn invoke_aws_sdk_integration(
         &initial,
         &translated_input,
         account_id,
+        region,
         timeout_seconds,
     )
     .await
@@ -1625,6 +1662,7 @@ async fn call_sdk_action(
     action_pascal: &str,
     input: &Value,
     account_id: &str,
+    region: &str,
 ) -> Result<Value, (String, String)> {
     call_sdk_action_in(
         registry,
@@ -1723,6 +1761,7 @@ async fn call_sdk_action_raw_bytes(
     action_pascal: &str,
     input: &Value,
     account_id: &str,
+    region: &str,
 ) -> Result<bytes::Bytes, (String, String)> {
     use bytes::Bytes;
     use fakecloud_core::service::AwsRequest;
@@ -1742,7 +1781,7 @@ async fn call_sdk_action_raw_bytes(
     let req = AwsRequest {
         service: service_name.to_string(),
         action: action_pascal.to_string(),
-        region: "us-east-1".to_string(),
+        region: region.to_string(),
         account_id: account_id.to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         headers: HeaderMap::new(),
@@ -1792,6 +1831,7 @@ const SYNC_POLL_INTERVAL_MS: u64 = 200;
 /// Dispatch `.sync` waiters by service+action. Each waiter polls the
 /// matching describe-style API until the downstream operation reaches a
 /// terminal state, then returns the full describe response.
+#[allow(clippy::too_many_arguments)]
 async fn sync_wait(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     service_name: &str,
@@ -1799,17 +1839,18 @@ async fn sync_wait(
     initial: &Value,
     input: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     match (service_name, action_pascal) {
         ("ecs", "RunTask") => {
-            sync_wait_ecs_run_task(registry, initial, input, account_id, timeout_seconds).await
+            sync_wait_ecs_run_task(registry, initial, input, account_id, region, timeout_seconds).await
         }
         ("athena", "StartQueryExecution") => {
-            sync_wait_athena_query(registry, initial, account_id, timeout_seconds).await
+            sync_wait_athena_query(registry, initial, account_id, region, timeout_seconds).await
         }
         ("states", "StartExecution") => {
-            sync_wait_states_start_execution(registry, initial, account_id, timeout_seconds).await
+            sync_wait_states_start_execution(registry, initial, account_id, region, timeout_seconds).await
         }
         ("glue", "StartJobRun") => {
             // Poll the real Glue `GetJobRun` (the job run was created by the
@@ -1834,7 +1875,7 @@ async fn sync_wait(
                     "glue",
                     "GetJobRun",
                     &json!({ "JobName": job_name, "RunId": job_run_id }),
-                    account_id,
+                    account_id, region,
                 )
                 .await?;
                 let state = described
@@ -1879,6 +1920,7 @@ async fn sync_wait_ecs_run_task(
     initial: &Value,
     input: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let tasks = initial
@@ -1918,6 +1960,7 @@ async fn sync_wait_ecs_run_task(
             "DescribeTasks",
             &describe_input,
             account_id,
+            region,
         )
         .await?;
         let described_tasks = described
@@ -1989,6 +2032,7 @@ async fn sync_wait_athena_query(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     initial: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let qid = initial
@@ -2010,6 +2054,7 @@ async fn sync_wait_athena_query(
             "GetQueryExecution",
             &json!({ "QueryExecutionId": qid }),
             account_id,
+            region,
         )
         .await?;
         let state = described
@@ -2054,6 +2099,7 @@ async fn sync_wait_states_start_execution(
     registry: &Arc<fakecloud_core::registry::ServiceRegistry>,
     initial: &Value,
     account_id: &str,
+    region: &str,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, (String, String)> {
     let exec_arn = initial
@@ -2076,6 +2122,7 @@ async fn sync_wait_states_start_execution(
             "DescribeExecution",
             &json!({ "executionArn": exec_arn }),
             account_id,
+            region,
         )
         .await?;
         let status = described

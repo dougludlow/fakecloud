@@ -154,3 +154,53 @@ async fn fire_schedule_endpoint_returns_404_for_missing() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+/// Schedules are regional: the listing names each schedule's region, and
+/// fire picks the schedule of one account and region.
+#[tokio::test]
+async fn introspection_is_region_aware() {
+    let server = TestServer::start().await;
+    let sched = aws_sdk_scheduler::Client::new(&server.aws_config_in("eu-west-1").await);
+    sched
+        .create_schedule()
+        .name("west-only")
+        .schedule_expression("rate(7300 days)")
+        .flexible_time_window(off_window())
+        .target(
+            Target::builder()
+                .arn("arn:aws:sqs:eu-west-1:000000000000:q")
+                .role_arn("arn:aws:iam::000000000000:role/s")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let sdk = fakecloud_sdk::FakeCloud::new(server.endpoint());
+    let listing = sdk.scheduler().get_schedules().await.unwrap();
+    let row = listing
+        .schedules
+        .iter()
+        .find(|s| s.name == "west-only")
+        .expect("listed");
+    assert_eq!(row.region, "eu-west-1");
+
+    // The server's default region has no such schedule.
+    assert!(sdk
+        .scheduler()
+        .fire_schedule("default", "west-only")
+        .await
+        .is_err());
+    let fired = sdk
+        .scheduler()
+        .fire_schedule_in(
+            "default",
+            "west-only",
+            Some(&row.account_id),
+            Some("eu-west-1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fired.schedule_arn, row.arn);
+}
