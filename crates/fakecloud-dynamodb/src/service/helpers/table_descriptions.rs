@@ -225,6 +225,18 @@ pub(crate) fn build_table_description(table: &DynamoTable) -> Value {
     // falls back to STANDARD when absent.
     desc["TableClassSummary"] = json!({ "TableClass": table.table_class });
 
+    // A multi-region (version 2019.11.21) table lists its other replicas.
+    if !table.replica_regions.is_empty() {
+        desc["GlobalTableVersion"] = json!("2019.11.21");
+        desc["Replicas"] = Value::Array(
+            table
+                .replica_regions
+                .iter()
+                .map(|region| json!({ "RegionName": region, "ReplicaStatus": "ACTIVE" }))
+                .collect(),
+        );
+    }
+
     // Vector indexes are only present once the table declares one, matching
     // the way AWS omits an empty index list rather than returning `[]`.
     if !table.vector_indexes.is_empty() {

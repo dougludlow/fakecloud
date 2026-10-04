@@ -108,9 +108,16 @@ impl JobContext {
         }
     }
 
-    fn with_account<R>(&self, account_id: &str, f: impl FnOnce(&mut DynamoDbState) -> R) -> R {
+    /// Run `f` on the state of `account_id` in `region`: a job commits in
+    /// the region its table lives in.
+    fn with_account<R>(
+        &self,
+        account_id: &str,
+        region: &str,
+        f: impl FnOnce(&mut DynamoDbState) -> R,
+    ) -> R {
         let mut accounts = self.state.write();
-        f(accounts.get_or_create(account_id))
+        f(accounts.regional_mut(account_id, region))
     }
 }
 
@@ -226,6 +233,7 @@ fn bucket_exists(ctx: &JobContext, account: &str, bucket: &str) -> bool {
 
 struct ImportJob {
     account_id: String,
+    region: String,
     import_arn: String,
     table_name: String,
     table_id: String,
@@ -253,7 +261,7 @@ fn parse_rows(job: &ImportJob, text: &str) -> Vec<ParsedRow> {
 /// Settle an import as failed. When `drop_table` is set the failure was hit
 /// before any data was imported and, as on AWS, the table is not created.
 fn fail_import(ctx: &JobContext, job: &ImportJob, code: &str, message: &str, drop_table: bool) {
-    ctx.with_account(&job.account_id, |state| {
+    ctx.with_account(&job.account_id, &job.region, |state| {
         if drop_table
             && state
                 .tables
@@ -315,7 +323,7 @@ fn run_import(ctx: &JobContext, job: &ImportJob) {
         }
     }
 
-    ctx.with_account(&job.account_id, |state| {
+    ctx.with_account(&job.account_id, &job.region, |state| {
         let Some(table) = state
             .tables
             .get_mut(&job.table_name)
@@ -378,6 +386,7 @@ fn run_import(ctx: &JobContext, job: &ImportJob) {
 
 struct ExportJob {
     account_id: String,
+    region: String,
     export_arn: String,
     export_id: String,
     table_arn: String,
@@ -544,7 +553,7 @@ fn gzip(data: &[u8]) -> Vec<u8> {
 }
 
 fn settle_export(ctx: &JobContext, job: &ExportJob, update: impl FnOnce(&mut ExportDescription)) {
-    ctx.with_account(&job.account_id, |state| {
+    ctx.with_account(&job.account_id, &job.region, |state| {
         if let Some(exp) = state.exports.get_mut(&job.export_arn) {
             update(exp);
             exp.end_time = Some(Utc::now());
@@ -731,9 +740,15 @@ fn csv_options(format_options: Option<&Value>, table: &DynamoTable) -> CsvOption
     }
 }
 
-fn import_job(account_id: &str, imp: &ImportDescription, table: &DynamoTable) -> ImportJob {
+fn import_job(
+    account_id: &str,
+    region: &str,
+    imp: &ImportDescription,
+    table: &DynamoTable,
+) -> ImportJob {
     ImportJob {
         account_id: account_id.to_string(),
+        region: region.to_string(),
         import_arn: imp.import_arn.clone(),
         table_name: imp.table_name.clone(),
         table_id: table.table_id.clone(),
@@ -753,9 +768,15 @@ fn import_job(account_id: &str, imp: &ImportDescription, table: &DynamoTable) ->
     }
 }
 
-fn export_job(account_id: &str, exp: &ExportDescription, table: &DynamoTable) -> ExportJob {
+fn export_job(
+    account_id: &str,
+    region: &str,
+    exp: &ExportDescription,
+    table: &DynamoTable,
+) -> ExportJob {
     ExportJob {
         account_id: account_id.to_string(),
+        region: region.to_string(),
         export_arn: exp.export_arn.clone(),
         export_id: exp
             .export_arn
@@ -890,10 +911,11 @@ fn spawn_import(ctx: JobContext, job: ImportJob) {
 fn spawn_export(ctx: JobContext, job: ExportJob) {
     let arn = job.export_arn.clone();
     let account = job.account_id.clone();
+    let region = job.region.clone();
     ctx.run(
         move |ctx| run_export(ctx, &job),
         move |ctx| {
-            ctx.with_account(&account, |state| {
+            ctx.with_account(&account, &region, |state| {
                 if let Some(exp) = state.exports.get_mut(&arn) {
                     exp.export_status = "FAILED".to_string();
                     exp.failure_code = Some("InternalServerError".to_string());
@@ -1045,15 +1067,16 @@ impl DynamoDbService {
         let mut exports = Vec::new();
         {
             let mut accounts = self.state.write();
-            for (account_id, state) in accounts.iter_mut() {
+            for (account_id, region, state) in accounts.iter_regional_mut() {
                 let account_id = account_id.to_string();
+                let region = region.to_string();
                 for imp in state.imports.values_mut() {
                     if imp.import_status != "IN_PROGRESS" {
                         continue;
                     }
                     match state.tables.get(&imp.table_name) {
                         Some(t) if imp.table_id.as_deref().is_none_or(|id| id == t.table_id) => {
-                            imports.push(import_job(&account_id, imp, t));
+                            imports.push(import_job(&account_id, &region, imp, t));
                         }
                         // The import's table was deleted (or replaced by a
                         // same-name table) before the job could finish: it
@@ -1075,7 +1098,7 @@ impl DynamoDbService {
                         continue;
                     }
                     match find_table_by_arn(&state.tables, &exp.table_arn) {
-                        Ok(t) => exports.push(export_job(&account_id, exp, t)),
+                        Ok(t) => exports.push(export_job(&account_id, &region, exp, t)),
                         Err(_) => {
                             exp.export_status = "FAILED".to_string();
                             exp.failure_code = Some("TableNotFoundException".to_string());
@@ -1168,7 +1191,9 @@ impl DynamoDbService {
                     format!("Requested resource not found: Table ARN: {table_arn} not found"),
                 )
             };
-            let state = accounts.get(&req.account_id).ok_or_else(not_found)?;
+            let state = accounts
+                .regional(&req.account_id, &req.region)
+                .ok_or_else(not_found)?;
             // ExportTableToPointInTime declares TableNotFoundException; remap
             // the generic ResourceNotFoundException from find_table_by_arn.
             let table = find_table_by_arn(&state.tables, &table_arn).map_err(|_| not_found())?;
@@ -1202,11 +1227,14 @@ impl DynamoDbService {
                 export_to_time: incremental.as_ref().and_then(|i| i.1),
                 export_view_type: incremental.as_ref().map(|i| i.2.clone()),
             };
-            (export_job(&req.account_id, &export, table), export)
+            (
+                export_job(&req.account_id, &req.region, &export, table),
+                export,
+            )
         };
         self.state
             .write()
-            .get_or_create(&req.account_id)
+            .regional_mut(&req.account_id, &req.region)
             .exports
             .insert(export.export_arn.clone(), export.clone());
         spawn_export(self.job_context(), job);
@@ -1219,7 +1247,7 @@ impl DynamoDbService {
         let export_arn = require_str(&body, "ExportArn")?;
         let accounts = self.state.read();
         let export = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .and_then(|s| s.exports.get(export_arn))
             .ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -1242,7 +1270,7 @@ impl DynamoDbService {
         let accounts = self.state.read();
         let empty = BTreeMap::new();
         let exports = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .map(|s| &s.exports)
             .unwrap_or(&empty);
         // Honor MaxResults + NextToken (export-arn cursor).
@@ -1389,7 +1417,7 @@ impl DynamoDbService {
         let table_exists = || {
             self.state
                 .read()
-                .get(&req.account_id)
+                .regional(&req.account_id, &req.region)
                 .is_some_and(|s| s.tables.contains_key(&table_name))
         };
         if table_exists() {
@@ -1446,11 +1474,11 @@ impl DynamoDbService {
             failure_code: None,
             failure_message: None,
         };
-        let job = import_job(&req.account_id, &imp, &table);
+        let job = import_job(&req.account_id, &req.region, &imp, &table);
         let response = json!({ "ImportTableDescription": import_description_json(&imp, true) });
         {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if state.tables.contains_key(&table_name) {
                 return Err(already_exists());
             }
@@ -1466,7 +1494,7 @@ impl DynamoDbService {
         let import_arn = require_str(&body, "ImportArn")?;
         let accounts = self.state.read();
         let import = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .and_then(|s| s.imports.get(import_arn))
             .ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -1511,7 +1539,7 @@ impl DynamoDbService {
         let accounts = self.state.read();
         let empty = BTreeMap::new();
         let imports = accounts
-            .get(&req.account_id)
+            .regional(&req.account_id, &req.region)
             .map(|s| &s.imports)
             .unwrap_or(&empty);
         // Honor PageSize + NextToken (import-arn cursor).
@@ -1651,7 +1679,7 @@ mod tests {
     fn table_status(svc: &DynamoDbService, name: &str) -> Option<(String, usize)> {
         svc.state
             .read()
-            .get(ACCOUNT)
+            .regional(ACCOUNT, "us-east-1")
             .and_then(|s| s.tables.get(name))
             .map(|t| (t.status.clone(), t.items().len()))
     }
@@ -1767,7 +1795,7 @@ mod tests {
         assert_eq!(d["ImportStatus"], "COMPLETED", "{d}");
         assert_eq!(d["InputFormatOptions"]["Csv"]["Delimiter"], "|");
         let accounts = svc.state.read();
-        let t = &accounts.get(ACCOUNT).unwrap().tables["imported"];
+        let t = &accounts.regional(ACCOUNT, "us-east-1").unwrap().tables["imported"];
         let mut rows: Vec<&Item> = t.items().iter().collect();
         rows.sort_by_key(|r| r["id"]["N"].as_str().unwrap().to_string());
         assert_eq!(rows[0]["id"], json!({"N": "1"}));
@@ -1790,7 +1818,7 @@ mod tests {
         let d = describe_import(&svc, &arn);
         assert_eq!(d["ImportStatus"], "COMPLETED", "{d}");
         let accounts = svc.state.read();
-        let row = accounts.get(ACCOUNT).unwrap().tables["imported"]
+        let row = accounts.regional(ACCOUNT, "us-east-1").unwrap().tables["imported"]
             .items()
             .iter()
             .next()
@@ -1892,7 +1920,7 @@ mod tests {
         let arn = t.arn.clone();
         svc.state
             .write()
-            .get_or_create(ACCOUNT)
+            .regional_mut(ACCOUNT, "us-east-1")
             .tables
             .insert("src-table".into(), t);
         arn
@@ -1957,7 +1985,7 @@ mod tests {
         assert_eq!(d["ImportStatus"], "COMPLETED", "{d}");
         assert_eq!(d["ImportedItemCount"], 3);
         let accounts = svc.state.read();
-        let state = accounts.get(ACCOUNT).unwrap();
+        let state = accounts.regional(ACCOUNT, "us-east-1").unwrap();
         let mut original: Vec<Item> = state.tables["src-table"].items().iter().cloned().collect();
         let mut imported: Vec<Item> = state.tables["imported"].items().iter().cloned().collect();
         let key = |i: &Item| i["pk"]["S"].as_str().unwrap().to_string();
@@ -2021,6 +2049,72 @@ mod tests {
         assert_eq!(d["FailureCode"], "InvalidExportTimeException");
     }
 
+    /// An export and an import run in, and commit to, the region of the
+    /// request: the eu-west-1 job lands in eu-west-1 and is invisible from
+    /// us-east-1, even with a same-named table there.
+    #[test]
+    fn jobs_run_in_the_request_region() {
+        let (svc, s3) = setup();
+        seed_table(&svc);
+        let west_arn = crate::state::table_arn("eu-west-1", ACCOUNT, "src-table");
+        {
+            let mut accounts = svc.state.write();
+            let mut t = accounts
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["src-table"]
+                .clone();
+            t.arn = west_arn.clone();
+            t.stream_records = Arc::new(RwLock::new(Vec::new()));
+            t.remove_item_by_key(&HashMap::from([("pk".to_string(), json!({"S": "a"}))]));
+            accounts
+                .regional_mut(ACCOUNT, "eu-west-1")
+                .tables
+                .insert("src-table".into(), t);
+        }
+        let mut req = request(
+            "ExportTableToPointInTime",
+            json!({ "TableArn": west_arn, "S3Bucket": "src" }),
+        );
+        req.region = "eu-west-1".into();
+        let body = body_of(svc.export_table_to_point_in_time(&req).unwrap());
+        let export_arn = body["ExportDescription"]["ExportArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(export_arn.starts_with(&west_arn));
+        let mut d = request("DescribeExport", json!({ "ExportArn": export_arn }));
+        d.region = "eu-west-1".into();
+        let desc = body_of(svc.describe_export(&d).unwrap())["ExportDescription"].clone();
+        assert_eq!(desc["ExportStatus"], "COMPLETED", "{desc}");
+        assert_eq!(desc["ItemCount"], 2);
+        assert!(svc
+            .describe_export(&request(
+                "DescribeExport",
+                json!({ "ExportArn": export_arn })
+            ))
+            .is_err());
+
+        put_bytes(
+            &s3,
+            "w/0.json",
+            b"{\"Item\":{\"pk\":{\"S\":\"w\"}}}\n".to_vec(),
+        );
+        let mut imp = import_req("DYNAMODB_JSON", "NONE", "w/", json!({}));
+        imp.region = "eu-west-1".into();
+        let import_arn = start_import(&svc, imp);
+        assert!(import_arn.starts_with("arn:aws:dynamodb:eu-west-1:"));
+        let accounts = svc.state.read();
+        let west = accounts.regional(ACCOUNT, "eu-west-1").unwrap();
+        assert_eq!(west.tables["imported"].items().len(), 1);
+        assert!(west.imports.contains_key(&import_arn));
+        assert!(!accounts
+            .regional(ACCOUNT, "us-east-1")
+            .unwrap()
+            .tables
+            .contains_key("imported"));
+    }
+
     /// A restart leaves persisted jobs IN_PROGRESS; resuming runs them again.
     #[test]
     fn resume_settles_interrupted_jobs() {
@@ -2034,7 +2128,7 @@ mod tests {
         // Simulate the persisted state of jobs a restart interrupted.
         let import_arn = {
             let mut accounts = svc.state.write();
-            let state = accounts.get_or_create(ACCOUNT);
+            let state = accounts.regional_mut(ACCOUNT, "us-east-1");
             let mut table = state.tables["src-table"].clone();
             table.name = "pending".into();
             table.table_id = "pending-id".into();
@@ -2102,7 +2196,7 @@ mod tests {
         let arn = seed_table(svc);
         let mut accounts = svc.state.write();
         let t = accounts
-            .get_or_create(ACCOUNT)
+            .regional_mut(ACCOUNT, "us-east-1")
             .tables
             .get_mut("src-table")
             .unwrap();
@@ -2309,32 +2403,36 @@ mod tests {
     fn resume_fails_an_import_whose_table_is_gone() {
         let (svc, _s3) = setup();
         let import_arn = "arn:aws:dynamodb:us-east-1:123456789012:table/gone/import/1".to_string();
-        svc.state.write().get_or_create(ACCOUNT).imports.insert(
-            import_arn.clone(),
-            ImportDescription {
-                import_arn: import_arn.clone(),
-                import_status: "IN_PROGRESS".into(),
-                table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/gone".into(),
-                table_name: "gone".into(),
-                s3_bucket_source: "src".into(),
-                input_format: "DYNAMODB_JSON".into(),
-                start_time: Utc::now(),
-                end_time: None,
-                processed_item_count: 0,
-                processed_size_bytes: 0,
-                imported_item_count: 0,
-                error_count: 0,
-                table_id: Some("gone-id".into()),
-                s3_key_prefix: None,
-                s3_bucket_owner: None,
-                input_compression_type: None,
-                input_format_options: None,
-                table_creation_parameters: None,
-                client_token: None,
-                failure_code: None,
-                failure_message: None,
-            },
-        );
+        svc.state
+            .write()
+            .regional_mut(ACCOUNT, "us-east-1")
+            .imports
+            .insert(
+                import_arn.clone(),
+                ImportDescription {
+                    import_arn: import_arn.clone(),
+                    import_status: "IN_PROGRESS".into(),
+                    table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/gone".into(),
+                    table_name: "gone".into(),
+                    s3_bucket_source: "src".into(),
+                    input_format: "DYNAMODB_JSON".into(),
+                    start_time: Utc::now(),
+                    end_time: None,
+                    processed_item_count: 0,
+                    processed_size_bytes: 0,
+                    imported_item_count: 0,
+                    error_count: 0,
+                    table_id: Some("gone-id".into()),
+                    s3_key_prefix: None,
+                    s3_bucket_owner: None,
+                    input_compression_type: None,
+                    input_format_options: None,
+                    table_creation_parameters: None,
+                    client_token: None,
+                    failure_code: None,
+                    failure_message: None,
+                },
+            );
         svc.resume_interrupted_jobs();
         let d = describe_import(&svc, &import_arn);
         assert_eq!(d["ImportStatus"], "FAILED", "{d}");
@@ -2429,7 +2527,7 @@ mod tests {
         {
             let mut accounts = svc.state.write();
             let t = accounts
-                .get_or_create(ACCOUNT)
+                .regional_mut(ACCOUNT, "us-east-1")
                 .tables
                 .get_mut("src-table")
                 .unwrap();

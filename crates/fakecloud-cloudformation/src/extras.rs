@@ -651,7 +651,7 @@ impl CloudFormationService {
                 .deps
                 .dynamodb
                 .read()
-                .get(aid)
+                .regional(aid, region)
                 // The physical id is the table name (an ARN on older stacks).
                 .map(|s| {
                     s.tables
@@ -3033,7 +3033,7 @@ pub(crate) mod tests {
             iam: shared::<IamState>(),
             s3: shared::<S3State>(),
             eventbridge: shared::<EventBridgeState>(),
-            dynamodb: shared::<DynamoDbState>(),
+            dynamodb: shared::<fakecloud_core::multi_account::RegionalState<DynamoDbState>>(),
             logs: shared::<LogsState>(),
             lambda: shared::<LambdaState>(),
             secretsmanager: shared::<SecretsManagerState>(),

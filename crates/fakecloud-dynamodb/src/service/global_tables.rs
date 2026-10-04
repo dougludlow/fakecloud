@@ -40,9 +40,23 @@ impl DynamoDbService {
             .collect::<Vec<_>>();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        // A legacy global table is one resource across its replica regions:
+        // the name is taken if the request's region or any region of the new
+        // replication group already sees a global table of that name.
+        let taken = std::iter::once(req.region.as_str())
+            .chain(replication_group.iter().map(|r| r.region_name.as_str()))
+            .any(|region| {
+                super::replicas::global_table_region(
+                    &accounts,
+                    &req.account_id,
+                    region,
+                    global_table_name,
+                )
+                .is_some()
+            });
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
-        if state.global_tables.contains_key(global_table_name) {
+        if taken {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "GlobalTableAlreadyExistsException",
@@ -90,15 +104,15 @@ impl DynamoDbService {
         validate_string_length("globalTableName", global_table_name, 3, 255)?;
 
         let accounts = self.state.read();
-        let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-        let gt = state.global_tables.get(global_table_name).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "GlobalTableNotFoundException",
-                format!("Global table not found: {global_table_name}"),
-            )
-        })?;
+        let gt = super::replicas::global_table_region(
+            &accounts,
+            &req.account_id,
+            &req.region,
+            global_table_name,
+        )
+        .and_then(|region| accounts.regional(&req.account_id, &region))
+        .and_then(|state| state.global_tables.get(global_table_name))
+        .ok_or_else(|| global_table_not_found(global_table_name))?;
 
         Self::ok_json(json!({
             "GlobalTableDescription": {
@@ -123,15 +137,15 @@ impl DynamoDbService {
         validate_string_length("globalTableName", global_table_name, 3, 255)?;
 
         let accounts = self.state.read();
-        let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-        let gt = state.global_tables.get(global_table_name).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "GlobalTableNotFoundException",
-                format!("Global table not found: {global_table_name}"),
-            )
-        })?;
+        let gt = super::replicas::global_table_region(
+            &accounts,
+            &req.account_id,
+            &req.region,
+            global_table_name,
+        )
+        .and_then(|region| accounts.regional(&req.account_id, &region))
+        .and_then(|state| state.global_tables.get(global_table_name))
+        .ok_or_else(|| global_table_not_found(global_table_name))?;
 
         Self::ok_json(global_table_settings_response(gt))
     }
@@ -150,16 +164,28 @@ impl DynamoDbService {
         validate_optional_range_i64("limit", body["Limit"].as_i64(), 1, 100)?;
         let limit = body["Limit"].as_i64().unwrap_or(100) as usize;
         let start = body["ExclusiveStartGlobalTableName"].as_str();
+        let region_filter = body["RegionName"].as_str();
 
         let accounts = self.state.read();
-        let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-        // Resume after ExclusiveStartGlobalTableName (BTreeMap is name-ordered)
-        // and emit LastEvaluatedGlobalTableName when the page is truncated.
-        // Previously the marker was ignored and the remainder was unreachable.
-        let matched: Vec<_> = state
-            .global_tables
+        // The account's global tables, wherever each was created, narrowed
+        // to those with a replica in `RegionName` when one is given; ordered
+        // by name.
+        let all: std::collections::BTreeMap<&str, &GlobalTableDescription> = accounts
+            .get(&req.account_id)
+            .into_iter()
+            .flat_map(|regional| regional.regions())
+            .flat_map(|(_, state)| state.global_tables.values())
+            .filter(|gt| {
+                region_filter
+                    .is_none_or(|r| gt.replication_group.iter().any(|g| g.region_name == r))
+            })
+            .map(|gt| (gt.global_table_name.as_str(), gt))
+            .collect();
+        // Resume after ExclusiveStartGlobalTableName and emit
+        // LastEvaluatedGlobalTableName when the page is truncated.
+        let matched: Vec<_> = all
             .values()
+            .copied()
             .filter(|gt| match start {
                 Some(s) => gt.global_table_name.as_str() > s,
                 None => true,
@@ -196,17 +222,20 @@ impl DynamoDbService {
         validate_required("replicaUpdates", &body["ReplicaUpdates"])?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let holder = super::replicas::global_table_region(
+            &accounts,
+            &req.account_id,
+            &req.region,
+            global_table_name,
+        )
+        .ok_or_else(|| global_table_not_found(global_table_name))?;
+        let state = accounts
+            .regional_get_mut(&req.account_id, &holder)
+            .ok_or_else(|| global_table_not_found(global_table_name))?;
         let gt = state
             .global_tables
             .get_mut(global_table_name)
-            .ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "GlobalTableNotFoundException",
-                    format!("Global table not found: {global_table_name}"),
-                )
-            })?;
+            .ok_or_else(|| global_table_not_found(global_table_name))?;
 
         if let Some(updates) = body["ReplicaUpdates"].as_array() {
             for update in updates {
@@ -263,17 +292,20 @@ impl DynamoDbService {
         )?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let holder = super::replicas::global_table_region(
+            &accounts,
+            &req.account_id,
+            &req.region,
+            global_table_name,
+        )
+        .ok_or_else(|| global_table_not_found(global_table_name))?;
+        let state = accounts
+            .regional_get_mut(&req.account_id, &holder)
+            .ok_or_else(|| global_table_not_found(global_table_name))?;
         let gt = state
             .global_tables
             .get_mut(global_table_name)
-            .ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "GlobalTableNotFoundException",
-                    format!("Global table not found: {global_table_name}"),
-                )
-            })?;
+            .ok_or_else(|| global_table_not_found(global_table_name))?;
 
         // Persist the billing mode + global provisioned write capacity so
         // they round-trip through DescribeGlobalTableSettings instead of
@@ -308,9 +340,16 @@ impl DynamoDbService {
             }
         }
 
-        let gt = &state.global_tables[global_table_name];
         Self::ok_json(global_table_settings_response(gt))
     }
+}
+
+fn global_table_not_found(name: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "GlobalTableNotFoundException",
+        format!("Global table not found: {name}"),
+    )
 }
 
 /// Build the GlobalTableSettings response shape shared by

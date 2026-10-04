@@ -2664,45 +2664,49 @@ async fn main() {
             let path = data_path.join("dynamodb").join("snapshot.json");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
-                Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_dynamodb::DynamoDbSnapshot>(&bytes) {
-                        Ok(snapshot) => {
-                            if snapshot.schema_version
-                                > fakecloud_dynamodb::DYNAMODB_SNAPSHOT_SCHEMA_VERSION
-                            {
-                                fatal_exit(format_args!(
-                                    "dynamodb persistence schema too new: on-disk={}, max supported={}",
-                                    snapshot.schema_version,
-                                    fakecloud_dynamodb::DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
-                                ));
-                            }
-                            if let Some(mut accounts) = snapshot.accounts {
-                                let account_count = accounts.account_count();
-                                for (_, state) in accounts.iter_mut() {
-                                    state.rebuild_derived_state();
-                                }
-                                *dynamodb_state_for_register.write() = accounts;
-                                tracing::info!(
-                                    accounts = account_count,
-                                    "loaded dynamodb persistence snapshot (multi-account)",
-                                );
-                            } else if let Some(mut single_state) = snapshot.state {
-                                single_state.rebuild_derived_state();
-                                let table_count = single_state.tables.len();
-                                let account_id = single_state.account_id.clone();
-                                let mut mas = dynamodb_state_for_register.write();
-                                *mas.get_or_create(&account_id) = single_state;
-                                tracing::info!(
-                                    tables = table_count,
-                                    "loaded dynamodb persistence snapshot (migrated from v1)",
-                                );
-                            }
+                Ok(Some(bytes)) => match fakecloud_dynamodb::parse_dynamodb_snapshot(&bytes) {
+                    Ok(snapshot) => {
+                        if snapshot.schema_version
+                            > fakecloud_dynamodb::DYNAMODB_SNAPSHOT_SCHEMA_VERSION
+                        {
+                            fatal_exit(format_args!(
+                                "dynamodb persistence schema too new: on-disk={}, max supported={}",
+                                snapshot.schema_version,
+                                fakecloud_dynamodb::DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
+                            ));
                         }
-                        Err(err) => fatal_exit(format_args!(
-                            "failed to parse dynamodb persistence snapshot: {err}"
-                        )),
+                        if let Some(mut accounts) = snapshot.accounts {
+                            let account_count = accounts.account_count();
+                            for (_, _, state) in accounts.iter_regional_mut() {
+                                state.rebuild_derived_state();
+                            }
+                            *dynamodb_state_for_register.write() = accounts;
+                            tracing::info!(
+                                accounts = account_count,
+                                "loaded dynamodb persistence snapshot (multi-account)",
+                            );
+                        } else if let Some(mut single_state) = snapshot.state {
+                            let mut table_count = 0;
+                            for (_, state) in single_state.regions_mut() {
+                                state.rebuild_derived_state();
+                                table_count += state.tables.len();
+                            }
+                            let account_id = single_state.account_id().to_string();
+                            let mut mas = dynamodb_state_for_register.write();
+                            let account = mas.get_or_create(&account_id);
+                            for (region, state) in single_state.regions() {
+                                account.insert_region(region, state.clone());
+                            }
+                            tracing::info!(
+                                tables = table_count,
+                                "loaded dynamodb persistence snapshot (migrated from v1)",
+                            );
+                        }
                     }
-                }
+                    Err(err) => fatal_exit(format_args!(
+                        "failed to parse dynamodb persistence snapshot: {err}"
+                    )),
+                },
                 Ok(None) => {
                     tracing::info!("no dynamodb persistence snapshot found; starting empty");
                 }

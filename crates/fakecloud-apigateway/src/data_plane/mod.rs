@@ -2572,14 +2572,29 @@ mod tests {
         .expect("dispatch must succeed");
         assert_eq!(resp.status, StatusCode::OK);
 
+        {
+            let locked = stub.last_request.lock();
+            let dispatched = locked.as_ref().expect("stub must have received a request");
+            assert_eq!(dispatched.action, "PutItem");
+            assert_eq!(dispatched.service, "dynamodb");
+            assert_eq!(dispatched.account_id, TEST_ACCOUNT);
+            assert_eq!(dispatched.region, TEST_REGION);
+            // The integration's POST overrides the client's GET.
+            assert_eq!(dispatched.method, Method::POST);
+        }
+
+        // The integration URI's region is where the target service is
+        // called: a DynamoDB table in eu-west-1 is reached there.
+        aws_direct_integration(
+            &req,
+            "arn:aws:apigateway:eu-west-1:dynamodb:action/PutItem",
+            &integration,
+            &service,
+        )
+        .await
+        .expect("dispatch must succeed");
         let locked = stub.last_request.lock();
-        let dispatched = locked.as_ref().expect("stub must have received a request");
-        assert_eq!(dispatched.action, "PutItem");
-        assert_eq!(dispatched.service, "dynamodb");
-        assert_eq!(dispatched.account_id, TEST_ACCOUNT);
-        assert_eq!(dispatched.region, TEST_REGION);
-        // The integration's POST overrides the client's GET.
-        assert_eq!(dispatched.method, Method::POST);
+        assert_eq!(locked.as_ref().unwrap().region, "eu-west-1");
     }
 
     #[tokio::test]

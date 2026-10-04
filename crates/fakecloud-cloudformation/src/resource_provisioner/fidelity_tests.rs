@@ -51,7 +51,7 @@ fn named_resources_that_already_exist_fail_instead_of_overwriting() {
     // Data written to the retained table must survive the second create.
     prov.dynamodb_state
         .write()
-        .get_or_create(ACCT)
+        .regional_mut(ACCT, "us-east-1")
         .tables
         .get_mut("kept")
         .unwrap()
@@ -59,7 +59,12 @@ fn named_resources_that_already_exist_fail_instead_of_overwriting() {
     let err = create_err(&prov, "AWS::DynamoDB::Table", "T", table);
     assert!(err.contains("already exists"), "{err}");
     assert_eq!(
-        prov.dynamodb_state.read().get(ACCT).unwrap().tables["kept"].item_count,
+        prov.dynamodb_state
+            .read()
+            .regional(ACCT, "us-east-1")
+            .unwrap()
+            .tables["kept"]
+            .item_count,
         7
     );
 
@@ -171,7 +176,7 @@ fn dynamodb_billing_mode_defaults_to_provisioned() {
         })),
     );
     let ddb = prov.dynamodb_state.read();
-    let t = &ddb.get(ACCT).unwrap().tables["settings"];
+    let t = &ddb.regional(ACCT, "us-east-1").unwrap().tables["settings"];
     assert_eq!(t.billing_mode, "PROVISIONED");
     assert_eq!(t.provisioned_throughput.read_capacity_units, 3);
     assert_eq!(t.provisioned_throughput.write_capacity_units, 4);
@@ -194,7 +199,7 @@ fn dynamodb_ttl_pitr_kinesis_and_stream_apply_on_create_and_update() {
     let sr = prov.create_resource(&def).unwrap();
     {
         let ddb = prov.dynamodb_state.read();
-        let t = &ddb.get(ACCT).unwrap().tables["settings"];
+        let t = &ddb.regional(ACCT, "us-east-1").unwrap().tables["settings"];
         assert!(t.ttl_enabled);
         assert_eq!(t.ttl_attribute.as_deref(), Some("expires"));
         assert!(t.pitr_enabled);
@@ -215,7 +220,7 @@ fn dynamodb_ttl_pitr_kinesis_and_stream_apply_on_create_and_update() {
     );
     let result = prov.update_resource(&sr, &updated).unwrap().unwrap();
     let ddb = prov.dynamodb_state.read();
-    let t = &ddb.get(ACCT).unwrap().tables["settings"];
+    let t = &ddb.regional(ACCT, "us-east-1").unwrap().tables["settings"];
     assert!(t.stream_enabled);
     assert_eq!(t.stream_view_type.as_deref(), Some("NEW_IMAGE"));
     let stream_arn = t.stream_arn.clone().unwrap();
@@ -772,4 +777,54 @@ fn http_api_body_change_renames_and_drops_removed_paths() {
         .collect();
     assert_eq!(keys, vec!["GET /a"]);
     assert_eq!(st.integrations[&api.physical_id].len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// A stack's DynamoDB table lives in the stack's region.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dynamodb_tables_are_provisioned_in_the_stack_region() {
+    let mut east = make_provisioner();
+    east.region = "us-east-1".to_string();
+    let mut west = make_provisioner();
+    west.region = "eu-west-1".to_string();
+    west.dynamodb_state = east.dynamodb_state.clone();
+    let props = json!({
+        "TableName": "regional",
+        "BillingMode": "PAY_PER_REQUEST",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+    });
+    // The same table name in two regions' stacks is two tables.
+    let east_res = create(&east, "AWS::DynamoDB::Table", "T", props.clone());
+    let west_res = create(&west, "AWS::DynamoDB::Table", "T", props);
+    // Ref is the table name in both stacks; the Arn names each region.
+    assert_eq!(west_res.physical_id, "regional");
+    assert_eq!(east_res.physical_id, "regional");
+    assert_eq!(
+        west_res.attributes["Arn"],
+        "arn:aws:dynamodb:eu-west-1:123456789012:table/regional"
+    );
+    {
+        let ddb = east.dynamodb_state.read();
+        for region in ["us-east-1", "eu-west-1"] {
+            assert_eq!(
+                ddb.regional(ACCT, region).unwrap().tables["regional"].arn,
+                format!("arn:aws:dynamodb:{region}:123456789012:table/regional")
+            );
+        }
+    }
+    // Deleting the eu-west-1 stack's table leaves us-east-1's.
+    west.delete_resource(&west_res).unwrap();
+    let ddb = east.dynamodb_state.read();
+    assert!(!ddb
+        .regional(ACCT, "eu-west-1")
+        .unwrap()
+        .tables
+        .contains_key("regional"));
+    assert_eq!(
+        ddb.regional(ACCT, "us-east-1").unwrap().tables["regional"].arn,
+        east_res.attributes["Arn"]
+    );
 }

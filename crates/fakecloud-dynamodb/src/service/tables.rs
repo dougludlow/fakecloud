@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -184,7 +184,7 @@ impl DynamoDbService {
             if self
                 .state
                 .read()
-                .get(&req.account_id)
+                .regional(&req.account_id, &req.region)
                 .is_some_and(|s| s.tables.contains_key(&table_name))
             {
                 return Err(already_exists());
@@ -195,7 +195,7 @@ impl DynamoDbService {
         };
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.tables.contains_key(&table_name) {
             return Err(already_exists());
         }
@@ -246,6 +246,8 @@ impl DynamoDbService {
             table_class,
             vector_indexes,
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         };
 
         // Build the response from the inserted table so CreateTable returns
@@ -264,7 +266,7 @@ impl DynamoDbService {
         let table_name = require_str(&body, "TableName")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
             // Deletion protection is checked first, and answered as a
             // validation failure rather than a resource conflict.
@@ -306,6 +308,16 @@ impl DynamoDbService {
         state
             .stream_policies
             .retain(|arn, _| !arn.starts_with(&stream_prefix));
+        // The other replicas of a multi-region table stay, without this one.
+        if !table.replica_regions.is_empty() {
+            super::replicas::leave_replica_set(
+                &mut accounts,
+                &req.account_id,
+                &req.region,
+                &table.name,
+                &table.replica_regions,
+            );
+        }
 
         let table_desc = build_table_description_json(&super::TableDescriptionInput {
             arn: &table.arn,
@@ -333,7 +345,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_table(&state.tables, table_name)?;
 
         let table_desc = build_table_description(table);
@@ -359,7 +373,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let mut names: Vec<&String> = state.tables.keys().collect();
         names.sort();
 
@@ -394,6 +410,7 @@ impl DynamoDbService {
         validate_update_table_model(&body)?;
         let table_name = require_str(&body, "TableName")?;
         validate_no_throughput_for_on_demand(&body)?;
+        let replica_updates = super::replicas::parse_replica_updates(&body);
 
         let not_found = || {
             AwsServiceError::aws_error(
@@ -415,7 +432,7 @@ impl DynamoDbService {
             {
                 let accounts = self.state.read();
                 let table = accounts
-                    .get(&req.account_id)
+                    .regional(&req.account_id, &req.region)
                     .and_then(|s| s.tables.get(super::resolve_table_name(table_name)))
                     .ok_or_else(not_found)?;
                 validate_update_table_request(table, &body)?;
@@ -425,8 +442,50 @@ impl DynamoDbService {
             None
         };
 
+        // A replica of a KMS-encrypted table is encrypted with a key of its
+        // own region: the one its Create names, or that region's
+        // AWS-managed key. Resolved with no lock held, like the table's own.
+        let mut replica_kms_keys = HashMap::new();
+        if replica_updates
+            .iter()
+            .any(|u| matches!(u, super::replicas::ReplicaUpdate::Create { .. }))
+        {
+            let table_uses_kms = sse_requested
+                || self
+                    .state
+                    .read()
+                    .regional(&req.account_id, &req.region)
+                    .and_then(|s| s.tables.get(super::resolve_table_name(table_name)))
+                    .is_some_and(|t| t.sse_type.as_deref() == Some("KMS"));
+            if table_uses_kms {
+                for update in &replica_updates {
+                    if let super::replicas::ReplicaUpdate::Create {
+                        region,
+                        kms_master_key_id,
+                        ..
+                    } = update
+                    {
+                        if let Some(key) = self.resolve_sse_key_arn_in(
+                            &req.account_id,
+                            region,
+                            kms_master_key_id.clone(),
+                        ) {
+                            replica_kms_keys.insert(region.clone(), key);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        super::replicas::validate_replica_updates(
+            &accounts,
+            &req.account_id,
+            &req.region,
+            super::resolve_table_name(table_name),
+            &replica_updates,
+        )?;
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // Snapshot region + account before taking a mutable borrow of
         // `state.tables` — we need them to mint a new stream ARN when the
         // caller flips stream_enabled from false to true mid-update. The stream
@@ -683,8 +742,22 @@ impl DynamoDbService {
             .attribute_definitions
             .retain(|ad| referenced.contains(&ad.attribute_name));
 
+        let name = table.name.clone();
+        // A global table's replicas share its schema-level settings.
+        super::replicas::sync_replica_settings(&mut accounts, &req.account_id, &req.region, &name);
+        super::replicas::apply_replica_updates(
+            &mut accounts,
+            &req.account_id,
+            &req.region,
+            &name,
+            &replica_updates,
+            &replica_kms_keys,
+        );
+        let table = accounts
+            .regional(&req.account_id, &req.region)
+            .and_then(|s| s.tables.get(&name))
+            .ok_or_else(not_found)?;
         let table_desc = build_table_description(table);
-
         Self::ok_json(json!({ "TableDescription": table_desc }))
     }
 
@@ -698,23 +771,28 @@ impl DynamoDbService {
         req: &AwsRequest,
         key_id: Option<String>,
     ) -> Option<String> {
+        self.resolve_sse_key_arn_in(&req.account_id, &req.region, key_id)
+    }
+
+    /// [`Self::resolve_sse_key_arn`] for a table in `region` of `account`.
+    fn resolve_sse_key_arn_in(
+        &self,
+        account: &str,
+        region: &str,
+        key_id: Option<String>,
+    ) -> Option<String> {
         let Some(hook) = &self.kms_hook else {
             return key_id;
         };
         let Some(wanted) = key_id else {
             return fakecloud_core::delivery::aws_managed_kms_key_arn(
                 Some(hook.as_ref()),
-                &req.account_id,
-                req.region.as_str(),
+                account,
+                region,
                 "dynamodb",
             );
         };
-        match hook.resolve_key_arn(
-            &req.account_id,
-            req.region.as_str(),
-            &wanted,
-            "dynamodb.amazonaws.com",
-        ) {
+        match hook.resolve_key_arn(account, region, &wanted, "dynamodb.amazonaws.com") {
             Ok(arn) => Some(arn),
             Err(_) => Some(wanted),
         }
@@ -761,7 +839,7 @@ impl DynamoDbService {
         })?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = get_table_mut(&mut state.tables, table_name)?;
 
         if enabled {
@@ -770,6 +848,9 @@ impl DynamoDbService {
         } else {
             table.ttl_enabled = false;
         }
+        // A global table keeps one TTL setting across its replicas.
+        let name = table.name.clone();
+        super::replicas::sync_replica_settings(&mut accounts, &req.account_id, &req.region, &name);
 
         Self::ok_json(json!({
             "TimeToLiveSpecification": {
@@ -788,7 +869,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_table(&state.tables, table_name)?;
 
         let status = if table.ttl_enabled {
@@ -819,7 +902,7 @@ impl DynamoDbService {
         validate_required("Tags", &body["Tags"])?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = find_table_by_arn_mut(&mut state.tables, resource_arn)?;
 
         fakecloud_core::tags::apply_tags(&mut table.tags, &body, "Tags", "Key", "Value").map_err(
@@ -842,7 +925,7 @@ impl DynamoDbService {
         validate_required("TagKeys", &body["TagKeys"])?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table = find_table_by_arn_mut(&mut state.tables, resource_arn)?;
 
         fakecloud_core::tags::remove_tags(&mut table.tags, &body, "TagKeys").map_err(|f| {
@@ -866,7 +949,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = find_table_by_arn(&state.tables, resource_arn)?;
 
         let tags = fakecloud_core::tags::tags_to_json(&table.tags, "Key", "Value");
@@ -887,7 +972,7 @@ impl DynamoDbService {
         validate_resource_policy_document(policy)?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let mut slot = resource_policy_slot(state, resource_arn)?;
         check_expected_revision(slot.current(), expected)?;
         slot.set(policy.to_string());
@@ -902,7 +987,7 @@ impl DynamoDbService {
         let resource_arn = require_str(&body, "ResourceArn")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         match resource_policy_slot(state, resource_arn)?.current() {
             Some(policy) => Self::ok_json(json!({
                 "Policy": policy,
@@ -923,7 +1008,7 @@ impl DynamoDbService {
         let expected = body["ExpectedRevisionId"].as_str();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let mut slot = resource_policy_slot(state, resource_arn)?;
         if expected.is_some() {
             // A conditional delete needs a policy at that revision; an
@@ -947,7 +1032,7 @@ impl DynamoDbService {
         let backup_name = require_str(&body, "BackupName")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         // CreateBackup declares TableNotFoundException, not the more common
         // ResourceNotFoundException; the strict probe rejects the latter.
         let table = get_table_with_code(&state.tables, table_name, "TableNotFoundException")?;
@@ -1010,7 +1095,7 @@ impl DynamoDbService {
         let backup_arn = require_str(&body, "BackupArn")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let backup = state.backups.remove(backup_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -1057,7 +1142,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let backup = state.backups.get(backup_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -1162,7 +1249,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         // Resume after ExclusiveStartBackupArn (backups are arn-ordered) and,
         // when a Limit truncates the set, emit LastEvaluatedBackupArn.
         // Previously every backup was returned with no continuation token.
@@ -1216,7 +1305,7 @@ impl DynamoDbService {
         let target_table_name = require_str(&body, "TargetTableName")?;
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let backup = state.backups.get(backup_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -1287,6 +1376,8 @@ impl DynamoDbService {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         };
         table.recalculate_stats();
 
@@ -1317,7 +1408,7 @@ impl DynamoDbService {
         let source_table_arn = body["SourceTableArn"].as_str();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
 
         // RestoreTableToPointInTime declares TableNotFoundException (not
         // ResourceNotFoundException). Missing source identifier also has no
@@ -1401,6 +1492,8 @@ impl DynamoDbService {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         };
         table.recalculate_stats();
 
@@ -1440,7 +1533,7 @@ impl DynamoDbService {
             .unwrap_or(false);
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let table =
             get_table_mut_with_code(&mut state.tables, table_name, "TableNotFoundException")?;
         table.set_pitr(enabled);
@@ -1469,7 +1562,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         // DescribeContinuousBackups declares TableNotFoundException, not
         // ResourceNotFoundException.
         let table = get_table_with_code(&state.tables, table_name, "TableNotFoundException")?;

@@ -55,7 +55,7 @@ pub fn import_aws_export(
     // from a persisted snapshot before this import runs), leave it untouched and
     // skip rather than error and refuse to boot. Checked before reading the
     // export so a no-op restart does no work.
-    if table_exists(state, account_id, &table_name) {
+    if table_exists(state, account_id, region, &table_name) {
         tracing::warn!(
             table = %table_name,
             "skipping DynamoDB export import: table already exists in state; existing data left untouched"
@@ -77,7 +77,7 @@ pub fn import_aws_export(
     let table = build_table(&table_name, region, account_id, shape, items)?;
 
     let mut guard = state.write();
-    let account = guard.get_or_create(account_id);
+    let account = guard.regional_mut(account_id, region);
     // Re-check under the write lock to close any check-then-insert gap and to
     // handle a genuinely conflicting table gracefully (warn + skip, never panic).
     if account.tables.contains_key(&table_name) {
@@ -134,11 +134,16 @@ pub fn import_aws_exports_dir(
     Ok(outcomes)
 }
 
-/// True if `account_id` already holds a table named `table_name`.
-fn table_exists(state: &SharedDynamoDbState, account_id: &str, table_name: &str) -> bool {
+/// True if `account_id` already holds a table named `table_name` in `region`.
+fn table_exists(
+    state: &SharedDynamoDbState,
+    account_id: &str,
+    region: &str,
+    table_name: &str,
+) -> bool {
     state
         .read()
-        .get(account_id)
+        .regional(account_id, region)
         .is_some_and(|account| account.tables.contains_key(table_name))
 }
 
@@ -312,6 +317,8 @@ fn build_table(
         table_class: "STANDARD".to_string(),
         vector_indexes: Vec::new(),
         pitr_history: Default::default(),
+        replica_regions: Vec::new(),
+        change_log: Default::default(),
     };
     table.recalculate_stats(); // fills item_count / size_bytes
     Ok(table)
@@ -359,7 +366,7 @@ mod tests {
         // Table lives in state with the right item count.
         let mut guard = state.write();
         let table = guard
-            .get_or_create("123456789012")
+            .regional_mut("123456789012", "us-east-1")
             .tables
             .get("Music")
             .expect("table in state");
@@ -460,7 +467,7 @@ mod tests {
             .accounts
             .expect("v2 multi-account snapshot written");
         let account = accounts
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .expect("account present after reload");
         let table = account
             .tables
@@ -535,7 +542,7 @@ mod tests {
         // Nothing partial landed in state.
         let mut guard = state.write();
         assert!(!guard
-            .get_or_create("123456789012")
+            .regional_mut("123456789012", "us-east-1")
             .tables
             .contains_key("MusicTypeMismatch"));
     }
@@ -566,7 +573,7 @@ mod tests {
         {
             let mut guard = state.write();
             let table = guard
-                .get_or_create("123456789012")
+                .regional_mut("123456789012", "us-east-1")
                 .tables
                 .get_mut("Music")
                 .expect("table in state");
@@ -590,7 +597,7 @@ mod tests {
         // re-populated with the 3 export items.
         let mut guard = state.write();
         let table = guard
-            .get_or_create("123456789012")
+            .regional_mut("123456789012", "us-east-1")
             .tables
             .get("Music")
             .expect("table still in state");
@@ -771,7 +778,7 @@ mod tests {
             .all(|o| matches!(o, ImportOutcome::Imported { items: 1, .. })));
 
         let mut guard = state.write();
-        let account = guard.get_or_create("123456789012");
+        let account = guard.regional_mut("123456789012", "us-east-1");
         assert!(account.tables.contains_key("TableA"));
         assert!(account.tables.contains_key("TableB"));
         drop(guard);
@@ -831,7 +838,7 @@ mod tests {
         // committed to state before the second subdirectory failed.
         let mut guard = state.write();
         assert!(guard
-            .get_or_create("123456789012")
+            .regional_mut("123456789012", "us-east-1")
             .tables
             .contains_key("TableA"));
         drop(guard);

@@ -74,7 +74,7 @@ impl DynamoDbService {
         // Capture kinesis delivery info alongside the return value
         let (old_item, kinesis_info, kms_audit, icm, consumed) = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             let region = state.region.clone();
             let table = get_data_table_mut(&mut state.tables, table_name)?;
 
@@ -237,7 +237,9 @@ impl DynamoDbService {
         let (result, needs_insights, kms_audit) = {
             let accounts = self.state.read();
             let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-            let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+            let state = accounts
+                .regional(&req.account_id, &req.region)
+                .unwrap_or(&empty_ddb);
             let table = get_data_table(&state.tables, table_name)?;
             validate_key_attributes_in_key(table, &key)?;
             let needs_insights = table.contributor_insights_status == "ENABLED";
@@ -285,7 +287,7 @@ impl DynamoDbService {
         // Only acquire write lock if contributor insights tracking is enabled
         if needs_insights {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 table.record_key_access(&key);
             }
@@ -335,7 +337,7 @@ impl DynamoDbService {
 
         let (result, kinesis_info) = {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             let region = state.region.clone();
             let table = get_data_table_mut(&mut state.tables, table_name)?;
             // The same key validation GetItem and UpdateItem apply: a missing,
@@ -481,7 +483,7 @@ impl DynamoDbService {
         let return_icm = return_icm_mode(&body).to_string();
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.regional_mut(&req.account_id, &req.region);
         let region = state.region.clone();
         let table = get_data_table_mut(&mut state.tables, table_name)?;
 
@@ -1173,7 +1175,7 @@ mod tests {
         ));
         {
             let mut accts = state.write();
-            let s = accts.get_or_create("123456789012");
+            let s = accts.regional_mut("123456789012", "us-east-1");
             s.tables.insert(
                 "T".to_string(),
                 DynamoTable {
@@ -1217,6 +1219,8 @@ mod tests {
                     table_class: "STANDARD".into(),
                     vector_indexes: Vec::new(),
                     pitr_history: Default::default(),
+                    replica_regions: Vec::new(),
+                    change_log: Default::default(),
                 },
             );
         }

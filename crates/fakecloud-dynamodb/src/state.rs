@@ -601,6 +601,23 @@ pub struct DynamoTable {
     /// incremental exports and exports at a past `ExportTime`.
     #[serde(default)]
     pub pitr_history: PitrHistory,
+    /// The other regions holding a replica of this table (a version
+    /// 2019.11.21 global table), sorted. Empty for a single-region table.
+    #[serde(default)]
+    pub replica_regions: Vec<String>,
+    /// The primary keys written while a replicated write is being tracked
+    /// (see [`DynamoTable::track_changes`]). Not persisted.
+    #[serde(skip)]
+    pub(crate) change_log: ChangeLog,
+}
+
+/// Keys of the rows a table's writes touched, recorded only while at least
+/// one tracker is open, so a replicated table can copy exactly the rows an
+/// operation wrote to its other replicas.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChangeLog {
+    trackers: u32,
+    keys: Vec<HashMap<String, AttributeValue>>,
 }
 
 /// How far back point-in-time recovery reaches (DynamoDB's default and
@@ -940,6 +957,43 @@ impl DynamoTable {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: PitrHistory::default(),
+            replica_regions: Vec::new(),
+            change_log: ChangeLog::default(),
+        }
+    }
+
+    /// Start recording the keys this table's writes touch. Every call must
+    /// be paired with [`Self::finish_tracking`].
+    pub(crate) fn track_changes(&mut self) {
+        self.change_log.trackers += 1;
+    }
+
+    /// Close one tracker and take the keys written since tracking started
+    /// (the log is shared by overlapping trackers; whoever drains it
+    /// replicates those rows). Recording stops when the last tracker closes.
+    pub(crate) fn finish_tracking(&mut self) -> Vec<HashMap<String, AttributeValue>> {
+        self.change_log.trackers = self.change_log.trackers.saturating_sub(1);
+        std::mem::take(&mut self.change_log.keys)
+    }
+
+    /// The primary-key attributes of `item`.
+    pub(crate) fn primary_key_of(
+        &self,
+        item: &HashMap<String, AttributeValue>,
+    ) -> HashMap<String, AttributeValue> {
+        self.key_schema
+            .iter()
+            .filter_map(|k| {
+                item.get(&k.attribute_name)
+                    .map(|v| (k.attribute_name.clone(), v.clone()))
+            })
+            .collect()
+    }
+
+    fn log_change(&mut self, item: &HashMap<String, AttributeValue>) {
+        if self.change_log.trackers > 0 {
+            let key = self.primary_key_of(item);
+            self.change_log.keys.push(key);
         }
     }
 
@@ -1313,6 +1367,7 @@ impl DynamoTable {
     /// this replaced an existing item. An overwrite keeps the row's place in
     /// storage order; an insert goes after every existing row.
     pub fn put_item_at_key(&mut self, item: HashMap<String, AttributeValue>) -> (ItemId, bool) {
+        self.log_change(&item);
         self.ensure_key_index();
         match self.find_item_index(&item) {
             Some(id) => {
@@ -1377,6 +1432,7 @@ impl DynamoTable {
         }
         self.size_bytes -= Self::estimate_item_size(&removed);
         self.item_count -= 1;
+        self.log_change(&removed);
         removed
     }
 
@@ -1405,6 +1461,11 @@ impl DynamoTable {
                     self.record_change(Some(&original), Some(&new));
                 }
                 self.sync_item_at(id, before);
+                if self.change_log.trackers > 0 {
+                    if let Some(row) = self.items.get(id).cloned() {
+                        self.log_change(&row);
+                    }
+                }
                 Ok(())
             }
             Err(err) => {
@@ -1435,12 +1496,23 @@ impl DynamoTable {
             self.record_change(Some(&original), Some(&new));
         }
         self.sync_item_at(id, before);
+        if self.change_log.trackers > 0 {
+            if let Some(row) = self.items.get(id).cloned() {
+                self.log_change(&row);
+            }
+        }
     }
 
     /// Replace every row at once, then re-derive the stats and the key index
     /// from the new rows. For the bulk paths (an import, a transaction
     /// revert), where a full pass is proportional to work already done.
     pub fn replace_items(&mut self, items: Vec<HashMap<String, AttributeValue>>) {
+        if self.change_log.trackers > 0 {
+            let touched: Vec<_> = self.items.iter().chain(items.iter()).cloned().collect();
+            for row in touched {
+                self.log_change(&row);
+            }
+        }
         self.items = TableItems::new(items);
         self.recalculate_stats();
     }
@@ -1616,21 +1688,86 @@ pub struct DynamoDbState {
     pub stream_policies: BTreeMap<String, String>,
 }
 
-/// On-disk snapshot envelope. The payload is the full [`DynamoDbState`];
-/// `schema_version` lets us evolve the format without accidentally loading
-/// an incompatible dump on upgrade.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamoDbSnapshot {
-    pub schema_version: u32,
-    /// v2+: multi-account state.
-    #[serde(default)]
-    pub accounts: Option<fakecloud_core::multi_account::MultiAccountState<DynamoDbState>>,
-    /// v1 compat: single-account state.
-    #[serde(default)]
-    pub state: Option<DynamoDbState>,
+/// On-disk snapshot envelope: the full DynamoDB state, partitioned by
+/// account and region; `schema_version` lets us evolve the format without
+/// accidentally loading an incompatible dump on upgrade.
+pub type DynamoDbSnapshot = fakecloud_core::multi_account::RegionalSnapshot<DynamoDbState>;
+
+/// v3: state partitioned by (account, region). v2 kept one account-wide
+/// state per account, so the same table name could not exist in two regions;
+/// v1 a single account's state.
+pub const DYNAMODB_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+
+/// Parse a persisted DynamoDB snapshot, migrating older schemas to the
+/// current one: every table, backup, export, import and stream policy moves
+/// to the region its ARN names. A snapshot newer than this build comes back
+/// with its on-disk `schema_version` and no state, for the caller to refuse.
+pub fn parse_dynamodb_snapshot(bytes: &[u8]) -> Result<DynamoDbSnapshot, serde_json::Error> {
+    fakecloud_core::multi_account::parse_regional_snapshot(
+        bytes,
+        DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
+        |state: DynamoDbState| {
+            let account = state.account_id.clone();
+            let region = state.region.clone();
+            fakecloud_core::multi_account::RegionalState::from_legacy(&account, &region, "", state)
+        },
+    )
 }
 
-pub const DYNAMODB_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+impl fakecloud_core::multi_account::SplitByRegion for DynamoDbState {
+    fn split_by_region(
+        self,
+        into: &mut fakecloud_core::multi_account::RegionalState<DynamoDbState>,
+    ) {
+        use fakecloud_aws::arn::region_of;
+        for (name, table) in self.tables {
+            let region = region_of(&table.arn).map(str::to_string);
+            into.region_or_default_mut(region.as_deref())
+                .tables
+                .insert(name, table);
+        }
+        for (arn, backup) in self.backups {
+            into.region_or_default_mut(region_of(&arn))
+                .backups
+                .insert(arn.clone(), backup);
+        }
+        for (arn, export) in self.exports {
+            into.region_or_default_mut(region_of(&arn))
+                .exports
+                .insert(arn.clone(), export);
+        }
+        for (arn, import) in self.imports {
+            into.region_or_default_mut(region_of(&arn))
+                .imports
+                .insert(arn.clone(), import);
+        }
+        for (arn, policy) in self.stream_policies {
+            into.region_or_default_mut(region_of(&arn))
+                .stream_policies
+                .insert(arn.clone(), policy);
+        }
+        // A legacy global table's ARN names no region; it stays in the
+        // region the account-wide state was kept in (the server's), where
+        // every replica region of its replication group still finds it.
+        for (name, gt) in self.global_tables {
+            into.region_or_default_mut(None)
+                .global_tables
+                .insert(name, gt);
+        }
+        // Stream -> Lambda checkpoints are keyed by mapping UUID, which names
+        // no region. Every region keeps a copy: the poller reads the one in
+        // its stream's region, and mapping UUIDs never collide.
+        if !self.lambda_stream_checkpoints.is_empty() {
+            into.region_or_default_mut(None);
+            let regions: Vec<String> = into.regions().map(|(r, _)| r.to_string()).collect();
+            for region in regions {
+                into.region_mut(&region)
+                    .lambda_stream_checkpoints
+                    .extend(self.lambda_stream_checkpoints.clone());
+            }
+        }
+    }
+}
 
 impl DynamoDbState {
     /// Rebuild what a snapshot does not carry, or carries from an older
@@ -1668,6 +1805,17 @@ impl DynamoDbState {
         }
     }
 
+    /// True when this region holds nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+            && self.backups.is_empty()
+            && self.global_tables.is_empty()
+            && self.exports.is_empty()
+            && self.imports.is_empty()
+            && self.lambda_stream_checkpoints.is_empty()
+            && self.stream_policies.is_empty()
+    }
+
     pub fn reset(&mut self) {
         self.tables.clear();
         self.backups.clear();
@@ -1700,8 +1848,10 @@ impl fakecloud_core::multi_account::AccountState for DynamoDbState {
     }
 }
 
+/// DynamoDB state, partitioned by account and then by region: every table,
+/// backup, export, import and stream lives in exactly one (account, region).
 pub type SharedDynamoDbState =
-    Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<DynamoDbState>>>;
+    Arc<RwLock<fakecloud_core::multi_account::MultiRegionState<DynamoDbState>>>;
 
 #[cfg(test)]
 mod tests {
@@ -1740,6 +1890,99 @@ mod tests {
         let state = DynamoDbState::new_for_account("123", "us-east-1", "");
         assert_eq!(state.account_id, "123");
         assert_eq!(state.region, "us-east-1");
+    }
+
+    /// A v2 (account-wide) snapshot loads with every resource in the region
+    /// its ARN names, and records naming no region in the server's.
+    #[test]
+    fn legacy_account_wide_snapshot_splits_by_region() {
+        let mut legacy = DynamoDbState::new("123456789012", "us-east-1");
+        for (name, region) in [("east", "us-east-1"), ("west", "eu-west-1")] {
+            let arn = table_arn(region, "123456789012", name);
+            let mut table = DynamoTable::new(
+                name.to_string(),
+                arn.clone(),
+                "id".to_string(),
+                vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: "HASH".to_string(),
+                }],
+                vec![],
+                ProvisionedThroughput {
+                    read_capacity_units: 0,
+                    write_capacity_units: 0,
+                },
+                "PAY_PER_REQUEST".to_string(),
+                Utc::now(),
+            );
+            table.set_pitr(true);
+            table.put_item_at_key(HashMap::from([("pk".to_string(), json!({"S": name}))]));
+            legacy.tables.insert(name.to_string(), table);
+            legacy
+                .stream_policies
+                .insert(format!("{arn}/stream/label"), "{}".to_string());
+        }
+        legacy
+            .lambda_stream_checkpoints
+            .insert("esm-1".into(), "42".into());
+        let mut accounts = fakecloud_core::multi_account::MultiAccountState::<DynamoDbState>::new(
+            "123456789012",
+            "us-east-1",
+            "",
+        );
+        *accounts.get_or_create("123456789012") = legacy;
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "accounts": accounts,
+        }))
+        .unwrap();
+
+        let snapshot = parse_dynamodb_snapshot(&bytes).unwrap();
+        assert_eq!(snapshot.schema_version, DYNAMODB_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = snapshot.accounts.unwrap();
+        let east = accounts.regional("123456789012", "us-east-1").unwrap();
+        let west = accounts.regional("123456789012", "eu-west-1").unwrap();
+        assert_eq!(east.tables.keys().collect::<Vec<_>>(), vec!["east"]);
+        assert_eq!(west.tables.keys().collect::<Vec<_>>(), vec!["west"]);
+        assert_eq!(west.region, "eu-west-1");
+        assert_eq!(west.tables["west"].items().len(), 1);
+        // The table's point-in-time history moves with it.
+        assert!(west.tables["west"].pitr_enabled);
+        assert_eq!(west.tables["west"].pitr_history.changes.len(), 1);
+        assert!(west.tables["west"].pitr_history.enabled_at.is_some());
+        assert!(west
+            .stream_policies
+            .keys()
+            .all(|arn| arn.contains(":eu-west-1:")));
+        assert_eq!(west.stream_policies.len(), 1);
+        for state in [east, west] {
+            assert_eq!(
+                state.lambda_stream_checkpoint("esm-1").as_deref(),
+                Some("42")
+            );
+        }
+
+        // v1: a single account-wide state.
+        let mut single = DynamoDbState::new("111122223333", "us-east-1");
+        single
+            .tables
+            .insert("west".into(), west.tables["west"].clone());
+        let bytes = serde_json::to_vec(&json!({"schema_version": 1, "state": single})).unwrap();
+        let snapshot = parse_dynamodb_snapshot(&bytes).unwrap();
+        let regional = snapshot.state.unwrap();
+        assert_eq!(regional.account_id(), "111122223333");
+        assert!(regional
+            .region("eu-west-1")
+            .unwrap()
+            .tables
+            .contains_key("west"));
+        assert!(regional.region("us-east-1").is_none());
+
+        // A snapshot from a newer build is handed back for the caller to refuse.
+        let bytes = serde_json::to_vec(&json!({"schema_version": 99})).unwrap();
+        let snapshot = parse_dynamodb_snapshot(&bytes).unwrap();
+        assert_eq!(snapshot.schema_version, 99);
+        assert!(snapshot.accounts.is_none());
     }
 
     #[test]
@@ -1790,6 +2033,8 @@ mod tests {
             table_class: default_table_class(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         }
     }
 

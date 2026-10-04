@@ -630,7 +630,7 @@ fn dynamodb_table_ref_is_the_table_name() {
     assert!(prov
         .dynamodb_state
         .read()
-        .get(ACCT)
+        .regional(ACCT, "us-east-1")
         .unwrap()
         .tables
         .is_empty());
@@ -830,41 +830,86 @@ fn iam_role_policy_is_an_inline_policy_on_the_role() {
 }
 
 #[test]
-fn dynamodb_global_table_creates_the_local_replica_and_replication_group() {
+fn dynamodb_global_table_creates_real_replicas_in_their_regions() {
     let prov = make_provisioner();
-    let gt = create(
-        &prov,
-        "AWS::DynamoDB::GlobalTable",
-        "G",
+    let props = |replicas: serde_json::Value| {
         json!({
             "TableName": "global-items",
             "BillingMode": "PAY_PER_REQUEST",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
-            "Replicas": [
-                {"Region": "us-east-1", "DeletionProtectionEnabled": false},
-                {"Region": "eu-west-1"}
-            ]
-        }),
+            "Replicas": replicas
+        })
+    };
+    let gt = create(
+        &prov,
+        "AWS::DynamoDB::GlobalTable",
+        "G",
+        props(json!([
+            {"Region": "us-east-1", "DeletionProtectionEnabled": false},
+            {"Region": "eu-west-1", "TableClass": "STANDARD_INFREQUENT_ACCESS"}
+        ])),
     );
     assert_eq!(gt.physical_id, "global-items");
     assert!(gt.attributes.contains_key("StreamArn"));
     {
         let ddb = prov.dynamodb_state.read();
-        let st = ddb.get(ACCT).unwrap();
-        assert!(st.tables.contains_key("global-items"));
-        let regions: Vec<&str> = st.global_tables["global-items"]
-            .replication_group
-            .iter()
-            .map(|r| r.region_name.as_str())
-            .collect();
-        assert_eq!(regions, vec!["us-east-1", "eu-west-1"]);
+        let east = &ddb.regional(ACCT, "us-east-1").unwrap().tables["global-items"];
+        assert_eq!(east.replica_regions, vec!["eu-west-1".to_string()]);
+        let west = &ddb.regional(ACCT, "eu-west-1").unwrap().tables["global-items"];
+        assert_eq!(
+            west.arn,
+            "arn:aws:dynamodb:eu-west-1:123456789012:table/global-items"
+        );
+        assert_eq!(west.replica_regions, vec!["us-east-1".to_string()]);
+        assert_eq!(west.table_class, "STANDARD_INFREQUENT_ACCESS");
+        assert!(west
+            .stream_arn
+            .as_deref()
+            .unwrap()
+            .starts_with("arn:aws:dynamodb:eu-west-1:"));
+        // A 2019.11.21 global table is not a legacy one.
+        assert!(ddb
+            .regional(ACCT, "us-east-1")
+            .unwrap()
+            .global_tables
+            .is_empty());
     }
-    prov.delete_resource(&gt).unwrap();
+
+    // A stack update swapping eu-west-1 for ap-south-1 moves the replica.
+    let updated = prov
+        .update_resource(
+            &gt,
+            &make_resource(
+                "AWS::DynamoDB::GlobalTable",
+                "G",
+                props(json!([{"Region": "us-east-1"}, {"Region": "ap-south-1"}])),
+            ),
+        )
+        .expect("update succeeds")
+        .expect("GlobalTable is updatable");
+    {
+        let ddb = prov.dynamodb_state.read();
+        assert!(!ddb
+            .regional(ACCT, "eu-west-1")
+            .unwrap()
+            .tables
+            .contains_key("global-items"));
+        assert_eq!(
+            ddb.regional(ACCT, "ap-south-1").unwrap().tables["global-items"].replica_regions,
+            vec!["us-east-1".to_string()]
+        );
+    }
+
+    // Deleting the stack resource removes every replica.
+    prov.delete_resource(&updated).unwrap();
     let ddb = prov.dynamodb_state.read();
-    let st = ddb.get(ACCT).unwrap();
-    assert!(st.tables.is_empty() && st.global_tables.is_empty());
+    for region in ["us-east-1", "eu-west-1", "ap-south-1"] {
+        assert!(ddb
+            .regional(ACCT, region)
+            .is_none_or(|s| !s.tables.contains_key("global-items")));
+    }
 }
 
 #[test]

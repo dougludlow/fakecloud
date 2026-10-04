@@ -51,7 +51,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_data_table(&state.tables, table_name)?;
 
         let mut expr_attr_names = parse_expression_attribute_names(&body);
@@ -441,7 +443,7 @@ impl DynamoDbService {
 
         if !accessed_keys.is_empty() {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 // Re-check insights status after acquiring write lock in case it
                 // was disabled between the read and write lock acquisitions.
@@ -538,7 +540,9 @@ impl DynamoDbService {
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
+        let state = accounts
+            .regional(&req.account_id, &req.region)
+            .unwrap_or(&empty_ddb);
         let table = get_data_table(&state.tables, table_name)?;
 
         let mut expr_attr_names = parse_expression_attribute_names(&body);
@@ -791,7 +795,7 @@ impl DynamoDbService {
 
         if !accessed_keys.is_empty() {
             let mut accounts = self.state.write();
-            let state = accounts.get_or_create(&req.account_id);
+            let state = accounts.regional_mut(&req.account_id, &req.region);
             if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 // Re-check insights status after acquiring write lock in case it
                 // was disabled between the read and write lock acquisitions.
@@ -1194,7 +1198,7 @@ mod tests {
         items: Vec<HashMap<String, AttributeValue>>,
     ) {
         let mut accts = state.write();
-        let s = accts.get_or_create("123456789012");
+        let s = accts.regional_mut("123456789012", "us-east-1");
         let table = DynamoTable {
             name: name.to_string(),
             arn: format!("arn:aws:dynamodb:us-east-1:123456789012:table/{name}"),
@@ -1236,6 +1240,8 @@ mod tests {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
             pitr_history: Default::default(),
+            replica_regions: Vec::new(),
+            change_log: Default::default(),
         };
         s.tables.insert(name.to_string(), table);
     }

@@ -57,7 +57,7 @@ fn load_recorded_snapshot(store: &RecordingSnapshotStore) -> Vec<u8> {
 }
 
 fn service_from_snapshot_bytes(bytes: &[u8]) -> DynamoDbService {
-    let snapshot: DynamoDbSnapshot = serde_json::from_slice(bytes).unwrap();
+    let snapshot: DynamoDbSnapshot = crate::state::parse_dynamodb_snapshot(bytes).unwrap();
     assert_eq!(snapshot.schema_version, DYNAMODB_SNAPSHOT_SCHEMA_VERSION);
 
     let state: SharedDynamoDbState = Arc::new(parking_lot::RwLock::new(
@@ -66,7 +66,7 @@ fn service_from_snapshot_bytes(bytes: &[u8]) -> DynamoDbService {
     if let Some(accounts) = snapshot.accounts {
         *state.write() = accounts;
     } else if let Some(single_state) = snapshot.state {
-        let account_id = single_state.account_id.clone();
+        let account_id = single_state.account_id().to_string();
         *state.write().get_or_create(&account_id) = single_state;
     } else {
         panic!("snapshot must contain either multi-account or legacy state");
@@ -918,7 +918,7 @@ fn resource_policy_lifecycle() {
 
     let table_arn = {
         let __mas = svc.state.read();
-        let state = __mas.default_ref();
+        let state = __mas.regional("123456789012", "us-east-1").unwrap();
         state.tables.get("test-table").unwrap().arn.clone()
     };
 
@@ -3785,7 +3785,8 @@ fn tag_operations() {
     create_test_table(&svc);
     let arn = {
         let s = svc.state.read();
-        s.default_ref()
+        s.regional("123456789012", "us-east-1")
+            .unwrap()
             .tables
             .get("test-table")
             .unwrap()
@@ -4264,7 +4265,7 @@ fn partiql_update_emits_stream_record() {
     let baseline = {
         let s = svc.state.read();
         let n = s
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Tbl")
@@ -4283,7 +4284,12 @@ fn partiql_update_emits_stream_record() {
 
     let after = {
         let s = svc.state.read();
-        let t = s.get("123456789012").unwrap().tables.get("Tbl").unwrap();
+        let t = s
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables
+            .get("Tbl")
+            .unwrap();
         let recs = t.stream_records.read();
         let last = recs.last().cloned();
         (recs.len(), last)
@@ -4319,7 +4325,7 @@ fn partiql_delete_emits_stream_record() {
     let baseline = {
         let s = svc.state.read();
         let n = s
-            .get("123456789012")
+            .regional("123456789012", "us-east-1")
             .unwrap()
             .tables
             .get("Tbl")
@@ -4338,7 +4344,12 @@ fn partiql_delete_emits_stream_record() {
 
     let after = {
         let s = svc.state.read();
-        let t = s.get("123456789012").unwrap().tables.get("Tbl").unwrap();
+        let t = s
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables
+            .get("Tbl")
+            .unwrap();
         let recs = t.stream_records.read();
         let last = recs.last().cloned();
         (recs.len(), last)
@@ -6195,7 +6206,7 @@ fn create_table_stores_vector_indexes_and_describe_returns_them() {
 /// Rewind an online-built index's creation clock by `ms`.
 fn age_vector_index(svc: &DynamoDbService, table: &str, index: &str, ms: i64) {
     let mut accounts = svc.state.write();
-    let state = accounts.get_or_create("123456789012");
+    let state = accounts.regional_mut("123456789012", "us-east-1");
     let idx = state
         .tables
         .get_mut(table)
@@ -6901,7 +6912,10 @@ async fn table_operations_and_insights_accept_a_table_arn() {
     .await;
     {
         let accounts = svc.state.read();
-        let table = &accounts.get("123456789012").unwrap().tables["test-table"];
+        let table = &accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables["test-table"];
         assert_eq!(
             table.contributor_insights_counters.values().sum::<u64>(),
             3,
@@ -6935,7 +6949,7 @@ async fn table_operations_and_insights_accept_a_table_arn() {
     assert!(svc
         .state
         .read()
-        .get("123456789012")
+        .regional("123456789012", "us-east-1")
         .unwrap()
         .tables
         .is_empty());
@@ -7180,7 +7194,13 @@ async fn resource_policy_revisions_and_stream_policies() {
 
     // Deleting the table drops its streams' policies.
     call_dynamodb(&svc, "DeleteTable", json!({"TableName": "Orders"})).await;
-    assert!(svc.state.read().default_ref().stream_policies.is_empty());
+    assert!(svc
+        .state
+        .read()
+        .regional("123456789012", "us-east-1")
+        .unwrap()
+        .stream_policies
+        .is_empty());
 }
 
 /// A policy given to CreateTable is attached to the new table.
@@ -7198,7 +7218,12 @@ async fn create_table_attaches_its_resource_policy() {
         }),
     ))
     .unwrap();
-    let arn = svc.state.read().default_ref().tables["WithPolicy"]
+    let arn = svc
+        .state
+        .read()
+        .regional("123456789012", "us-east-1")
+        .unwrap()
+        .tables["WithPolicy"]
         .arn
         .clone();
     let got = call_dynamodb(&svc, "GetResourcePolicy", json!({"ResourceArn": arn})).await;
@@ -7702,7 +7727,11 @@ async fn two_account_tables() -> DynamoDbService {
 }
 
 fn item_count(svc: &DynamoDbService, account: &str) -> usize {
-    svc.state.read().get(account).unwrap().tables["Shared"]
+    svc.state
+        .read()
+        .regional(account, "us-east-1")
+        .unwrap()
+        .tables["Shared"]
         .items
         .len()
 }
@@ -7758,7 +7787,12 @@ async fn cross_account_item_operations_act_on_the_owners_table() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        svc.state.read().get(OWNER).unwrap().tables["Shared"].tags["team"],
+        svc.state
+            .read()
+            .regional(OWNER, "us-east-1")
+            .unwrap()
+            .tables["Shared"]
+            .tags["team"],
         "blue"
     );
 }
@@ -7828,7 +7862,7 @@ async fn cross_account_transactions_are_atomic_across_accounts() {
     // The writes landed on each table's stream.
     for account in ["123456789012", OWNER] {
         let accounts = svc.state.read();
-        let records = accounts.get(account).unwrap().tables["Shared"]
+        let records = accounts.regional(account, "us-east-1").unwrap().tables["Shared"]
             .stream_records
             .read()
             .len();
@@ -8353,7 +8387,7 @@ fn update_item_normalizes_only_the_values_it_writes() {
     create_test_table(&svc);
     {
         let mut accounts = svc.state.write();
-        let state = accounts.get_or_create("123456789012");
+        let state = accounts.regional_mut("123456789012", "us-east-1");
         let table = state.tables.get_mut("test-table").unwrap();
         let legacy: HashMap<String, Value> = serde_json::from_value(json!({
             "pk": {"S": "legacy"},
@@ -9119,7 +9153,11 @@ fn default_sse_key_is_what_the_regions_dynamodb_alias_resolves_to() {
         );
         r.region = region.to_string();
         svc.create_table(&r).unwrap();
-        describe(&svc, name)["SSEDescription"]["KMSMasterKeyArn"]
+        let mut d = make_request("DescribeTable", json!({ "TableName": name }));
+        d.region = region.to_string();
+        let resp = svc.describe_table(&d).unwrap();
+        serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()["Table"]
+            ["SSEDescription"]["KMSMasterKeyArn"]
             .as_str()
             .unwrap()
             .to_string()
@@ -9158,4 +9196,637 @@ fn default_sse_key_is_what_the_regions_dynamodb_alias_resolves_to() {
             "alias/aws/dynamodb",
         );
     }
+}
+
+// ── Region scoping ─────────────────────────────────────────────────────
+
+/// Call `action` in `region`, returning the status and JSON body.
+async fn call_in(
+    svc: &DynamoDbService,
+    region: &str,
+    action: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut req = make_request(action, body);
+    req.region = region.to_string();
+    match svc.handle(req).await {
+        Ok(resp) => (
+            resp.status,
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap(),
+        ),
+        Err(e) => (
+            e.status(),
+            json!({ "__type": e.code(), "message": format!("{e:?}") }),
+        ),
+    }
+}
+
+fn simple_table(name: &str) -> Value {
+    json!({
+        "TableName": name,
+        "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+        "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": { "StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES" },
+    })
+}
+
+#[tokio::test]
+async fn the_same_table_name_is_a_separate_table_in_each_region() {
+    let svc = make_service();
+    for region in ["us-east-1", "eu-west-1"] {
+        let (status, body) = call_in(&svc, region, "CreateTable", simple_table("Orders")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["TableDescription"]["TableArn"],
+            format!("arn:aws:dynamodb:{region}:123456789012:table/Orders")
+        );
+        call_in(
+            &svc,
+            region,
+            "PutItem",
+            json!({"TableName": "Orders", "Item": {"pk": {"S": "k"}, "region": {"S": region}}}),
+        )
+        .await;
+    }
+    call_in(&svc, "eu-west-1", "CreateTable", simple_table("OnlyWest")).await;
+
+    for region in ["us-east-1", "eu-west-1"] {
+        let (_, item) = call_in(
+            &svc,
+            region,
+            "GetItem",
+            json!({"TableName": "Orders", "Key": {"pk": {"S": "k"}}}),
+        )
+        .await;
+        assert_eq!(item["Item"]["region"]["S"], region);
+        let (_, d) = call_in(
+            &svc,
+            region,
+            "DescribeTable",
+            json!({"TableName": "Orders"}),
+        )
+        .await;
+        assert_eq!(d["Table"]["ItemCount"], 1);
+        assert!(d["Table"]["LatestStreamArn"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("arn:aws:dynamodb:{region}:")));
+    }
+    let (_, east) = call_in(&svc, "us-east-1", "ListTables", json!({})).await;
+    assert_eq!(east["TableNames"], json!(["Orders"]));
+    let (_, west) = call_in(&svc, "eu-west-1", "ListTables", json!({})).await;
+    assert_eq!(west["TableNames"], json!(["OnlyWest", "Orders"]));
+
+    // A table ARN naming another region is not found, even when the
+    // request's region has a table of that name.
+    let (status, err) = call_in(
+        &svc,
+        "us-east-1",
+        "DescribeTable",
+        json!({"TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/OnlyWest"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["__type"], "ResourceNotFoundException");
+    let (status, err) = call_in(
+        &svc,
+        "us-east-1",
+        "DescribeTable",
+        json!({"TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/Orders"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["__type"], "ResourceNotFoundException");
+    // By its own region's ARN it is found.
+    let (status, _) = call_in(
+        &svc,
+        "eu-west-1",
+        "DescribeTable",
+        json!({"TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/OnlyWest"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deleting one region's table leaves the other's.
+    call_in(
+        &svc,
+        "us-east-1",
+        "DeleteTable",
+        json!({"TableName": "Orders"}),
+    )
+    .await;
+    let (status, _) = call_in(
+        &svc,
+        "eu-west-1",
+        "DescribeTable",
+        json!({"TableName": "Orders"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A read in a region nobody has used leaves no state behind.
+    call_in(&svc, "ap-south-1", "ListTables", json!({})).await;
+    call_in(
+        &svc,
+        "ap-south-1",
+        "DescribeTable",
+        json!({"TableName": "Orders"}),
+    )
+    .await;
+    assert!(svc
+        .state
+        .read()
+        .regional("123456789012", "ap-south-1")
+        .is_none());
+}
+
+#[tokio::test]
+async fn backups_and_streams_live_in_their_tables_region() {
+    let svc = make_service();
+    for region in ["us-east-1", "eu-west-1"] {
+        call_in(&svc, region, "CreateTable", simple_table("Tbl")).await;
+    }
+    let (_, backup) = call_in(
+        &svc,
+        "eu-west-1",
+        "CreateBackup",
+        json!({"TableName": "Tbl", "BackupName": "b"}),
+    )
+    .await;
+    let backup_arn = backup["BackupDetails"]["BackupArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(backup_arn.starts_with("arn:aws:dynamodb:eu-west-1:123456789012:table/Tbl/backup/"));
+    let (_, east) = call_in(&svc, "us-east-1", "ListBackups", json!({})).await;
+    assert_eq!(east["BackupSummaries"], json!([]));
+    let (_, west) = call_in(&svc, "eu-west-1", "ListBackups", json!({})).await;
+    assert_eq!(west["BackupSummaries"].as_array().unwrap().len(), 1);
+    let (status, _) = call_in(
+        &svc,
+        "us-east-1",
+        "DescribeBackup",
+        json!({ "BackupArn": backup_arn }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Tags by ARN reach the ARN's table only.
+    let west_arn = "arn:aws:dynamodb:eu-west-1:123456789012:table/Tbl";
+    call_in(
+        &svc,
+        "eu-west-1",
+        "TagResource",
+        json!({"ResourceArn": west_arn, "Tags": [{"Key": "r", "Value": "west"}]}),
+    )
+    .await;
+    let (_, tags) = call_in(
+        &svc,
+        "us-east-1",
+        "ListTagsOfResource",
+        json!({"ResourceArn": "arn:aws:dynamodb:us-east-1:123456789012:table/Tbl"}),
+    )
+    .await;
+    assert_eq!(tags["Tags"], json!([]));
+    let (_, tags) = call_in(
+        &svc,
+        "eu-west-1",
+        "ListTagsOfResource",
+        json!({"ResourceArn": west_arn}),
+    )
+    .await;
+    assert_eq!(tags["Tags"], json!([{"Key": "r", "Value": "west"}]));
+
+    // The DynamoDB Streams data plane sees each region's streams.
+    let streams = crate::DynamoDbStreamsService::new(svc.state.clone());
+    let mut req = make_request("ListStreams", json!({}));
+    req.service = "dynamodbstreams".into();
+    req.region = "eu-west-1".into();
+    let resp = streams.handle(req).await.unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arns: Vec<&str> = body["Streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["StreamArn"].as_str().unwrap())
+        .collect();
+    assert_eq!(arns.len(), 1);
+    assert!(arns[0].starts_with(west_arn));
+}
+
+#[tokio::test]
+async fn replica_updates_create_a_live_replica_in_the_other_region() {
+    let svc = make_service();
+    call_in(&svc, "us-east-1", "CreateTable", simple_table("Glob")).await;
+    call_in(
+        &svc,
+        "us-east-1",
+        "PutItem",
+        json!({"TableName": "Glob", "Item": {"pk": {"S": "seed"}}}),
+    )
+    .await;
+    let (status, body) = call_in(
+        &svc,
+        "us-east-1",
+        "UpdateTable",
+        json!({"TableName": "Glob", "ReplicaUpdates": [{"Create": {"RegionName": "eu-west-1"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["TableDescription"]["GlobalTableVersion"], "2019.11.21");
+    assert_eq!(
+        body["TableDescription"]["Replicas"],
+        json!([{"RegionName": "eu-west-1", "ReplicaStatus": "ACTIVE"}])
+    );
+
+    // The replica is a table of eu-west-1, with the source's rows.
+    let (status, d) = call_in(
+        &svc,
+        "eu-west-1",
+        "DescribeTable",
+        json!({"TableName": "Glob"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        d["Table"]["TableArn"],
+        "arn:aws:dynamodb:eu-west-1:123456789012:table/Glob"
+    );
+    assert_eq!(
+        d["Table"]["Replicas"],
+        json!([{"RegionName": "us-east-1", "ReplicaStatus": "ACTIVE"}])
+    );
+    assert_eq!(d["Table"]["ItemCount"], 1);
+    let (_, list) = call_in(&svc, "eu-west-1", "ListTables", json!({})).await;
+    assert_eq!(list["TableNames"], json!(["Glob"]));
+
+    // Writes in either region reach the other.
+    call_in(
+        &svc,
+        "eu-west-1",
+        "PutItem",
+        json!({"TableName": "Glob", "Item": {"pk": {"S": "w"}, "v": {"S": "from-west"}}}),
+    )
+    .await;
+    let (_, got) = call_in(
+        &svc,
+        "us-east-1",
+        "GetItem",
+        json!({"TableName": "Glob", "Key": {"pk": {"S": "w"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"]["v"]["S"], "from-west");
+    call_in(
+        &svc,
+        "us-east-1",
+        "BatchWriteItem",
+        json!({"RequestItems": {"Glob": [{"DeleteRequest": {"Key": {"pk": {"S": "seed"}}}}]}}),
+    )
+    .await;
+    let (_, got) = call_in(
+        &svc,
+        "eu-west-1",
+        "GetItem",
+        json!({"TableName": "Glob", "Key": {"pk": {"S": "seed"}}}),
+    )
+    .await;
+    assert!(got.get("Item").is_none(), "{got}");
+
+    // Creating it again, or in the table's own region, is refused.
+    for region in ["eu-west-1", "us-east-1"] {
+        let (status, err) = call_in(
+            &svc,
+            "us-east-1",
+            "UpdateTable",
+            json!({"TableName": "Glob", "ReplicaUpdates": [{"Create": {"RegionName": region}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{region}");
+        assert_eq!(err["__type"], "ValidationException");
+    }
+
+    // Removing the replica deletes the eu-west-1 table.
+    let (status, body) = call_in(
+        &svc,
+        "us-east-1",
+        "UpdateTable",
+        json!({"TableName": "Glob", "ReplicaUpdates": [{"Delete": {"RegionName": "eu-west-1"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["TableDescription"].get("Replicas").is_none());
+    let (status, _) = call_in(
+        &svc,
+        "eu-west-1",
+        "DescribeTable",
+        json!({"TableName": "Glob"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn legacy_global_tables_are_visible_from_each_replica_region() {
+    let svc = make_service();
+    for region in ["us-east-1", "eu-west-1"] {
+        call_in(&svc, region, "CreateTable", simple_table("Legacy")).await;
+    }
+    let (status, body) = call_in(
+        &svc,
+        "us-east-1",
+        "CreateGlobalTable",
+        json!({"GlobalTableName": "Legacy", "ReplicationGroup": [
+            {"RegionName": "us-east-1"}, {"RegionName": "eu-west-1"}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, d) = call_in(
+        &svc,
+        "eu-west-1",
+        "DescribeGlobalTable",
+        json!({"GlobalTableName": "Legacy"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(d["GlobalTableDescription"]["GlobalTableName"], "Legacy");
+    let (status, _) = call_in(
+        &svc,
+        "ap-south-1",
+        "DescribeGlobalTable",
+        json!({"GlobalTableName": "Legacy"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A second CreateGlobalTable from another member region is a duplicate.
+    let (status, err) = call_in(
+        &svc,
+        "eu-west-1",
+        "CreateGlobalTable",
+        json!({"GlobalTableName": "Legacy", "ReplicationGroup": [{"RegionName": "eu-west-1"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["__type"], "GlobalTableAlreadyExistsException");
+    let (_, list) = call_in(
+        &svc,
+        "eu-west-1",
+        "ListGlobalTables",
+        json!({"RegionName": "ap-south-1"}),
+    )
+    .await;
+    assert_eq!(list["GlobalTables"], json!([]));
+    let (_, list) = call_in(
+        &svc,
+        "eu-west-1",
+        "ListGlobalTables",
+        json!({"RegionName": "eu-west-1"}),
+    )
+    .await;
+    assert_eq!(list["GlobalTables"].as_array().unwrap().len(), 1);
+
+    // A write to one member table replicates to the other.
+    call_in(
+        &svc,
+        "eu-west-1",
+        "PutItem",
+        json!({"TableName": "Legacy", "Item": {"pk": {"S": "x"}}}),
+    )
+    .await;
+    let (_, got) = call_in(
+        &svc,
+        "us-east-1",
+        "GetItem",
+        json!({"TableName": "Legacy", "Key": {"pk": {"S": "x"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"]["pk"]["S"], "x");
+}
+
+#[tokio::test]
+async fn regional_state_survives_a_snapshot_round_trip() {
+    let store = Arc::new(RecordingSnapshotStore::default());
+    let svc = make_service().with_snapshot_store(store.clone());
+    for region in ["us-east-1", "eu-west-1"] {
+        call_in(&svc, region, "CreateTable", simple_table("Snap")).await;
+        call_in(
+            &svc,
+            region,
+            "PutItem",
+            json!({"TableName": "Snap", "Item": {"pk": {"S": region}}}),
+        )
+        .await;
+    }
+    // A read-only visit to another region is not persisted.
+    call_in(
+        &svc,
+        "ap-south-1",
+        "DeleteTable",
+        json!({"TableName": "Snap"}),
+    )
+    .await;
+    let bytes = load_recorded_snapshot(&store);
+    let restored = service_from_snapshot_bytes(&bytes);
+    for region in ["us-east-1", "eu-west-1"] {
+        let (_, got) = call_in(
+            &restored,
+            region,
+            "GetItem",
+            json!({"TableName": "Snap", "Key": {"pk": {"S": region}}}),
+        )
+        .await;
+        assert_eq!(got["Item"]["pk"]["S"], region);
+    }
+    let snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(snapshot["schema_version"], 3);
+    let regions = snapshot["accounts"]["accounts"]["123456789012"]["regions"]
+        .as_object()
+        .unwrap();
+    assert!(regions.contains_key("eu-west-1"));
+    assert!(!regions.contains_key("ap-south-1"));
+}
+
+#[tokio::test]
+async fn global_table_settings_follow_to_every_replica() {
+    let svc = make_service();
+    call_in(
+        &svc,
+        "us-east-1",
+        "CreateTable",
+        json!({
+            "TableName": "Synced",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    call_in(
+        &svc,
+        "us-east-1",
+        "UpdateTable",
+        json!({"TableName": "Synced", "ReplicaUpdates": [{"Create": {"RegionName": "eu-west-1"}}]}),
+    )
+    .await;
+    let (status, body) = call_in(
+        &svc,
+        "us-east-1",
+        "UpdateTable",
+        json!({
+            "TableName": "Synced",
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "g", "AttributeType": "S" }
+            ],
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "by-g",
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" }
+            }}],
+            "StreamSpecification": { "StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    call_in(
+        &svc,
+        "eu-west-1",
+        "UpdateTimeToLive",
+        json!({"TableName": "Synced", "TimeToLiveSpecification": {"AttributeName": "exp", "Enabled": true}}),
+    )
+    .await;
+
+    let (_, west) = call_in(
+        &svc,
+        "eu-west-1",
+        "DescribeTable",
+        json!({"TableName": "Synced"}),
+    )
+    .await;
+    let west = &west["Table"];
+    assert_eq!(west["GlobalSecondaryIndexes"][0]["IndexName"], "by-g");
+    assert_eq!(
+        west["StreamSpecification"]["StreamViewType"],
+        "NEW_AND_OLD_IMAGES"
+    );
+    assert!(west["LatestStreamArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws:dynamodb:eu-west-1:123456789012:table/Synced/stream/"));
+    // TTL set from the replica reaches the original table.
+    let (_, ttl) = call_in(
+        &svc,
+        "us-east-1",
+        "DescribeTimeToLive",
+        json!({"TableName": "Synced"}),
+    )
+    .await;
+    assert_eq!(ttl["TimeToLiveDescription"]["TimeToLiveStatus"], "ENABLED");
+    assert_eq!(ttl["TimeToLiveDescription"]["AttributeName"], "exp");
+    // The index serves queries on the replica, over replicated rows.
+    call_in(
+        &svc,
+        "us-east-1",
+        "PutItem",
+        json!({"TableName": "Synced", "Item": {"pk": {"S": "1"}, "g": {"S": "x"}}}),
+    )
+    .await;
+    let (status, q) = call_in(
+        &svc,
+        "eu-west-1",
+        "Query",
+        json!({
+            "TableName": "Synced",
+            "IndexName": "by-g",
+            "KeyConditionExpression": "g = :g",
+            "ExpressionAttributeValues": {":g": {"S": "x"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{q}");
+    assert_eq!(q["Count"], 1);
+}
+
+#[tokio::test]
+async fn point_in_time_recovery_is_per_region() {
+    let svc = make_service();
+    for region in ["us-east-1", "eu-west-1"] {
+        call_in(&svc, region, "CreateTable", simple_table("Pitr")).await;
+        call_in(
+            &svc,
+            region,
+            "PutItem",
+            json!({"TableName": "Pitr", "Item": {"pk": {"S": region}}}),
+        )
+        .await;
+    }
+    let (status, body) = call_in(
+        &svc,
+        "eu-west-1",
+        "UpdateContinuousBackups",
+        json!({"TableName": "Pitr", "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, east) = call_in(
+        &svc,
+        "us-east-1",
+        "DescribeContinuousBackups",
+        json!({"TableName": "Pitr"}),
+    )
+    .await;
+    assert_eq!(
+        east["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]
+            ["PointInTimeRecoveryStatus"],
+        "DISABLED"
+    );
+    call_in(
+        &svc,
+        "eu-west-1",
+        "PutItem",
+        json!({"TableName": "Pitr", "Item": {"pk": {"S": "later"}}}),
+    )
+    .await;
+    {
+        let accounts = svc.state.read();
+        let west = &accounts
+            .regional("123456789012", "eu-west-1")
+            .unwrap()
+            .tables["Pitr"];
+        assert_eq!(west.pitr_history.changes.len(), 1);
+        let east = &accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables["Pitr"];
+        assert!(east.pitr_history.changes.is_empty());
+    }
+    let (status, body) = call_in(
+        &svc,
+        "eu-west-1",
+        "RestoreTableToPointInTime",
+        json!({"SourceTableName": "Pitr", "TargetTableName": "PitrRestored", "UseLatestRestorableTime": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["TableDescription"]["TableArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws:dynamodb:eu-west-1:"));
+    let (_, got) = call_in(
+        &svc,
+        "eu-west-1",
+        "GetItem",
+        json!({"TableName": "PitrRestored", "Key": {"pk": {"S": "eu-west-1"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"]["pk"]["S"], "eu-west-1");
+    let (status, _) = call_in(
+        &svc,
+        "us-east-1",
+        "DescribeTable",
+        json!({"TableName": "PitrRestored"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

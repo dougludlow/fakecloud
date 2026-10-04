@@ -177,7 +177,7 @@ impl ResourceProvisioner {
         attribute: &str,
     ) -> Option<String> {
         let accounts = self.dynamodb_state.read();
-        let state = accounts.get(&self.account_id)?;
+        let state = accounts.regional(&self.account_id, &self.region)?;
         let table = state.tables.get(dynamodb_table_name(physical_id))?;
         match attribute {
             "Arn" => Some(table.arn.clone()),
@@ -312,7 +312,7 @@ impl ResourceProvisioner {
             });
 
         let mut __ddb_mas = self.dynamodb_state.write();
-        let state = __ddb_mas.get_or_create(&self.account_id);
+        let state = __ddb_mas.regional_mut(&self.account_id, &self.region);
         if state.tables.contains_key(table_name) {
             return Err(resource_already_exists("AWS::DynamoDB::Table", table_name));
         }
@@ -421,7 +421,7 @@ impl ResourceProvisioner {
         let table_name = dynamodb_table_name(&existing.physical_id).to_string();
 
         let mut __ddb_mas = self.dynamodb_state.write();
-        let state = __ddb_mas.get_or_create(&self.account_id);
+        let state = __ddb_mas.regional_mut(&self.account_id, &self.region);
         let table = state
             .tables
             .get_mut(&table_name)
@@ -510,7 +510,9 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_dynamodb_table(&self, physical_id: &str) -> Result<(), String> {
         let mut __ddb_mas = self.dynamodb_state.write();
-        let state = __ddb_mas.get_or_create(&self.account_id);
+        let Some(state) = __ddb_mas.regional_get_mut(&self.account_id, &self.region) else {
+            return Ok(());
+        };
         state.tables.remove(dynamodb_table_name(physical_id));
         Ok(())
     }
@@ -550,45 +552,21 @@ impl ResourceProvisioner {
         let mut result = self.create_dynamodb_table(&table_def)?;
         let table_name = result.physical_id.clone();
 
-        let replication_group: Vec<fakecloud_dynamodb::ReplicaDescription> = replicas
-            .iter()
-            .filter_map(|r| r.get("Region").and_then(|v| v.as_str()))
-            .map(|region| fakecloud_dynamodb::ReplicaDescription {
-                region_name: region.to_string(),
-                replica_status: "ACTIVE".to_string(),
-                read_capacity_auto_scaling: None,
-                write_capacity_auto_scaling: None,
-                read_capacity_units: None,
-            })
-            .collect();
-        let billing_mode = props
-            .get("BillingMode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("PROVISIONED")
-            .to_string();
+        // The other replicas are real tables in their own regions, kept in
+        // step with this one (DynamoDB global tables version 2019.11.21).
         let mut accounts = self.dynamodb_state.write();
-        let state = accounts.get_or_create(&self.account_id);
-        let table_id = state
-            .tables
-            .get(&table_name)
+        fakecloud_dynamodb::set_table_replicas(
+            &mut accounts,
+            &self.account_id,
+            &self.region,
+            &table_name,
+            &replica_specs(replicas),
+        )?;
+        let table_id = accounts
+            .regional(&self.account_id, &self.region)
+            .and_then(|s| s.tables.get(&table_name))
             .map(|t| t.table_id.clone())
             .unwrap_or_default();
-        state.global_tables.insert(
-            table_name.clone(),
-            fakecloud_dynamodb::GlobalTableDescription {
-                global_table_name: table_name.clone(),
-                global_table_arn: fakecloud_dynamodb::global_table_arn(
-                    &self.region,
-                    &self.account_id,
-                    &table_name,
-                ),
-                global_table_status: "ACTIVE".to_string(),
-                creation_date: Utc::now(),
-                replication_group,
-                billing_mode,
-                provisioned_write_capacity_units: None,
-            },
-        );
         result = result.with("TableId", table_id);
         Ok(result)
     }
@@ -620,45 +598,68 @@ impl ResourceProvisioner {
         };
         let result = self.update_dynamodb_table(existing, &table_def)?;
         let mut accounts = self.dynamodb_state.write();
-        let state = accounts.get_or_create(&self.account_id);
-        if let Some(gt) = state.global_tables.get_mut(&result.physical_id) {
-            gt.replication_group = replicas
-                .iter()
-                .filter_map(|r| r.get("Region").and_then(|v| v.as_str()))
-                .map(|region| {
-                    gt.replication_group
-                        .iter()
-                        .find(|r| r.region_name == region)
-                        .cloned()
-                        .unwrap_or(fakecloud_dynamodb::ReplicaDescription {
-                            region_name: region.to_string(),
-                            replica_status: "ACTIVE".to_string(),
-                            read_capacity_auto_scaling: None,
-                            write_capacity_auto_scaling: None,
-                            read_capacity_units: None,
-                        })
-                })
-                .collect();
-            if let Some(mode) = props.get("BillingMode").and_then(|v| v.as_str()) {
-                gt.billing_mode = mode.to_string();
-            }
-        }
-        let table_id = state
-            .tables
-            .get(&result.physical_id)
+        // Replicas added to or removed from the template are created or
+        // deleted in their regions; the kept ones take their overrides.
+        fakecloud_dynamodb::set_table_replicas(
+            &mut accounts,
+            &self.account_id,
+            &self.region,
+            &result.physical_id,
+            &replica_specs(&replicas),
+        )?;
+        let table_id = accounts
+            .regional(&self.account_id, &self.region)
+            .and_then(|s| s.tables.get(&result.physical_id))
             .map(|t| t.table_id.clone())
             .unwrap_or_default();
         Ok(result.with("TableId", table_id))
     }
 
+    /// Deleting a GlobalTable deletes every replica, then the table in the
+    /// stack's region.
     pub(super) fn delete_dynamodb_global_table(&self, physical_id: &str) -> Result<(), String> {
         let name = dynamodb_table_name(physical_id).to_string();
-        self.delete_dynamodb_table(&name)?;
-        let mut accounts = self.dynamodb_state.write();
-        let state = accounts.get_or_create(&self.account_id);
-        state.global_tables.remove(&name);
-        Ok(())
+        {
+            let mut accounts = self.dynamodb_state.write();
+            let exists = accounts
+                .regional(&self.account_id, &self.region)
+                .is_some_and(|s| s.tables.contains_key(&name));
+            if exists {
+                fakecloud_dynamodb::set_table_replicas(
+                    &mut accounts,
+                    &self.account_id,
+                    &self.region,
+                    &name,
+                    &[],
+                )?;
+            }
+        }
+        self.delete_dynamodb_table(&name)
     }
+}
+
+/// The replicas a GlobalTable's `Replicas` property declares, with each one's
+/// KMS key, read capacity and table class.
+fn replica_specs(replicas: &[serde_json::Value]) -> Vec<fakecloud_dynamodb::ReplicaSpec> {
+    replicas
+        .iter()
+        .filter_map(|r| {
+            Some(fakecloud_dynamodb::ReplicaSpec {
+                region: r.get("Region")?.as_str()?.to_string(),
+                kms_master_key_id: r
+                    .pointer("/SSESpecification/KMSMasterKeyId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                read_capacity_units: r
+                    .pointer("/ReadProvisionedThroughputSettings/ReadCapacityUnits")
+                    .and_then(|v| v.as_i64()),
+                table_class: r
+                    .get("TableClass")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 /// The `AWS::DynamoDB::Table` properties a GlobalTable's local replica

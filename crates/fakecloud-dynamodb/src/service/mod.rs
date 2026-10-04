@@ -10,6 +10,7 @@ mod import_formats;
 mod items;
 mod partiql;
 mod queries;
+pub mod replicas;
 mod streams;
 mod tables;
 pub(crate) mod vectors;
@@ -129,6 +130,60 @@ impl DynamoDbService {
             region: "us-east-1".to_string(),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             transact_idempotency: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Before an item write: start recording the keys written to every
+    /// multi-region table the request names. Returns those tables.
+    fn track_replicated_writes(&self, req: &AwsRequest) -> Vec<(String, String)> {
+        let tables = written_tables(req, &req.json_body());
+        if tables.is_empty() {
+            return tables;
+        }
+        let mut accounts = self.state.write();
+        tables
+            .into_iter()
+            .filter(|(account, name)| {
+                if replicas::replica_peers(&accounts, account, &req.region, name).is_empty() {
+                    return false;
+                }
+                match accounts
+                    .regional_get_mut(account, &req.region)
+                    .and_then(|s| s.tables.get_mut(name))
+                {
+                    Some(table) => {
+                        table.track_changes();
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .collect()
+    }
+
+    /// After an item write: stop recording and, when the write succeeded,
+    /// copy exactly the rows it wrote to the other replicas.
+    fn replicate_tracked_writes(
+        &self,
+        req: &AwsRequest,
+        tracked: Vec<(String, String)>,
+        succeeded: bool,
+    ) {
+        if tracked.is_empty() {
+            return;
+        }
+        let mut accounts = self.state.write();
+        for (account, name) in tracked {
+            let Some(table) = accounts
+                .regional_get_mut(&account, &req.region)
+                .and_then(|s| s.tables.get_mut(&name))
+            else {
+                continue;
+            };
+            let keys = table.finish_tracking();
+            if succeeded {
+                replicas::replicate_keys(&mut accounts, &account, &req.region, &name, &keys);
+            }
         }
     }
 
@@ -410,6 +465,56 @@ pub(crate) fn deliver_kinesis_change(
     }
 }
 
+/// The (owner account, table name) of every table an item-writing request
+/// names. Empty for any other operation.
+fn written_tables(req: &AwsRequest, body: &Value) -> Vec<(String, String)> {
+    let mut names: Vec<String> = Vec::new();
+    match req.action.as_str() {
+        "PutItem" | "UpdateItem" | "DeleteItem" => {
+            names.extend(body["TableName"].as_str().map(str::to_string));
+        }
+        "BatchWriteItem" => {
+            names.extend(
+                body["RequestItems"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, _)| k.clone()),
+            );
+        }
+        "TransactWriteItems" => {
+            for item in body["TransactItems"].as_array().into_iter().flatten() {
+                for member in ["Put", "Update", "Delete"] {
+                    names.extend(item[member]["TableName"].as_str().map(str::to_string));
+                }
+            }
+        }
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction" => {
+            let statements = body["Statement"].as_str().into_iter().chain(
+                body["Statements"]
+                    .as_array()
+                    .into_iter()
+                    .chain(body["TransactStatements"].as_array())
+                    .flatten()
+                    .filter_map(|s| s["Statement"].as_str()),
+            );
+            for statement in statements {
+                if let Some((_, table)) = iam::partiql_verb_and_table(statement) {
+                    names.push(table);
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut out: Vec<(String, String)> = names
+        .iter()
+        .map(|name| cross_account::table_id(req, name))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Persist the current DynamoDB state as a snapshot. Offloads the serde +
 /// blocking file write to the Tokio blocking pool. Noop when `store` is `None`
 /// (memory mode). Shared by `DynamoDbService::save_snapshot` and the
@@ -426,7 +531,19 @@ pub async fn save_dynamodb_snapshot(
     let _guard = lock.lock().await;
     let snapshot = DynamoDbSnapshot {
         schema_version: DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
-        accounts: Some(state.read().clone()),
+        // A region a request only looked into (a write that missed, say)
+        // holds nothing worth persisting.
+        accounts: Some(state.read().map(|regional| {
+            let mut kept = fakecloud_core::multi_account::RegionalState::new(
+                regional.account_id(),
+                regional.default_region(),
+                regional.endpoint(),
+            );
+            for (region, s) in regional.regions().filter(|(_, s)| !s.is_empty()) {
+                kept.insert_region(region, s.clone());
+            }
+            kept
+        })),
         state: None,
     };
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -482,6 +599,11 @@ impl AwsService for DynamoDbService {
             is_mutating_request(req.action.as_str(), &req.json_body())
         } else {
             false
+        };
+        let tracked = if mutates {
+            self.track_replicated_writes(&req)
+        } else {
+            Vec::new()
         };
         let result = match req.action.as_str() {
             "CreateTable" => self.create_table(&req),
@@ -557,7 +679,9 @@ impl AwsService for DynamoDbService {
                 &req.action,
             )),
         };
-        if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
+        let succeeded = matches!(result.as_ref(), Ok(resp) if resp.status.is_success());
+        self.replicate_tracked_writes(&req, tracked, succeeded);
+        if mutates && succeeded {
             if let Err(err) = self.save_snapshot().await {
                 tracing::error!(%err, "dynamodb snapshot save failed");
             }

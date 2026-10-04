@@ -598,7 +598,7 @@ impl PipesRunner {
         if self.checkpoint(&account, &pipe.arn).is_none() {
             let init = {
                 let ds = dynamodb_state.read();
-                let Some(dynamodb) = ds.get(&account) else {
+                let Some(dynamodb) = ds.by_arn(&pipe.source_arn) else {
                     return;
                 };
                 let Some(table) = dynamodb.tables.get(&table_name) else {
@@ -623,7 +623,7 @@ impl PipesRunner {
 
         let (last_seq, events) = {
             let ds = dynamodb_state.read();
-            let Some(dynamodb) = ds.get(&account) else {
+            let Some(dynamodb) = ds.by_arn(&pipe.source_arn) else {
                 return;
             };
             let Some(table) = dynamodb.tables.get(&table_name) else {

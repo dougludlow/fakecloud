@@ -95,11 +95,11 @@ impl DynamoDbCapacityHook for DynamoDbCapacityHookImpl {
     fn current_capacity(
         &self,
         account_id: &str,
-        _region: &str,
+        region: &str,
         table_name: &str,
     ) -> Option<(i64, i64)> {
         let guard = self.state.read();
-        let acct = guard.get(account_id)?;
+        let acct = guard.regional(account_id, region)?;
         let table = acct.tables.get(table_name)?;
         if table.billing_mode != "PROVISIONED" {
             return None;
@@ -113,15 +113,15 @@ impl DynamoDbCapacityHook for DynamoDbCapacityHookImpl {
     fn set_capacity(
         &self,
         account_id: &str,
-        _region: &str,
+        region: &str,
         table_name: &str,
         read: Option<i64>,
         write: Option<i64>,
     ) -> Result<(), String> {
         let mut guard = self.state.write();
         let acct = guard
-            .get_mut(account_id)
-            .ok_or_else(|| format!("account {account_id} not found"))?;
+            .regional_get_mut(account_id, region)
+            .ok_or_else(|| format!("account {account_id} has no tables in {region}"))?;
         let table = acct
             .tables
             .get_mut(table_name)

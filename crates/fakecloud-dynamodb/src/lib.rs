@@ -12,11 +12,13 @@ pub(crate) use service::helpers::schemas::{
     parse_attribute_definitions, parse_key_schema, parse_provisioned_throughput,
 };
 pub use service::helpers::schemas::{parse_gsi, parse_lsi, parse_tags};
+pub use service::replicas::{set_table_replicas, ReplicaSpec};
 pub use service::{save_dynamodb_snapshot, DynamoDbService};
 pub use state::{
-    global_table_arn, table_arn, AttributeDefinition, DynamoDbSnapshot, DynamoDbState, DynamoTable,
-    GlobalSecondaryIndex, GlobalTableDescription, ItemId, KeySchemaElement, KinesisDestination,
-    LocalSecondaryIndex, OnDemandThroughput, Projection, ProvisionedThroughput, ReplicaDescription,
-    SharedDynamoDbState, StreamRecord, TableItems, DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
+    global_table_arn, parse_dynamodb_snapshot, table_arn, AttributeDefinition, DynamoDbSnapshot,
+    DynamoDbState, DynamoTable, GlobalSecondaryIndex, GlobalTableDescription, ItemId,
+    KeySchemaElement, KinesisDestination, LocalSecondaryIndex, OnDemandThroughput, Projection,
+    ProvisionedThroughput, ReplicaDescription, SharedDynamoDbState, StreamRecord, TableItems,
+    DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use streams_dataplane::{cmp_seq, DynamoDbStreamsService};

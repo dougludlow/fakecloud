@@ -656,10 +656,53 @@ pub(crate) fn invoke_eventbridge_put_events(
     Ok(response)
 }
 
+/// The account, region and table name a DynamoDB task's `TableName` names.
+/// The task calls DynamoDB in the state machine's own account and region, so
+/// a plain name resolves there; a table ARN names its own account (a
+/// cross-account table). A table ARN in another region than the execution's
+/// is `None`: DynamoDB does not find it, as for a direct call.
+fn dynamodb_table_scope(execution_arn: &str, table_name: &str) -> Option<(String, String, String)> {
+    let exec_account = fakecloud_aws::arn::account_of(execution_arn).unwrap_or_default();
+    let exec_region = fakecloud_aws::arn::region_of(execution_arn).unwrap_or_default();
+    if let Some(rest) = fakecloud_aws::arn::arn_resource(table_name, "dynamodb") {
+        let mut parts = rest.splitn(3, ':');
+        let region = parts
+            .next()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(exec_region);
+        if region != exec_region {
+            return None;
+        }
+        let account = parts
+            .next()
+            .filter(|a| !a.is_empty())
+            .unwrap_or(exec_account);
+        let name = parts
+            .next()
+            .and_then(|r| r.strip_prefix("table/"))
+            .map(|r| r.split('/').next().unwrap_or(r))
+            .unwrap_or(table_name);
+        return Some((account.to_string(), region.to_string(), name.to_string()));
+    }
+    Some((
+        exec_account.to_string(),
+        exec_region.to_string(),
+        table_name.to_string(),
+    ))
+}
+
+fn dynamodb_table_not_found(table_name: &str) -> (String, String) {
+    (
+        "DynamoDB.ResourceNotFoundException".to_string(),
+        format!("Requested resource not found: Table: {table_name} not found"),
+    )
+}
+
 /// Get an item from DynamoDB via direct state access.
 pub(crate) fn invoke_dynamodb_get_item(
     input: &Value,
     dynamodb_state: &Option<SharedDynamoDbState>,
+    execution_arn: &str,
 ) -> Result<Value, (String, String)> {
     let ddb = dynamodb_state.as_ref().ok_or_else(|| {
         (
@@ -687,14 +730,13 @@ pub(crate) fn invoke_dynamodb_get_item(
 
     let key_map: HashMap<String, Value> = key.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+    let (account, region, name) = dynamodb_table_scope(execution_arn, table_name)
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
     let __mas = ddb.read();
-    let state = __mas.default_ref();
-    let table = state.tables.get(table_name).ok_or_else(|| {
-        (
-            "States.TaskFailed".to_string(),
-            format!("Table '{table_name}' not found"),
-        )
-    })?;
+    let table = __mas
+        .regional(&account, &region)
+        .and_then(|state| state.tables.get(&name))
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
 
     let item = table
         .find_item_index(&key_map)
@@ -713,6 +755,7 @@ pub(crate) fn invoke_dynamodb_get_item(
 pub(crate) fn invoke_dynamodb_put_item(
     input: &Value,
     dynamodb_state: &Option<SharedDynamoDbState>,
+    execution_arn: &str,
 ) -> Result<Value, (String, String)> {
     let ddb = dynamodb_state.as_ref().ok_or_else(|| {
         (
@@ -741,14 +784,13 @@ pub(crate) fn invoke_dynamodb_put_item(
     let item_map: HashMap<String, Value> =
         item.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+    let (account, region, name) = dynamodb_table_scope(execution_arn, table_name)
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
     let mut __mas = ddb.write();
-    let state = __mas.default_mut();
-    let table = state.tables.get_mut(table_name).ok_or_else(|| {
-        (
-            "States.TaskFailed".to_string(),
-            format!("Table '{table_name}' not found"),
-        )
-    })?;
+    let table = __mas
+        .regional_get_mut(&account, &region)
+        .and_then(|state| state.tables.get_mut(&name))
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
 
     // Replace existing item with same key, or insert new. Goes through the
     // table helper so `items`, the key index and the cached item_count /
@@ -763,6 +805,7 @@ pub(crate) fn invoke_dynamodb_put_item(
 pub(crate) fn invoke_dynamodb_delete_item(
     input: &Value,
     dynamodb_state: &Option<SharedDynamoDbState>,
+    execution_arn: &str,
 ) -> Result<Value, (String, String)> {
     let ddb = dynamodb_state.as_ref().ok_or_else(|| {
         (
@@ -790,14 +833,13 @@ pub(crate) fn invoke_dynamodb_delete_item(
 
     let key_map: HashMap<String, Value> = key.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+    let (account, region, name) = dynamodb_table_scope(execution_arn, table_name)
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
     let mut __mas = ddb.write();
-    let state = __mas.default_mut();
-    let table = state.tables.get_mut(table_name).ok_or_else(|| {
-        (
-            "States.TaskFailed".to_string(),
-            format!("Table '{table_name}' not found"),
-        )
-    })?;
+    let table = __mas
+        .regional_get_mut(&account, &region)
+        .and_then(|state| state.tables.get_mut(&name))
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
 
     table.remove_item_by_key(&key_map);
 
@@ -811,6 +853,7 @@ pub(crate) fn invoke_dynamodb_delete_item(
 pub(crate) fn invoke_dynamodb_update_item(
     input: &Value,
     dynamodb_state: &Option<SharedDynamoDbState>,
+    execution_arn: &str,
 ) -> Result<Value, (String, String)> {
     let ddb = dynamodb_state.as_ref().ok_or_else(|| {
         (
@@ -838,14 +881,13 @@ pub(crate) fn invoke_dynamodb_update_item(
 
     let key_map: HashMap<String, Value> = key.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+    let (account, region, name) = dynamodb_table_scope(execution_arn, table_name)
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
     let mut __mas = ddb.write();
-    let state = __mas.default_mut();
-    let table = state.tables.get_mut(table_name).ok_or_else(|| {
-        (
-            "States.TaskFailed".to_string(),
-            format!("Table '{table_name}' not found"),
-        )
-    })?;
+    let table = __mas
+        .regional_get_mut(&account, &region)
+        .and_then(|state| state.tables.get_mut(&name))
+        .ok_or_else(|| dynamodb_table_not_found(table_name))?;
 
     // Parse UpdateExpression to apply SET operations
     if let Some(update_expr) = input["UpdateExpression"].as_str() {
@@ -1747,7 +1789,7 @@ mod tests {
     #[test]
     fn dynamodb_update_item_rejects_writing_a_key_attribute() {
         let ddb: SharedDynamoDbState = std::sync::Arc::new(parking_lot::RwLock::new(
-            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+            fakecloud_core::multi_account::MultiRegionState::new("123456789012", "us-east-1", ""),
         ));
         {
             let mut accounts = ddb.write();
@@ -1770,7 +1812,10 @@ mod tests {
             let mut row = HashMap::new();
             row.insert("pk".to_string(), json!({"S": "a"}));
             table.put_item_at_key(row);
-            accounts.default_mut().tables.insert("t".to_string(), table);
+            accounts
+                .regional_mut("123456789012", "us-east-1")
+                .tables
+                .insert("t".to_string(), table);
         }
         let state = Some(ddb.clone());
 
@@ -1783,13 +1828,17 @@ mod tests {
                 "ExpressionAttributeValues": {":v": {"S": "b"}}
             }),
             &state,
+            DDB_EXEC_ARN,
         )
         .expect_err("key write accepted");
         assert_eq!(err.0, "DynamoDB.AmazonDynamoDBException");
         assert!(err.1.contains("Cannot update attribute pk"), "{}", err.1);
 
         let accounts = ddb.read();
-        let rows: Vec<_> = accounts.default_ref().tables["t"]
+        let rows: Vec<_> = accounts
+            .regional("123456789012", "us-east-1")
+            .unwrap()
+            .tables["t"]
             .items()
             .iter()
             .cloned()
@@ -1809,8 +1858,244 @@ mod tests {
                 "ExpressionAttributeValues": {":v": {"S": "b"}}
             }),
             &state,
+            DDB_EXEC_ARN,
         )
         .unwrap();
+    }
+
+    const DDB_EXEC_ARN: &str = "arn:aws:states:us-east-1:123456789012:execution:sm:run";
+
+    fn ddb_table(region: &str, row: &str) -> fakecloud_dynamodb::DynamoTable {
+        let mut table = fakecloud_dynamodb::DynamoTable::new(
+            "t".to_string(),
+            format!("arn:aws:dynamodb:{region}:123456789012:table/t"),
+            "id".to_string(),
+            vec![fakecloud_dynamodb::KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: "HASH".to_string(),
+            }],
+            vec![],
+            fakecloud_dynamodb::ProvisionedThroughput {
+                read_capacity_units: 1,
+                write_capacity_units: 1,
+            },
+            "PAY_PER_REQUEST".to_string(),
+            chrono::Utc::now(),
+        );
+        table.put_item_at_key(HashMap::from([
+            ("pk".to_string(), json!({"S": "a"})),
+            ("v".to_string(), json!({"S": row})),
+        ]));
+        table
+    }
+
+    /// A DynamoDB task reads and writes the table of the execution's own
+    /// region: the same table name in another region is another table.
+    #[test]
+    fn dynamodb_tasks_use_the_execution_region() {
+        let ddb: SharedDynamoDbState = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiRegionState::new("123456789012", "us-east-1", ""),
+        ));
+        for region in ["us-east-1", "eu-west-1"] {
+            ddb.write()
+                .regional_mut("123456789012", region)
+                .tables
+                .insert("t".to_string(), ddb_table(region, region));
+        }
+        let state = Some(ddb.clone());
+        let eu_exec = "arn:aws:states:eu-west-1:123456789012:execution:sm:run";
+        let got = invoke_dynamodb_get_item(
+            &json!({"TableName": "t", "Key": {"pk": {"S": "a"}}}),
+            &state,
+            eu_exec,
+        )
+        .unwrap();
+        assert_eq!(got["Item"]["v"], json!({"S": "eu-west-1"}));
+        let got = invoke_dynamodb_get_item(
+            &json!({"TableName": "t", "Key": {"pk": {"S": "a"}}}),
+            &state,
+            DDB_EXEC_ARN,
+        )
+        .unwrap();
+        assert_eq!(got["Item"]["v"], json!({"S": "us-east-1"}));
+
+        invoke_dynamodb_put_item(
+            &json!({"TableName": "t", "Item": {"pk": {"S": "b"}}}),
+            &state,
+            eu_exec,
+        )
+        .unwrap();
+        let accounts = ddb.read();
+        assert_eq!(
+            accounts
+                .regional("123456789012", "eu-west-1")
+                .unwrap()
+                .tables["t"]
+                .item_count,
+            2
+        );
+        assert_eq!(
+            accounts
+                .regional("123456789012", "us-east-1")
+                .unwrap()
+                .tables["t"]
+                .item_count,
+            1
+        );
+        drop(accounts);
+
+        // No table of that name in the execution's region: not found.
+        let err = invoke_dynamodb_get_item(
+            &json!({"TableName": "t", "Key": {"pk": {"S": "a"}}}),
+            &state,
+            "arn:aws:states:ap-south-1:123456789012:execution:sm:run",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "DynamoDB.ResourceNotFoundException");
+
+        // A table ARN naming another region than the execution's is not
+        // found, even though that table exists.
+        let err = invoke_dynamodb_get_item(
+            &json!({
+                "TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/t",
+                "Key": {"pk": {"S": "a"}}
+            }),
+            &state,
+            DDB_EXEC_ARN,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "DynamoDB.ResourceNotFoundException");
+        // In its own region it is.
+        invoke_dynamodb_get_item(
+            &json!({
+                "TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/t",
+                "Key": {"pk": {"S": "a"}}
+            }),
+            &state,
+            eu_exec,
+        )
+        .unwrap();
+    }
+
+    /// With a service registry, an optimized DynamoDB task is a real
+    /// DynamoDB call in the execution's account and region: it records the
+    /// change on the table's stream, reports DynamoDB's errors, and refuses a
+    /// table ARN of another region.
+    #[tokio::test]
+    async fn dynamodb_tasks_go_through_the_dynamodb_service() {
+        use fakecloud_core::service::AwsService;
+        let ddb: SharedDynamoDbState = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiRegionState::new("123456789012", "us-east-1", ""),
+        ));
+        let svc = std::sync::Arc::new(fakecloud_dynamodb::DynamoDbService::new(ddb.clone()));
+        let create = fakecloud_core::service::AwsRequest {
+            service: "dynamodb".into(),
+            action: "CreateTable".into(),
+            region: "eu-west-1".into(),
+            account_id: "123456789012".into(),
+            request_id: "r".into(),
+            headers: http::HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: serde_json::to_vec(&json!({
+                "TableName": "tasks",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}
+            }))
+            .unwrap()
+            .into(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec![],
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        };
+        svc.handle(create).await.unwrap();
+        let mut registry = fakecloud_core::registry::ServiceRegistry::new();
+        registry.register(svc);
+        let handle: crate::service::SharedServiceRegistry =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let _ = handle.set(std::sync::Arc::new(registry));
+        let registry = Some(handle);
+        let sfn_state: SharedStepFunctionsState = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let eu_exec = "arn:aws:states:eu-west-1:123456789012:execution:sm:run";
+        let run = |resource: &'static str, input: Value, exec: &'static str| {
+            let registry = registry.clone();
+            let sfn_state = sfn_state.clone();
+            async move {
+                invoke_resource(
+                    resource, &input, &None, &None, &registry, exec, None, None, &sfn_state,
+                )
+                .await
+            }
+        };
+
+        run(
+            "arn:aws:states:::dynamodb:putItem",
+            json!({"TableName": "tasks", "Item": {"pk": {"S": "a"}}}),
+            eu_exec,
+        )
+        .await
+        .unwrap();
+        {
+            let accounts = ddb.read();
+            let table = &accounts
+                .regional("123456789012", "eu-west-1")
+                .unwrap()
+                .tables["tasks"];
+            assert_eq!(table.item_count, 1);
+            assert_eq!(table.stream_records.read().len(), 1);
+        }
+        let got = run(
+            "arn:aws:states:::dynamodb:getItem",
+            json!({"TableName": "tasks", "Key": {"pk": {"S": "a"}}}),
+            eu_exec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["Item"]["pk"], json!({"S": "a"}));
+
+        // The us-east-1 execution has no such table.
+        let err = run(
+            "arn:aws:states:::dynamodb:getItem",
+            json!({"TableName": "tasks", "Key": {"pk": {"S": "a"}}}),
+            DDB_EXEC_ARN,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "DynamoDB.ResourceNotFoundException");
+        // Nor does it reach eu-west-1's table by ARN.
+        let err = run(
+            "arn:aws:states:::dynamodb:deleteItem",
+            json!({
+                "TableName": "arn:aws:dynamodb:eu-west-1:123456789012:table/tasks",
+                "Key": {"pk": {"S": "a"}}
+            }),
+            DDB_EXEC_ARN,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "DynamoDB.ResourceNotFoundException");
+        // A key-attribute update is DynamoDB's validation failure.
+        let err = run(
+            "arn:aws:states:::dynamodb:updateItem",
+            json!({
+                "TableName": "tasks",
+                "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET pk = :v",
+                "ExpressionAttributeValues": {":v": {"S": "b"}}
+            }),
+            eu_exec,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "DynamoDB.AmazonDynamoDBException");
     }
 
     #[test]
