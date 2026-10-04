@@ -4705,12 +4705,14 @@ dependencies = [
  "fakecloud-glue",
  "fakecloud-persistence",
  "fakecloud-s3",
+ "flate2",
  "http 1.4.0",
  "parking_lot",
  "regex",
  "serde",
  "serde_json",
  "sqlparser",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5467,6 +5469,7 @@ dependencies = [
  "fakecloud-s3",
  "flate2",
  "http 1.4.0",
+ "md-5 0.10.6",
  "parking_lot",
  "serde",
  "serde_json",
@@ -5475,6 +5478,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -6678,6 +6682,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "bytes-utils",
+ "bzip2",
  "chrono",
  "crc32c",
  "crc32fast",
@@ -6687,6 +6692,7 @@ dependencies = [
  "fakecloud-iam",
  "fakecloud-kms",
  "fakecloud-persistence",
+ "flate2",
  "futures-util",
  "http 1.4.0",
  "md-5 0.10.6",
@@ -6703,6 +6709,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

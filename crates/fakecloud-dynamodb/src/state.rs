@@ -597,6 +597,63 @@ pub struct DynamoTable {
     /// Vector indexes for similarity search, keyed by index name.
     #[serde(default)]
     pub vector_indexes: Vec<VectorIndex>,
+    /// Write history kept while point-in-time recovery is enabled; backs
+    /// incremental exports and exports at a past `ExportTime`.
+    #[serde(default)]
+    pub pitr_history: PitrHistory,
+}
+
+/// How far back point-in-time recovery reaches (DynamoDB's default and
+/// maximum `RecoveryPeriodInDays`).
+pub const PITR_RETENTION_DAYS: i64 = 35;
+
+/// One committed write to an item: the item before (`None` for an insert)
+/// and after (`None` for a delete).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemChange {
+    /// Position in the table's history, unique and increasing, so a rolled
+    /// back transaction can remove exactly the entries it appended even if
+    /// pruning dropped older ones meanwhile.
+    #[serde(default)]
+    pub seq: u64,
+    pub at: DateTime<Utc>,
+    pub keys: HashMap<String, AttributeValue>,
+    pub old_image: Option<HashMap<String, AttributeValue>>,
+    pub new_image: Option<HashMap<String, AttributeValue>>,
+}
+
+/// The table's point-in-time recovery history: when recovery was enabled
+/// (the earliest restorable time) and every write since, oldest first,
+/// pruned to the recovery window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PitrHistory {
+    /// When recovery was enabled, at whole-second precision (the precision
+    /// `EarliestRestorableDateTime` is reported at).
+    #[serde(default)]
+    pub enabled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub changes: Vec<ItemChange>,
+    #[serde(default)]
+    pub next_seq: u64,
+}
+
+/// `t` truncated to whole seconds.
+fn whole_seconds(t: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(t.timestamp(), 0).unwrap_or(t)
+}
+
+/// The earliest time a PITR-enabled table can be restored or exported at:
+/// when recovery was enabled, or the start of the retained window if that
+/// is later. Whole-second precision, exactly what DescribeContinuousBackups
+/// reports, so a request for the reported time is accepted. `None` while
+/// recovery is disabled.
+pub fn earliest_restorable(table: &DynamoTable, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if !table.pitr_enabled {
+        return None;
+    }
+    let window_start = now - chrono::Duration::days(PITR_RETENTION_DAYS);
+    let enabled_at = table.pitr_history.enabled_at.unwrap_or(now);
+    Some(whole_seconds(enabled_at.max(window_start)))
 }
 
 pub(crate) fn default_table_class() -> String {
@@ -740,13 +797,17 @@ pub struct ReplicaDescription {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportDescription {
     pub export_arn: String,
+    /// `IN_PROGRESS` while the background export runs, then `COMPLETED` or
+    /// `FAILED`.
     pub export_status: String,
     pub table_arn: String,
     pub s3_bucket: String,
     pub s3_prefix: Option<String>,
     pub export_format: String,
     pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    /// Set once the export has finished (successfully or not).
+    #[serde(default)]
+    pub end_time: Option<DateTime<Utc>>,
     pub export_time: DateTime<Utc>,
     pub item_count: i64,
     pub billed_size_bytes: i64,
@@ -755,28 +816,76 @@ pub struct ExportDescription {
     pub failure_code: Option<String>,
     #[serde(default)]
     pub failure_message: Option<String>,
+    /// S3 key of the export's `manifest-summary.json`, once written.
+    #[serde(default)]
+    pub export_manifest: Option<String>,
+    #[serde(default)]
+    pub table_id: Option<String>,
+    #[serde(default)]
+    pub s3_bucket_owner: Option<String>,
+    #[serde(default)]
+    pub s3_sse_algorithm: Option<String>,
+    #[serde(default)]
+    pub s3_sse_kms_key_id: Option<String>,
+    #[serde(default)]
+    pub client_token: Option<String>,
+    /// `FULL_EXPORT` (default) or `INCREMENTAL_EXPORT`.
+    #[serde(default)]
+    pub export_type: Option<String>,
+    /// Resolved `IncrementalExportSpecification` of an incremental export:
+    /// changes in `[export_from_time, export_to_time)`, rendered as
+    /// `export_view_type` (`NEW_IMAGE` or `NEW_AND_OLD_IMAGES`).
+    #[serde(default)]
+    pub export_from_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub export_to_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub export_view_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportDescription {
     pub import_arn: String,
+    /// `IN_PROGRESS` while the background import runs, then `COMPLETED` or
+    /// `FAILED`.
     pub import_status: String,
     pub table_arn: String,
     pub table_name: String,
     pub s3_bucket_source: String,
     pub input_format: String,
     pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    /// Set once the import has finished (successfully or not).
+    #[serde(default)]
+    pub end_time: Option<DateTime<Utc>>,
     pub processed_item_count: i64,
     pub processed_size_bytes: i64,
     /// Rows written to the table: processed rows less the invalid ones, with
     /// rows sharing a primary key counted once.
     #[serde(default)]
     pub imported_item_count: i64,
-    /// Rows skipped because they lack a key attribute or carry one of the
-    /// wrong type.
+    /// Rows skipped because they could not form a valid item.
     #[serde(default)]
     pub error_count: i64,
+    #[serde(default)]
+    pub table_id: Option<String>,
+    #[serde(default)]
+    pub s3_key_prefix: Option<String>,
+    #[serde(default)]
+    pub s3_bucket_owner: Option<String>,
+    #[serde(default)]
+    pub input_compression_type: Option<String>,
+    /// `InputFormatOptions` exactly as requested (CSV delimiter / header).
+    #[serde(default)]
+    pub input_format_options: Option<serde_json::Value>,
+    /// `TableCreationParameters` exactly as requested.
+    #[serde(default)]
+    pub table_creation_parameters: Option<serde_json::Value>,
+    #[serde(default)]
+    pub client_token: Option<String>,
+    #[serde(default)]
+    pub failure_code: Option<String>,
+    #[serde(default)]
+    pub failure_message: Option<String>,
 }
 
 impl DynamoTable {
@@ -830,7 +939,86 @@ impl DynamoTable {
             on_demand_throughput: None,
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
+            pitr_history: PitrHistory::default(),
         }
+    }
+
+    /// Record a committed write in the point-in-time recovery history (a
+    /// no-op while recovery is disabled), dropping entries that fell out of
+    /// the recovery window.
+    fn record_change(
+        &mut self,
+        old_image: Option<&HashMap<String, AttributeValue>>,
+        new_image: Option<&HashMap<String, AttributeValue>>,
+    ) {
+        if !self.pitr_enabled {
+            return;
+        }
+        let Some(source) = old_image.or(new_image) else {
+            return;
+        };
+        let keys = self
+            .key_schema
+            .iter()
+            .filter_map(|k| {
+                source
+                    .get(&k.attribute_name)
+                    .map(|v| (k.attribute_name.clone(), v.clone()))
+            })
+            .collect();
+        let now = Utc::now();
+        // Entries before the earliest restorable time can never be served.
+        let cutoff = earliest_restorable(self, now).unwrap_or(now);
+        let seq = self.pitr_history.next_seq;
+        self.pitr_history.next_seq += 1;
+        let changes = &mut self.pitr_history.changes;
+        let stale = changes.iter().take_while(|c| c.at < cutoff).count();
+        if stale > 0 {
+            changes.drain(..stale);
+        }
+        changes.push(ItemChange {
+            seq,
+            at: now,
+            keys,
+            old_image: old_image.cloned(),
+            new_image: new_image.cloned(),
+        });
+    }
+
+    /// A marker for the next history entry, so a reverted transaction can
+    /// drop exactly the entries it recorded with
+    /// [`Self::discard_changes_since`].
+    pub fn change_marker(&self) -> u64 {
+        self.pitr_history.next_seq
+    }
+
+    pub fn discard_changes_since(&mut self, marker: u64) {
+        self.pitr_history.changes.retain(|c| c.seq < marker);
+    }
+
+    /// Number of recorded history entries.
+    pub fn change_count(&self) -> usize {
+        self.pitr_history.changes.len()
+    }
+
+    /// Turn point-in-time recovery on or off. Enabling starts a fresh history
+    /// (the earliest restorable time is now); disabling discards it, as on
+    /// DynamoDB.
+    pub fn set_pitr(&mut self, enabled: bool) {
+        if enabled && !self.pitr_enabled {
+            self.pitr_history = PitrHistory {
+                enabled_at: Some(whole_seconds(Utc::now())),
+                changes: Vec::new(),
+                next_seq: 0,
+            };
+        } else if enabled && self.pitr_history.enabled_at.is_none() {
+            // Enabled by a path that predates the history (an older
+            // snapshot): the history starts now.
+            self.pitr_history.enabled_at = Some(whole_seconds(Utc::now()));
+        } else if !enabled {
+            self.pitr_history = PitrHistory::default();
+        }
+        self.pitr_enabled = enabled;
     }
 
     /// The table's rows, in storage order. Read-only: the key index records
@@ -1128,6 +1316,10 @@ impl DynamoTable {
         self.ensure_key_index();
         match self.find_item_index(&item) {
             Some(id) => {
+                if self.pitr_enabled {
+                    let old = self.items[id].clone();
+                    self.record_change(Some(&old), Some(&item));
+                }
                 // Adjust the cached size by the delta rather than resumming the
                 // whole table (#2502).
                 self.size_bytes -= Self::estimate_item_size(&self.items[id]);
@@ -1139,6 +1331,7 @@ impl DynamoTable {
                 (id, true)
             }
             None => {
+                self.record_change(None, Some(&item));
                 self.size_bytes += Self::estimate_item_size(&item);
                 self.item_count += 1;
                 let key = self.encode_key(&item);
@@ -1176,6 +1369,7 @@ impl DynamoTable {
     /// Panics if no row has this id.
     pub fn remove_item_at(&mut self, id: ItemId) -> HashMap<String, AttributeValue> {
         let removed = self.items.remove(id).expect("remove_item_at: no such row");
+        self.record_change(Some(&removed), None);
         self.index_remove(&removed, id);
         match &mut self.key_index {
             KeyIndex::Built { rows, .. } | KeyIndex::Ambiguous { rows } => *rows -= 1,
@@ -1206,6 +1400,10 @@ impl DynamoTable {
         let original = row.clone();
         match f(row) {
             Ok(()) => {
+                if self.pitr_enabled {
+                    let new = self.items[id].clone();
+                    self.record_change(Some(&original), Some(&new));
+                }
                 self.sync_item_at(id, before);
                 Ok(())
             }
@@ -1230,7 +1428,12 @@ impl DynamoTable {
         f: impl FnOnce(&mut HashMap<String, AttributeValue>),
     ) {
         let before = self.snapshot_item_at(id);
+        let original = self.pitr_enabled.then(|| self.items[id].clone());
         f(self.items.get_mut(id).expect("mutate_item_at: no such row"));
+        if let Some(original) = original {
+            let new = self.items[id].clone();
+            self.record_change(Some(&original), Some(&new));
+        }
         self.sync_item_at(id, before);
     }
 
@@ -1443,6 +1646,11 @@ impl DynamoDbState {
     pub fn rebuild_derived_state(&mut self) {
         for table in self.tables.values_mut() {
             table.recalculate_stats();
+            // A snapshot written before the history existed has PITR on but
+            // no start time; the history starts at load.
+            if table.pitr_enabled && table.pitr_history.enabled_at.is_none() {
+                table.set_pitr(true);
+            }
         }
     }
 
@@ -1581,6 +1789,7 @@ mod tests {
             on_demand_throughput: None,
             table_class: default_table_class(),
             vector_indexes: Vec::new(),
+            pitr_history: Default::default(),
         }
     }
 
@@ -2046,6 +2255,110 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("pk".to_string(), json!({ "S": pk }));
         m
+    }
+
+    #[test]
+    fn pitr_history_records_every_write_path_only_while_enabled() {
+        let mut t = table_with_hash_key("pk");
+        t.put_item_at_key(mk_pk("before"));
+        assert_eq!(t.change_count(), 0, "nothing is recorded with PITR off");
+
+        t.set_pitr(true);
+        assert!(t.pitr_history.enabled_at.is_some());
+        let mut v1 = mk_pk("a");
+        v1.insert("v".into(), json!({"N": "1"}));
+        t.put_item_at_key(v1.clone()); // insert
+        let mut v2 = mk_pk("a");
+        v2.insert("v".into(), json!({"N": "2"}));
+        t.put_item_at_key(v2.clone()); // overwrite
+        let id = t.find_item_index(&mk_pk("a")).unwrap();
+        t.update_item_at(id, |item| {
+            item.insert("v".into(), json!({"N": "3"}));
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        // A rejected update is put back and leaves no history entry.
+        let _ = t.update_item_at(id, |item| {
+            item.insert("v".into(), json!({"N": "99"}));
+            Err::<(), ()>(())
+        });
+        t.mutate_item_at(id, |item| {
+            item.insert("v".into(), json!({"N": "4"}));
+        });
+        t.remove_item_by_key(&mk_pk("a"));
+
+        let c = &t.pitr_history.changes;
+        assert_eq!(c.len(), 5);
+        assert!(c.iter().all(|c| c.keys == mk_pk("a")));
+        assert_eq!(
+            (c[0].old_image.as_ref(), c[0].new_image.as_ref()),
+            (None, Some(&v1))
+        );
+        assert_eq!(c[1].old_image.as_ref(), Some(&v1));
+        assert_eq!(c[1].new_image.as_ref(), Some(&v2));
+        assert_eq!(c[2].new_image.as_ref().unwrap()["v"], json!({"N": "3"}));
+        assert_eq!(c[3].old_image.as_ref().unwrap()["v"], json!({"N": "3"}));
+        assert_eq!(c[3].new_image.as_ref().unwrap()["v"], json!({"N": "4"}));
+        assert!(c[4].new_image.is_none());
+
+        let marker = t.change_marker();
+        t.put_item_at_key(mk_pk("z"));
+        t.discard_changes_since(marker);
+        assert_eq!(t.change_count(), 5);
+        // Disabling PITR discards the history, as on DynamoDB.
+        t.set_pitr(false);
+        assert_eq!(t.change_count(), 0);
+        assert!(t.pitr_history.enabled_at.is_none());
+    }
+
+    #[test]
+    fn earliest_restorable_is_whole_seconds_within_the_window() {
+        let mut t = table_with_hash_key("pk");
+        let now = Utc::now();
+        assert_eq!(earliest_restorable(&t, now), None);
+        t.set_pitr(true);
+        let e = earliest_restorable(&t, now).unwrap();
+        assert_eq!(e.timestamp_subsec_nanos(), 0);
+        assert_eq!(Some(e), t.pitr_history.enabled_at);
+        t.pitr_history.enabled_at = Some(now - chrono::Duration::days(40));
+        let e = earliest_restorable(&t, now).unwrap();
+        assert_eq!(
+            e.timestamp(),
+            (now - chrono::Duration::days(PITR_RETENTION_DAYS)).timestamp()
+        );
+    }
+
+    #[test]
+    fn rollback_removes_exactly_its_entries_even_after_pruning() {
+        let mut t = table_with_hash_key("pk");
+        t.set_pitr(true);
+        // An entry that has fallen out of the window: the next write prunes
+        // it, so the list shrinks during the "transaction".
+        t.pitr_history.enabled_at = Some(Utc::now() - chrono::Duration::days(40));
+        t.pitr_history.changes.push(ItemChange {
+            seq: 0,
+            at: Utc::now() - chrono::Duration::days(36),
+            keys: mk_pk("old"),
+            old_image: None,
+            new_image: Some(mk_pk("old")),
+        });
+        t.pitr_history.next_seq = 1;
+        let marker = t.change_marker();
+        t.put_item_at_key(mk_pk("tx"));
+        assert_eq!(t.change_count(), 1, "stale entry pruned");
+        t.discard_changes_since(marker);
+        assert_eq!(t.change_count(), 0, "the transaction's write is gone");
+    }
+
+    #[test]
+    fn loading_a_pitr_table_without_history_start_initialises_it() {
+        let mut state = DynamoDbState::new("123456789012", "us-east-1");
+        let mut t = table_with_hash_key("pk");
+        t.pitr_enabled = true;
+        state.tables.insert("t".into(), t);
+        state.rebuild_derived_state();
+        assert!(state.tables["t"].pitr_history.enabled_at.is_some());
+        assert!(earliest_restorable(&state.tables["t"], Utc::now()).is_some());
     }
 
     fn pks(t: &DynamoTable) -> Vec<String> {
