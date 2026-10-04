@@ -5643,6 +5643,23 @@ fn persisted_command_status(store: &CapturingSnapshotStore, command_id: &str) ->
         .map(|c| c.status.clone())
 }
 
+/// Poll the persisted command status until it is `want` or a deadline passes:
+/// the snapshot save follows the in-memory status flip asynchronously.
+async fn wait_for_persisted_status(
+    store: &CapturingSnapshotStore,
+    command_id: &str,
+    want: &str,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let persisted = persisted_command_status(store, command_id);
+        if persisted.as_deref() == Some(want) || std::time::Instant::now() >= deadline {
+            return persisted;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 fn insert_pending_command(svc: &SsmService, command_id: &str, instance_id: &str) {
     let now = chrono::Utc::now();
     let mut accounts = svc.state.write();
@@ -5711,15 +5728,11 @@ async fn send_command_completion_persists_success() {
     assert_eq!(status, "Success", "command should complete in-memory");
 
     // The completed command must be on disk as Success, not stranded at
-    // Pending. The save follows the in-memory flip asynchronously, so poll.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut persisted = persisted_command_status(&store, &command_id);
-    while persisted.as_deref() != Some("Success") && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        persisted = persisted_command_status(&store, &command_id);
-    }
+    // Pending.
     assert_eq!(
-        persisted.as_deref(),
+        wait_for_persisted_status(&store, &command_id, "Success")
+            .await
+            .as_deref(),
         Some("Success"),
         "background advance must persist the Success transition"
     );
@@ -5746,7 +5759,9 @@ async fn rearm_in_flight_commands_settles_restored_pending() {
         "restored Pending command must be re-advanced, not stranded"
     );
     assert_eq!(
-        persisted_command_status(&store, command_id).as_deref(),
+        wait_for_persisted_status(&store, command_id, "Success")
+            .await
+            .as_deref(),
         Some("Success"),
         "re-armed completion must persist the terminal status"
     );
