@@ -322,27 +322,17 @@ impl S3Service {
                 )
             })?;
 
-        // Split on '?' BEFORE percent-decoding so keys containing literal '?' are preserved
-        let raw_source = copy_source.strip_prefix('/').unwrap_or(copy_source);
-
-        // Parse versionId from ?versionId=X
-        let (raw_path, source_version_id) = if let Some(idx) = raw_source.find("?versionId=") {
-            let vid = raw_source[idx + 11..].to_string();
-            (&raw_source[..idx], Some(vid))
-        } else {
-            (raw_source, None)
-        };
-        let decoded_path = percent_encoding::percent_decode_str(raw_path)
-            .decode_utf8_lossy()
-            .to_string();
-
-        let (src_bucket, src_key) = decoded_path.split_once('/').ok_or_else(|| {
+        // Parsed by the same function the source authorization uses, so the
+        // object copied is exactly the object authorized.
+        let source = super::parse_copy_source(copy_source).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidArgument",
                 "Invalid copy source format",
             )
         })?;
+        let source_version_id = source.version_id.clone();
+        let (src_bucket, src_key) = (source.bucket.as_str(), source.key.as_str());
 
         let copy_range = req
             .headers
@@ -380,7 +370,14 @@ impl S3Service {
             let accts = self.state.read();
             let empty_state = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&empty_state);
-            let sb = state
+            // The source bucket is read in the account that owns it, which is
+            // not the destination's when copying out of another account's
+            // bucket (authorized by s3:GetObject on the source at dispatch).
+            let src_state = accts
+                .find_account(|s| s.buckets.contains_key(src_bucket))
+                .and_then(|owner| accts.get(owner))
+                .unwrap_or(state);
+            let sb = src_state
                 .buckets
                 .get(src_bucket)
                 .ok_or_else(|| no_such_bucket(src_bucket))?;
@@ -958,7 +955,7 @@ impl S3Service {
                 &super::notifications::ObjectEvent {
                     event_name: "ObjectCreated:CompleteMultipartUpload",
                     bucket_name: &bucket_name,
-                    requester_account: account_id,
+                    requester_account: &req.account_id,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,

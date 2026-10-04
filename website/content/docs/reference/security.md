@@ -54,7 +54,7 @@ Filter the audit events with `RUST_LOG=fakecloud::iam::audit=warn`.
 
 ### Root is always allowed
 
-The account's IAM root identity (`arn:aws:iam::<account>:root`) and the reserved `test*` bypass AKIDs always pass enforcement, matching AWS's own behavior where root bypasses identity-based policies.
+The account's IAM root identity (`arn:aws:iam::<account>:root`) and the reserved `test*` bypass AKIDs always pass enforcement, matching AWS's own behavior where root bypasses identity-based policies. The root exemption stops at the account boundary: root of one account reaching an S3 bucket or a DynamoDB table or stream that another account owns is a cross-account request, allowed only when the owner's bucket (or table/stream) policy grants it, as on AWS.
 
 ### Credentials that resolve to no identity
 
@@ -182,7 +182,7 @@ S3 bucket policies, SNS topic policies, Lambda function policies, KMS key polici
 - **Same-account** callers (principal account ID equals the resource's owning account): the request is allowed if the identity policy **or** the resource policy grants it.
 - **Cross-account** callers: the request is allowed only if the identity policy **and** the resource policy both grant it.
 
-The resource's owning account is parsed from the ARN; S3 ARNs have an empty account segment, so fakecloud falls back to the server's configured account ID (#381 multi-account alignment — the decision is per-ARN, not a global config knob).
+The resource's owning account is parsed from the ARN. S3 ARNs have an empty account segment, so for S3 the owner is the account that holds the bucket (bucket names are global); the decision is per resource, not a global config knob.
 
 **Where policies come from.**
 

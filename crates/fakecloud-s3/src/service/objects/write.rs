@@ -317,14 +317,37 @@ impl S3Service {
         if sse_algorithm.as_deref() == Some("aws:kms") {
             if let Some(ref kms) = self.kms_state {
                 if let Some(ref key_id) = sse_kms_key_id {
-                    let kms_accounts = kms.read();
-                    let kms_state = kms_accounts
-                        .get(&req.account_id)
-                        .unwrap_or(kms_accounts.default_ref());
+                    // A key or alias ARN names its account (possibly the
+                    // requester's); a bare id or alias resolves in the
+                    // bucket owner's account.
+                    let key_account =
+                        crate::service::kms_reference_account(key_id).unwrap_or(account_id);
                     // The key (or alias) lives in the bucket's region; an
-                    // alias ARN names its own region.
-                    match kms_state.resolve_key_arn(&bucket_region, key_id) {
-                        Some(arn) => sse_kms_key_id = Some(arn.to_string()),
+                    // alias ARN names its own region. Through the hook an
+                    // AWS-managed `aws/s3` reference mints its key, so the
+                    // object records the key's ARN as on AWS.
+                    let resolved = self
+                        .kms_hook
+                        .as_ref()
+                        .and_then(|hook| {
+                            hook.resolve_key_arn(
+                                key_account,
+                                &bucket_region,
+                                key_id,
+                                "s3.amazonaws.com",
+                            )
+                            .ok()
+                        })
+                        .or_else(|| {
+                            let kms_accounts = kms.read();
+                            kms_accounts
+                                .get(key_account)
+                                .unwrap_or(kms_accounts.default_ref())
+                                .resolve_key_arn(&bucket_region, key_id)
+                                .map(str::to_string)
+                        });
+                    match resolved {
+                        Some(arn) => sse_kms_key_id = Some(arn),
                         None => {
                             // Still allow it — AWS doesn't always reject unknown keys
                             // for emulation purposes, just set the key ID
@@ -457,6 +480,7 @@ impl S3Service {
                 .map_err(crate::service::io_to_aws)?;
             let _ = tokio::fs::remove_file(&spooled.path).await;
             let cipher = self.encrypt_object_body(
+                req,
                 account_id,
                 &bucket_region,
                 bucket,
@@ -667,7 +691,7 @@ impl S3Service {
                 &crate::service::notifications::ObjectEvent {
                     event_name,
                     bucket_name: &bucket_name,
-                    requester_account: account_id,
+                    requester_account: &req.account_id,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,
@@ -715,28 +739,17 @@ impl S3Service {
                 )
             })?;
 
-        // Split on '?' BEFORE percent-decoding so keys containing literal '?' are preserved
-        let raw_source = copy_source.strip_prefix('/').unwrap_or(copy_source);
-        let (raw_path, src_version_id) = if let Some((path, query)) = raw_source.split_once('?') {
-            let vid = query
-                .split('&')
-                .find_map(|p| p.strip_prefix("versionId="))
-                .map(|s| s.to_string());
-            (path, vid)
-        } else {
-            (raw_source, None)
-        };
-        let decoded_path = percent_encoding::percent_decode_str(raw_path)
-            .decode_utf8_lossy()
-            .to_string();
-
-        let (src_bucket, src_key) = decoded_path.split_once('/').ok_or_else(|| {
+        // Parsed by the same function the source authorization uses, so the
+        // object copied is exactly the object authorized.
+        let source = crate::service::parse_copy_source(copy_source).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidArgument",
                 "Invalid copy source format",
             )
         })?;
+        let src_version_id = source.version_id.clone();
+        let (src_bucket, src_key) = (source.bucket.as_str(), source.key.as_str());
 
         let metadata_directive = req
             .headers
@@ -826,10 +839,17 @@ impl S3Service {
         let accts_r = self.state.read();
         let empty_state = crate::state::S3State::new(account_id, "us-east-1");
         let state = accts_r.get(account_id).unwrap_or(&empty_state);
+        // The source bucket is read in the account that owns it, which is not
+        // the destination's when copying out of another account's bucket
+        // (authorized by s3:GetObject on the source at dispatch).
+        let src_account = accts_r
+            .find_account(|s| s.buckets.contains_key(src_bucket))
+            .map_or_else(|| account_id.to_string(), |a| a.to_string());
+        let src_state = accts_r.get(&src_account).unwrap_or(state);
 
         // Resolve source object, possibly a specific version
         let (src_obj, src_version_id_actual) = {
-            let sb = state
+            let sb = src_state
                 .buckets
                 .get(src_bucket)
                 .ok_or_else(|| no_such_bucket(src_bucket))?;
@@ -1084,7 +1104,13 @@ impl S3Service {
             super::run_blocking_io(|| src_handle.read_all()).map_err(crate::service::io_to_aws)?;
         let src_bytes =
             if src_obj.sse_algorithm.as_deref() == Some("aws:kms") && self.kms_hook.is_some() {
-                self.decrypt_object_body(account_id, src_bucket, &raw_src_bytes)?
+                self.decrypt_object_body(
+                    req,
+                    &src_account,
+                    src_bucket,
+                    &raw_src_bytes,
+                    src_obj.sse_kms_key_id.as_deref(),
+                )?
             } else {
                 raw_src_bytes
             };
@@ -1106,6 +1132,7 @@ impl S3Service {
         let dest_stored_bytes = if new_sse.as_deref() == Some("aws:kms") && self.kms_hook.is_some()
         {
             self.encrypt_object_body(
+                req,
                 account_id,
                 &dest_region,
                 dest_bucket,
@@ -1336,7 +1363,7 @@ impl S3Service {
                 &crate::service::notifications::ObjectEvent {
                     event_name: "ObjectCreated:Copy",
                     bucket_name: &copy_bucket,
-                    requester_account: account_id,
+                    requester_account: &req.account_id,
                     key: &copy_key,
                     size: copy_size,
                     etag: &copy_etag,

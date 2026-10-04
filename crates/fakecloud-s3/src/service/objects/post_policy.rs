@@ -562,7 +562,9 @@ impl S3Service {
             // ObjectCreated:Post on real S3.
             action: "PostObject".to_string(),
             region: req.region.clone(),
-            account_id: account_id.to_string(),
+            // The caller, not the bucket owner `account_id` the write is
+            // served in: the object-created event reports this requester.
+            account_id: req.account_id.clone(),
             request_id: req.request_id.clone(),
             headers: synth_headers,
             query_params: HashMap::new(),

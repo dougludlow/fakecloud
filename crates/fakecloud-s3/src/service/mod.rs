@@ -380,6 +380,54 @@ pub(crate) fn io_to_aws(err: std::io::Error) -> AwsServiceError {
 }
 
 impl S3Service {
+    /// The read authorization a copy request needs on its source object:
+    /// `s3:GetObject` (or `s3:GetObjectVersion` when the source names a
+    /// version) on `arn:...:s3:::src-bucket/src-key`. `None` for a request
+    /// that is not a copy, or whose source is not a `bucket/key` path (an
+    /// access-point ARN source is authorized through the access point).
+    fn copy_source_read_action(
+        &self,
+        request: &AwsRequest,
+    ) -> Option<fakecloud_core::auth::IamAction> {
+        if request.method != Method::PUT
+            || request.path_segments.len() < 2
+            || fakecloud_core::protocol::is_s3_control_host(&request.headers)
+        {
+            return None;
+        }
+        let header = request.headers.get("x-amz-copy-source")?.to_str().ok()?;
+        if header.trim_start_matches('/').starts_with("arn:") {
+            return None;
+        }
+        let source = parse_copy_source(header)?;
+        let (src_bucket, src_key) = (source.bucket.as_str(), source.key.as_str());
+        if src_bucket.is_empty() || src_key.is_empty() {
+            return None;
+        }
+        let action = if source.version_id.is_some() {
+            "GetObjectVersion"
+        } else {
+            "GetObject"
+        };
+        let region = self
+            .bucket_region(src_bucket)
+            .unwrap_or_else(|| request.region.clone());
+        Some(fakecloud_core::auth::IamAction {
+            service: "s3",
+            action,
+            resource: Arn::s3_in(&region, &format!("{src_bucket}/{src_key}")).to_string(),
+        })
+    }
+
+    /// The account that owns `bucket`, searched across accounts (bucket names
+    /// are global). `None` when no account holds a bucket by that name.
+    pub(crate) fn bucket_owner_account(&self, bucket: &str) -> Option<String> {
+        self.state
+            .read()
+            .find_account(|s| s.buckets.contains_key(bucket))
+            .map(|a| a.to_string())
+    }
+
     /// The region of an existing bucket, searched across accounts (bucket
     /// names are global).
     fn bucket_region(&self, bucket: &str) -> Option<String> {
@@ -449,6 +497,7 @@ impl S3Service {
     /// plaintext is returned unchanged so existing tests keep working.
     pub(crate) fn encrypt_object_body(
         &self,
+        req: &AwsRequest,
         account_id: &str,
         region: &str,
         bucket: &str,
@@ -459,36 +508,40 @@ impl S3Service {
             return Ok(bytes::Bytes::copy_from_slice(plaintext));
         };
         let key = kms_key_id.filter(|k| !k.is_empty()).unwrap_or("aws/s3");
+        // A key or alias ARN names its own account (it may be the
+        // requester's, outside the bucket owner's); a bare key id or alias
+        // resolves in the bucket owner's account.
+        let key_account = kms_reference_account(key).unwrap_or(account_id);
+        self.authorize_kms_key_use(req, key_account, region, key, "GenerateDataKey")?;
         let bucket_arn = Arn::s3(bucket).to_string();
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("aws:s3:arn".to_string(), bucket_arn);
-        match hook.encrypt(account_id, region, key, plaintext, "s3.amazonaws.com", ctx) {
-            Ok(envelope) => Ok(bytes::Bytes::from(envelope.into_bytes())),
-            Err(err) => {
+        hook.encrypt(key_account, region, key, plaintext, "s3.amazonaws.com", ctx)
+            .map(|envelope| bytes::Bytes::from(envelope.into_bytes()))
+            .map_err(|err| {
                 tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS encrypt failed");
-                Err(AwsServiceError::aws_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "KMS.InternalFailureException",
-                    format!("Failed to encrypt object via KMS: {err}"),
-                ))
-            }
-        }
+                kms_hook_error(&err, key, "encrypt")
+            })
     }
 
     /// Decrypt object body bytes that were stored as a fakecloud-kms
     /// envelope. Caller is expected to gate this on
-    /// `obj.sse_algorithm == Some("aws:kms")`.
+    /// `obj.sse_algorithm == Some("aws:kms")`. `kms_key_id` is the key the
+    /// object records (normally its ARN), which names the account whose KMS
+    /// holds the key; without one the key is the bucket owner's.
     ///
     /// Fail-closed: when a hook is wired and the bytes look like an
     /// envelope but don't decrypt (key revoked, malformed ciphertext),
-    /// this returns `Err` so GetObject surfaces a 500. When no hook is
-    /// wired, or the bytes aren't UTF-8 (legacy snapshots from before
-    /// the hook landed), the bytes are returned unchanged.
+    /// this returns `Err`. When no hook is wired, or the bytes aren't UTF-8
+    /// (legacy snapshots from before the hook landed), the bytes are
+    /// returned unchanged.
     pub(crate) fn decrypt_object_body(
         &self,
+        req: &AwsRequest,
         account_id: &str,
         bucket: &str,
         ciphertext: &[u8],
+        kms_key_id: Option<&str>,
     ) -> Result<bytes::Bytes, AwsServiceError> {
         let Some(hook) = &self.kms_hook else {
             return Ok(bytes::Bytes::copy_from_slice(ciphertext));
@@ -499,20 +552,138 @@ impl S3Service {
             Ok(s) => s,
             Err(_) => return Ok(bytes::Bytes::copy_from_slice(ciphertext)),
         };
+        let key = kms_key_id.filter(|k| !k.is_empty()).unwrap_or("aws/s3");
+        let key_account = kms_reference_account(key).unwrap_or(account_id);
+        let region = self
+            .bucket_region(bucket)
+            .unwrap_or_else(|| req.region.clone());
+        self.authorize_kms_key_use(req, key_account, &region, key, "Decrypt")?;
         let bucket_arn = Arn::s3(bucket).to_string();
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("aws:s3:arn".to_string(), bucket_arn);
-        match hook.decrypt(account_id, envelope, "s3.amazonaws.com", ctx) {
-            Ok(bytes) => Ok(bytes::Bytes::from(bytes)),
-            Err(err) => {
+        hook.decrypt(key_account, envelope, "s3.amazonaws.com", ctx)
+            .map(bytes::Bytes::from)
+            .map_err(|err| {
                 tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS decrypt failed");
-                Err(AwsServiceError::aws_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "KMS.InternalFailureException",
-                    format!("Failed to decrypt object via KMS: {err}"),
-                ))
-            }
+                kms_hook_error(&err, key, "decrypt")
+            })
+    }
+
+    /// Authorize the requester's use of a KMS key that another account owns
+    /// for SSE-KMS (`kms:GenerateDataKey` to write, `kms:Decrypt` to read).
+    ///
+    /// Using a key across accounts is a cross-account KMS request, which on
+    /// AWS needs the key policy to grant the requester -- a default key
+    /// policy (and an AWS-managed `aws/s3` key's) trusts only its own
+    /// account, so another account's writes under it are refused. A key in
+    /// the requester's own account is governed by the requester's own
+    /// permissions and is not checked here. Enforced under `--iam strict`,
+    /// logged under `--iam soft`, skipped with IAM off and for the `test*`
+    /// root-bypass credentials.
+    fn authorize_kms_key_use(
+        &self,
+        req: &AwsRequest,
+        key_account: &str,
+        region: &str,
+        key: &str,
+        action: &str,
+    ) -> Result<(), AwsServiceError> {
+        if !self.iam_mode.is_enabled()
+            || key_account == req.account_id
+            || req
+                .access_key_id
+                .as_deref()
+                .is_some_and(fakecloud_core::auth::is_root_bypass)
+        {
+            return Ok(());
         }
+        let Some(kms) = &self.kms_state else {
+            return Ok(());
+        };
+        let key_ref =
+            if !key.starts_with("arn:") && !key.starts_with("alias/") && key.starts_with("aws/") {
+                format!("alias/{key}")
+            } else {
+                key.to_string()
+            };
+        let key_region = fakecloud_kms::parse_kms_arn(&key_ref).map_or(region, |(r, _, _)| r);
+        let (key_arn, policy) = {
+            let accounts = kms.read();
+            let found = accounts.get(key_account).and_then(|state| {
+                let arn = state.resolve_key_arn(key_region, &key_ref)?.to_string();
+                let id = arn.rsplit('/').next().unwrap_or_default().to_string();
+                Some((arn, state.keys.get(&id).map(|k| k.policy.clone())))
+            });
+            match found {
+                Some((arn, policy)) => (arn, policy.unwrap_or_default()),
+                // An AWS-managed key not minted yet has the managed-key
+                // policy, which trusts only its own account.
+                None if key_ref.starts_with("alias/aws/") => (key_ref.clone(), String::new()),
+                None => return Err(kms_not_found(key)),
+            }
+        };
+        let principal = req
+            .principal
+            .clone()
+            .unwrap_or_else(|| fakecloud_core::auth::Principal {
+                arn: Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string(),
+                user_id: req.account_id.clone(),
+                account_id: req.account_id.clone(),
+                principal_type: fakecloud_core::auth::PrincipalType::Root,
+                source_identity: None,
+                tags: None,
+            });
+        let action = format!("kms:{action}");
+        let mut context = fakecloud_iam::evaluator::RequestContext {
+            aws_principal_arn: Some(principal.arn.clone()),
+            aws_principal_account: Some(principal.account_id.clone()),
+            aws_requested_region: Some(region.to_string()),
+            ..Default::default()
+        };
+        context.service_keys.insert(
+            "kms:calleraccount".to_string(),
+            vec![principal.account_id.clone()],
+        );
+        context.service_keys.insert(
+            "kms:viaservice".to_string(),
+            vec![format!("s3.{region}.amazonaws.com")],
+        );
+        let allowed = !policy.is_empty() && {
+            let doc = fakecloud_iam::evaluator::PolicyDocument::parse(&policy);
+            let request = fakecloud_iam::evaluator::EvalRequest {
+                principal: &principal,
+                action: action.clone(),
+                resource: key_arn.clone(),
+                context,
+            };
+            matches!(
+                fakecloud_iam::evaluator::evaluate_resource_policy_only(&doc, &request),
+                fakecloud_iam::evaluator::Decision::Allow
+            )
+        };
+        if allowed {
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "fakecloud::iam::audit",
+            principal = %principal.arn,
+            action = %action,
+            key = %key_arn,
+            mode = %self.iam_mode,
+            "SSE-KMS use of another account's key denied: the key policy does not grant it"
+        );
+        if !self.iam_mode.is_strict() {
+            return Ok(());
+        }
+        Err(AwsServiceError::aws_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            format!(
+                "User: {} is not authorized to perform: {action} on resource: {key_arn} \
+                 because no resource-based policy allows the {action} action",
+                principal.arn
+            ),
+        ))
     }
 }
 
@@ -624,6 +795,20 @@ impl AwsService for S3Service {
                     .into_owned()
             })
         });
+
+        // Bucket names are one global namespace, so a bucket-addressed request
+        // is served in the account that OWNS the bucket, not the caller's: a
+        // principal in account B reading account A's bucket (authorized by A's
+        // bucket policy at dispatch, which resolves the same owner) must find
+        // A's bucket and objects, and anything it writes lands in A's bucket.
+        // A bucket no account holds keeps the caller's account, so the
+        // handlers answer NoSuchBucket from there. CreateBucket and
+        // ListBuckets stay in the caller's account (they are routed with
+        // `caller_account` below), and the requester recorded on events is
+        // always the caller.
+        let caller_account = req.account_id.as_str();
+        let owner_account = bucket.and_then(|b| self.bucket_owner_account(b));
+        let account_id = owner_account.as_deref().unwrap_or(caller_account);
 
         // Multipart upload operations (checked before main match). Held in an
         // Option rather than returned directly so these responses still reach
@@ -789,8 +974,8 @@ impl AwsService for S3Service {
                 let origin = origin.unwrap_or("");
                 let cors_config = {
                     let accounts = self.state.read();
-                    let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
-                    let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                    let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                    let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                     state
                         .buckets
                         .get(b_name)
@@ -1028,9 +1213,9 @@ impl AwsService for S3Service {
                     if req.query_params.get("x-id").map(|s| s.as_str())
                         == Some("ListDirectoryBuckets")
                     {
-                        self.list_directory_buckets(account_id, &req)
+                        self.list_directory_buckets(caller_account, &req)
                     } else {
-                        self.list_buckets(account_id, &req)
+                        self.list_buckets(caller_account, &req)
                     }
                 }
 
@@ -1087,7 +1272,7 @@ impl AwsService for S3Service {
                     } else if req.query_params.contains_key("metadataJournalTable") {
                         self.update_bucket_metadata_journal_table(account_id, &req, b)
                     } else {
-                        self.create_bucket(account_id, &req, b)
+                        self.create_bucket(caller_account, &req, b)
                     }
                 }
                 (&Method::DELETE, Some(b), None) => {
@@ -1203,9 +1388,8 @@ impl AwsService for S3Service {
                         // If bucket has website config and no query params, serve index document
                         let website_config = {
                             let accounts = self.state.read();
-                            let _empty_s3 =
-                                crate::state::S3State::new(&req.account_id, &req.region);
-                            let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                            let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                            let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                             state
                                 .buckets
                                 .get(b)
@@ -1289,9 +1473,8 @@ impl AwsService for S3Service {
                         if is_not_found {
                             let website_config = {
                                 let accounts = self.state.read();
-                                let _empty_s3 =
-                                    crate::state::S3State::new(&req.account_id, &req.region);
-                                let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                                let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                                let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                                 state
                                     .buckets
                                     .get(b)
@@ -1391,8 +1574,8 @@ impl AwsService for S3Service {
         if let Some(b_name) = bucket.filter(|_| req.headers.contains_key("origin")) {
             let cors_config = {
                 let accounts = self.state.read();
-                let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
-                let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                let _empty_s3 = crate::state::S3State::new(account_id, &req.region);
+                let state = accounts.get(account_id).unwrap_or(&_empty_s3);
                 state
                     .buckets
                     .get(b_name)
@@ -1782,12 +1965,32 @@ impl AwsService for S3Service {
         }
         // A replication configuration names the role S3 assumes to copy
         // objects, so AWS also requires `iam:PassRole` on it.
-        if action.service == "s3" && action.action == "PutBucketReplication" {
-            if let Some(role) = replication_role_arn(&request.body) {
-                return vec![action, fakecloud_core::auth::IamAction::pass_role(role)];
-            }
+        let pass_role = if action.service == "s3" && action.action == "PutBucketReplication" {
+            replication_role_arn(&request.body)
+        } else {
+            None
+        };
+        let mut actions = vec![action];
+        if let Some(role) = pass_role {
+            actions.push(fakecloud_core::auth::IamAction::pass_role(role));
         }
-        vec![action]
+        // CopyObject and UploadPartCopy also read the source object, which AWS
+        // authorizes as s3:GetObject (s3:GetObjectVersion for a versioned
+        // source) on the SOURCE object -- evaluated against the source
+        // bucket's owner and bucket policy, so copying out of another
+        // account's bucket needs that bucket's grant.
+        if let Some(source) = self.copy_source_read_action(request) {
+            actions.push(source);
+        }
+        actions
+    }
+
+    /// CreateBucket creates in the caller's account: a name another account
+    /// owns is authorized against the caller's own policies and then answered
+    /// `BucketAlreadyExists`, not refused by that account's bucket policy.
+    fn iam_resource_in_caller_account(&self, request: &AwsRequest) -> bool {
+        self.iam_action_for(request)
+            .is_some_and(|a| a.service == "s3" && a.action == "CreateBucket")
     }
 
     fn iam_condition_keys_for(
@@ -3670,6 +3873,79 @@ pub(crate) fn location_constraint_region(constraint: &str) -> &str {
     }
 }
 
+/// The account a KMS key reference names: the account field of a key or
+/// alias ARN. `None` for a bare key id, alias name or `aws/<service>`
+/// reference, which resolves in the account using it.
+pub(crate) fn kms_reference_account(key: &str) -> Option<&str> {
+    fakecloud_kms::parse_kms_arn(key)
+        .map(|(_, account, _)| account)
+        .filter(|a| !a.is_empty())
+}
+
+/// `KMS.NotFoundException` for an SSE-KMS key reference that names no key.
+pub(crate) fn kms_not_found(key: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "KMS.NotFoundException",
+        format!("Invalid keyId '{key}'"),
+    )
+}
+
+/// The S3 error for a failed KMS hook call: a missing key is
+/// `KMS.NotFoundException` and a disabled one `KMS.DisabledException` (both
+/// 400, as S3 relays them); only a corrupt envelope is an internal failure.
+fn kms_hook_error(err: &str, key: &str, op: &str) -> AwsServiceError {
+    if err.starts_with("kms key not found") {
+        kms_not_found(key)
+    } else if err.starts_with("kms key is disabled") {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "KMS.DisabledException",
+            format!("{key} is disabled."),
+        )
+    } else {
+        AwsServiceError::aws_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "KMS.InternalFailureException",
+            format!("Failed to {op} object via KMS: {err}"),
+        )
+    }
+}
+
+/// An `x-amz-copy-source` value, parsed once for both the copy handlers and
+/// the copy's source authorization so they always name the same object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopySource {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// Parse `[/]bucket/key[?versionId=v]`. The query starts at the first raw
+/// `?`, split BEFORE percent-decoding, so a key containing `?` (sent, as S3
+/// requires, URL-encoded as `%3F`) keeps it. `None` when the value has no
+/// `bucket/key` shape.
+pub(crate) fn parse_copy_source(header: &str) -> Option<CopySource> {
+    let raw = header.strip_prefix('/').unwrap_or(header);
+    let (raw_path, version_id) = match raw.split_once('?') {
+        Some((path, query)) => (
+            path,
+            query
+                .split('&')
+                .find_map(|p| p.strip_prefix("versionId="))
+                .map(|s| s.to_string()),
+        ),
+        None => (raw, None),
+    };
+    let decoded = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
+    let (bucket, key) = decoded.split_once('/')?;
+    Some(CopySource {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id,
+    })
+}
+
 pub(crate) fn resolve_object<'a>(
     b: &'a S3Bucket,
     key: &str,
@@ -4417,7 +4693,7 @@ mod partition_tests {
             path_segments: path
                 .split('/')
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
+                .map(|a| a.to_string())
                 .collect(),
             raw_path: path.to_string(),
             raw_query: String::new(),
