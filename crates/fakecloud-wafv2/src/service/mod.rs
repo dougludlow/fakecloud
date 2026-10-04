@@ -251,6 +251,7 @@ impl AwsService for Wafv2Service {
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let mutates = MUTATING_ACTIONS.contains(&req.action.as_str());
+        check_scope_region(&req)?;
         let result = match req.action.as_str() {
             "CreateWebACL" => self.create_web_acl(&req),
             "GetWebACL" => self.get_web_acl(&req),
@@ -399,8 +400,28 @@ impl Wafv2Service {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn account_mut<'a>(state: &'a mut Wafv2Accounts, account_id: &str) -> &'a mut AccountState {
-    state.accounts.entry(account_id.to_string()).or_default()
+/// The state of `account_id` in `region`, created on first use.
+fn account_mut<'a>(
+    state: &'a mut Wafv2Accounts,
+    account_id: &str,
+    region: &str,
+) -> &'a mut AccountState {
+    state.region_mut(account_id, region)
+}
+
+/// AWS only serves CLOUDFRONT-scope calls from the partition's global region
+/// (`us-east-1` for `aws`); anywhere else the scope value is rejected.
+fn check_scope_region(req: &AwsRequest) -> Result<(), AwsServiceError> {
+    let body = req.json_body();
+    if body.get("Scope").and_then(Value::as_str) != Some("CLOUDFRONT") {
+        return Ok(());
+    }
+    if req.region.is_empty() || req.region == implicit_global_region(partition_for(&req.region)) {
+        return Ok(());
+    }
+    Err(invalid_param(
+        "Error reason: The scope is not valid., field: SCOPE_VALUE, parameter: CLOUDFRONT",
+    ))
 }
 
 fn require_str(body: &Value, field: &str) -> Result<String, AwsServiceError> {
@@ -1092,7 +1113,7 @@ mod arn_norm_tests {
     fn china_region_arns_use_the_aws_cn_partition_and_its_global_region() {
         use super::*;
         let svc = Wafv2Service::default();
-        let call = |action: &str, body: Value| -> Value {
+        let call_in = |region: &str, action: &str, body: Value| -> Result<Value, String> {
             let req = AwsRequest {
                 service: "wafv2".into(),
                 action: action.into(),
@@ -1105,7 +1126,7 @@ mod arn_norm_tests {
                 body: serde_json::to_vec(&body).unwrap().into(),
                 body_stream: parking_lot::Mutex::new(None),
                 account_id: "123456789012".into(),
-                region: "cn-north-1".into(),
+                region: region.into(),
                 request_id: "r".into(),
                 is_query_protocol: false,
                 access_key_id: None,
@@ -1116,8 +1137,14 @@ mod arn_norm_tests {
                 .build()
                 .unwrap()
                 .block_on(svc.handle(req))
-                .unwrap_or_else(|e| panic!("{action}: {}", e.code()));
-            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+                .map_err(|e| e.code().to_string())?;
+            Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+        };
+        let call = |action: &str, body: Value| -> Value {
+            call_in("cn-north-1", action, body).unwrap_or_else(|e| panic!("{action}: {e}"))
+        };
+        let call_global = |action: &str, body: Value| -> Value {
+            call_in("cn-northwest-1", action, body).unwrap_or_else(|e| panic!("{action}: {e}"))
         };
         let regional = call(
             "CreateIPSet",
@@ -1128,7 +1155,15 @@ mod arn_norm_tests {
             regional_arn.starts_with("arn:aws-cn:wafv2:cn-north-1:123456789012:regional/ipset/r/"),
             "{regional_arn}"
         );
-        let global = call(
+        // CLOUDFRONT scope is only served from the partition's global region.
+        let err = call_in(
+            "cn-north-1",
+            "CreateIPSet",
+            json!({ "Name": "g", "Scope": "CLOUDFRONT", "IPAddressVersion": "IPV4", "Addresses": [] }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "WAFInvalidParameterException");
+        let global = call_global(
             "CreateIPSet",
             json!({ "Name": "g", "Scope": "CLOUDFRONT", "IPAddressVersion": "IPV4", "Addresses": [] }),
         );
@@ -1137,11 +1172,11 @@ mod arn_norm_tests {
             global_arn.starts_with("arn:aws-cn:wafv2:cn-northwest-1:123456789012:global/ipset/g/"),
             "{global_arn}"
         );
-        call(
+        call_global(
             "TagResource",
             json!({ "ResourceARN": global_arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
         );
-        let tags = call("ListTagsForResource", json!({ "ResourceARN": global_arn }));
+        let tags = call_global("ListTagsForResource", json!({ "ResourceARN": global_arn }));
         assert_eq!(tags["TagInfoForResource"]["TagList"][0]["Key"], "k");
 
         let products = call("DescribeAllManagedProducts", json!({ "Scope": "REGIONAL" }));
@@ -1590,7 +1625,7 @@ mod managed_rule_set_validation_tests {
         let svc = Wafv2Service::default();
         {
             let mut state = svc.state.write();
-            let account = account_mut(&mut state, "123456789012");
+            let account = account_mut(&mut state, "123456789012", "us-east-1");
             account.managed_rule_sets.insert(
                 ("REGIONAL".to_string(), "Legacy".to_string()),
                 crate::state::ManagedRuleSet {
@@ -1638,7 +1673,7 @@ mod managed_rule_set_validation_tests {
         // Force a distinct, old PublishTimestamp on the stored detail.
         {
             let mut state = svc.state.write();
-            let account = account_mut(&mut state, "123456789012");
+            let account = account_mut(&mut state, "123456789012", "us-east-1");
             let set = account
                 .managed_rule_sets
                 .get_mut(&("REGIONAL".to_string(), "Rs".to_string()))
@@ -1679,5 +1714,292 @@ mod managed_rule_set_validation_tests {
             Some(1000.0),
             "LastUpdateTimestamp must be refreshed on republish"
         );
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    fn call(svc: &Wafv2Service, region: &str, action: &str, body: Value) -> Result<Value, String> {
+        let req = AwsRequest {
+            service: "wafv2".into(),
+            action: action.into(),
+            method: http::Method::POST,
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            path_segments: Vec::new(),
+            query_params: std::collections::HashMap::new(),
+            headers: http::HeaderMap::new(),
+            body: serde_json::to_vec(&body).unwrap().into(),
+            body_stream: parking_lot::Mutex::new(None),
+            account_id: "123456789012".into(),
+            region: region.into(),
+            request_id: "r".into(),
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        };
+        let resp = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(svc.handle(req))
+            .map_err(|e| e.code().to_string())?;
+        Ok(serde_json::from_slice(resp.body.expect_bytes()).unwrap())
+    }
+
+    fn ok(svc: &Wafv2Service, region: &str, action: &str, body: Value) -> Value {
+        call(svc, region, action, body).unwrap_or_else(|e| panic!("{action} in {region}: {e}"))
+    }
+
+    fn create_acl(svc: &Wafv2Service, region: &str, scope: &str, name: &str) -> Value {
+        ok(
+            svc,
+            region,
+            "CreateWebACL",
+            json!({
+                "Name": name,
+                "Scope": scope,
+                "DefaultAction": { "Allow": {} },
+                "VisibilityConfig": {
+                    "SampledRequestsEnabled": false,
+                    "CloudWatchMetricsEnabled": false,
+                    "MetricName": name,
+                },
+            }),
+        )["Summary"]
+            .clone()
+    }
+
+    #[test]
+    fn regional_resources_are_scoped_to_their_region() {
+        let svc = Wafv2Service::default();
+        let east = create_acl(&svc, "us-east-1", "REGIONAL", "same");
+        let west = create_acl(&svc, "eu-west-1", "REGIONAL", "same");
+        assert!(east["ARN"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws:wafv2:us-east-1:123456789012:regional/webacl/same/"));
+        assert!(west["ARN"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws:wafv2:eu-west-1:123456789012:regional/webacl/same/"));
+
+        for (region, own) in [("us-east-1", &east), ("eu-west-1", &west)] {
+            let list = ok(&svc, region, "ListWebACLs", json!({ "Scope": "REGIONAL" }));
+            let ids: Vec<&str> = list["WebACLs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["Id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, [own["Id"].as_str().unwrap()], "{region}");
+        }
+        // The other region's id is not found, and its ARN cannot be tagged.
+        let err = call(
+            &svc,
+            "eu-west-1",
+            "GetWebACL",
+            json!({ "Name": "same", "Scope": "REGIONAL", "Id": east["Id"] }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "WAFNonexistentItemException");
+        let err = call(
+            &svc,
+            "eu-west-1",
+            "TagResource",
+            json!({ "ResourceARN": east["ARN"], "Tags": [{ "Key": "k", "Value": "v" }] }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "WAFNonexistentItemException");
+        // A read in an untouched region creates nothing.
+        ok(
+            &svc,
+            "ap-south-1",
+            "ListIPSets",
+            json!({ "Scope": "REGIONAL" }),
+        );
+        assert!(svc
+            .state
+            .read()
+            .region("123456789012", "ap-south-1")
+            .is_none());
+    }
+
+    #[test]
+    fn cloudfront_scope_lives_in_the_global_region_only() {
+        let svc = Wafv2Service::default();
+        let err = call(
+            &svc,
+            "eu-west-1",
+            "ListWebACLs",
+            json!({ "Scope": "CLOUDFRONT" }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "WAFInvalidParameterException");
+        let acl = create_acl(&svc, "us-east-1", "CLOUDFRONT", "cf");
+        assert!(acl["ARN"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws:wafv2:us-east-1:123456789012:global/webacl/cf/"));
+        let list = ok(
+            &svc,
+            "us-east-1",
+            "ListWebACLs",
+            json!({ "Scope": "CLOUDFRONT" }),
+        );
+        assert_eq!(list["WebACLs"].as_array().unwrap().len(), 1);
+        // REGIONAL scope in us-east-1 is a separate namespace.
+        let list = ok(
+            &svc,
+            "us-east-1",
+            "ListWebACLs",
+            json!({ "Scope": "REGIONAL" }),
+        );
+        assert!(list["WebACLs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn associations_live_in_the_resource_region_and_drive_evaluation() {
+        let svc = Wafv2Service::default();
+        let acl = create_acl(&svc, "eu-west-1", "REGIONAL", "a");
+        let acl_arn = acl["ARN"].as_str().unwrap().to_string();
+        let west_lb = "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/lb/abc";
+        let east_lb = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/lb/abc";
+        // A resource in another region does not exist from this one.
+        let err = call(
+            &svc,
+            "eu-west-1",
+            "AssociateWebACL",
+            json!({ "WebACLArn": acl_arn, "ResourceArn": east_lb }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "WAFNonexistentItemException");
+        // Nor does the web ACL from the resource's region.
+        let err = call(
+            &svc,
+            "us-east-1",
+            "AssociateWebACL",
+            json!({ "WebACLArn": acl_arn, "ResourceArn": east_lb }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "WAFNonexistentItemException");
+        ok(
+            &svc,
+            "eu-west-1",
+            "AssociateWebACL",
+            json!({ "WebACLArn": acl_arn, "ResourceArn": west_lb }),
+        );
+        let got = ok(
+            &svc,
+            "eu-west-1",
+            "GetWebACLForResource",
+            json!({ "ResourceArn": west_lb }),
+        );
+        assert_eq!(got["WebACL"]["ARN"], json!(acl_arn));
+        let got = ok(
+            &svc,
+            "us-east-1",
+            "GetWebACLForResource",
+            json!({ "ResourceArn": west_lb }),
+        );
+        assert!(got.get("WebACL").is_none());
+
+        // Data-plane evaluation resolves the association in the resource's
+        // region.
+        let state = svc.shared_state();
+        let limiter = svc.rate_limiter();
+        let ctx = crate::RequestContext::new("GET", "/", "");
+        let hit = crate::evaluate_request(&state, west_lb, &ctx, &limiter, 0);
+        assert_eq!(hit.web_acl_arn(), Some(acl_arn.as_str()));
+        let miss = crate::evaluate_request(&state, east_lb, &ctx, &limiter, 0);
+        assert!(miss.web_acl_arn().is_none());
+    }
+
+    #[test]
+    fn legacy_snapshot_is_split_by_arn_region() {
+        let svc = Wafv2Service::default();
+        let east = create_acl(&svc, "us-east-1", "REGIONAL", "e");
+        let west = create_acl(&svc, "eu-west-1", "REGIONAL", "w");
+        let global = create_acl(&svc, "us-east-1", "CLOUDFRONT", "g");
+        let lb = "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/lb/abc";
+        ok(
+            &svc,
+            "eu-west-1",
+            "AssociateWebACL",
+            json!({ "WebACLArn": west["ARN"], "ResourceArn": lb }),
+        );
+        ok(
+            &svc,
+            "us-east-1",
+            "CreateAPIKey",
+            json!({ "Scope": "CLOUDFRONT", "TokenDomains": ["example.com"] }),
+        );
+        // Flatten the per-region state into the v1 (account-wide) shape.
+        let mut flat = AccountState::default();
+        for (_, _, s) in svc.state.read().iter_regional() {
+            let s = s.clone();
+            flat.web_acls.extend(s.web_acls);
+            flat.associations.extend(s.associations);
+            flat.api_keys.extend(s.api_keys);
+            flat.tags.extend(s.tags);
+        }
+        let mut legacy_accounts = serde_json::Map::new();
+        legacy_accounts.insert("123456789012".into(), serde_json::to_value(&flat).unwrap());
+        let legacy = json!({ "schema_version": 1, "accounts": { "accounts": legacy_accounts } });
+        // The server region is eu-west-1, so records naming no region land
+        // there, except CLOUDFRONT scope ones which go to us-east-1.
+        let parsed =
+            crate::parse_wafv2_snapshot(&serde_json::to_vec(&legacy).unwrap(), "eu-west-1")
+                .unwrap();
+        assert_eq!(parsed.schema_version, crate::WAFV2_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = parsed.accounts.unwrap();
+        let e = accounts.region("123456789012", "us-east-1").unwrap();
+        let w = accounts.region("123456789012", "eu-west-1").unwrap();
+        let mut east_arns: Vec<&str> = e.web_acls.values().map(|a| a.arn.as_str()).collect();
+        east_arns.sort_unstable();
+        let mut want = vec![
+            east["ARN"].as_str().unwrap(),
+            global["ARN"].as_str().unwrap(),
+        ];
+        want.sort_unstable();
+        assert_eq!(east_arns, want);
+        assert_eq!(
+            w.web_acls
+                .values()
+                .map(|a| a.arn.as_str())
+                .collect::<Vec<_>>(),
+            [west["ARN"].as_str().unwrap()]
+        );
+        assert_eq!(
+            w.associations.get(lb),
+            west["ARN"].as_str().map(String::from).as_ref()
+        );
+        assert_eq!(e.api_keys.len(), 1);
+        assert!(w.api_keys.is_empty());
+
+        // The current shape round-trips (tuple keys stay string-safe JSON);
+        // a newer one is reported, not parsed.
+        let current = Wafv2Snapshot {
+            schema_version: crate::WAFV2_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts),
+        };
+        let again =
+            crate::parse_wafv2_snapshot(&serde_json::to_vec(&current).unwrap(), "us-east-1")
+                .unwrap();
+        assert_eq!(
+            again
+                .accounts
+                .unwrap()
+                .region("123456789012", "eu-west-1")
+                .unwrap()
+                .web_acls
+                .len(),
+            1
+        );
+        let newer = crate::parse_wafv2_snapshot(br#"{"schema_version": 99}"#, "us-east-1").unwrap();
+        assert_eq!(newer.schema_version, 99);
+        assert!(newer.accounts.is_none());
     }
 }

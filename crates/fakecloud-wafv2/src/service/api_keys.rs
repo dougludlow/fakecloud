@@ -24,7 +24,7 @@ impl Wafv2Service {
         let api_key = base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_vec(&payload).unwrap_or_default());
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         account.api_keys.insert(
             api_key.clone(),
             ApiKey {
@@ -43,7 +43,7 @@ impl Wafv2Service {
         let api_key = require_str(&body, "APIKey")?;
         let scope = require_scope(&body)?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         // Check the stored key's scope matches BEFORE removal. A
         // CLOUDFRONT-scoped request shouldn't delete a REGIONAL key.
         match account.api_keys.get(&api_key) {
@@ -64,8 +64,7 @@ impl Wafv2Service {
         let _scope = require_scope(&body)?;
         let state = self.state.read();
         let key = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.api_keys.get(&api_key))
             .cloned()
             .ok_or_else(|| not_found("APIKey"))?;
@@ -87,8 +86,7 @@ impl Wafv2Service {
             .map(str::to_owned);
         let state = self.state.read();
         let mut all: Vec<ApiKey> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.api_keys
                     .values()

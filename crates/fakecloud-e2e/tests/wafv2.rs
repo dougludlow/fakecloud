@@ -1092,3 +1092,83 @@ async fn paginate_with_stale_marker_does_not_panic() {
     assert!(resp.web_acls().is_empty());
     assert!(resp.next_marker().is_none());
 }
+
+/// REGIONAL-scope resources live in the region they were created in: the same
+/// name coexists in two regions and each region lists only its own. CLOUDFRONT
+/// scope is only served from us-east-1.
+#[tokio::test]
+async fn regional_scope_resources_are_scoped_to_their_region() {
+    use aws_sdk_wafv2::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let east = aws_sdk_wafv2::Client::new(&server.aws_config_in("us-east-1").await);
+    let west = aws_sdk_wafv2::Client::new(&server.aws_config_in("eu-west-1").await);
+
+    let mut arns = Vec::new();
+    for waf in [&east, &west] {
+        let summary = waf
+            .create_ip_set()
+            .name("same-name")
+            .scope(Scope::Regional)
+            .ip_address_version(IpAddressVersion::Ipv4)
+            .addresses("10.0.0.0/8")
+            .send()
+            .await
+            .expect("CreateIPSet")
+            .summary
+            .expect("summary");
+        arns.push(summary.arn().unwrap().to_string());
+    }
+    assert!(
+        arns[0].starts_with("arn:aws:wafv2:us-east-1:"),
+        "{}",
+        arns[0]
+    );
+    assert!(
+        arns[1].starts_with("arn:aws:wafv2:eu-west-1:"),
+        "{}",
+        arns[1]
+    );
+
+    for (waf, own) in [(&east, &arns[0]), (&west, &arns[1])] {
+        let listed: Vec<String> = waf
+            .list_ip_sets()
+            .scope(Scope::Regional)
+            .send()
+            .await
+            .expect("ListIPSets")
+            .ip_sets()
+            .iter()
+            .map(|s| s.arn().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, std::slice::from_ref(own));
+    }
+
+    // The other region's ARN does not exist here.
+    let err = west
+        .list_tags_for_resource()
+        .resource_arn(&arns[0])
+        .send()
+        .await
+        .expect_err("ListTagsForResource from another region");
+    assert_eq!(
+        err.into_service_error().code(),
+        Some("WAFNonexistentItemException")
+    );
+
+    // CLOUDFRONT scope outside us-east-1 is rejected like AWS does.
+    let err = west
+        .list_web_acls()
+        .scope(Scope::Cloudfront)
+        .send()
+        .await
+        .expect_err("CLOUDFRONT scope from eu-west-1");
+    assert_eq!(
+        err.into_service_error().code(),
+        Some("WAFInvalidParameterException")
+    );
+    east.list_web_acls()
+        .scope(Scope::Cloudfront)
+        .send()
+        .await
+        .expect("CLOUDFRONT scope from us-east-1");
+}

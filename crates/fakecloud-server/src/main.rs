@@ -3866,7 +3866,9 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_acm::AcmSnapshot>(&bytes) {
+                    // Pre-region (v1/v2) snapshots are split by region on
+                    // parse: each resource goes to the region its ARN names.
+                    match fakecloud_acm::parse_acm_snapshot(&bytes, &cli.region) {
                         Ok(snapshot) => {
                             if snapshot.schema_version > fakecloud_acm::ACM_SNAPSHOT_SCHEMA_VERSION
                             {
@@ -4908,7 +4910,9 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_wafv2::Wafv2Snapshot>(&bytes) {
+                    // Pre-region (v1) snapshots are split by region on
+                    // parse: each resource goes to the region its ARN names.
+                    match fakecloud_wafv2::parse_wafv2_snapshot(&bytes, &cli.region) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_wafv2::WAFV2_SNAPSHOT_SCHEMA_VERSION

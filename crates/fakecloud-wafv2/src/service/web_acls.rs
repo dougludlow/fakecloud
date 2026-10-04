@@ -36,7 +36,7 @@ impl Wafv2Service {
 
         let key = (scope.clone(), name.clone());
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if account.web_acls.contains_key(&key) {
             return Err(already_exists(&format!("WebACL {name} already exists")));
         }
@@ -84,8 +84,7 @@ impl Wafv2Service {
         let arn_in = body.get("ARN").and_then(Value::as_str).map(str::to_owned);
         let state = self.state.read();
         let account = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .ok_or_else(|| not_found("WebACL"))?;
         let acl = if let Some(arn) = arn_in.as_deref() {
             account
@@ -96,10 +95,20 @@ impl Wafv2Service {
         } else {
             let name = require_str(&body, "Name")?;
             let scope = require_scope(&body)?;
-            account
+            let acl = account
                 .web_acls
                 .get(&(scope, name))
-                .ok_or_else(|| not_found("WebACL"))?
+                .ok_or_else(|| not_found("WebACL"))?;
+            // Name, Scope and Id identify the web ACL together; a stale or
+            // foreign Id names no web ACL.
+            if body
+                .get("Id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != acl.id)
+            {
+                return Err(not_found("WebACL"));
+            }
+            acl
         };
         let mut response = json!({
             "WebACL": web_acl_detail_json(acl),
@@ -135,8 +144,7 @@ impl Wafv2Service {
             .map(str::to_owned);
         let state = self.state.read();
         let mut all: Vec<WebAcl> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.web_acls
                     .values()
@@ -194,7 +202,7 @@ impl Wafv2Service {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let acl = account
             .web_acls
             .get_mut(&(scope, name.clone()))
@@ -233,7 +241,7 @@ impl Wafv2Service {
         let id_in = require_str(&body, "Id")?;
         let lock_token_in = require_str(&body, "LockToken")?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let key = (scope, name);
         let acl = account
             .web_acls
@@ -271,8 +279,14 @@ impl Wafv2Service {
         let acl_arn = require_str_len(&body, "WebACLArn", 20, 2048)?;
         let resource_arn =
             normalize_resource_arn(&require_str_len(&body, "ResourceArn", 20, 2048)?);
+        // The resource must be in the region the call is made in (the web
+        // ACL is looked up there too); from any other region it does not
+        // exist.
+        if fakecloud_aws::arn::region_of(&resource_arn).is_some_and(|r| r != req.region) {
+            return Err(not_found("Resource"));
+        }
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         if !account.web_acls.values().any(|a| a.arn == acl_arn) {
             return Err(not_found("WebACL"));
         }
@@ -288,7 +302,7 @@ impl Wafv2Service {
         let resource_arn =
             normalize_resource_arn(&require_str_len(&body, "ResourceArn", 20, 2048)?);
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         account.associations.remove(&resource_arn);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -301,7 +315,7 @@ impl Wafv2Service {
         let resource_arn =
             normalize_resource_arn(&require_str_len(&body, "ResourceArn", 20, 2048)?);
         let state = self.state.read();
-        let account = state.accounts.get(&req.account_id);
+        let account = state.region(&req.account_id, &req.region);
         let acl_arn = account.and_then(|a| a.associations.get(&resource_arn).cloned());
         let mut response = json!({});
         if let Some(arn) = acl_arn {
@@ -342,8 +356,7 @@ impl Wafv2Service {
             .map(str::to_string);
         let state = self.state.read();
         let resources: Vec<String> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| {
                 a.associations
                     .iter()

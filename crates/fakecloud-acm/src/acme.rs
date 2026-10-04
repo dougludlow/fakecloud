@@ -282,7 +282,7 @@ impl AcmService {
         let region = req.region.clone();
         let account_id = req.account_id.clone();
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
 
         // A repeat create with the same token returns the endpoint the first
         // call made, rather than minting a second one.
@@ -337,8 +337,7 @@ impl AcmService {
         let arn = require(&body, "AcmeEndpointArn")?;
         let state = self.state.read();
         let e = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.acme_endpoints.get(&arn))
             .ok_or_else(|| not_found(format!("ACME endpoint not found: {arn}")))?;
         Ok(AwsResponse::ok_json(
@@ -353,8 +352,7 @@ impl AcmService {
         let body = req.json_body();
         let state = self.state.read();
         let items: Vec<Value> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| a.acme_endpoints.values().map(endpoint_json).collect())
             .unwrap_or_default();
         page(items, &body, "AcmeEndpoints")
@@ -367,7 +365,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeEndpointArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         let e = acct
             .acme_endpoints
             .get_mut(&arn)
@@ -420,7 +418,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeEndpointArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         // The ACME deletes declare no ResourceNotFoundException in the model,
         // so removing something already gone succeeds.
         acct.acme_endpoints.remove(&arn);
@@ -498,7 +496,7 @@ impl AcmService {
         let region = req.region.clone();
         let account_id = req.account_id.clone();
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         Self::require_endpoint(acct, &endpoint_arn)?;
 
         if let Some(t) = &token {
@@ -558,8 +556,7 @@ impl AcmService {
         let arn = require(&body, "AcmeExternalAccountBindingArn")?;
         let state = self.state.read();
         let b = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.acme_bindings.get(&arn))
             .ok_or_else(|| not_found(format!("External account binding not found: {arn}")))?;
         Ok(AwsResponse::ok_json(
@@ -575,7 +572,7 @@ impl AcmService {
         let endpoint_arn = require(&body, "AcmeEndpointArn")?;
         let state = self.state.read();
         let empty = Default::default();
-        let acct = state.accounts.get(&req.account_id).unwrap_or(&empty);
+        let acct = state.region(&req.account_id, &req.region).unwrap_or(&empty);
         Self::require_endpoint(acct, &endpoint_arn)?;
         let items: Vec<Value> = acct
             .acme_bindings
@@ -593,7 +590,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeExternalAccountBindingArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         let b = acct
             .acme_bindings
             .get_mut(&arn)
@@ -614,7 +611,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeExternalAccountBindingArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         // The ACME deletes declare no ResourceNotFoundException in the model,
         // so removing something already gone succeeds.
         acct.acme_bindings.remove(&arn);
@@ -634,7 +631,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeExternalAccountBindingArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         let b = acct
             .acme_bindings
             .get_mut(&arn)
@@ -681,7 +678,7 @@ impl AcmService {
         let region = req.region.clone();
         let account_id = req.account_id.clone();
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         Self::require_endpoint(acct, &endpoint_arn)?;
 
         if let Some(t) = &token {
@@ -751,7 +748,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeDomainValidationArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         let d = acct
             .acme_domain_validations
             .get_mut(&arn)
@@ -773,7 +770,7 @@ impl AcmService {
         let endpoint_arn = require(&body, "AcmeEndpointArn")?;
         let state = self.state.read();
         let empty = Default::default();
-        let acct = state.accounts.get(&req.account_id).unwrap_or(&empty);
+        let acct = state.region(&req.account_id, &req.region).unwrap_or(&empty);
         Self::require_endpoint(acct, &endpoint_arn)?;
         let items: Vec<Value> = acct
             .acme_domain_validations
@@ -791,7 +788,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeDomainValidationArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         let d = acct
             .acme_domain_validations
             .get_mut(&arn)
@@ -825,7 +822,7 @@ impl AcmService {
         let body = req.json_body();
         let arn = require(&body, "AcmeDomainValidationArn")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         // The ACME deletes declare no ResourceNotFoundException in the model,
         // so removing something already gone succeeds.
         acct.acme_domain_validations.remove(&arn);
@@ -843,7 +840,7 @@ impl AcmService {
         let account_url = require(&body, "AccountUrl")?;
         let state = self.state.read();
         let empty = Default::default();
-        let acct = state.accounts.get(&req.account_id).unwrap_or(&empty);
+        let acct = state.region(&req.account_id, &req.region).unwrap_or(&empty);
         Self::require_endpoint(acct, &endpoint_arn)?;
         let a = acct
             .acme_accounts
@@ -871,7 +868,7 @@ impl AcmService {
         let endpoint_arn = require(&body, "AcmeEndpointArn")?;
         let state = self.state.read();
         let empty = Default::default();
-        let acct = state.accounts.get(&req.account_id).unwrap_or(&empty);
+        let acct = state.region(&req.account_id, &req.region).unwrap_or(&empty);
         Self::require_endpoint(acct, &endpoint_arn)?;
         let items: Vec<Value> = acct
             .acme_accounts
@@ -898,7 +895,7 @@ impl AcmService {
         let endpoint_arn = require(&body, "AcmeEndpointArn")?;
         let account_url = require(&body, "AccountUrl")?;
         let mut state = self.state.write();
-        let acct = crate::service::account_mut(&mut state, &req.account_id);
+        let acct = crate::service::account_mut(&mut state, &req.account_id, &req.region);
         Self::require_endpoint(acct, &endpoint_arn)?;
         let a = acct
             .acme_accounts
@@ -1162,7 +1159,7 @@ mod tests {
         // Wind the expiry into the past.
         {
             let mut state = s.state.write();
-            let acct = crate::service::account_mut(&mut state, "123456789012");
+            let acct = crate::service::account_mut(&mut state, "123456789012", "us-east-1");
             acct.acme_bindings.get_mut(&binding).unwrap().expires_at =
                 Some(Utc::now() - Duration::minutes(1));
         }
@@ -1296,7 +1293,7 @@ mod tests {
         let endpoint = make_endpoint(&s);
         {
             let mut state = s.state.write();
-            let acct = crate::service::account_mut(&mut state, "123456789012");
+            let acct = crate::service::account_mut(&mut state, "123456789012", "us-east-1");
             acct.acme_accounts.insert(
                 "acct-1".to_string(),
                 crate::state::AcmeAccount {

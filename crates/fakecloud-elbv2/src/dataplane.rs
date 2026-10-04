@@ -883,7 +883,9 @@ struct WafSnapshot {
 
 fn waf_snapshot_for_lb(waf_state: &SharedWafv2State, lb_arn: &str) -> Option<WafSnapshot> {
     let st = waf_state.read();
-    for account in st.accounts.values() {
+    // The web ACL association lives in the load balancer's own region and
+    // account.
+    for account in st.states_for_resource(lb_arn) {
         let Some(acl_arn) = account.associations.get(lb_arn) else {
             continue;
         };
@@ -1450,7 +1452,7 @@ mod waf_tests {
         if let Some(resource) = association {
             acct.associations.insert(resource.into(), ACL_ARN.into());
         }
-        accounts.accounts.insert(ACCOUNT.into(), acct);
+        *accounts.region_mut(ACCOUNT, "us-east-1") = acct;
         Arc::new(RwLock::new(accounts))
     }
 

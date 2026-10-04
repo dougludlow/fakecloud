@@ -179,23 +179,23 @@ impl AcmService {
     /// exited. Without this, a restored pending cert would never transition to
     /// `ISSUED`. Called by the server after loading a persistence snapshot.
     pub fn rearm_pending_validations(&self) {
-        let pending: Vec<(String, String)> = {
+        let pending: Vec<(String, String, String)> = {
             let state = self.state.read();
             let mut out = Vec::new();
-            for (account_id, account) in state.accounts.iter() {
+            for (account_id, region, account) in state.iter_regional() {
                 for (arn, cert) in account.certificates.iter() {
                     if cert.status == "PENDING_VALIDATION"
                         && cert.cert_type == "AMAZON_ISSUED"
                         && cert.validation_method.as_deref() == Some("DNS")
                     {
-                        out.push((account_id.clone(), arn.clone()));
+                        out.push((account_id.to_string(), region.to_string(), arn.clone()));
                     }
                 }
             }
             out
         };
-        for (account_id, arn) in pending {
-            self.spawn_auto_issue_tick(account_id, arn);
+        for (account_id, region, arn) in pending {
+            self.spawn_auto_issue_tick(account_id, region, arn);
         }
     }
 
@@ -203,7 +203,7 @@ impl AcmService {
     /// from `PENDING_VALIDATION` to `ISSUED` after `pending_validation_delay`,
     /// then persists the transition. Shared by `request_certificate` and
     /// `rearm_pending_validations`.
-    fn spawn_auto_issue_tick(&self, account_id: String, arn: String) {
+    fn spawn_auto_issue_tick(&self, account_id: String, region: String, arn: String) {
         let state_for_tick = Arc::clone(&self.state);
         let delay = self.pending_validation_delay;
         let store = self.snapshot_store.clone();
@@ -213,7 +213,7 @@ impl AcmService {
             let flipped = {
                 let mut state = state_for_tick.write();
                 let mut flipped = false;
-                if let Some(account) = state.accounts.get_mut(&account_id) {
+                if let Some(account) = state.region_get_mut(&account_id, &region) {
                     if let Some(cert) = account.certificates.get_mut(&arn) {
                         if cert.status == "PENDING_VALIDATION" && cert.cert_type == "AMAZON_ISSUED"
                         {
@@ -274,12 +274,15 @@ impl AcmService {
     /// marker that documents the emulator gap.
     pub fn chain_info(&self, arn_or_id: &str) -> Option<serde_json::Value> {
         let state = self.state.read();
-        for account in state.accounts.values() {
-            let key = account
+        for (_, _, account) in state.iter_regional() {
+            let Some(key) = account
                 .certificates
                 .keys()
                 .find(|k| k.as_str() == arn_or_id || cert_id_from_arn(k) == arn_or_id)
-                .cloned()?;
+                .cloned()
+            else {
+                continue;
+            };
             if let Some(cert) = account.certificates.get(&key) {
                 let pem = cert.certificate_pem.as_deref().unwrap_or("");
                 let chain = cert.certificate_chain_pem.as_deref().unwrap_or("");
@@ -314,7 +317,7 @@ impl AcmService {
         reason: Option<String>,
     ) -> bool {
         let mut state = self.state.write();
-        for account in state.accounts.values_mut() {
+        for (_, _, account) in state.iter_regional_mut() {
             let key = account
                 .certificates
                 .keys()
@@ -566,7 +569,7 @@ impl AcmService {
         let options = parse_options(body.get("Options"));
 
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
 
         let domain_validation =
             synth_domain_validation(&domain_name, &sans, &validation_method, &validation_domains);
@@ -652,7 +655,7 @@ impl AcmService {
         // (real ACM completes them once the redirect resolves); only EMAIL
         // waits for explicit approval.
         if validation_method == "DNS" || validation_method == "HTTP" {
-            self.spawn_auto_issue_tick(req.account_id.clone(), arn.clone());
+            self.spawn_auto_issue_tick(req.account_id.clone(), req.region.clone(), arn.clone());
         }
 
         Ok(AwsResponse::ok_json(json!({ "CertificateArn": arn })))
@@ -662,8 +665,7 @@ impl AcmService {
         let arn = require_certificate_arn(req)?;
         let state = self.state.read();
         let cert = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.certificates.get(&arn))
             .ok_or_else(|| no_such_certificate(&arn))?
             .clone();
@@ -710,8 +712,7 @@ impl AcmService {
 
         let state = self.state.read();
         let cert = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.certificates.get(&arn))
             .ok_or_else(|| no_such_certificate(&arn))?;
 
@@ -828,8 +829,7 @@ impl AcmService {
 
         let state = self.state.read();
         let mut all: Vec<StoredCertificate> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| a.certificates.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -893,7 +893,7 @@ impl AcmService {
     fn delete_certificate(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let arn = require_certificate_arn(req)?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let cert = account
             .certificates
             .get(&arn)
@@ -937,7 +937,7 @@ impl AcmService {
         let domain_name = parse_cn_from_pem(&cert_pem).unwrap_or_else(|| "imported".to_string());
         let now = Utc::now();
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
 
         let arn = match arn_in {
             Some(existing) => {
@@ -1040,8 +1040,7 @@ impl AcmService {
         };
         let state = self.state.read();
         let cert = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.certificates.get(&arn))
             .ok_or_else(|| no_such_certificate(&arn))?
             .clone();
@@ -1080,8 +1079,7 @@ impl AcmService {
         let arn = require_certificate_arn(req)?;
         let state = self.state.read();
         let cert = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.certificates.get(&arn))
             .ok_or_else(|| no_such_certificate(&arn))?
             .clone();
@@ -1102,7 +1100,7 @@ impl AcmService {
     fn renew_certificate(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let arn = require_certificate_arn(req)?;
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let cert = account
             .certificates
             .get_mut(&arn)
@@ -1149,7 +1147,7 @@ impl AcmService {
             .ok_or_else(|| invalid_param("RevocationReason is required"))?
             .to_string();
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let cert = account
             .certificates
             .get_mut(&arn)
@@ -1182,8 +1180,7 @@ impl AcmService {
             .ok_or_else(|| invalid_param("ValidationDomain is required"))?;
         let state = self.state.read();
         let cert = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.certificates.get(&arn))
             .ok_or_else(|| no_such_certificate(&arn))?;
         if cert.validation_method.as_deref() != Some("EMAIL") {
@@ -1206,7 +1203,7 @@ impl AcmService {
             return Err(invalid_param("Tags must contain at least one entry"));
         }
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let cert = account
             .certificates
             .get_mut(&arn)
@@ -1232,7 +1229,7 @@ impl AcmService {
             return Err(invalid_param("Tags must contain at least one entry"));
         }
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let cert = account
             .certificates
             .get_mut(&arn)
@@ -1253,8 +1250,7 @@ impl AcmService {
         let arn = require_certificate_arn(req)?;
         let state = self.state.read();
         let cert = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.certificates.get(&arn))
             .ok_or_else(|| no_such_certificate(&arn))?;
         let mut tags: Vec<(String, String)> = cert
@@ -1298,7 +1294,7 @@ impl AcmService {
             return Err(validation_error("Tags must contain at least one entry"));
         }
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let resource_tags = account
             .resource_tags_mut(&arn)
             .ok_or_else(|| no_such_resource(&arn))?;
@@ -1336,7 +1332,7 @@ impl AcmService {
             return Err(validation_error("TagKeys must contain at least one entry"));
         }
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let resource_tags = account
             .resource_tags_mut(&arn)
             .ok_or_else(|| no_such_resource(&arn))?;
@@ -1351,8 +1347,7 @@ impl AcmService {
         let arn = Self::require_resource_arn(req)?;
         let state = self.state.read();
         let resource_tags = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .and_then(|a| a.resource_tags(&arn))
             .ok_or_else(|| no_such_resource(&arn))?;
         let tag_list: Vec<Value> = resource_tags
@@ -1365,8 +1360,7 @@ impl AcmService {
     fn get_account_configuration(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let cfg = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| a.account_config.clone())
             .unwrap_or_default();
         let mut expiry = json!({});
@@ -1406,7 +1400,7 @@ impl AcmService {
             .and_then(Value::as_i64)
             .map(|n| n as i32);
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         account.account_config.expiry_events_days_before_expiry = days;
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -1434,7 +1428,7 @@ impl AcmService {
                 .to_string(),
         };
         let mut state = self.state.write();
-        let account = account_mut(&mut state, &req.account_id);
+        let account = account_mut(&mut state, &req.account_id, &req.region);
         let cert = account
             .certificates
             .get_mut(&arn)
@@ -1513,8 +1507,7 @@ impl AcmService {
 
         let state = self.state.read();
         let mut all: Vec<StoredCertificate> = state
-            .accounts
-            .get(&req.account_id)
+            .region(&req.account_id, &req.region)
             .map(|a| a.certificates.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -1588,11 +1581,13 @@ impl AcmService {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
+/// The state of `account_id` in `region`, created on first use.
 pub(crate) fn account_mut<'a>(
     state: &'a mut AcmAccounts,
     account_id: &str,
+    region: &str,
 ) -> &'a mut AccountState {
-    state.accounts.entry(account_id.to_string()).or_default()
+    state.region_mut(account_id, region)
 }
 
 // Canonical EKU/KeyUsage sets carried by every fakecloud-issued cert (kept in
@@ -2674,8 +2669,7 @@ mod tests {
         let arn = body["CertificateArn"].as_str().unwrap();
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(arn)
@@ -2770,8 +2764,7 @@ mod tests {
         let original_key_pem = svc
             .state
             .read()
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3109,8 +3102,7 @@ mod tests {
         let arn = body["CertificateArn"].as_str().unwrap().to_string();
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3347,8 +3339,7 @@ mod tests {
         assert!(svc.set_certificate_status(&arn, "ISSUED", None));
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3384,8 +3375,7 @@ mod tests {
 
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3424,8 +3414,7 @@ mod tests {
         {
             let st = svc.state.read();
             let cert = st
-                .accounts
-                .get("123456789012")
+                .region("123456789012", "us-east-1")
                 .unwrap()
                 .certificates
                 .get(&arn)
@@ -3438,8 +3427,7 @@ mod tests {
         assert!(svc.approve_certificate(&arn));
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3476,8 +3464,7 @@ mod tests {
 
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3517,8 +3504,7 @@ mod tests {
         assert!(svc.set_certificate_status(&arn, "FAILED", Some("DNS lookup error".to_string())));
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3542,8 +3528,7 @@ mod tests {
 
         let st = svc.state.read();
         let cert = st
-            .accounts
-            .get("123456789012")
+            .region("123456789012", "us-east-1")
             .unwrap()
             .certificates
             .get(&arn)
@@ -3586,7 +3571,10 @@ mod tests {
         // Stamp deterministic statuses + creation times: a oldest, c newest.
         {
             let mut state = svc.state.write();
-            let certs = &mut state.accounts.get_mut("123456789012").unwrap().certificates;
+            let certs = &mut state
+                .region_get_mut("123456789012", "us-east-1")
+                .unwrap()
+                .certificates;
             let now = chrono::Utc::now();
             for c in certs.values_mut() {
                 match c.domain_name.as_str() {
@@ -3685,7 +3673,10 @@ mod tests {
         // a oldest, c newest.
         {
             let mut state = svc.state.write();
-            let certs = &mut state.accounts.get_mut("123456789012").unwrap().certificates;
+            let certs = &mut state
+                .region_get_mut("123456789012", "us-east-1")
+                .unwrap()
+                .certificates;
             let now = chrono::Utc::now();
             for c in certs.values_mut() {
                 match c.domain_name.as_str() {
@@ -3766,7 +3757,10 @@ mod tests {
         // comparison is a tie.
         {
             let mut state = svc.state.write();
-            let certs = &mut state.accounts.get_mut("123456789012").unwrap().certificates;
+            let certs = &mut state
+                .region_get_mut("123456789012", "us-east-1")
+                .unwrap()
+                .certificates;
             let now = chrono::Utc::now();
             for c in certs.values_mut() {
                 c.created_at = now;
@@ -3869,7 +3863,10 @@ mod tests {
         }
         {
             let mut state = svc.state.write();
-            let certs = &mut state.accounts.get_mut("123456789012").unwrap().certificates;
+            let certs = &mut state
+                .region_get_mut("123456789012", "us-east-1")
+                .unwrap()
+                .certificates;
             let now = chrono::Utc::now();
             for c in certs.values_mut() {
                 match c.domain_name.as_str() {
@@ -4221,8 +4218,7 @@ mod tests {
         {
             let mut state = svc.state.write();
             let cert = state
-                .accounts
-                .get_mut("123456789012")
+                .region_get_mut("123456789012", "us-east-1")
                 .unwrap()
                 .certificates
                 .get_mut(&arn)
@@ -4242,5 +4238,207 @@ mod tests {
             Err(other) => panic!("expected an InvalidParameterException, got {other:?}"),
             Ok(_) => panic!("expected export of a malformed key to error, not panic"),
         }
+    }
+
+    fn acm_request_in(region: &str, action: &str, body: Value) -> AwsRequest {
+        let mut r = acm_request(action, body);
+        r.region = region.to_string();
+        r
+    }
+
+    async fn call_in(svc: &AcmService, region: &str, action: &str, body: Value) -> Value {
+        let resp = svc
+            .handle(acm_request_in(region, action, body))
+            .await
+            .unwrap();
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn certificates_are_scoped_to_their_region() {
+        let svc = AcmService::default();
+        let east = call_in(
+            &svc,
+            "us-east-1",
+            "RequestCertificate",
+            json!({ "DomainName": "same.example.com" }),
+        )
+        .await["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let west = call_in(
+            &svc,
+            "eu-west-1",
+            "RequestCertificate",
+            json!({ "DomainName": "same.example.com" }),
+        )
+        .await["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(east.starts_with("arn:aws:acm:us-east-1:123456789012:"));
+        assert!(west.starts_with("arn:aws:acm:eu-west-1:123456789012:"));
+
+        for (region, own) in [("us-east-1", &east), ("eu-west-1", &west)] {
+            let list = call_in(&svc, region, "ListCertificates", json!({})).await;
+            let arns: Vec<&str> = list["CertificateSummaryList"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["CertificateArn"].as_str().unwrap())
+                .collect();
+            assert_eq!(arns, [own.as_str()], "{region}");
+            let search = call_in(&svc, region, "SearchCertificates", json!({})).await;
+            assert_eq!(search["Results"].as_array().unwrap().len(), 1, "{region}");
+        }
+
+        // An ARN from another region is not found in this one, for reads and
+        // writes alike; the certificate is untouched.
+        for action in ["DescribeCertificate", "GetCertificate", "DeleteCertificate"] {
+            let err = svc
+                .handle(acm_request_in(
+                    "eu-west-1",
+                    action,
+                    json!({ "CertificateArn": east }),
+                ))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{action} must fail"));
+            assert_eq!(err.code(), "ResourceNotFoundException", "{action}");
+        }
+        let d = call_in(
+            &svc,
+            "us-east-1",
+            "DescribeCertificate",
+            json!({ "CertificateArn": east }),
+        )
+        .await;
+        assert_eq!(d["Certificate"]["CertificateArn"], json!(east));
+        // The admin endpoint resolves a certificate in whichever region it lives.
+        assert!(svc.set_certificate_status(&west, "ISSUED", None));
+        assert!(svc.chain_info(&west).is_some());
+    }
+
+    #[tokio::test]
+    async fn account_configuration_is_per_region() {
+        let svc = AcmService::default();
+        call_in(
+            &svc,
+            "eu-west-1",
+            "PutAccountConfiguration",
+            json!({ "IdempotencyToken": "t", "ExpiryEvents": { "DaysBeforeExpiry": 10 } }),
+        )
+        .await;
+        let west = call_in(&svc, "eu-west-1", "GetAccountConfiguration", json!({})).await;
+        assert_eq!(west["ExpiryEvents"]["DaysBeforeExpiry"], json!(10));
+        let east = call_in(&svc, "us-east-1", "GetAccountConfiguration", json!({})).await;
+        assert!(east["ExpiryEvents"].get("DaysBeforeExpiry").is_none());
+        // A read in an untouched region creates nothing.
+        assert!(svc
+            .state
+            .read()
+            .region("123456789012", "us-east-1")
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_snapshot_is_split_by_arn_region() {
+        let east_arn = "arn:aws:acm:us-east-1:123456789012:certificate/a";
+        let west_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/b";
+        let endpoint_arn = "arn:aws:acm:eu-west-1:123456789012:acme-endpoint/e";
+        let mut legacy_account = crate::state::AccountState::default();
+        for arn in [east_arn, west_arn] {
+            let cert = StoredCertificate {
+                arn: arn.to_string(),
+                domain_name: "x.example.com".into(),
+                subject_alternative_names: vec![],
+                status: "ISSUED".into(),
+                cert_type: "IMPORTED".into(),
+                certificate_pem: None,
+                certificate_chain_pem: None,
+                private_key_pem: None,
+                idempotency_token: None,
+                serial: "s".into(),
+                subject: "CN=x".into(),
+                issuer: "i".into(),
+                key_algorithm: "RSA_2048".into(),
+                signature_algorithm: "SHA256WITHRSA".into(),
+                created_at: Utc::now(),
+                issued_at: None,
+                imported_at: None,
+                revoked_at: None,
+                revocation_reason: None,
+                failure_reason: None,
+                not_before: Utc::now(),
+                not_after: Utc::now(),
+                validation_method: None,
+                domain_validation: vec![],
+                options: CertificateOptions::default(),
+                renewal_eligibility: "INELIGIBLE".into(),
+                managed_by: None,
+                certificate_authority_arn: None,
+                tags: BTreeMap::new(),
+                in_use_by: vec![],
+                describe_read_count: 0,
+                renewal_summary: None,
+            };
+            legacy_account.certificates.insert(arn.to_string(), cert);
+        }
+        legacy_account.acme_accounts.insert(
+            "k".into(),
+            crate::state::AcmeAccount {
+                endpoint_arn: endpoint_arn.into(),
+                account_url: "u".into(),
+                public_key_thumbprint: "t".into(),
+                status: "VALID".into(),
+                binding_arn: None,
+                contacts: vec![],
+                created_at: Utc::now(),
+            },
+        );
+        legacy_account
+            .account_config
+            .expiry_events_days_before_expiry = Some(7);
+        let legacy = json!({
+            "schema_version": 2,
+            "accounts": { "accounts": { "123456789012": legacy_account } },
+        });
+        let parsed =
+            crate::state::parse_acm_snapshot(&serde_json::to_vec(&legacy).unwrap(), "us-east-1")
+                .unwrap();
+        assert_eq!(parsed.schema_version, ACM_SNAPSHOT_SCHEMA_VERSION);
+        let accounts = parsed.accounts.unwrap();
+        let east = accounts.region("123456789012", "us-east-1").unwrap();
+        let west = accounts.region("123456789012", "eu-west-1").unwrap();
+        assert_eq!(east.certificates.keys().collect::<Vec<_>>(), [east_arn]);
+        assert_eq!(west.certificates.keys().collect::<Vec<_>>(), [west_arn]);
+        assert!(west.acme_accounts.contains_key("k"));
+        assert_eq!(
+            east.account_config.expiry_events_days_before_expiry,
+            Some(7)
+        );
+        assert_eq!(west.account_config.expiry_events_days_before_expiry, None);
+
+        // The current shape round-trips; a newer one is reported, not parsed.
+        let current = AcmSnapshot {
+            schema_version: ACM_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts),
+        };
+        let again =
+            crate::state::parse_acm_snapshot(&serde_json::to_vec(&current).unwrap(), "us-east-1")
+                .unwrap();
+        assert!(again
+            .accounts
+            .unwrap()
+            .region("123456789012", "eu-west-1")
+            .is_some());
+        let newer = crate::state::parse_acm_snapshot(
+            br#"{"schema_version": 99, "accounts": {"bogus": true}}"#,
+            "us-east-1",
+        )
+        .unwrap();
+        assert_eq!(newer.schema_version, 99);
+        assert!(newer.accounts.is_none());
     }
 }
