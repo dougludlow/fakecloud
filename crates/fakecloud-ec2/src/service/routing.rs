@@ -292,6 +292,39 @@ pub(crate) fn describe_route_tables(
     ))
 }
 
+/// The destination a route request names, as `(query parameter, value)`:
+/// the IPv4 CIDR, the IPv6 CIDR or the prefix list.
+fn route_destination(route: &Route) -> Option<(&'static str, &str)> {
+    route
+        .destination_cidr_block
+        .as_deref()
+        .map(|d| ("DestinationCidrBlock", d))
+        .or_else(|| {
+            route
+                .destination_ipv6_cidr_block
+                .as_deref()
+                .map(|d| ("DestinationIpv6CidrBlock", d))
+        })
+        .or_else(|| {
+            route
+                .destination_prefix_list_id
+                .as_deref()
+                .map(|d| ("DestinationPrefixListId", d))
+        })
+}
+
+/// Whether `existing` has the destination `route` names.
+fn same_destination(existing: &Route, route: &Route) -> bool {
+    match route_destination(route) {
+        Some(("DestinationCidrBlock", d)) => existing.destination_cidr_block.as_deref() == Some(d),
+        Some(("DestinationIpv6CidrBlock", d)) => {
+            existing.destination_ipv6_cidr_block.as_deref() == Some(d)
+        }
+        Some((_, d)) => existing.destination_prefix_list_id.as_deref() == Some(d),
+        None => false,
+    }
+}
+
 fn route_mutate(
     svc: &Ec2Service,
     req: &AwsRequest,
@@ -299,32 +332,47 @@ fn route_mutate(
     replace: bool,
 ) -> Result<AwsResponse, AwsServiceError> {
     let rt_id = require(&req.query_params, "RouteTableId")?;
-    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::ROUTES_PER_ROUTE_TABLE);
+    // Only CreateRoute adds a route; ReplaceRoute swaps one in place.
+    let limit = if replace {
+        None
+    } else {
+        svc.enforced_count_quota(&req.account_id, &req.region, rq::ROUTES_PER_ROUTE_TABLE)
+    };
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if let Some(current) = state.route_tables.get(&rt_id) {
-            let mut rt = current.clone();
-            let route = parse_route(&req.query_params);
+        let route = parse_route(&req.query_params);
+        if limit.is_some() {
+            if let Some(rt) = state.route_tables.get(&rt_id) {
+                let prefix_lists = &state.managed_prefix_lists;
+                rq::check_routes(
+                    limit,
+                    rq::route_counts(rt, prefix_lists, &req.region),
+                    rq::route_weight(&route, prefix_lists, &req.region),
+                )?;
+            }
+        }
+        if let Some(rt) = state.route_tables.get_mut(&rt_id) {
             if replace {
-                if let Some(existing) = rt
-                    .routes
-                    .iter_mut()
-                    .find(|r| r.destination_cidr_block == route.destination_cidr_block)
-                {
-                    *existing = route;
-                } else {
-                    rt.routes.push(route);
+                // AWS replaces the route with the destination the request
+                // names, whichever kind it is, and refuses when there is none.
+                match rt.routes.iter_mut().find(|r| same_destination(r, &route)) {
+                    Some(existing) => *existing = route,
+                    None => {
+                        let dest = route_destination(&route).map_or("", |(_, d)| d);
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidParameterValue",
+                            format!(
+                                "There is no route defined for '{dest}' in the route table. \
+                                 Use CreateRoute instead."
+                            ),
+                        ));
+                    }
                 }
             } else {
                 rt.routes.push(route);
             }
-            if limit.is_some() {
-                let before = rq::route_counts(current, &state.managed_prefix_lists, &req.region);
-                let after = rq::route_counts(&rt, &state.managed_prefix_lists, &req.region);
-                rq::check_routes(limit, before, after)?;
-            }
-            state.route_tables.insert(rt_id.clone(), rt);
         }
     }
     Ok(Ec2Service::respond(

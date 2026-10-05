@@ -694,3 +694,398 @@ fn an_account_ec2_has_not_stored_reports_its_default_network() {
         None
     );
 }
+
+// ---- review follow-ups ----
+
+fn req_as(
+    account: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> fakecloud_core::service::AwsRequest {
+    let mut r = req(action, params);
+    r.account_id = account.to_string();
+    r
+}
+
+fn make_vpc_as(svc: &Ec2Service, account: &str, cidr: &str) -> String {
+    xml(
+        &body(vpc::create_vpc(
+            svc,
+            &req_as(account, "CreateVpc", &[("CidrBlock", cidr)]),
+        )),
+        "vpcId",
+    )
+}
+
+fn route_table(svc: &Ec2Service) -> String {
+    let v = make_vpc(svc);
+    xml(
+        &body(routing::create_route_table(
+            svc,
+            &req("CreateRouteTable", &[("VpcId", &v)]),
+        )),
+        "routeTableId",
+    )
+}
+
+fn routes_of(svc: &Ec2Service, rtb: &str) -> Vec<crate::state::Route> {
+    svc.state.read().get(ACCT).unwrap().route_tables[rtb]
+        .routes
+        .clone()
+}
+
+#[test]
+fn replace_route_matches_the_destination_it_names() {
+    let svc = seeded(Ec2Service::new());
+    let rtb = route_table(&svc);
+    let route = |action: &str, key: &str, dest: &str, gw: &str| {
+        let r = req(
+            action,
+            &[("RouteTableId", &rtb), (key, dest), ("GatewayId", gw)],
+        );
+        if action == "CreateRoute" {
+            routing::create_route(&svc, &r)
+        } else {
+            routing::replace_route(&svc, &r)
+        }
+    };
+    body(route(
+        "CreateRoute",
+        "DestinationCidrBlock",
+        "0.0.0.0/0",
+        "igw-4",
+    ));
+    body(route(
+        "CreateRoute",
+        "DestinationIpv6CidrBlock",
+        "::/0",
+        "igw-6",
+    ));
+    body(route(
+        "CreateRoute",
+        "DestinationPrefixListId",
+        "pl-1",
+        "igw-p",
+    ));
+    let before = routes_of(&svc, &rtb).len();
+    body(route(
+        "ReplaceRoute",
+        "DestinationIpv6CidrBlock",
+        "::/0",
+        "igw-6b",
+    ));
+    body(route(
+        "ReplaceRoute",
+        "DestinationPrefixListId",
+        "pl-1",
+        "igw-pb",
+    ));
+    let routes = routes_of(&svc, &rtb);
+    assert_eq!(routes.len(), before, "a replace adds no route");
+    let gw = |f: &dyn Fn(&crate::state::Route) -> bool| {
+        routes
+            .iter()
+            .find(|r| f(r))
+            .unwrap()
+            .gateway_id
+            .clone()
+            .unwrap()
+    };
+    assert_eq!(
+        gw(&|r| r.destination_ipv6_cidr_block.as_deref() == Some("::/0")),
+        "igw-6b"
+    );
+    assert_eq!(
+        gw(&|r| r.destination_prefix_list_id.as_deref() == Some("pl-1")),
+        "igw-pb"
+    );
+    assert_eq!(
+        gw(&|r| r.destination_cidr_block.as_deref() == Some("0.0.0.0/0")),
+        "igw-4"
+    );
+    // No route with the destination: refused, nothing appended.
+    for (key, dest) in [
+        ("DestinationCidrBlock", "192.168.0.0/16"),
+        ("DestinationIpv6CidrBlock", "2001:db8::/32"),
+        ("DestinationPrefixListId", "pl-2"),
+    ] {
+        let e = crate::test_support::err_of(route("ReplaceRoute", key, dest, "igw-x"));
+        assert_eq!(e.code(), "InvalidParameterValue");
+        assert_eq!(
+            e.message(),
+            format!("There is no route defined for '{dest}' in the route table. Use CreateRoute instead.")
+        );
+    }
+    assert_eq!(routes_of(&svc, &rtb).len(), before);
+}
+
+#[test]
+fn replace_route_is_not_held_to_the_routes_quota() {
+    let svc = seeded(enforcing(&[(ROUTES_PER_ROUTE_TABLE, 1.0)]));
+    let rtb = route_table(&svc);
+    let r = |action: &str, gw: &str| {
+        req(
+            action,
+            &[
+                ("RouteTableId", &rtb),
+                ("DestinationCidrBlock", "0.0.0.0/0"),
+                ("GatewayId", gw),
+            ],
+        )
+    };
+    body(routing::create_route(&svc, &r("CreateRoute", "igw-1")));
+    body(routing::replace_route(&svc, &r("ReplaceRoute", "igw-2")));
+}
+
+#[test]
+fn quota_arithmetic_saturates() {
+    assert_eq!(
+        check(Some(5), usize::MAX, usize::MAX, "X", |_| String::new())
+            .unwrap_err()
+            .code(),
+        "X"
+    );
+    assert!(check(Some(5), usize::MAX, 0, "X", |_| String::new()).is_ok());
+    assert!(check_routes(Some(1), [usize::MAX, 0], [1, 0]).is_err());
+    // A huge Spot request is refused, not overflowed.
+    let svc = seeded(enforcing(&[(SPOT_STANDARD, 4.0)]));
+    let huge = usize::MAX.to_string();
+    let e = crate::test_support::err_of(fleet::request_spot_instances(
+        &svc,
+        &req(
+            "RequestSpotInstances",
+            &[
+                ("InstanceCount", &huge),
+                ("LaunchSpecification.InstanceType", "m5.large"),
+            ],
+        ),
+    ));
+    assert_eq!(e.code(), "MaxSpotInstanceCountExceeded");
+}
+
+#[test]
+fn create_vpc_checks_the_quotas_of_its_default_resources() {
+    let probe = seeded(Ec2Service::new());
+    let groups = usage(&probe, SECURITY_GROUPS_PER_REGION);
+    let vpcs_before = usage(&probe, VPCS_PER_REGION);
+    let refused = |quota: CountQuota, n: f64, code: &str| {
+        let svc = seeded(enforcing(&[(quota, n)]));
+        let r = vpc::create_vpc(&svc, &req("CreateVpc", &[("CidrBlock", "10.0.0.0/16")]));
+        assert_eq!(crate::test_support::err_of(r).code(), code);
+        // Nothing of the VPC is left behind.
+        assert_eq!(usage(&svc, VPCS_PER_REGION), vpcs_before);
+        assert_eq!(usage(&svc, SECURITY_GROUPS_PER_REGION), groups);
+    };
+    // The new VPC's default security group would be one too many.
+    refused(
+        SECURITY_GROUPS_PER_REGION,
+        groups as f64,
+        "SecurityGroupLimitExceeded",
+    );
+    // Its default network ACL and main route table need a per-VPC limit of 1.
+    refused(NETWORK_ACLS_PER_VPC, 0.0, "NetworkAclLimitExceeded");
+    refused(ROUTE_TABLES_PER_VPC, 0.0, "RouteTableLimitExceeded");
+    // With room for one more group, the VPC and its group are created.
+    let svc = seeded(enforcing(&[
+        (SECURITY_GROUPS_PER_REGION, (groups + 1) as f64),
+        (NETWORK_ACLS_PER_VPC, 1.0),
+        (ROUTE_TABLES_PER_VPC, 1.0),
+    ]));
+    make_vpc(&svc);
+    assert_eq!(usage(&svc, SECURITY_GROUPS_PER_REGION), groups + 1);
+}
+
+#[tokio::test]
+async fn an_unknown_instance_type_is_refused_only_while_its_vcpu_quota_is_enforced() {
+    let one = [
+        ("InstanceType", "m5.huge"),
+        ("MinCount", "1"),
+        ("MaxCount", "1"),
+    ];
+    body(run(&seeded(Ec2Service::new()), &one).await);
+    let svc = seeded(enforcing(&[(ON_DEMAND_STANDARD, 100.0)]));
+    let e = crate::test_support::err_of(run(&svc, &one).await);
+    assert_eq!(e.code(), "InvalidParameterValue");
+    assert_eq!(e.message(), "Invalid value 'm5.huge' for InstanceType.");
+    // A family whose quota is not enforced is not refused.
+    body(
+        run(
+            &svc,
+            &[
+                ("InstanceType", "g5.huge"),
+                ("MinCount", "1"),
+                ("MaxCount", "1"),
+            ],
+        )
+        .await,
+    );
+    // Spot requests too.
+    let svc = seeded(enforcing(&[(SPOT_STANDARD, 100.0)]));
+    let r = fleet::request_spot_instances(
+        &svc,
+        &req(
+            "RequestSpotInstances",
+            &[("LaunchSpecification.InstanceType", "m5.huge")],
+        ),
+    );
+    assert_eq!(code(r), "InvalidParameterValue");
+}
+
+#[tokio::test]
+async fn starting_counts_each_instance_once() {
+    let svc = seeded(enforcing(&[(ON_DEMAND_STANDARD, 2.0)]));
+    let one = [
+        ("InstanceType", "t3.micro"),
+        ("MinCount", "1"),
+        ("MaxCount", "1"),
+    ];
+    let id = xml(&body(run(&svc, &one).await), "instanceId");
+    body(instance::stop_instances(&svc, &req("StopInstances", &[("InstanceId.1", &id)])).await);
+    // The same instance named twice adds its 2 vCPUs once.
+    body(
+        instance::start_instances(
+            &svc,
+            &req(
+                "StartInstances",
+                &[("InstanceId.1", &id), ("InstanceId.2", &id)],
+            ),
+        )
+        .await,
+    );
+    assert_eq!(usage(&svc, ON_DEMAND_STANDARD), 2);
+}
+
+#[test]
+fn accepting_a_connection_not_pending_acceptance_is_an_invalid_transition() {
+    let svc = seeded(Ec2Service::new());
+    let a = make_vpc(&svc);
+    let b = make_vpc(&svc);
+    let peer = |from: &str, to: &str| {
+        xml(
+            &body(nacl::create_vpc_peering_connection(
+                &svc,
+                &req(
+                    "CreateVpcPeeringConnection",
+                    &[("VpcId", from), ("PeerVpcId", to)],
+                ),
+            )),
+            "vpcPeeringConnectionId",
+        )
+    };
+    let accept = |id: &str| {
+        nacl::accept_vpc_peering_connection(
+            &svc,
+            &req(
+                "AcceptVpcPeeringConnection",
+                &[("VpcPeeringConnectionId", id)],
+            ),
+        )
+    };
+    let active = peer(&a, &b);
+    body(accept(&active));
+    let e = crate::test_support::err_of(accept(&active));
+    assert_eq!(e.code(), "InvalidStateTransition");
+    assert_eq!(
+        e.message(),
+        format!(
+            "Invalid state transition for {active}, attempted to transition from active to active"
+        )
+    );
+    let rejected = peer(&a, &b);
+    body(nacl::reject_vpc_peering_connection(
+        &svc,
+        &req(
+            "RejectVpcPeeringConnection",
+            &[("VpcPeeringConnectionId", &rejected)],
+        ),
+    ));
+    assert_eq!(code(accept(&rejected)), "InvalidStateTransition");
+}
+
+/// Enforces the active-peering quota at 1 for one account only.
+struct OneAccount(&'static str);
+
+impl fakecloud_core::quota::QuotaProvider for OneAccount {
+    fn applied_value(&self, account: &str, _: &str, s: &str, q: &str) -> Option<f64> {
+        self.enforced_limit(account, "", s, q)
+    }
+    fn enforced_limit(&self, account: &str, _: &str, s: &str, q: &str) -> Option<f64> {
+        (account == self.0
+            && s == ACTIVE_PEERINGS_PER_VPC.service
+            && q == ACTIVE_PEERINGS_PER_VPC.code)
+            .then_some(1.0)
+    }
+}
+
+#[test]
+fn active_peerings_are_limited_by_each_vpc_owner() {
+    const OTHER: &str = "111111111111";
+    let svc = seeded(Ec2Service::new().with_quota_provider(Some(Arc::new(OneAccount(ACCT)))));
+    let a1 = make_vpc_as(&svc, ACCT, "10.1.0.0/16");
+    let a2 = make_vpc_as(&svc, ACCT, "10.2.0.0/16");
+    let a3 = make_vpc_as(&svc, ACCT, "10.3.0.0/16");
+    let b1 = make_vpc_as(&svc, OTHER, "10.11.0.0/16");
+    let b2 = make_vpc_as(&svc, OTHER, "10.12.0.0/16");
+    let peer = |account: &str, from: &str, to: &str, owner: &str| {
+        xml(
+            &body(nacl::create_vpc_peering_connection(
+                &svc,
+                &req_as(
+                    account,
+                    "CreateVpcPeeringConnection",
+                    &[("VpcId", from), ("PeerVpcId", to), ("PeerOwnerId", owner)],
+                ),
+            )),
+            "vpcPeeringConnectionId",
+        )
+    };
+    let accept = |account: &str, id: &str| {
+        nacl::accept_vpc_peering_connection(
+            &svc,
+            &req_as(
+                account,
+                "AcceptVpcPeeringConnection",
+                &[("VpcPeeringConnectionId", id)],
+            ),
+        )
+    };
+    // a1 and b1 each get one active connection.
+    body(accept(ACCT, &peer(ACCT, &a1, &a2, ACCT)));
+    body(accept(OTHER, &peer(OTHER, &b1, &b2, OTHER)));
+    // OTHER asks to peer b1 with a1, which ACCT owns and has no room for.
+    let into_full = peer(OTHER, &b1, &a1, ACCT);
+    let out = body(nacl::describe_vpc_peering_connections(
+        &svc,
+        &req_as(OTHER, "DescribeVpcPeeringConnections", &[]),
+    ));
+    assert!(out.contains(&format!("<ownerId>{ACCT}</ownerId>")), "{out}");
+    assert_eq!(
+        code(accept(ACCT, &into_full)),
+        "ActiveVpcPeeringConnectionPerVpcLimitExceeded"
+    );
+    // b1 already has an active connection too, but OTHER does not enforce
+    // the quota: ACCT's limit applies only to ACCT's VPC.
+    let into_room = peer(OTHER, &b1, &a3, ACCT);
+    let out = body(accept(ACCT, &into_room));
+    assert!(out.contains("<code>active</code>"), "{out}");
+}
+
+#[test]
+fn counted_but_unenforced_quotas_report_usage() {
+    let svc = seeded(Ec2Service::new());
+    let v = make_vpc(&svc);
+    body(routing::create_egress_only_igw(
+        &svc,
+        &req("CreateEgressOnlyInternetGateway", &[("VpcId", &v)]),
+    ));
+    body(vpc::associate_vpc_cidr_block(
+        &svc,
+        &req(
+            "AssociateVpcCidrBlock",
+            &[("VpcId", &v), ("AmazonProvidedIpv6CidrBlock", "true")],
+        ),
+    ));
+    assert_eq!(usage(&svc, EGRESS_ONLY_IGWS_PER_REGION), 1);
+    assert_eq!(usage(&svc, IPV6_CIDR_BLOCKS_PER_VPC), 1);
+    assert_eq!(usage(&svc, TRANSIT_GATEWAYS), 0);
+}

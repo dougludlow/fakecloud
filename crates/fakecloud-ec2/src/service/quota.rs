@@ -17,7 +17,8 @@ use fakecloud_core::service::AwsServiceError;
 use crate::service::resource_quotas;
 use crate::service::Ec2Service;
 use crate::service_helpers::indexed_list;
-use crate::state::{ManagedPrefixList, SecurityGroupRule, SharedEc2State};
+use crate::state::{Ec2State, ManagedPrefixList, SecurityGroupRule, SharedEc2State};
+use parking_lot::Mutex;
 
 pub(crate) use fakecloud_core::quota::{
     DEFAULT_RULES_PER_SECURITY_GROUP, DEFAULT_SECURITY_GROUPS_PER_INTERFACE,
@@ -326,11 +327,25 @@ pub(crate) fn rules_limit_exceeded(message: String) -> AwsServiceError {
 /// utilization reports and introspection show real usage.
 pub struct Ec2QuotaUsage {
     state: SharedEc2State,
+    /// The default network an account EC2 has not stored yet ships with, per
+    /// region, built once: every account's defaults count the same.
+    defaults: Mutex<HashMap<String, Arc<Ec2State>>>,
 }
 
 impl Ec2QuotaUsage {
     pub fn new(state: SharedEc2State) -> Arc<Self> {
-        Arc::new(Self { state })
+        Arc::new(Self {
+            state,
+            defaults: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn default_state(&self, account_id: &str, region: &str) -> Arc<Ec2State> {
+        self.defaults
+            .lock()
+            .entry(region.to_string())
+            .or_insert_with(|| Arc::new(Ec2State::new(account_id, region)))
+            .clone()
     }
 }
 
@@ -346,36 +361,14 @@ impl QuotaUsageSource for Ec2QuotaUsage {
         service_code: &str,
         quota_code: &str,
     ) -> Option<f64> {
-        let accounts = self.state.read();
+        let quota = resource_quotas::by_code(service_code, quota_code)?;
         // An account EC2 has not stored yet still has the default network
         // every account ships with (default VPC, subnets, security group...),
-        // as the EC2 read paths report it.
-        let fresh;
-        let state = match accounts.get(account_id) {
-            Some(s) => s,
-            None => {
-                fresh = crate::state::Ec2State::new(account_id, region);
-                &fresh
-            }
-        };
-        let n = match (service_code, quota_code) {
-            (VPC, "L-45FE3B85") => state.egress_only_igws.len(),
-            (VPC, "L-085A6257") => state
-                .vpcs
-                .values()
-                .map(|v| usize::from(v.ipv6_cidr_block.is_some()))
-                .max()
-                .unwrap_or(0),
-            ("ec2", "L-A2478D36") => state
-                .transit_gateways
-                .values()
-                .filter(|t| t.state != "deleted")
-                .count(),
-            _ => {
-                resource_quotas::usage(state, resource_quotas::by_code(service_code, quota_code)?)?
-            }
-        };
-        Some(n as f64)
+        // as the EC2 read paths report it. Resolved before the EC2 lock.
+        let fallback = self.default_state(account_id, region);
+        let accounts = self.state.read();
+        let state = accounts.get(account_id).unwrap_or(&fallback);
+        resource_quotas::usage(&accounts, account_id, state, quota).map(|n| n as f64)
     }
 }
 

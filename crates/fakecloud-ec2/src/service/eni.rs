@@ -170,7 +170,11 @@ pub(crate) fn create_network_interface(
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        check_interface_count(state, &eni.availability_zone, 1, limit)?;
+        let in_az = rq::network_interfaces_by_az(state)
+            .get(eni.availability_zone.as_str())
+            .copied()
+            .unwrap_or(0);
+        check_interface_count(in_az, 1, limit)?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -193,19 +197,14 @@ pub(crate) fn create_network_interface(
     ))
 }
 
-/// `NetworkInterfaceLimitExceeded` when `adding` interfaces in `az` would
-/// go past "Network interfaces per Region", which AWS enforces per
-/// Availability Zone.
+/// `NetworkInterfaceLimitExceeded` when `adding` interfaces in a zone that
+/// holds `in_az` would go past "Network interfaces per Region", which AWS
+/// enforces per Availability Zone.
 pub(crate) fn check_interface_count(
-    state: &crate::state::Ec2State,
-    az: &str,
+    in_az: usize,
     adding: usize,
     limit: Option<usize>,
 ) -> Result<(), AwsServiceError> {
-    let in_az = rq::network_interfaces_by_az(state)
-        .get(az)
-        .copied()
-        .unwrap_or(0);
     rq::check(
         limit,
         in_az,

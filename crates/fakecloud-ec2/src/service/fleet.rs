@@ -984,8 +984,10 @@ pub(crate) fn request_spot_instances(
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
         if let (Some(quota), Some(t)) = (spot_quota, instance_type.as_deref()) {
-            let adding = count.max(1) * rq::vcpus_of(t);
-            rq::check_vcpus(state, quota, spot_limit, adding, &[])?;
+            let adding = count
+                .max(1)
+                .saturating_mul(rq::launch_vcpus(t, spot_limit)?);
+            rq::check_vcpus(quota, spot_limit, rq::instance_vcpus(state, quota), adding)?;
         }
         for _ in 0..count.max(1) {
             let id = gen_id("sir");

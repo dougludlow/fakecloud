@@ -421,6 +421,7 @@ pub(crate) fn replace_network_acl_association(
 
 // ---- VPC peering ----
 
+/// Render a peering connection held by `owner` (the requester's account).
 fn peering_xml(p: &VpcPeering, tags: &[Tag], owner: &str) -> String {
     // `<peeringOptions>` carries the three modifiable cross-VPC flags AWS
     // returns per side. The requester side is present from creation; the
@@ -452,7 +453,7 @@ fn peering_xml(p: &VpcPeering, tags: &[Tag], owner: &str) -> String {
         ec2_elem("ownerId", owner),
         requester_opts,
         ec2_elem("vpcId", &p.accepter_vpc_id),
-        ec2_elem("ownerId", owner),
+        ec2_elem("ownerId", rq::accepter_owner(p, owner)),
         accepter_opts,
         super::tags::tag_set_xml(tags),
     )
@@ -480,6 +481,11 @@ pub(crate) fn create_vpc_peering_connection(
         status: "pending-acceptance".to_string(),
         requester_allow_dns: false,
         accepter_allow_dns: false,
+        accepter_owner_id: req
+            .query_params
+            .get("PeerOwnerId")
+            .filter(|o| !o.is_empty() && **o != req.account_id)
+            .cloned(),
     };
     let owner = req.account_id.clone();
     let limit = svc.enforced_count_quota(
@@ -563,56 +569,134 @@ pub(crate) fn describe_vpc_peering_connections(
     ))
 }
 
+/// The peering connection `id` as `caller` sees it, with the account that
+/// holds it: the caller's own, else one another account requested with a VPC
+/// the caller owns as its accepter.
+fn find_peering<'a>(
+    accounts: &'a rq::Accounts,
+    caller: &'a str,
+    id: &str,
+) -> Option<(&'a str, &'a VpcPeering)> {
+    accounts
+        .get(caller)
+        .and_then(|s| s.vpc_peerings.get(id))
+        .map(|p| (caller, p))
+        .or_else(|| {
+            accounts.iter().find_map(|(holder, s)| {
+                s.vpc_peerings
+                    .get(id)
+                    .filter(|p| p.accepter_owner_id.as_deref() == Some(caller))
+                    .map(|p| (holder, p))
+            })
+        })
+}
+
 pub(crate) fn accept_vpc_peering_connection(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "VpcPeeringConnectionId")?;
-    let owner = req.account_id.clone();
-    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::ACTIVE_PEERINGS_PER_VPC);
-    let (p, tags) = {
+    // Accepting makes the connection active for both of its VPCs; each must
+    // have room under its owner's "Active VPC peering connections per VPC".
+    // The owners' limits are resolved before the write lock.
+    let located: Option<(String, String)> = {
+        let accounts = svc.state.read();
+        find_peering(&accounts, &req.account_id, &id).map(|(holder, p)| {
+            (
+                holder.to_string(),
+                rq::accepter_owner(p, holder).to_string(),
+            )
+        })
+    };
+    let limit_of =
+        |account: &str| svc.enforced_count_quota(account, &req.region, rq::ACTIVE_PEERINGS_PER_VPC);
+    let limits = located
+        .as_ref()
+        .map(|(holder, accepter)| (limit_of(holder), limit_of(accepter)));
+    let (p, tags, holder) = {
         let mut accounts = svc.state.write();
-        let state = accounts.get_or_create(&req.account_id);
-        // Accepting makes the connection active for both of its VPCs; each
-        // must have room under "Active VPC peering connections per VPC".
-        if let Some(p) = state.vpc_peerings.get(&id).filter(|p| p.status != "active") {
-            let mut vpcs = vec![p.requester_vpc_id.as_str(), p.accepter_vpc_id.as_str()];
-            vpcs.dedup();
-            for vpc_id in vpcs {
-                rq::check(
-                    limit,
-                    rq::active_peerings_of(state, vpc_id),
-                    1,
-                    "ActiveVpcPeeringConnectionPerVpcLimitExceeded",
-                    |_| {
+        let found = located.as_ref().and_then(|(holder, _)| {
+            accounts
+                .get(holder)
+                .and_then(|s| s.vpc_peerings.get(&id))
+                .cloned()
+                .map(|p| (holder.clone(), p))
+        });
+        match found {
+            Some((holder, current)) => {
+                if current.status != "pending-acceptance" {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidStateTransition",
                         format!(
-                            "The maximum number of active VPC peering connections for VPC \
-                             '{vpc_id}' has been reached."
-                        )
-                    },
-                )?;
+                            "Invalid state transition for {id}, attempted to transition from \
+                             {} to active",
+                            current.status
+                        ),
+                    ));
+                }
+                let (requester_limit, accepter_limit) = limits.unwrap_or((None, None));
+                let accepter = rq::accepter_owner(&current, &holder).to_string();
+                let mut sides = vec![
+                    (
+                        holder.as_str(),
+                        current.requester_vpc_id.as_str(),
+                        requester_limit,
+                    ),
+                    (
+                        accepter.as_str(),
+                        current.accepter_vpc_id.as_str(),
+                        accepter_limit,
+                    ),
+                ];
+                sides.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                for (owner, vpc_id, limit) in sides {
+                    rq::check(
+                        limit,
+                        rq::active_peerings_of(&accounts, owner, vpc_id),
+                        1,
+                        "ActiveVpcPeeringConnectionPerVpcLimitExceeded",
+                        |_| {
+                            format!(
+                                "The maximum number of active VPC peering connections for VPC \
+                                 '{vpc_id}' has been reached."
+                            )
+                        },
+                    )?;
+                }
+                let state = accounts.get_or_create(&holder);
+                let p = state
+                    .vpc_peerings
+                    .get_mut(&id)
+                    .expect("connection read under this lock");
+                p.status = "active".to_string();
+                let p = p.clone();
+                let t = state.tags_for(&id).to_vec();
+                (p, t, holder)
+            }
+            // Lenient: an unknown id still gets an AWS-shaped response.
+            None => {
+                let state = accounts.get_or_create(&req.account_id);
+                let p = VpcPeering {
+                    id: id.clone(),
+                    requester_vpc_id: String::new(),
+                    accepter_vpc_id: String::new(),
+                    status: "active".to_string(),
+                    requester_allow_dns: false,
+                    accepter_allow_dns: false,
+                    accepter_owner_id: None,
+                };
+                let t = state.tags_for(&id).to_vec();
+                (p, t, req.account_id.clone())
             }
         }
-        if let Some(p) = state.vpc_peerings.get_mut(&id) {
-            p.status = "active".to_string();
-        }
-        let p = state.vpc_peerings.get(&id).cloned().unwrap_or(VpcPeering {
-            id: id.clone(),
-            requester_vpc_id: String::new(),
-            accepter_vpc_id: String::new(),
-            status: "active".to_string(),
-            requester_allow_dns: false,
-            accepter_allow_dns: false,
-        });
-        let t = state.tags_for(&id).to_vec();
-        (p, t)
     };
     Ok(Ec2Service::respond(
         "AcceptVpcPeeringConnection",
         &req.request_id,
         &format!(
             "<vpcPeeringConnection>{}</vpcPeeringConnection>",
-            peering_xml(&p, &tags, &owner)
+            peering_xml(&p, &tags, &holder)
         ),
     ))
 }

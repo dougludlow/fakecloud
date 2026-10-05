@@ -18,7 +18,12 @@ use fakecloud_core::quota::VPC_SERVICE_CODE as VPC;
 use fakecloud_core::service::AwsServiceError;
 
 use crate::service::Ec2Service;
-use crate::state::{Ec2State, Instance, ManagedPrefixList, NetworkAcl, RouteTable, Vpc};
+use crate::state::{
+    Ec2State, Instance, ManagedPrefixList, NetworkAcl, Route, RouteTable, Vpc, VpcPeering,
+};
+
+/// Every account's EC2 state.
+pub(crate) type Accounts = fakecloud_core::multi_account::MultiAccountState<Ec2State>;
 
 /// A quota by service code and quota code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +74,13 @@ pub(crate) const ON_DEMAND_HIGH_MEMORY: CountQuota = ec2("L-43DA4232");
 /// vCPUs.
 pub(crate) const SPOT_STANDARD: CountQuota = ec2("L-34B43A08");
 
+/// Counted for utilization but not enforced: AWS documents no error code for
+/// egress-only internet gateways or transit gateways, and fakecloud keeps one
+/// IPv6 block per VPC.
+pub(crate) const EGRESS_ONLY_IGWS_PER_REGION: CountQuota = vpc("L-45FE3B85");
+pub(crate) const IPV6_CIDR_BLOCKS_PER_VPC: CountQuota = vpc("L-085A6257");
+pub(crate) const TRANSIT_GATEWAYS: CountQuota = ec2("L-A2478D36");
+
 /// Every quota counted here.
 const ALL: &[CountQuota] = &[
     VPCS_PER_REGION,
@@ -96,6 +108,9 @@ const ALL: &[CountQuota] = &[
     ON_DEMAND_X,
     ON_DEMAND_HIGH_MEMORY,
     SPOT_STANDARD,
+    EGRESS_ONLY_IGWS_PER_REGION,
+    IPV6_CIDR_BLOCKS_PER_VPC,
+    TRANSIT_GATEWAYS,
 ];
 
 /// The quota counted here for `service_code`/`quota_code`.
@@ -144,7 +159,7 @@ pub(crate) fn check(
     message: impl FnOnce(usize) -> String,
 ) -> Result<(), AwsServiceError> {
     match limit {
-        Some(limit) if adding > 0 && current + adding > limit => {
+        Some(limit) if adding > 0 && current.saturating_add(adding) > limit => {
             Err(limit_exceeded(code, message(limit)))
         }
         _ => Ok(()),
@@ -199,8 +214,8 @@ pub(crate) fn route_tables_in_vpc(state: &Ec2State, vpc_id: &str) -> usize {
         .count()
 }
 
-/// The routes of a table that count toward "Routes per route table", as
-/// `[IPv4, IPv6]`: AWS enforces the quota separately for each family.
+/// What one route weighs against "Routes per route table", as `[IPv4,
+/// IPv6]`: AWS enforces the quota separately for each family.
 ///
 /// The quota covers non-propagated routes; fakecloud does not propagate
 /// routes into VPC route tables, so every route counts except the table's
@@ -208,48 +223,59 @@ pub(crate) fn route_tables_in_vpc(state: &Ec2State, vpc_id: &str) -> usize {
 /// added to it. A route whose destination is a prefix list weighs the list's
 /// maximum entries (a customer-managed list) or published weight (an
 /// AWS-managed list), as AWS counts it, toward that list's family.
+pub(crate) fn route_weight(
+    r: &Route,
+    prefix_lists: &BTreeMap<String, ManagedPrefixList>,
+    region: &str,
+) -> [usize; 2] {
+    if r.gateway_id.as_deref() == Some("local") {
+        return [0, 0];
+    }
+    if let Some(id) = &r.destination_prefix_list_id {
+        let (ipv6, weight) = match prefix_lists.get(id) {
+            Some(l) => (
+                l.address_family.eq_ignore_ascii_case("IPv6"),
+                l.max_entries.max(1) as usize,
+            ),
+            None => match super::aws_prefix_lists::by_id(region, id) {
+                Some(l) => (l.address_family.eq_ignore_ascii_case("IPv6"), l.weight),
+                None => (false, 1),
+            },
+        };
+        return if ipv6 { [0, weight] } else { [weight, 0] };
+    }
+    if r.destination_ipv6_cidr_block.is_some() {
+        [0, 1]
+    } else {
+        [1, 0]
+    }
+}
+
+/// The routes of a table that count toward "Routes per route table", as
+/// `[IPv4, IPv6]` (see [`route_weight`]).
 pub(crate) fn route_counts(
     rt: &RouteTable,
     prefix_lists: &BTreeMap<String, ManagedPrefixList>,
     region: &str,
 ) -> [usize; 2] {
-    rt.routes
-        .iter()
-        .filter(|r| r.gateway_id.as_deref() != Some("local"))
-        .fold([0, 0], |[v4, v6], r| {
-            if let Some(id) = &r.destination_prefix_list_id {
-                let (family, weight) = match prefix_lists.get(id) {
-                    Some(l) => (l.address_family.clone(), l.max_entries.max(1) as usize),
-                    None => match super::aws_prefix_lists::by_id(region, id) {
-                        Some(l) => (l.address_family.to_string(), l.weight),
-                        None => ("IPv4".to_string(), 1),
-                    },
-                };
-                if family.eq_ignore_ascii_case("IPv6") {
-                    [v4, v6 + weight]
-                } else {
-                    [v4 + weight, v6]
-                }
-            } else if r.destination_ipv6_cidr_block.is_some() {
-                [v4, v6 + 1]
-            } else {
-                [v4 + 1, v6]
-            }
-        })
+    rt.routes.iter().fold([0, 0], |[v4, v6], r| {
+        let [w4, w6] = route_weight(r, prefix_lists, region);
+        [v4.saturating_add(w4), v6.saturating_add(w6)]
+    })
 }
 
-/// `RouteLimitExceeded` when a change of a table's routes grows either
-/// family past `limit`. A family that was already over the limit and does
-/// not grow is left alone: the change did not cause it.
+/// `RouteLimitExceeded` when adding a route weighing `adding` to a table
+/// holding `current` grows either family past `limit`. A family the route
+/// does not count toward is left alone, even when already over the limit.
 pub(crate) fn check_routes(
     limit: Option<usize>,
-    before: [usize; 2],
-    after: [usize; 2],
+    current: [usize; 2],
+    adding: [usize; 2],
 ) -> Result<(), AwsServiceError> {
     let Some(limit) = limit else {
         return Ok(());
     };
-    if (0..2).any(|i| after[i] > limit && after[i] > before[i]) {
+    if (0..2).any(|i| adding[i] > 0 && current[i].saturating_add(adding[i]) > limit) {
         return Err(limit_exceeded(
             "RouteLimitExceeded",
             "The maximum number of routes has been reached.".to_string(),
@@ -326,13 +352,24 @@ pub(crate) fn ipv4_cidr_blocks(vpc: &Vpc) -> usize {
         .count()
 }
 
-/// Active peering connections with `vpc_id` on either side.
-pub(crate) fn active_peerings_of(state: &Ec2State, vpc_id: &str) -> usize {
-    state
-        .vpc_peerings
-        .values()
-        .filter(|p| p.status == "active")
-        .filter(|p| p.requester_vpc_id == vpc_id || p.accepter_vpc_id == vpc_id)
+/// The account that owns a peering connection's accepter VPC. `stored_in`
+/// is the requester's account, which holds the connection.
+pub(crate) fn accepter_owner<'a>(p: &'a VpcPeering, stored_in: &'a str) -> &'a str {
+    p.accepter_owner_id.as_deref().unwrap_or(stored_in)
+}
+
+/// Active peering connections of `owner`'s VPC `vpc_id`, on either side. A
+/// connection is held by the requester's account, so a cross-account one is
+/// found in the other account's state.
+pub(crate) fn active_peerings_of(accounts: &Accounts, owner: &str, vpc_id: &str) -> usize {
+    accounts
+        .iter()
+        .flat_map(|(acct, st)| st.vpc_peerings.values().map(move |p| (acct, p)))
+        .filter(|(_, p)| p.status == "active")
+        .filter(|(acct, p)| {
+            (*acct == owner && p.requester_vpc_id == vpc_id)
+                || (accepter_owner(p, acct) == owner && p.accepter_vpc_id == vpc_id)
+        })
         .count()
 }
 
@@ -430,20 +467,49 @@ pub(crate) fn vcpu_quota(instance_type: &str, spot: bool) -> Option<CountQuota> 
     (on_demand == ON_DEMAND_STANDARD).then_some(SPOT_STANDARD)
 }
 
-/// The vCPUs of an instance type, `0` for a type fakecloud has no data for.
-pub(crate) fn vcpus_of(instance_type: &str) -> usize {
-    crate::instance_types::default_vcpus(instance_type).unwrap_or(0) as usize
+/// The default vCPUs of an instance type, `None` for a type fakecloud has no
+/// data for.
+pub(crate) fn vcpus_of(instance_type: &str) -> Option<usize> {
+    crate::instance_types::default_vcpus(instance_type).map(|v| v as usize)
+}
+
+/// The vCPUs an instance of `instance_type` adds to a vCPU quota whose
+/// enforced limit is `limit`. A type fakecloud has no vCPU data for cannot
+/// be counted, so while the quota is enforced it is refused the way AWS
+/// refuses an instance type it does not offer; unenforced, it counts 0.
+pub(crate) fn launch_vcpus(
+    instance_type: &str,
+    limit: Option<usize>,
+) -> Result<usize, AwsServiceError> {
+    match (vcpus_of(instance_type), limit) {
+        (Some(v), _) => Ok(v),
+        (None, None) => Ok(0),
+        (None, Some(_)) => Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidParameterValue",
+            format!("Invalid value '{instance_type}' for InstanceType."),
+        )),
+    }
 }
 
 /// Whether a running or launching instance occupies vCPUs. Instances on a
 /// Dedicated Host use the host's capacity, not the account's vCPU quota.
-fn occupies_vcpus(i: &Instance) -> bool {
+pub(crate) fn occupies_vcpus(i: &Instance) -> bool {
     matches!(i.state_code, 0 | 16) && i.placement_tenancy.as_deref() != Some("host")
 }
 
-/// vCPUs of running and pending instances counted toward `quota`, leaving
-/// out the instances in `except` (the ones a start is about to count).
-pub(crate) fn instance_vcpus(state: &Ec2State, quota: CountQuota, except: &[String]) -> usize {
+/// The vCPU quota an instance counts toward.
+pub(crate) fn instance_vcpu_quota(i: &Instance) -> Option<CountQuota> {
+    vcpu_quota(
+        &i.instance_type,
+        i.instance_lifecycle.as_deref() == Some("spot"),
+    )
+}
+
+/// vCPUs counted toward `quota`: running and pending instances, plus open
+/// and active requests for the Spot quota. A type with no vCPU data (stored
+/// while the quota was not enforced) counts 0.
+pub(crate) fn instance_vcpus(state: &Ec2State, quota: CountQuota) -> usize {
     let spot_requests = if quota == SPOT_STANDARD {
         state
             .spot_requests
@@ -451,36 +517,28 @@ pub(crate) fn instance_vcpus(state: &Ec2State, quota: CountQuota, except: &[Stri
             .filter(|r| r.state == "open" || r.state == "active")
             .filter_map(|r| r.instance_type.as_deref())
             .filter(|t| vcpu_quota(t, true) == Some(quota))
-            .map(vcpus_of)
-            .sum()
+            .filter_map(vcpus_of)
+            .fold(0usize, usize::saturating_add)
     } else {
         0
     };
-    spot_requests
-        + state
-            .instances
-            .values()
-            .filter(|i| occupies_vcpus(i) && !except.contains(&i.instance_id))
-            .filter(|i| {
-                vcpu_quota(
-                    &i.instance_type,
-                    i.instance_lifecycle.as_deref() == Some("spot"),
-                ) == Some(quota)
-            })
-            .map(|i| vcpus_of(&i.instance_type))
-            .sum::<usize>()
+    state
+        .instances
+        .values()
+        .filter(|i| occupies_vcpus(i) && instance_vcpu_quota(i) == Some(quota))
+        .filter_map(|i| vcpus_of(&i.instance_type))
+        .fold(spot_requests, usize::saturating_add)
 }
 
 /// `VcpuLimitExceeded` (or `MaxSpotInstanceCountExceeded` for Spot) when
-/// adding `adding` vCPUs to `quota` goes past `limit`.
+/// adding `adding` vCPUs to the `current` vCPUs of `quota` goes past
+/// `limit`.
 pub(crate) fn check_vcpus(
-    state: &Ec2State,
     quota: CountQuota,
     limit: Option<usize>,
+    current: usize,
     adding: usize,
-    except: &[String],
 ) -> Result<(), AwsServiceError> {
-    let current = instance_vcpus(state, quota, except);
     if quota == SPOT_STANDARD {
         return check(
             limit,
@@ -505,7 +563,15 @@ pub(crate) fn check_vcpus(
 /// Usage of a count-based quota, `None` for a quota not counted here.
 /// "Network interfaces per Region" reports its busiest Availability Zone,
 /// the scope AWS enforces it in.
-pub(crate) fn usage(state: &Ec2State, quota: CountQuota) -> Option<usize> {
+///
+/// `state` is `account_id`'s state (its default network when EC2 has not
+/// stored the account yet); `accounts` resolves cross-account peering.
+pub(crate) fn usage(
+    accounts: &Accounts,
+    account_id: &str,
+    state: &Ec2State,
+    quota: CountQuota,
+) -> Option<usize> {
     let region = state.region.as_str();
     let per_vpc = |count: &dyn Fn(&str) -> usize| busiest(state.vpcs.keys().map(|v| count(v)));
     let n = match quota {
@@ -516,7 +582,19 @@ pub(crate) fn usage(state: &Ec2State, quota: CountQuota) -> Option<usize> {
         ROUTE_TABLES_PER_VPC => per_vpc(&|v| route_tables_in_vpc(state, v)),
         NETWORK_ACLS_PER_VPC => per_vpc(&|v| network_acls_in_vpc(state, v)),
         INTERFACE_ENDPOINTS_PER_VPC => per_vpc(&|v| interface_endpoints_in_vpc(state, v)),
-        ACTIVE_PEERINGS_PER_VPC => per_vpc(&|v| active_peerings_of(state, v)),
+        ACTIVE_PEERINGS_PER_VPC => per_vpc(&|v| active_peerings_of(accounts, account_id, v)),
+        IPV6_CIDR_BLOCKS_PER_VPC => busiest(
+            state
+                .vpcs
+                .values()
+                .map(|v| usize::from(v.ipv6_cidr_block.is_some())),
+        ),
+        EGRESS_ONLY_IGWS_PER_REGION => state.egress_only_igws.len(),
+        TRANSIT_GATEWAYS => state
+            .transit_gateways
+            .values()
+            .filter(|t| t.state != "deleted")
+            .count(),
         IPV4_CIDR_BLOCKS_PER_VPC => busiest(state.vpcs.values().map(ipv4_cidr_blocks)),
         ROUTES_PER_ROUTE_TABLE => busiest(state.route_tables.values().map(|rt| {
             let [v4, v6] = route_counts(rt, &state.managed_prefix_lists, region);
@@ -534,9 +612,7 @@ pub(crate) fn usage(state: &Ec2State, quota: CountQuota) -> Option<usize> {
         GATEWAY_ENDPOINTS_PER_REGION => gateway_endpoints(state),
         ELASTIC_IPS => elastic_ips(state),
         VPN_CONNECTIONS_PER_REGION => vpn_connections(state),
-        q if q == SPOT_STANDARD || ON_DEMAND_VCPU_QUOTAS.contains(&q) => {
-            instance_vcpus(state, q, &[])
-        }
+        q if q == SPOT_STANDARD || ON_DEMAND_VCPU_QUOTAS.contains(&q) => instance_vcpus(state, q),
         _ => return None,
     };
     Some(n)
