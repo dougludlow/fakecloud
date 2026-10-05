@@ -170,40 +170,46 @@ pub const QUOTAS: &[QuotaDef] = &[
         fakecloud_core::quota::DEFAULT_RULES_PER_SECURITY_GROUP as f64,
         true,
     )),
-    q(VPC, "L-F678F1CE", "VPCs per Region", 5.0, true),
-    q(VPC, "L-A4707A72", "Internet gateways per Region", 5.0, true),
-    q(VPC, "L-407747CB", "Subnets per VPC", 200.0, true),
-    q(
+    enforceable(q(VPC, "L-F678F1CE", "VPCs per Region", 5.0, true)),
+    enforceable(q(
+        VPC,
+        "L-A4707A72",
+        "Internet gateways per Region",
+        5.0,
+        true,
+    )),
+    enforceable(q(VPC, "L-407747CB", "Subnets per VPC", 200.0, true)),
+    enforceable(q(
         VPC,
         "L-E79EC296",
         "VPC security groups per Region",
         2500.0,
         true,
-    ),
-    q(VPC, "L-589F43AA", "Route tables per VPC", 200.0, true),
-    max(
+    )),
+    enforceable(q(VPC, "L-589F43AA", "Route tables per VPC", 200.0, true)),
+    enforceable(max(
         q(VPC, "L-93826ACB", "Routes per route table", 500.0, true),
         1000.0,
-    ),
-    q(VPC, "L-B4A6D682", "Network ACLs per VPC", 200.0, true),
-    max(
+    )),
+    enforceable(q(VPC, "L-B4A6D682", "Network ACLs per VPC", 200.0, true)),
+    enforceable(max(
         q(VPC, "L-2AEEBF1A", "Rules per network ACL", 20.0, true),
         40.0,
-    ),
-    q(
+    )),
+    enforceable(q(
         VPC,
         "L-FE5A380F",
         "NAT gateways per Availability Zone",
         5.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         VPC,
         "L-DF5E4CA3",
         "Network interfaces per Region",
         5000.0,
         true,
-    ),
+    )),
     q(
         VPC,
         "L-45FE3B85",
@@ -211,15 +217,15 @@ pub const QUOTAS: &[QuotaDef] = &[
         5.0,
         true,
     ),
-    max(
+    enforceable(max(
         q(VPC, "L-83CA0A9D", "IPv4 CIDR blocks per VPC", 5.0, true),
         50.0,
-    ),
+    )),
     max(
         q(VPC, "L-085A6257", "IPv6 CIDR blocks per VPC", 5.0, true),
         50.0,
     ),
-    max(
+    enforceable(max(
         q(
             VPC,
             "L-7E9ECCDB",
@@ -228,14 +234,14 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         125.0,
-    ),
-    q(
+    )),
+    enforceable(q(
         VPC,
         "L-DC9F7029",
         "Outstanding VPC peering connection requests",
         25.0,
         true,
-    ),
+    )),
     q(
         VPC,
         "L-8312C5BB",
@@ -243,20 +249,20 @@ pub const QUOTAS: &[QuotaDef] = &[
         168.0,
         false,
     ),
-    q(
+    enforceable(q(
         VPC,
         "L-1B52E74A",
         "Gateway VPC endpoints per Region",
         20.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         VPC,
         "L-29B6F2EB",
         "Interface VPC endpoints per VPC",
         50.0,
         true,
-    ),
+    )),
     q(
         VPC,
         "L-3248932A",
@@ -293,7 +299,7 @@ pub const QUOTAS: &[QuotaDef] = &[
         true,
     ),
     // ---- Amazon EC2 ----
-    vcpu_metric(
+    enforceable(vcpu_metric(
         q(
             EC2,
             "L-1216C47A",
@@ -302,8 +308,8 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         ON_DEMAND_VCPU,
-    ),
-    vcpu_metric(
+    )),
+    enforceable(vcpu_metric(
         q(
             EC2,
             "L-34B43A08",
@@ -312,58 +318,58 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         SPOT_VCPU,
-    ),
-    q(EC2, "L-0263D0A3", "EC2-VPC Elastic IPs", 5.0, true),
-    q(
+    )),
+    enforceable(q(EC2, "L-0263D0A3", "EC2-VPC Elastic IPs", 5.0, true)),
+    enforceable(q(
         EC2,
         "L-74FC7D96",
         "Running On-Demand F instances",
         0.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         EC2,
         "L-DB2E81BA",
         "Running On-Demand G and VT instances",
         0.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         EC2,
         "L-1945791B",
         "Running On-Demand Inf instances",
         0.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         EC2,
         "L-417A185B",
         "Running On-Demand P instances",
         0.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         EC2,
         "L-7295265B",
         "Running On-Demand X instances",
         0.0,
         true,
-    ),
-    q(
+    )),
+    enforceable(q(
         EC2,
         "L-43DA4232",
         "Running On-Demand High Memory instances",
         0.0,
         true,
-    ),
+    )),
     q(EC2, "L-A2478D36", "Transit gateways per account", 5.0, true),
-    q(
+    enforceable(q(
         EC2,
         "L-3E6EC3A3",
         "Site-to-Site VPN connections per Region",
         50.0,
         true,
-    ),
+    )),
     // ---- IAM (global) ----
     global(q("iam", "L-F55AF5E4", "Users per account", 5000.0, false)),
     global(max(
@@ -576,6 +582,63 @@ mod tests {
             assert!(q.global, "{}", s.quota_code);
             assert_eq!(q.default, s.default, "{}", s.summary_key);
         }
+    }
+
+    /// The EC2 and VPC quotas EC2 checks, and the ones it cannot: no AWS
+    /// error code is documented for egress-only internet gateways or transit
+    /// gateways, and fakecloud keeps one IPv6 block per VPC.
+    #[test]
+    fn ec2_enforceable_quotas() {
+        let on = [
+            (VPC, "L-2AFB9258"),
+            (VPC, "L-0EA8095F"),
+            (VPC, "L-F678F1CE"),
+            (VPC, "L-A4707A72"),
+            (VPC, "L-407747CB"),
+            (VPC, "L-E79EC296"),
+            (VPC, "L-589F43AA"),
+            (VPC, "L-93826ACB"),
+            (VPC, "L-B4A6D682"),
+            (VPC, "L-2AEEBF1A"),
+            (VPC, "L-FE5A380F"),
+            (VPC, "L-DF5E4CA3"),
+            (VPC, "L-83CA0A9D"),
+            (VPC, "L-7E9ECCDB"),
+            (VPC, "L-DC9F7029"),
+            (VPC, "L-1B52E74A"),
+            (VPC, "L-29B6F2EB"),
+            (EC2, "L-0263D0A3"),
+            (EC2, "L-3E6EC3A3"),
+            (EC2, "L-1216C47A"),
+            (EC2, "L-74FC7D96"),
+            (EC2, "L-DB2E81BA"),
+            (EC2, "L-1945791B"),
+            (EC2, "L-417A185B"),
+            (EC2, "L-7295265B"),
+            (EC2, "L-43DA4232"),
+            (EC2, "L-34B43A08"),
+        ];
+        for (service, code) in on {
+            assert!(
+                quota(service, code).unwrap().enforceable,
+                "{service}/{code}"
+            );
+        }
+        for (service, code) in [
+            (VPC, "L-45FE3B85"),
+            (VPC, "L-085A6257"),
+            (EC2, "L-A2478D36"),
+        ] {
+            assert!(
+                !quota(service, code).unwrap().enforceable,
+                "{service}/{code}"
+            );
+        }
+        let enforceable = QUOTAS
+            .iter()
+            .filter(|q| q.enforceable && (q.service_code == VPC || q.service_code == EC2))
+            .count();
+        assert_eq!(enforceable, on.len());
     }
 
     #[test]

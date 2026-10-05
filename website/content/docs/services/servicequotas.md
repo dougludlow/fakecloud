@@ -10,8 +10,11 @@ persists across restarts in persistent mode. The wire protocol is awsJson1.1
 (x-amz-target `ServiceQuotasV20190624.<Op>`), signing as `servicequotas`.
 
 Quotas are not just reported. Once you switch enforcement on, EC2 reads the
-applied value of the security-group quotas from Service Quotas, so raising one
-with `RequestServiceQuotaIncrease` changes what EC2 accepts. Enforcement is
+applied value of the EC2 and VPC quotas it checks (security groups and their
+rules, VPCs, subnets, gateways, route tables, network ACLs, network interfaces,
+endpoints, peering, Elastic IPs, VPN connections and the On-Demand and Spot vCPU
+quotas) from Service Quotas, so raising one with `RequestServiceQuotaIncrease`
+changes what EC2 accepts. Enforcement is
 **opt-in**: by default nothing is enforced, so a local test suite that creates
 more resources than a fresh AWS account allows keeps working. See
 [Enforcement](#enforcement).
@@ -143,6 +146,24 @@ persist across restarts in persistent mode.
 |---|---|
 | Security groups per network interface (`vpc`/`L-2AFB9258`) | `CreateNetworkInterface`, `ModifyNetworkInterfaceAttribute` (`SecurityGroupsPerInterfaceLimitExceeded`); `RunInstances`, `ModifyInstanceAttribute`, Auto Scaling and CloudFormation launches (`SecurityGroupsPerInstanceLimitExceeded`) |
 | Inbound or outbound rules per security group (`vpc`/`L-0EA8095F`) | `AuthorizeSecurityGroupIngress`, `AuthorizeSecurityGroupEgress`, `ModifySecurityGroupRules`, `ModifyManagedPrefixList`, CloudFormation security groups (`RulesPerSecurityGroupLimitExceeded`) |
+| VPCs per Region (`vpc`/`L-F678F1CE`) | `CreateVpc`, `CreateDefaultVpc` when it re-creates a deleted default VPC (`VpcLimitExceeded`) |
+| Internet gateways per Region (`vpc`/`L-A4707A72`) | `CreateInternetGateway` (`InternetGatewayLimitExceeded`) |
+| Subnets per VPC (`vpc`/`L-407747CB`) | `CreateSubnet`, `CreateDefaultSubnet` when it creates one (`SubnetLimitExceeded`) |
+| VPC security groups per Region (`vpc`/`L-E79EC296`) | `CreateSecurityGroup` (`SecurityGroupLimitExceeded`) |
+| Route tables per VPC (`vpc`/`L-589F43AA`) | `CreateRouteTable` (`RouteTableLimitExceeded`) |
+| Routes per route table (`vpc`/`L-93826ACB`) | `CreateRoute`, `ReplaceRoute` when it adds a route (`RouteLimitExceeded`) |
+| Network ACLs per VPC (`vpc`/`L-B4A6D682`) | `CreateNetworkAcl` (`NetworkAclLimitExceeded`) |
+| Rules per network ACL (`vpc`/`L-2AEEBF1A`) | `CreateNetworkAclEntry`, `ReplaceNetworkAclEntry` when it adds a rule (`NetworkAclEntryLimitExceeded`) |
+| NAT gateways per Availability Zone (`vpc`/`L-FE5A380F`) | `CreateNatGateway` (`NatGatewayLimitExceeded`) |
+| Network interfaces per Region (`vpc`/`L-DF5E4CA3`) | `CreateNetworkInterface`, the secondary interfaces `RunInstances` creates (`NetworkInterfaceLimitExceeded`) |
+| IPv4 CIDR blocks per VPC (`vpc`/`L-83CA0A9D`) | `AssociateVpcCidrBlock` (`CidrLimitExceeded`) |
+| Active VPC peering connections per VPC (`vpc`/`L-7E9ECCDB`) | `AcceptVpcPeeringConnection` (`ActiveVpcPeeringConnectionPerVpcLimitExceeded`) |
+| Outstanding VPC peering connection requests (`vpc`/`L-DC9F7029`) | `CreateVpcPeeringConnection` (`OutstandingVpcPeeringConnectionLimitExceeded`) |
+| Gateway VPC endpoints per Region (`vpc`/`L-1B52E74A`), Interface VPC endpoints per VPC (`vpc`/`L-29B6F2EB`) | `CreateVpcEndpoint` (`VpcEndpointLimitExceeded`) |
+| EC2-VPC Elastic IPs (`ec2`/`L-0263D0A3`) | `AllocateAddress` (`AddressLimitExceeded`) |
+| Site-to-Site VPN connections per Region (`ec2`/`L-3E6EC3A3`) | `CreateVpnConnection` (`VpnConnectionLimitExceeded`) |
+| Running On-Demand Standard, F, G and VT, Inf, P, X and High Memory instances (`ec2`/`L-1216C47A`, `L-74FC7D96`, `L-DB2E81BA`, `L-1945791B`, `L-417A185B`, `L-7295265B`, `L-43DA4232`) | `RunInstances`, `StartInstances`, Auto Scaling and CloudFormation launches (`VcpuLimitExceeded`) |
+| All Standard Spot Instance Requests (`ec2`/`L-34B43A08`) | `RunInstances` with `InstanceMarketOptions.MarketType=spot`, `RequestSpotInstances` (`MaxSpotInstanceCountExceeded`) |
 
 As on AWS, the rules quota applies to each direction separately and counts
 IPv4 and IPv6 rules separately. A rule that references a security group counts
@@ -155,6 +176,36 @@ alongside the account's own.
 `ModifyManagedPrefixList` honours this too: a larger `MaxEntries` that would
 push a referencing group over the quota leaves the list at its old size in
 `modify-failed`, with the group ids in `StateMessage`.
+
+Each count follows the AWS quota's scope and rules:
+
+- The VPC, security group and network ACL counts include the defaults every
+  account and VPC ships with: the default VPC, each VPC's default security
+  group and default network ACL, and its main route table.
+- Routes per route table is enforced separately for IPv4 and IPv6 routes.
+  It covers non-propagated routes (fakecloud does not propagate routes into VPC
+  route tables); the table's implicit `local` route is not counted, and a route
+  to a prefix list counts as the list's maximum entries (or an AWS-managed
+  list's published weight).
+- Rules per network ACL is enforced separately for inbound and outbound rules;
+  the default deny rule (`*`) does not count.
+- NAT gateways are counted per Availability Zone of their subnet, in the
+  `pending`, `available` and `deleting` states. Network interfaces are also
+  counted per Availability Zone: the quota is named per Region, but AWS
+  enforces it per zone.
+- IPv4 CIDR blocks per VPC counts the primary block and every associated
+  secondary block.
+- Gateway endpoints count per Region; interface and Gateway Load Balancer
+  endpoints share the per-VPC quota.
+- Elastic IPs count addresses from Amazon's pool; BYOIP addresses do not.
+- The vCPU quotas sum the default vCPUs of `pending` and `running` instances
+  of the quota's families (`DescribeInstanceTypes` reports the same vCPU
+  counts), leaving out instances on a Dedicated Host. A launch takes as many
+  instances as fit, down to `MinCount`, and is refused when not even
+  `MinCount` fits. The Spot quota adds open and active Spot requests.
+
+A quota scoped to a resource (per VPC, per zone, per route table, per network
+ACL) reports its busiest resource as its `usage` and in utilization reports.
 
 `ValidateSecurityGroupQuotasForInterface` exists to ask whether groups fit the
 quotas, so it always answers against the applied values, enforced or not.
@@ -211,7 +262,19 @@ AWS limits.
 
 ## Known limitations
 
-- Only the two security-group quotas are enforceable. Other catalog quotas are
-  reported and can be raised or lowered, but fakecloud does not refuse
-  requests that go past them.
+- Only the EC2 and VPC quotas listed under
+  [Enforceable quotas](#enforceable-quotas) are enforceable. Other catalog
+  quotas are reported and can be raised or lowered, but fakecloud does not
+  refuse requests that go past them. Among the EC2 and VPC quotas, egress-only
+  internet gateways per Region and transit gateways per account are counted
+  but not enforced, as AWS documents no error code for them, and IPv6 CIDR
+  blocks per VPC is not enforced because fakecloud keeps one IPv6 block per
+  VPC.
+- `RunInstances` does not create a network interface record for an instance's
+  primary interface, so only the secondary interfaces it creates count toward
+  network interfaces. Interfaces other services place in a VPC (an EFS mount
+  target's, for example) count toward the quota but those services do not
+  refuse a create past it.
+- An instance type fakecloud has no vCPU data for counts as 0 vCPUs, and the
+  Trn, DL, HPC and Mac families have quotas outside the catalog.
 - The catalog covers the services above, not every AWS service.

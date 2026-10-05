@@ -3,6 +3,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     filter_value_matches, gen_id, indexed_list, parse_filters, require, validate_enum,
@@ -184,9 +185,17 @@ pub(crate) fn create_route_table(
         associations: Vec::new(),
     };
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::ROUTE_TABLES_PER_VPC);
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        rq::check(
+            limit,
+            rq::route_tables_in_vpc(state, &rt.vpc_id),
+            1,
+            "RouteTableLimitExceeded",
+            |_| "The maximum number of route tables has been reached.".to_string(),
+        )?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -290,10 +299,12 @@ fn route_mutate(
     replace: bool,
 ) -> Result<AwsResponse, AwsServiceError> {
     let rt_id = require(&req.query_params, "RouteTableId")?;
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::ROUTES_PER_ROUTE_TABLE);
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if let Some(rt) = state.route_tables.get_mut(&rt_id) {
+        if let Some(current) = state.route_tables.get(&rt_id) {
+            let mut rt = current.clone();
             let route = parse_route(&req.query_params);
             if replace {
                 if let Some(existing) = rt
@@ -308,6 +319,12 @@ fn route_mutate(
             } else {
                 rt.routes.push(route);
             }
+            if limit.is_some() {
+                let before = rq::route_counts(current, &state.managed_prefix_lists, &req.region);
+                let after = rq::route_counts(&rt, &state.managed_prefix_lists, &req.region);
+                rq::check_routes(limit, before, after)?;
+            }
+            state.route_tables.insert(rt_id.clone(), rt);
         }
     }
     Ok(Ec2Service::respond(
@@ -459,9 +476,21 @@ pub(crate) fn create_internet_gateway(
         attachments: Vec::new(),
     };
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(
+        &req.account_id,
+        &req.region,
+        rq::INTERNET_GATEWAYS_PER_REGION,
+    );
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        rq::check(
+            limit,
+            rq::internet_gateways(state),
+            1,
+            "InternetGatewayLimitExceeded",
+            |_| "The maximum number of internet gateways has been reached.".to_string(),
+        )?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -664,9 +693,18 @@ pub(crate) fn create_nat_gateway(
         .get("SubnetId")
         .cloned()
         .unwrap_or_default();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::NAT_GATEWAYS_PER_AZ);
     let (nat, tags) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        // The quota is per Availability Zone: the zone of the gateway's
+        // subnet. A subnet fakecloud does not know places it in no zone.
+        if let Some(az) = rq::subnet_az(state, &subnet_id) {
+            let in_az = rq::nat_gateways_by_az(state).get(az).copied().unwrap_or(0);
+            rq::check(limit, in_az, 1, "NatGatewayLimitExceeded", |limit| {
+                format!("Performing this operation would exceed the limit of {limit} NAT gateways")
+            })?;
+        }
         // Derive the VPC from the subnet so DescribeNatGateways renders <vpcId>.
         let vpc_id = state
             .subnets

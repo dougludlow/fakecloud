@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     gen_id, indexed_list, instance_limit_exceeded, invalid_parameter_value, missing_parameter,
@@ -290,6 +291,11 @@ struct LaunchOpts {
     private_dns_hostname_type: Option<String>,
     enable_a_record: bool,
     enable_aaaa_record: bool,
+}
+
+/// `Placement.Tenancy` of a launch.
+fn launch_opts_tenancy(params: &HashMap<String, String>) -> Option<&str> {
+    params.get("Placement.Tenancy").map(String::as_str)
 }
 
 fn parse_launch_opts(params: &HashMap<String, String>) -> LaunchOpts {
@@ -735,15 +741,45 @@ pub(crate) fn launch_instances(
         ));
     }
 
-    let ids: Vec<String> = (0..count).map(|_| gen_id("i")).collect();
+    let mut ids: Vec<String> = (0..count).map(|_| gen_id("i")).collect();
     // EBS volumes the block-device mappings create for each instance, with
     // their encryption resolved (KMS) before the EC2 lock is taken.
     let launch_volumes =
         super::volume::launch_volumes(svc, account_id, region, params, "BlockDeviceMapping");
+    // The quotas a launch counts toward, resolved before the EC2 lock: the
+    // vCPU quota of the instance type's family (Spot or On-Demand), and the
+    // network interfaces it creates.
+    let vcpu_quota = rq::vcpu_quota(&instance_type, instance_lifecycle.is_some())
+        .filter(|_| launch_opts_tenancy(params) != Some("host"));
+    let vcpu_limit = vcpu_quota.and_then(|q| svc.enforced_count_quota(account_id, region, q));
+    let eni_limit = svc.enforced_count_quota(account_id, region, rq::NETWORK_INTERFACES_PER_REGION);
     let mut rendered = Vec::new();
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(account_id);
+        // Within the quotas, launch as many instances as fit, down to
+        // MinCount; when not even MinCount fits, launch none.
+        let instance_vcpus = rq::vcpus_of(&instance_type);
+        let instance_enis = secondary_nis.iter().filter(|n| n.eni_id.is_none()).count();
+        let vcpus_used = vcpu_quota.map_or(0, |q| rq::instance_vcpus(state, q, &[]));
+        let enis_used = rq::network_interfaces_by_az(state)
+            .get(az.as_str())
+            .copied()
+            .unwrap_or(0);
+        let fits = |limit: Option<usize>, used: usize, each: usize| match limit {
+            Some(limit) if each > 0 => limit.saturating_sub(used) / each,
+            _ => usize::MAX,
+        };
+        let n = ids
+            .len()
+            .min(fits(vcpu_limit, vcpus_used, instance_vcpus))
+            .min(fits(eni_limit, enis_used, instance_enis))
+            .max(min);
+        if let Some(q) = vcpu_quota {
+            rq::check_vcpus(state, q, vcpu_limit, n * instance_vcpus, &[])?;
+        }
+        super::eni::check_interface_count(state, &az, n * instance_enis, eni_limit)?;
+        ids.truncate(n);
         // Checked under the write lock the instances are inserted under, so
         // two concurrent launches cannot both claim one address.
         // Re-validated under the write lock the attachment happens under, so
@@ -1694,6 +1730,31 @@ async fn change_state(
         }
     }
 
+    // A start brings stopped instances back into their vCPU quotas: resolve
+    // the enforced limit of each quota they count toward before the lock.
+    let vcpu_limits: Vec<(rq::CountQuota, Option<usize>)> = if new_code == 16 {
+        let mut quotas: Vec<rq::CountQuota> = {
+            let accounts = svc.state.read();
+            accounts
+                .get(&req.account_id)
+                .map(|state| {
+                    ids.iter()
+                        .filter_map(|id| state.instances.get(id))
+                        .filter_map(|i| starting_vcpus(i).map(|(q, _)| q))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        quotas.sort_by_key(|q| q.code);
+        quotas.dedup();
+        quotas
+            .into_iter()
+            .map(|q| (q, svc.enforced_count_quota(&req.account_id, &req.region, q)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // For StartInstances, AWS returns the instances in `pending` (not yet
     // `running`); the container comes up in the background. Stop/Terminate
     // apply their target state immediately (and AWS reports stopping/
@@ -1722,6 +1783,30 @@ async fn change_state(
                 .get(id)
                 .ok_or_else(|| crate::service_helpers::instance_not_found(id))?;
             check_transition(inst, id, new_code)?;
+        }
+        // The instances this start brings up must fit their vCPU quotas
+        // together with every instance already running.
+        for (quota, limit) in &vcpu_limits {
+            let mut starting: Vec<String> = ids
+                .iter()
+                .filter(|id| {
+                    state
+                        .instances
+                        .get(*id)
+                        .and_then(starting_vcpus)
+                        .is_some_and(|(q, _)| q == *quota)
+                })
+                .cloned()
+                .collect();
+            starting.sort();
+            starting.dedup();
+            let adding = starting
+                .iter()
+                .filter_map(|id| state.instances.get(id))
+                .filter_map(starting_vcpus)
+                .map(|(_, v)| v)
+                .sum();
+            rq::check_vcpus(state, *quota, *limit, adding, &starting)?;
         }
         for id in &ids {
             let (prev_code, prev_name) = state
@@ -1881,6 +1966,20 @@ async fn change_state(
         &req.request_id,
         &ec2_list("instancesSet", &changes),
     ))
+}
+
+/// The vCPU quota a start of `inst` counts toward and the vCPUs it adds,
+/// `None` when the instance already occupies its vCPUs (pending or running),
+/// sits on a Dedicated Host, or its family has no modeled quota.
+fn starting_vcpus(inst: &Instance) -> Option<(rq::CountQuota, usize)> {
+    if matches!(inst.state_code, 0 | 16) || inst.placement_tenancy.as_deref() == Some("host") {
+        return None;
+    }
+    let quota = rq::vcpu_quota(
+        &inst.instance_type,
+        inst.instance_lifecycle.as_deref() == Some("spot"),
+    )?;
+    Some((quota, rq::vcpus_of(&inst.instance_type)))
 }
 
 pub(crate) async fn start_instances(
@@ -2351,10 +2450,11 @@ fn instance_type_items(req: &AwsRequest) -> Vec<String> {
                 "{}<currentGeneration>true</currentGeneration><bareMetal>false</bareMetal>\
                  <hypervisor>nitro</hypervisor><instanceStorageSupported>false</instanceStorageSupported>\
                  <processorInfo><supportedArchitectures><item>x86_64</item></supportedArchitectures></processorInfo>\
-                 <vCpuInfo><defaultVCpus>2</defaultVCpus></vCpuInfo>\
+                 <vCpuInfo><defaultVCpus>{}</defaultVCpus></vCpuInfo>\
                  <memoryInfo><sizeInMiB>1024</sizeInMiB></memoryInfo>\
                  <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>",
                 ec2_elem("instanceType", t),
+                crate::instance_types::default_vcpus(t).unwrap_or(2),
             )
         })
         .collect()

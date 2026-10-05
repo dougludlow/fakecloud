@@ -3,6 +3,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     filter_value_matches, gen_id, indexed_list, parse_filters, require, validate_enum,
@@ -96,9 +97,17 @@ pub(crate) fn create_network_acl(
         associations: Vec::new(),
     };
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::NETWORK_ACLS_PER_VPC);
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        rq::check(
+            limit,
+            rq::network_acls_in_vpc(state, &acl.vpc_id),
+            1,
+            "NetworkAclLimitExceeded",
+            |_| "The maximum number of network ACLs has been reached.".to_string(),
+        )?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -261,6 +270,7 @@ pub(crate) fn create_network_acl_entry(
     require(&req.query_params, "RuleAction")?;
     require(&req.query_params, "Egress")?;
     validate_enum(&req.query_params, "RuleAction", &["allow", "deny"])?;
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::RULES_PER_NETWORK_ACL);
     {
         let mut accounts = svc.state.write();
         if let Some(acl) = accounts
@@ -268,7 +278,9 @@ pub(crate) fn create_network_acl_entry(
             .network_acls
             .get_mut(&id)
         {
-            acl.entries.push(parse_entry(req));
+            let entry = parse_entry(req);
+            check_nacl_rules(acl, entry.egress, limit)?;
+            acl.entries.push(entry);
         }
     }
     svc.spawn_firewall_reconcile();
@@ -291,6 +303,7 @@ pub(crate) fn replace_network_acl_entry(
     require(&req.query_params, "RuleAction")?;
     let egress = require(&req.query_params, "Egress")? == "true";
     validate_enum(&req.query_params, "RuleAction", &["allow", "deny"])?;
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::RULES_PER_NETWORK_ACL);
     {
         let mut accounts = svc.state.write();
         if let Some(acl) = accounts
@@ -306,6 +319,8 @@ pub(crate) fn replace_network_acl_entry(
             {
                 *e = new;
             } else {
+                // No rule to replace: the entry is added, and counts.
+                check_nacl_rules(acl, new.egress, limit)?;
                 acl.entries.push(new);
             }
         }
@@ -316,6 +331,23 @@ pub(crate) fn replace_network_acl_entry(
         &req.request_id,
         &ec2_return(true),
     ))
+}
+
+/// `NetworkAclEntryLimitExceeded` once the direction an entry goes in holds
+/// as many rules as "Rules per network ACL" allows. Inbound and outbound
+/// rules are limited separately; the default deny rule does not count.
+fn check_nacl_rules(
+    acl: &NetworkAcl,
+    egress: bool,
+    limit: Option<usize>,
+) -> Result<(), AwsServiceError> {
+    rq::check(
+        limit,
+        rq::nacl_rules(acl, egress),
+        1,
+        "NetworkAclEntryLimitExceeded",
+        |_| "The maximum number of network ACL entries has been reached.".to_string(),
+    )
 }
 
 pub(crate) fn delete_network_acl_entry(
@@ -450,9 +482,25 @@ pub(crate) fn create_vpc_peering_connection(
         accepter_allow_dns: false,
     };
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(
+        &req.account_id,
+        &req.region,
+        rq::OUTSTANDING_PEERING_REQUESTS,
+    );
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        rq::check(
+            limit,
+            rq::outstanding_peering_requests(state),
+            1,
+            "OutstandingVpcPeeringConnectionLimitExceeded",
+            |_| {
+                "The maximum number of outstanding VPC peering connection requests has been \
+                 reached."
+                    .to_string()
+            },
+        )?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -521,9 +569,30 @@ pub(crate) fn accept_vpc_peering_connection(
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "VpcPeeringConnectionId")?;
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::ACTIVE_PEERINGS_PER_VPC);
     let (p, tags) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        // Accepting makes the connection active for both of its VPCs; each
+        // must have room under "Active VPC peering connections per VPC".
+        if let Some(p) = state.vpc_peerings.get(&id).filter(|p| p.status != "active") {
+            let mut vpcs = vec![p.requester_vpc_id.as_str(), p.accepter_vpc_id.as_str()];
+            vpcs.dedup();
+            for vpc_id in vpcs {
+                rq::check(
+                    limit,
+                    rq::active_peerings_of(state, vpc_id),
+                    1,
+                    "ActiveVpcPeeringConnectionPerVpcLimitExceeded",
+                    |_| {
+                        format!(
+                            "The maximum number of active VPC peering connections for VPC \
+                             '{vpc_id}' has been reached."
+                        )
+                    },
+                )?;
+            }
+        }
         if let Some(p) = state.vpc_peerings.get_mut(&id) {
             p.status = "active".to_string();
         }
