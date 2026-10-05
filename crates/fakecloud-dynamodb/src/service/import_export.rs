@@ -34,10 +34,12 @@ use crate::state::{
 
 use super::import_formats::{self, CsvOptions, ParsedRow};
 use super::{
-    find_table_by_arn, parse_attribute_definitions, parse_gsi, parse_key_schema,
-    parse_on_demand_throughput, parse_provisioned_throughput, require_str, save_dynamodb_snapshot,
+    evaluate_filter_expression, evaluate_key_condition, find_table_by_arn,
+    parse_attribute_definitions, parse_expression_attribute_names,
+    parse_expression_attribute_values, parse_gsi, parse_key_schema, parse_on_demand_throughput,
+    parse_provisioned_throughput, project_item, require_str, save_dynamodb_snapshot,
     validate_index_keys_in_item, validate_item_attribute_values, validate_key_in_item,
-    DynamoDbService,
+    validate_request_expressions, DynamoDbService, ExprOp,
 };
 
 type Item = HashMap<String, Value>;
@@ -414,6 +416,9 @@ enum ExportContent {
         to: DateTime<Utc>,
         view_type: String,
         changes: Vec<ItemChange>,
+        /// The export's `FilterSpecification`, applied to each item's final
+        /// state once its changes are compacted.
+        filter: Option<ExportFilter>,
     },
     /// The request cannot be served from the table's history; the job fails
     /// with this error code and message.
@@ -473,7 +478,11 @@ fn items_as_of(table: &DynamoTable, t: DateTime<Utc>) -> Vec<Item> {
 /// item: the image before the window's first change and after its last, with
 /// the last write's timestamp. An item created and deleted inside the window
 /// left no trace and yields no record.
-fn incremental_records(changes: &[ItemChange], view_type: &str) -> Vec<Value> {
+fn incremental_records(
+    changes: &[ItemChange],
+    view_type: &str,
+    filter: Option<&ExportFilter>,
+) -> Vec<Value> {
     struct Acc<'a> {
         keys: &'a Item,
         old: Option<&'a Item>,
@@ -507,7 +516,13 @@ fn incremental_records(changes: &[ItemChange], view_type: &str) -> Vec<Value> {
         .iter()
         .filter_map(|k| by_key.get(k))
         .filter(|acc| acc.old.is_some() || acc.new.is_some())
+        // A filtered export keeps an item when its final state (the new image,
+        // or the old one for a deleted item) matches the specification.
+        .filter(|acc| {
+            filter.is_none_or(|f| acc.new.or(acc.old).is_some_and(|item| f.matches(item)))
+        })
         .map(|acc| {
+            let image = |i: &Item| filter.map_or_else(|| i.clone(), |f| f.project(i));
             let mut rec = json!({
                 "Metadata": {
                     "WriteTimestampMicros": { "N": acc.last.timestamp_micros().to_string() }
@@ -516,11 +531,11 @@ fn incremental_records(changes: &[ItemChange], view_type: &str) -> Vec<Value> {
             });
             if view_type == "NEW_AND_OLD_IMAGES" {
                 if let Some(old) = acc.old {
-                    rec["OldImage"] = json!(old);
+                    rec["OldImage"] = json!(image(old));
                 }
             }
             if let Some(new) = acc.new {
-                rec["NewImage"] = json!(new);
+                rec["NewImage"] = json!(image(new));
             }
             rec
         })
@@ -594,9 +609,12 @@ fn run_export(ctx: &JobContext, job: &ExportJob) {
             items.len() as i64
         }
         ExportContent::Incremental {
-            changes, view_type, ..
+            changes,
+            view_type,
+            filter,
+            ..
         } => {
-            let records = incremental_records(changes, view_type);
+            let records = incremental_records(changes, view_type, filter.as_ref());
             for rec in &records {
                 data.push_str(&if ion {
                     import_formats::ion_record_line(rec)
@@ -768,6 +786,51 @@ fn import_job(
     }
 }
 
+/// A resolved export `FilterSpecification`. `KeyConditionExpression` and
+/// `FilterExpression` select the exported items with Query semantics;
+/// `ProjectionExpression` picks the attributes written for each.
+struct ExportFilter {
+    /// The specification as sent; `project_item` reads the projection and
+    /// its `ExpressionAttributeNames` from it.
+    spec: Value,
+    names: HashMap<String, String>,
+    values: HashMap<String, Value>,
+    key_condition: Option<String>,
+    filter: Option<String>,
+}
+
+impl ExportFilter {
+    fn from_spec(spec: &Value) -> Self {
+        let expr = |k: &str| {
+            spec.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            names: parse_expression_attribute_names(spec),
+            values: parse_expression_attribute_values(spec),
+            key_condition: expr("KeyConditionExpression"),
+            filter: expr("FilterExpression"),
+            spec: spec.clone(),
+        }
+    }
+
+    fn matches(&self, item: &Item) -> bool {
+        self.key_condition
+            .as_deref()
+            .is_none_or(|k| evaluate_key_condition(k, item, &self.names, &self.values))
+            && self
+                .filter
+                .as_deref()
+                .is_none_or(|f| evaluate_filter_expression(f, item, &self.names, &self.values))
+    }
+
+    fn project(&self, item: &Item) -> Item {
+        project_item(item, &self.spec)
+    }
+}
+
 fn export_job(
     account_id: &str,
     region: &str,
@@ -814,6 +877,10 @@ fn export_content(exp: &ExportDescription, table: &DynamoTable) -> ExportContent
     // The same earliest restorable time DescribeContinuousBackups reports:
     // when recovery was enabled, or the start of the retained window.
     let enabled_at = crate::state::earliest_restorable(table, exp.start_time);
+    let filter = exp
+        .filter_specification
+        .as_ref()
+        .map(ExportFilter::from_spec);
     if exp.export_time > exp.start_time {
         return invalid(
             "InvalidExportTimeException",
@@ -833,8 +900,14 @@ fn export_content(exp: &ExportDescription, table: &DynamoTable) -> ExportContent
                     start.to_rfc3339()
                 ),
             ),
-            Some(_) => ExportContent::Full(items_as_of(table, exp.export_time)),
-            None => ExportContent::Full(table.items().iter().cloned().collect()),
+            Some(_) => ExportContent::Full(filter_items(
+                filter.as_ref(),
+                items_as_of(table, exp.export_time),
+            )),
+            None => ExportContent::Full(filter_items(
+                filter.as_ref(),
+                table.items().iter().cloned().collect(),
+            )),
         };
     }
     let Some(start) = enabled_at else {
@@ -887,6 +960,20 @@ fn export_content(exp: &ExportDescription, table: &DynamoTable) -> ExportContent
             .iter()
             .filter(|c| c.at >= from && c.at < to)
             .cloned()
+            .collect(),
+        filter,
+    }
+}
+
+/// Keep the items a `FilterSpecification` selects, projected to the
+/// attributes it names. No filter exports every item whole.
+fn filter_items(filter: Option<&ExportFilter>, items: Vec<Item>) -> Vec<Item> {
+    match filter {
+        None => items,
+        Some(f) => items
+            .iter()
+            .filter(|item| f.matches(item))
+            .map(|item| f.project(item))
             .collect(),
     }
 }
@@ -1022,6 +1109,9 @@ fn export_description_json(exp: &ExportDescription) -> Value {
     opt(&mut d, "ExportManifest", &exp.export_manifest);
     opt(&mut d, "FailureCode", &exp.failure_code);
     opt(&mut d, "FailureMessage", &exp.failure_message);
+    if let Some(f) = &exp.filter_specification {
+        d["FilterSpecification"] = f.clone();
+    }
     if exp.export_type.as_deref() == Some("INCREMENTAL_EXPORT") {
         let mut spec = json!({});
         if let Some(t) = exp.export_from_time {
@@ -1179,6 +1269,16 @@ impl DynamoDbService {
             None
         };
 
+        // FilterSpecification takes Query's expression members; validate
+        // them the way Query does before the job is recorded.
+        let filter_specification = match body.get("FilterSpecification") {
+            Some(spec) if spec.is_object() => {
+                validate_request_expressions(spec, ExprOp::Query)?;
+                Some(spec.clone())
+            }
+            _ => None,
+        };
+
         let export_id = job_id(now);
         // Snapshot the table's rows under a read guard; the job serializes and
         // writes them with no lock held.
@@ -1197,6 +1297,16 @@ impl DynamoDbService {
             // ExportTableToPointInTime declares TableNotFoundException; remap
             // the generic ResourceNotFoundException from find_table_by_arn.
             let table = find_table_by_arn(&state.tables, &table_arn).map_err(|_| not_found())?;
+            // A key condition must test the table's partition key for equality.
+            if let Some(spec) = filter_specification.as_ref() {
+                if let Some(kce) = spec["KeyConditionExpression"].as_str() {
+                    super::queries::validate_partition_key_condition(
+                        kce,
+                        table.hash_key_name(),
+                        &parse_expression_attribute_names(spec),
+                    )?;
+                }
+            }
             let export = ExportDescription {
                 export_arn: format!("{}/export/{export_id}", table.arn),
                 export_status: "IN_PROGRESS".to_string(),
@@ -1226,6 +1336,7 @@ impl DynamoDbService {
                 export_from_time: incremental.as_ref().and_then(|i| i.0),
                 export_to_time: incremental.as_ref().and_then(|i| i.1),
                 export_view_type: incremental.as_ref().map(|i| i.2.clone()),
+                filter_specification,
             };
             (
                 export_job(&req.account_id, &req.region, &export, table),
@@ -2368,6 +2479,146 @@ mod tests {
                 "{from}..{to}"
             );
         }
+    }
+
+    fn export_items(s3: &SharedS3State, d: &Value) -> Vec<Value> {
+        let mut rows: Vec<Value> = export_lines(s3, d)
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["Item"].clone())
+            .collect();
+        rows.sort_by_key(|r| r["pk"]["S"].as_str().unwrap_or_default().to_string());
+        rows
+    }
+
+    #[test]
+    fn full_export_applies_filter_specification() {
+        let (svc, s3) = setup();
+        seed_table(&svc);
+        let spec = json!({
+            "FilterExpression": "#p IN (:a, :c)",
+            "ProjectionExpression": "#p",
+            "ExpressionAttributeNames": { "#p": "pk" },
+            "ExpressionAttributeValues": { ":a": {"S": "a"}, ":c": {"S": "c"} },
+        });
+        let arn = start_export(&svc, json!({ "FilterSpecification": spec }));
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["ExportStatus"], "COMPLETED", "{d}");
+        assert_eq!(d["FilterSpecification"], spec);
+        assert_eq!(d["ItemCount"], 2);
+        assert_eq!(
+            export_items(&s3, &d),
+            vec![json!({"pk": {"S": "a"}}), json!({"pk": {"S": "c"}})]
+        );
+
+        // A key condition selects one partition; the filter then sees only
+        // the non-key attributes of that partition's items.
+        let arn = start_export(
+            &svc,
+            json!({ "FilterSpecification": {
+                "KeyConditionExpression": "pk = :b",
+                "FilterExpression": "attribute_exists(v)",
+                "ExpressionAttributeValues": { ":b": {"S": "b"} },
+            } }),
+        );
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["ItemCount"], 1, "{d}");
+        assert_eq!(
+            export_items(&s3, &d),
+            vec![json!({"pk": {"S": "b"}, "v": {"SS": ["x", "y"]}})]
+        );
+
+        // No FilterSpecification: every item, and none rendered.
+        let arn = start_export(&svc, json!({}));
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["ItemCount"], 3);
+        assert!(d.get("FilterSpecification").is_none());
+    }
+
+    #[test]
+    fn export_filter_specification_is_validated_like_query() {
+        let (svc, _s3) = setup();
+        seed_table(&svc);
+        let start = |spec: Value| {
+            let body = json!({
+                "TableArn": crate::state::table_arn("us-east-1", ACCOUNT, "src-table"),
+                "S3Bucket": "src",
+                "FilterSpecification": spec,
+            });
+            match svc.export_table_to_point_in_time(&request("ExportTableToPointInTime", body)) {
+                Ok(_) => panic!("expected a validation error"),
+                Err(e) => (e.code().to_string(), e.message().to_string()),
+            }
+        };
+        let (code, msg) = start(json!({
+            "KeyConditionExpression": "v = :x",
+            "ExpressionAttributeValues": { ":x": {"N": "1"} },
+        }));
+        assert_eq!(code, "ValidationException");
+        assert_eq!(msg, "Query condition missed key schema element: pk");
+        let (code, msg) = start(json!({
+            "FilterExpression": "v = :x",
+            "ExpressionAttributeValues": { ":x": {"N": "1"}, ":unused": {"N": "2"} },
+        }));
+        assert_eq!(code, "ValidationException");
+        assert!(
+            msg.contains("unused in expressions: keys: {:unused}"),
+            "{msg}"
+        );
+        let (code, _) = start(json!({ "FilterExpression": "v = = :x" }));
+        assert_eq!(code, "ValidationException");
+        // A rejected request records no export.
+        assert!(svc
+            .state
+            .read()
+            .regional(ACCOUNT, "us-east-1")
+            .unwrap()
+            .exports
+            .is_empty());
+    }
+
+    #[test]
+    fn incremental_export_applies_filter_specification_to_final_state() {
+        let (svc, s3) = setup();
+        seed_history(&svc);
+        // a was modified (final v = 3) and b deleted inside the window; the
+        // filter keeps a by its new image, projected to v.
+        let arn = start_export(
+            &svc,
+            json!({ "ExportType": "INCREMENTAL_EXPORT",
+                    "IncrementalExportSpecification": {
+                        "ExportFromTime": secs_ago(60), "ExportToTime": secs_ago(5) },
+                    "FilterSpecification": {
+                        "FilterExpression": "v > :n",
+                        "ProjectionExpression": "v",
+                        "ExpressionAttributeValues": { ":n": {"N": "2"} } } }),
+        );
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["ExportStatus"], "COMPLETED", "{d}");
+        assert_eq!(d["ItemCount"], 1);
+        let records: Vec<Value> = export_lines(&s3, &d)
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["Keys"], json!({"pk": {"S": "a"}}));
+        assert_eq!(records[0]["NewImage"], json!({"v": {"N": "3"}}));
+        assert_eq!(records[0]["OldImage"], json!({"v": {"N": "1.5"}}));
+
+        // A deleted item is judged by its old image.
+        let arn = start_export(
+            &svc,
+            json!({ "ExportType": "INCREMENTAL_EXPORT",
+                    "IncrementalExportSpecification": {
+                        "ExportFromTime": secs_ago(60), "ExportToTime": secs_ago(5) },
+                    "FilterSpecification": {
+                        "KeyConditionExpression": "pk = :b",
+                        "ExpressionAttributeValues": { ":b": {"S": "b"} } } }),
+        );
+        let d = describe_export(&svc, &arn);
+        assert_eq!(d["ItemCount"], 1, "{d}");
+        let rec: Value = serde_json::from_str(&export_lines(&s3, &d)[0]).unwrap();
+        assert_eq!(rec["Keys"], json!({"pk": {"S": "b"}}));
+        assert!(rec.get("NewImage").is_none());
     }
 
     #[test]

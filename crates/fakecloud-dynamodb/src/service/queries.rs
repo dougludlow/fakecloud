@@ -881,7 +881,7 @@ fn validate_limit(body: &Value) -> Result<Option<usize>, AwsServiceError> {
 /// element: <pk>", and one that uses any non-`=` operator on the partition
 /// key with "Query key condition not supported" — rather than evaluating the
 /// expression as a generic filter over every partition.
-fn validate_partition_key_condition(
+pub(super) fn validate_partition_key_condition(
     key_condition: &str,
     partition_key: &str,
     expr_attr_names: &HashMap<String, String>,

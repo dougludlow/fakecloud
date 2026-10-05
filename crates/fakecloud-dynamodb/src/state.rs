@@ -858,6 +858,11 @@ pub struct ExportDescription {
     pub export_to_time: Option<DateTime<Utc>>,
     #[serde(default)]
     pub export_view_type: Option<String>,
+    /// `FilterSpecification` the export was requested with, stored as sent:
+    /// the key condition / filter select which items are written and the
+    /// projection which of their attributes.
+    #[serde(default)]
+    pub filter_specification: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
