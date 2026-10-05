@@ -20,7 +20,7 @@ submitted and round-trip verbatim on describe. The model's `@length` and
 free-form profile attributes 1-1024, `MaxResults` 1-100, `NextToken` 1-65535)
 are enforced with `ValidationException`.
 
-## Supported now (all 19 operations)
+## Supported now (all 22 operations)
 
 - **Users** — `CreateUser`, `DescribeUser`, `UpdateUser`, `DeleteUser`,
   `ListUsers`, `GetUserId`. `UserName` is unique per store (duplicate ->

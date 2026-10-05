@@ -5,7 +5,7 @@ weight = 48
 +++
 
 fakecloud implements **AWS Account Management** (`account`) as a restJson1
-control plane. **The complete 16-operation surface** ships — alternate contacts,
+control plane. **The complete 18-operation surface** ships — alternate contacts,
 primary contact information, account information, primary-email management, and
 Region opt-in control — backed by account-partitioned state that persists across
 restarts in persistent mode.
@@ -16,7 +16,7 @@ would against real AWS; absent `AccountId`, the operation targets the caller's
 own account. (The primary-email operations mark `AccountId` as required, matching
 the AWS Smithy model.)
 
-## Supported now (all 16 operations)
+## Supported now (all 18 operations)
 
 - **Alternate contacts** — `PutAlternateContact`, `GetAlternateContact`,
   `DeleteAlternateContact`. Each account exposes three independent contact slots
