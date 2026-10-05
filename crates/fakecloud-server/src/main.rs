@@ -4201,7 +4201,8 @@ async fn main() {
                                     fakecloud_glue::GLUE_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            if let Some(accounts) = snapshot.accounts {
+                            if let Some(mut accounts) = snapshot.accounts {
+                                accounts.upgrade_loaded();
                                 let account_count = accounts.accounts.len();
                                 *glue_state.write() = accounts;
                                 tracing::info!(

@@ -2866,6 +2866,53 @@ fn column_statistics_task_settings_upgrade_legacy_stored_request() {
 }
 
 #[test]
+fn column_statistics_task_settings_legacy_other_catalog_rekeyed_on_load() {
+    // The old layout keyed every catalog's settings `db\x1ftable`; a record
+    // naming another catalog must move to that catalog's key on load.
+    let mut accounts = crate::GlueAccounts::new();
+    {
+        let st = accounts.get_or_create("123456789012", "us-east-1");
+        st.column_stats_task_settings.insert(
+            "db\u{1f}other".to_string(),
+            json!({"DatabaseName": "db", "TableName": "other", "Role": "r",
+                   "CatalogID": "999999999999", "Schedule": "cron(0 2 * * ? *)"}),
+        );
+        st.column_stats_task_settings.insert(
+            "db\u{1f}own".to_string(),
+            json!({"DatabaseName": "db", "TableName": "own", "Role": "r",
+                   "CatalogID": "123456789012"}),
+        );
+    }
+    let bytes = serde_json::to_vec(&crate::GlueSnapshot {
+        schema_version: crate::GLUE_SNAPSHOT_SCHEMA_VERSION,
+        accounts: Some(accounts),
+    })
+    .unwrap();
+    let mut loaded = serde_json::from_slice::<crate::GlueSnapshot>(&bytes)
+        .unwrap()
+        .accounts
+        .unwrap();
+    loaded.upgrade_loaded();
+    let svc = GlueService::default();
+    *svc.state.write() = loaded;
+
+    let get = |body: Value| {
+        svc.get_column_statistics_task_settings(&req("GetColumnStatisticsTaskSettings", body))
+    };
+    let got = body_of(
+        get(json!({"DatabaseName": "db", "TableName": "other", "CatalogID": "999999999999"}))
+            .unwrap(),
+    )["ColumnStatisticsTaskSettings"]
+        .clone();
+    assert_eq!(got["CatalogID"], "999999999999");
+    assert_eq!(got["Role"], "r");
+    // No longer reachable as the account's own catalog.
+    assert!(get(json!({"DatabaseName": "db", "TableName": "other"})).is_err());
+    // A legacy record in the account's own catalog keeps its key.
+    assert!(get(json!({"DatabaseName": "db", "TableName": "own"})).is_ok());
+}
+
+#[test]
 fn column_statistics_task_runs_scoped_by_catalog() {
     let svc = GlueService::default();
     let start = |catalog: Option<&str>| {
