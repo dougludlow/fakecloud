@@ -1375,3 +1375,87 @@ async fn glue_create_time_tags_job_mode_and_catalog_input_round_trip() {
         .expect("get tags");
     assert!(tags.tags().map(|t| t.is_empty()).unwrap_or(true));
 }
+
+/// POST a Glue JSON request directly, for members the pinned SDK predates
+/// (Crawler CatalogId, column-statistics CatalogID).
+async fn glue_raw(server: &TestServer, action: &str, body: serde_json::Value) -> serde_json::Value {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/", server.endpoint()))
+        .header("Content-Type", "application/x-amz-json-1.1")
+        .header("X-Amz-Target", format!("AWSGlue.{action}"))
+        .header(
+            "Authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIAIOSFODNN7EXAMPLE/20260501/us-east-1/glue/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=deadbeef",
+        )
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    assert!(status.is_success(), "{action}: {status} {json}");
+    json
+}
+
+#[tokio::test]
+async fn glue_crawler_and_column_statistics_catalog_ids() {
+    let server = TestServer::start().await;
+    let glue = server.glue_client().await;
+
+    glue_raw(
+        &server,
+        "CreateCrawler",
+        serde_json::json!({ "Name": "c", "Role": "arn:aws:iam::123456789012:role/glue",
+            "CatalogId": "111122223333",
+            "Targets": {"S3Targets": [{"Path": "s3://bucket/data"}]} }),
+    )
+    .await;
+    let got = glue_raw(&server, "GetCrawler", serde_json::json!({ "Name": "c" })).await;
+    assert_eq!(got["Crawler"]["CatalogId"], "111122223333");
+    // The SDK still reads the rest of the crawler.
+    let crawler = glue.get_crawler().name("c").send().await.unwrap();
+    assert_eq!(crawler.crawler().unwrap().name(), Some("c"));
+
+    // Column statistics task settings live per catalog.
+    for (catalog, role) in [("123456789012", "own"), ("999988887777", "other")] {
+        glue_raw(
+            &server,
+            "CreateColumnStatisticsTaskSettings",
+            serde_json::json!({ "DatabaseName": "db", "TableName": "t", "CatalogID": catalog,
+                "Role": role, "Schedule": "cron(0 1 * * ? *)", "SampleSize": 20.0 }),
+        )
+        .await;
+    }
+    glue_raw(
+        &server,
+        "StopColumnStatisticsTaskRunSchedule",
+        serde_json::json!({ "DatabaseName": "db", "TableName": "t", "CatalogID": "999988887777" }),
+    )
+    .await;
+    let own = glue
+        .get_column_statistics_task_settings()
+        .database_name("db")
+        .table_name("t")
+        .send()
+        .await
+        .unwrap();
+    let own = own.column_statistics_task_settings().unwrap();
+    assert_eq!(own.role(), Some("own"));
+    assert_eq!(own.sample_size(), 20.0);
+    assert_eq!(
+        own.schedule().unwrap().state(),
+        Some(&aws_sdk_glue::types::ScheduleState::Scheduled)
+    );
+    let other = glue_raw(
+        &server,
+        "GetColumnStatisticsTaskSettings",
+        serde_json::json!({ "DatabaseName": "db", "TableName": "t", "CatalogID": "999988887777" }),
+    )
+    .await;
+    let other = &other["ColumnStatisticsTaskSettings"];
+    assert_eq!(other["CatalogID"], "999988887777");
+    assert_eq!(other["Role"], "other");
+    assert_eq!(other["Schedule"]["State"], "NOT_SCHEDULED");
+}
