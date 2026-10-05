@@ -7,6 +7,7 @@ use fakecloud_aws::ec2query::{ec2_bool, ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::quota::{check_group_count, rules_limit_exceeded, GroupHolder, RuleWeights};
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     ec2_arn, filter_value_matches, gen_id, indexed_list, invalid_parameter_value,
@@ -393,9 +394,18 @@ pub(crate) fn create_security_group(
     };
     let owner = req.account_id.clone();
     let region = req.region.clone();
+    let limit =
+        svc.enforced_count_quota(&req.account_id, &req.region, rq::SECURITY_GROUPS_PER_REGION);
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        rq::check(
+            limit,
+            rq::security_groups(state),
+            1,
+            "SecurityGroupLimitExceeded",
+            |_| "The maximum number of security groups has been reached.".to_string(),
+        )?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,

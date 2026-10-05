@@ -866,6 +866,9 @@ pub struct SpotRequest {
     pub state: String,
     pub request_type: String,
     pub spot_price: String,
+    /// `LaunchSpecification.InstanceType`, which the Spot vCPU quota counts.
+    #[serde(default)]
+    pub instance_type: Option<String>,
 }
 
 /// A Spot fleet request.

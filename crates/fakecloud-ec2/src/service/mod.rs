@@ -24,6 +24,7 @@ mod nacl;
 mod ni;
 pub mod quota;
 mod reserved;
+mod resource_quotas;
 mod rest;
 mod routing;
 mod sg;
