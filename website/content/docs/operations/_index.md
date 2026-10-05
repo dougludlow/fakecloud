@@ -4186,7 +4186,9 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `PutAccountName`
 - `PutAlternateContact`
 - `PutContactInformation`
+- `SendPhoneNumberVerification`
 - `StartPrimaryEmailUpdate`
+- `VerifyPhoneNumber`
 
 ## [IAM Identity Center Identity Store](@/docs/services/identitystore.md)
 
@@ -4198,6 +4200,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `DeleteUser`
 - `DescribeGroup`
 - `DescribeGroupMembership`
+- `DescribeIdentityStore`
 - `DescribeUser`
 - `GetGroupId`
 - `GetGroupMembershipId`
@@ -4206,8 +4209,10 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `ListGroupMemberships`
 - `ListGroupMembershipsForMember`
 - `ListGroups`
+- `ListIdentityStores`
 - `ListUsers`
 - `UpdateGroup`
+- `UpdateIdentityStore`
 - `UpdateUser`
 
 ## [IAM Identity Center SSO Admin](@/docs/services/ssoadmin.md)
@@ -7360,6 +7365,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `DeleteCapacityManagerDataExport`
 - `DeleteCarrierGateway`
 - `DeleteClientVpnEndpoint`
+- `DeleteClientVpnEndpointAuthorizationPolicy`
 - `DeleteClientVpnRoute`
 - `DeleteCoipCidr`
 - `DeleteCoipPool`
@@ -7742,6 +7748,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `GetCapacityManagerMetricDimensions`
 - `GetCapacityManagerMonitoredTagKeys`
 - `GetCapacityReservationUsage`
+- `GetClientVpnEndpointAuthorizationPolicy`
 - `GetCoipPoolUsage`
 - `GetConsoleOutput`
 - `GetConsoleScreenshot`
@@ -7826,6 +7833,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `ModifyCapacityReservation`
 - `ModifyCapacityReservationFleet`
 - `ModifyClientVpnEndpoint`
+- `ModifyClientVpnEndpointAuthorizationPolicy`
 - `ModifyDefaultCreditSpecification`
 - `ModifyEbsDefaultKmsKeyId`
 - `ModifyFleet`

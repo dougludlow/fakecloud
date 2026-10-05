@@ -83,6 +83,7 @@ fn resolve_service_key_handles_short_and_long() {
             availability_zone_rebalancing: None,
             volume_configurations: vec![],
             service_connect_configuration: None,
+            vpc_lattice_configurations: vec![],
         },
     );
     // Long-form: cluster/service.
@@ -331,6 +332,7 @@ mod scheduler_reconcile {
             availability_zone_rebalancing: None,
             volume_configurations: vec![],
             service_connect_configuration: None,
+            vpc_lattice_configurations: vec![],
         }
     }
 

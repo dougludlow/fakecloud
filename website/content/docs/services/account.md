@@ -1,12 +1,12 @@
 +++
 title = "Account Management"
-description = "AWS Account Management (account) on fakecloud: alternate contacts, primary contact information, account information, primary-email OTP flow, and Region opt-in control. restJson1."
+description = "AWS Account Management (account) on fakecloud: alternate contacts, primary contact information and phone-number verification, account information, primary-email OTP flow, and Region opt-in control. restJson1."
 weight = 48
 +++
 
 fakecloud implements **AWS Account Management** (`account`) as a restJson1
-control plane. **The complete 16-operation surface** ships — alternate contacts,
-primary contact information, account information, primary-email management, and
+control plane. **The complete 18-operation surface** ships — alternate contacts,
+primary contact information and its phone-number verification, account information, primary-email management, and
 Region opt-in control — backed by account-partitioned state that persists across
 restarts in persistent mode.
 
@@ -16,7 +16,7 @@ would against real AWS; absent `AccountId`, the operation targets the caller's
 own account. (The primary-email operations mark `AccountId` as required, matching
 the AWS Smithy model.)
 
-## Supported now (all 16 operations)
+## Supported now (all 18 operations)
 
 - **Alternate contacts** — `PutAlternateContact`, `GetAlternateContact`,
   `DeleteAlternateContact`. Each account exposes three independent contact slots
@@ -28,7 +28,19 @@ the AWS Smithy model.)
   `GetContactInformation`. The full `ContactInformation` object round-trips
   (`FullName`, `AddressLine1`-`3`, `City`, `CountryCode`, `PhoneNumber`,
   `PostalCode`, `CompanyName`, `DistrictOrCounty`, `StateOrRegion`, `WebsiteUrl`);
-  the model's required members are validated on write.
+  the model's required members are validated on write. `GetContactInformation`
+  also returns `VerificationStatus` for the contact phone number (`UNVERIFIED`,
+  `PENDING`, or `VERIFIED`).
+- **Phone-number verification**: `SendPhoneNumberVerification`,
+  `VerifyPhoneNumber`. Sending issues a one-time passcode for the current
+  contact phone number and returns `Status: PENDING`; verifying with the
+  passcode returns `Status: VERIFIED`. fakecloud sends no SMS, so the passcode
+  is always `000000` (the same fixed code the primary-email flow uses). A
+  malformed or wrong passcode returns `ValidationException`; verifying with
+  nothing pending, or sending/verifying an already-verified number, returns
+  `ConflictException`; with no contact information both return
+  `ResourceNotFoundException`. Changing the contact `PhoneNumber` with
+  `PutContactInformation` resets the status to `UNVERIFIED`.
 - **Account information** — `GetAccountInformation` (returns `AccountId`,
   `AccountName`, `AccountCreatedDate`, `AccountState`), `PutAccountName`
   (`AccountName` <= 50), and `GetGovCloudAccountInformation` (returns a
@@ -37,7 +49,7 @@ the AWS Smithy model.)
   `AcceptPrimaryEmailUpdate`, `GetPrimaryEmailUpdateStatus`. Starting an update
   records a pending change and returns `Status: PENDING`; accepting it with the
   matching one-time password commits the new address and returns
-  `Status: ACCEPTED`. A wrong OTP or email returns `ValidationException`.
+  `Status: ACCEPTED` (the one-time password is always `000000`). A wrong OTP or email returns `ValidationException`.
   `GetPrimaryEmailUpdateStatus` reports the in-flight status (`PENDING` while an
   update awaits acceptance, `ACCEPTED` once committed) and returns
   `ResourceNotFoundException` when no update has been started.
@@ -53,7 +65,7 @@ the AWS Smithy model.)
 
 ## Persistence
 
-All account data — contacts, contact information, account name, the pending and
+All account data — contacts, contact information and its phone verification, account name, the pending and
 committed primary email, and per-region opt overrides — is account-partitioned
 and written through to the persistence snapshot, so it survives a restart in
 persistent mode.

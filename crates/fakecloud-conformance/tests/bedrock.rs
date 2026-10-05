@@ -711,7 +711,7 @@ async fn bedrock_bidirectional_stream_conformance() {
 #[test_action(
     "bedrock",
     "StartAutomatedReasoningPolicyBuildWorkflow",
-    checksum = "217ecc35"
+    checksum = "c0fb6770"
 )]
 #[test_action(
     "bedrock",
@@ -736,7 +736,7 @@ async fn bedrock_bidirectional_stream_conformance() {
 #[test_action(
     "bedrock",
     "GetAutomatedReasoningPolicyBuildWorkflowResultAssets",
-    checksum = "51cd3df4"
+    checksum = "a454dc00"
 )]
 #[test_action(
     "bedrock",
@@ -751,12 +751,12 @@ async fn bedrock_bidirectional_stream_conformance() {
 #[test_action(
     "bedrock",
     "GetAutomatedReasoningPolicyAnnotations",
-    checksum = "9aca0a7a"
+    checksum = "884cd1cf"
 )]
 #[test_action(
     "bedrock",
     "UpdateAutomatedReasoningPolicyAnnotations",
-    checksum = "917c31c9"
+    checksum = "967e3ba3"
 )]
 #[test_action(
     "bedrock",
@@ -1018,10 +1018,10 @@ async fn bedrock_ar_test_result() {
 // Automated Reasoning Policies — Core
 // ---------------------------------------------------------------------------
 
-#[test_action("bedrock", "CreateAutomatedReasoningPolicy", checksum = "f393af04")]
+#[test_action("bedrock", "CreateAutomatedReasoningPolicy", checksum = "8d72588b")]
 #[test_action("bedrock", "GetAutomatedReasoningPolicy", checksum = "72f1e179")]
 #[test_action("bedrock", "ListAutomatedReasoningPolicies", checksum = "8f74b1fa")]
-#[test_action("bedrock", "UpdateAutomatedReasoningPolicy", checksum = "152863e5")]
+#[test_action("bedrock", "UpdateAutomatedReasoningPolicy", checksum = "87b54997")]
 #[test_action("bedrock", "DeleteAutomatedReasoningPolicy", checksum = "395df130")]
 #[test_action(
     "bedrock",
@@ -1031,7 +1031,7 @@ async fn bedrock_ar_test_result() {
 #[test_action(
     "bedrock",
     "ExportAutomatedReasoningPolicyVersion",
-    checksum = "07d318c1"
+    checksum = "e1c8e6ac"
 )]
 #[tokio::test]
 async fn bedrock_automated_reasoning_policy_lifecycle() {

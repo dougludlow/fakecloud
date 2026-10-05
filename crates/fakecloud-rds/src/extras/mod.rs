@@ -430,6 +430,33 @@ fn get_param(req: &AwsRequest, key: &str) -> Option<String> {
     body_params.get(key).cloned()
 }
 
+/// `CreateBlueGreenDeployment.TargetResourceConfigurations`: each entry's
+/// `SourceArn` (a blue DB instance / cluster ARN) and optional
+/// `TargetKmsKeyId`. Accepts the modeled `TargetResourceConfiguration.N`
+/// member name and the generic `member.N` spelling.
+fn target_resource_configurations(req: &AwsRequest) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for member in ["TargetResourceConfiguration", "member"] {
+        for i in 1.. {
+            let prefix = format!("TargetResourceConfigurations.{member}.{i}");
+            let Some(source) = get_param(req, &format!("{prefix}.SourceArn")) else {
+                break;
+            };
+            out.push((source, get_param(req, &format!("{prefix}.TargetKmsKeyId"))));
+        }
+    }
+    out
+}
+
+/// The green KMS key a `TargetResourceConfigurations` entry sets for the
+/// blue resource `blue_arn`, if any.
+fn target_kms_override(overrides: &[(String, Option<String>)], blue_arn: &str) -> Option<String> {
+    overrides
+        .iter()
+        .find(|(source, _)| source == blue_arn)
+        .and_then(|(_, key)| key.clone())
+}
+
 fn missing(name: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -2745,6 +2772,20 @@ impl RdsService {
                             "{source_id}-green-{}",
                             &uuid::Uuid::new_v4().simple().to_string()[..8]
                         ));
+                // Per-resource green overrides: each names a blue resource
+                // by ARN and the KMS key its green counterpart is encrypted
+                // with. Resolve every key to its ARN before taking the RDS
+                // lock (the KMS lookup has its own).
+                let target_kms_overrides: Vec<(String, Option<String>)> =
+                    target_resource_configurations(req)
+                        .into_iter()
+                        .map(|(source, key)| {
+                            let key = key.and_then(|k| {
+                                self.storage_kms_key(Some(&k), &aid, region)
+                            });
+                            (source, key)
+                        })
+                        .collect();
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
                 let source_arn_full = if source_arn.starts_with("arn:") {
@@ -2786,6 +2827,7 @@ impl RdsService {
                     if let Some(mut green_cluster) = source_cluster {
                         let green_arn =
                             rds_arn(region, &aid, "cluster", &target_id);
+                        let blue_cluster_arn = rds_arn(region, &aid, "cluster", &source_id);
                         if let Some(obj) = green_cluster.as_object_mut() {
                             obj.insert(
                                 "DBClusterIdentifier".to_string(),
@@ -2793,6 +2835,14 @@ impl RdsService {
                             );
                             obj.insert("DBClusterArn".to_string(), json!(green_arn.clone()));
                             obj.insert("Status".to_string(), json!("available"));
+                            // Aurora encryption applies at the cluster level.
+                            if let Some(key) = target_kms_override(
+                                &target_kms_overrides,
+                                &blue_cluster_arn,
+                            ) {
+                                obj.insert("StorageEncrypted".to_string(), json!(true));
+                                obj.insert("KmsKeyId".to_string(), json!(key));
+                            }
                         }
                         store(&mut state.extras, "clusters")
                             .insert(target_id.clone(), green_cluster);
@@ -2811,6 +2861,12 @@ impl RdsService {
                     // the blue one's adopted legacy data volume.
                     green.data_volume =
                         Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped);
+                    if let Some(key) =
+                        target_kms_override(&target_kms_overrides, &source.db_instance_arn)
+                    {
+                        green.storage_encrypted = true;
+                        green.kms_key_id = Some(key);
+                    }
                     state.instances.insert(target_id.clone(), green);
                     target_arn.clone()
                 } else {

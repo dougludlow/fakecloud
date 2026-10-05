@@ -124,6 +124,7 @@ impl ResourceProvisioner {
             user_attribute_update_settings: None,
             user_pool_add_ons: None,
             username_configuration: None,
+            acr_configuration: Default::default(),
         };
 
         let mut accounts = self.cognito_state.write();

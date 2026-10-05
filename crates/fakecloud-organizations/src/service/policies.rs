@@ -162,6 +162,11 @@ impl OrganizationsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let policy_type = required_str(&body, "PolicyType")?.to_string();
+        if !is_valid_policy_type(&policy_type) {
+            return Err(invalid_input(&format!(
+                "You specified an invalid value for the PolicyType parameter: {policy_type}"
+            )));
+        }
         let mut guard = self.state.write();
         let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.enable_policy_type(&policy_type);

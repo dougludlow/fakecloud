@@ -1104,7 +1104,16 @@ impl TransferService {
         let mut wf = Map::new();
         wf.insert("Arn".into(), json!(wf_arn));
         wf.insert("WorkflowId".into(), json!(workflow_id));
-        copy_present(b, &mut wf, &["Description", "Steps", "OnExceptionSteps"]);
+        copy_present(
+            b,
+            &mut wf,
+            &[
+                "Description",
+                "Steps",
+                "OnExceptionSteps",
+                "StructuredLogDestinations",
+            ],
+        );
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         data.workflows

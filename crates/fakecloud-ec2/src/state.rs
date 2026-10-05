@@ -1250,7 +1250,7 @@ pub struct IpamInternetRegistryAssociation {
     pub id: String,
     pub ipam_id: String,
     pub region: String,
-    /// `Rir`: ripe | apnic | arin | lacnic.
+    /// `Rir`: ripe | apnic | arin | lacnic | nicbr.
     pub rir: String,
     pub organization_handle: String,
     pub description: Option<String>,
@@ -1289,11 +1289,12 @@ pub struct IpamInternetRegistryAssociation {
 /// on every call rather than only on retries: these records are written far
 /// more often than they are read, and they are cloned with the association
 /// into every snapshot. They are therefore aged out and capped -- see
-/// `CLIENT_TOKEN_TTL_SECONDS` in the handler module.
+/// `CLIENT_TOKEN_TTL_SECONDS` in the `ipam_registry` handler module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpamIdempotencyRecord {
-    /// The delta the original call produced, or the association's own id for
-    /// Enable, which produces no delta.
+    /// The result the original call produced: for an IPAM registry
+    /// association, the delta (or the association's own id for Enable, which
+    /// produces no delta); for a Client VPN authorization policy, the status.
     pub result_id: String,
     /// A fingerprint of the parameters the original call carried. A token
     /// reused with different parameters is not a retry.
@@ -1529,6 +1530,52 @@ pub struct ClientVpnEndpoint {
     /// Ingress authorization rule target CIDRs.
     #[serde(default)]
     pub auth_rules: Vec<String>,
+    /// `ConnectionLogOptions` as last set by Create/Modify.
+    #[serde(default)]
+    pub connection_log: ClientVpnConnectionLog,
+    /// Device trust providers from `DevicePostureOptions`. Empty when device
+    /// posture evaluation is disabled.
+    #[serde(default)]
+    pub trust_providers: Vec<ClientVpnTrustProvider>,
+    /// The endpoint's authorization policy, if one was set with
+    /// `ModifyClientVpnEndpointAuthorizationPolicy`.
+    #[serde(default)]
+    pub authorization_policy: Option<ClientVpnAuthorizationPolicy>,
+}
+
+/// Client connection logging options of a Client VPN endpoint.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClientVpnConnectionLog {
+    pub enabled: bool,
+    pub log_group: Option<String>,
+    pub log_stream: Option<String>,
+    pub include_authorization_policy_context: Option<bool>,
+}
+
+/// A device trust provider configured on a Client VPN endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientVpnTrustProvider {
+    /// `crowdstrike` | `jamf` | `jumpcloud`.
+    pub trust_provider_type: Option<String>,
+    pub tenant_id: Option<String>,
+    pub public_signing_key_url: Option<String>,
+}
+
+/// The (single) Cedar authorization policy of a Client VPN endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClientVpnAuthorizationPolicy {
+    pub policy_document: String,
+    pub description: Option<String>,
+    /// `enabled` | `disabled`.
+    pub shadow_mode: String,
+    /// `ClientVpnAuthorizationPolicyStatus`.
+    pub status: String,
+    /// `ClientToken` -> the call it served (`result_id` holds the status that
+    /// call returned), so a retried Modify replays its original answer. Aged
+    /// out and capped like the IPAM registry's records, since SDKs mint a
+    /// fresh token on every call.
+    #[serde(default)]
+    pub client_tokens: BTreeMap<String, IpamIdempotencyRecord>,
 }
 
 /// A Transit Gateway peering attachment.

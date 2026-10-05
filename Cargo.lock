@@ -5338,6 +5338,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "fakecloud-cognito",
+ "fakecloud-conformance-checksum",
  "fakecloud-conformance-macros",
  "fakecloud-testkit",
  "flate2",
@@ -5354,13 +5355,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fakecloud-conformance-checksum"
+version = "0.48.1"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "fakecloud-conformance-macros"
 version = "0.48.1"
 dependencies = [
+ "fakecloud-conformance-checksum",
  "proc-macro2",
  "quote",
  "serde_json",
- "sha2 0.11.0",
  "syn 2.0.117",
 ]
 

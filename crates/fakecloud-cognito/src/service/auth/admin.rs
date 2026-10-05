@@ -144,6 +144,7 @@ impl CognitoService {
                         challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
                         challenge_results: vec![],
                         challenge_metadata: None,
+                        step_up: None,
                     },
                 );
                 return Ok(AdminAuthOutcome::NewPasswordRequired { session });
@@ -182,6 +183,7 @@ impl CognitoService {
                         challenge_name: challenge_name.to_string(),
                         challenge_results: vec![],
                         challenge_metadata: sms_code,
+                        step_up: None,
                     },
                 );
                 return Ok(AdminAuthOutcome::MfaChallenge {
@@ -257,6 +259,7 @@ impl CognitoService {
                 username: input.username.clone(),
                 client_id: input.client_id.clone(),
                 issued_at: Utc::now(),
+                auth_context: None,
             },
         );
 
@@ -268,6 +271,7 @@ impl CognitoService {
                 client_id: input.client_id.clone(),
                 issued_at: Utc::now(),
                 expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                auth_context: None,
             },
         );
 

@@ -44,6 +44,39 @@ impl GlueAccounts {
     pub fn get(&self, account_id: &str) -> Option<&GlueState> {
         self.accounts.get(account_id)
     }
+
+    /// Upgrade state loaded from a snapshot to the current storage layout.
+    pub fn upgrade_loaded(&mut self) {
+        for (account_id, state) in &mut self.accounts {
+            state.rekey_legacy_column_stats_task_settings(account_id);
+        }
+    }
+}
+
+impl GlueState {
+    /// Column-statistics task settings used to be keyed `db\x1ftable` whatever
+    /// their `CatalogID`; another catalog's settings now key
+    /// `catalog\x1fdb\x1ftable`. Move legacy records that name another catalog
+    /// to that key so lookups in that catalog find them (and lookups in the
+    /// account's own catalog no longer do). A record already at the new key
+    /// wins over a legacy one.
+    fn rekey_legacy_column_stats_task_settings(&mut self, account_id: &str) {
+        let legacy: Vec<(String, String)> = self
+            .column_stats_task_settings
+            .iter()
+            .filter(|(key, _)| key.matches('\u{1f}').count() == 1)
+            .filter_map(|(key, v)| {
+                let catalog = v.get("CatalogID").and_then(Value::as_str)?;
+                (!catalog.is_empty() && catalog != account_id)
+                    .then(|| (key.clone(), format!("{catalog}\u{1f}{key}")))
+            })
+            .collect();
+        for (old, new) in legacy {
+            if let Some(v) = self.column_stats_task_settings.remove(&old) {
+                self.column_stats_task_settings.entry(new).or_insert(v);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

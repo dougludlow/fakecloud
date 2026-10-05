@@ -1011,7 +1011,7 @@ async fn elasticache_test_failover() {
     );
 }
 
-#[test_action("elasticache", "CreateServerlessCache", checksum = "eab3b237")]
+#[test_action("elasticache", "CreateServerlessCache", checksum = "5e61acb6")]
 #[tokio::test]
 async fn elasticache_create_serverless_cache() {
     let server = TestServer::start().await;
@@ -1039,7 +1039,7 @@ async fn elasticache_create_serverless_cache() {
     assert_eq!(cache.status(), Some("creating"));
 }
 
-#[test_action("elasticache", "DescribeServerlessCaches", checksum = "ff0205f0")]
+#[test_action("elasticache", "DescribeServerlessCaches", checksum = "507b849d")]
 #[tokio::test]
 async fn elasticache_describe_serverless_caches() {
     let server = TestServer::start().await;
@@ -1065,7 +1065,7 @@ async fn elasticache_describe_serverless_caches() {
     assert_eq!(caches[0].serverless_cache_name(), Some("desc-serverless"));
 }
 
-#[test_action("elasticache", "ModifyServerlessCache", checksum = "88f0dbff")]
+#[test_action("elasticache", "ModifyServerlessCache", checksum = "45677420")]
 #[tokio::test]
 async fn elasticache_modify_serverless_cache() {
     let server = TestServer::start().await;
@@ -1095,7 +1095,7 @@ async fn elasticache_modify_serverless_cache() {
     assert_eq!(cache.snapshot_retention_limit(), Some(9));
 }
 
-#[test_action("elasticache", "DeleteServerlessCache", checksum = "28efbe0c")]
+#[test_action("elasticache", "DeleteServerlessCache", checksum = "5eadd252")]
 #[tokio::test]
 async fn elasticache_delete_serverless_cache() {
     let server = TestServer::start().await;

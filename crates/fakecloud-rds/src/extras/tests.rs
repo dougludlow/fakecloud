@@ -1836,6 +1836,63 @@ fn create_blue_green_deployment_clones_source_into_green() {
 }
 
 #[test]
+fn create_blue_green_deployment_applies_target_kms_key_to_green_instance() {
+    let svc = svc();
+    seed_blue_instance(&svc, "blue", "10.0.0.1", 5432);
+    let key = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
+    svc.handle_extra_action(&req(
+        "CreateBlueGreenDeployment",
+        &[
+            ("Source", "arn:aws:rds:us-east-1:000000000000:db:blue"),
+            ("TargetDBInstanceName", "green"),
+            (
+                "TargetResourceConfigurations.TargetResourceConfiguration.1.SourceArn",
+                "arn:aws:rds:us-east-1:000000000000:db:blue",
+            ),
+            (
+                "TargetResourceConfigurations.TargetResourceConfiguration.1.TargetKmsKeyId",
+                key,
+            ),
+        ],
+    ))
+    .expect("CreateBlueGreenDeployment");
+    let accounts = svc.state_handle().read();
+    let state = accounts.get("000000000000").unwrap();
+    let blue = state.instances.get("blue").unwrap();
+    assert!(!blue.storage_encrypted, "blue stays as it was");
+    let green = state.instances.get("green").unwrap();
+    assert!(green.storage_encrypted);
+    assert_eq!(green.kms_key_id.as_deref(), Some(key));
+}
+
+#[test]
+fn create_blue_green_deployment_ignores_target_config_for_other_resources() {
+    let svc = svc();
+    seed_blue_instance(&svc, "blue", "10.0.0.1", 5432);
+    svc.handle_extra_action(&req(
+        "CreateBlueGreenDeployment",
+        &[
+            ("Source", "arn:aws:rds:us-east-1:000000000000:db:blue"),
+            ("TargetDBInstanceName", "green"),
+            (
+                "TargetResourceConfigurations.TargetResourceConfiguration.1.SourceArn",
+                "arn:aws:rds:us-east-1:000000000000:db:someone-else",
+            ),
+            (
+                "TargetResourceConfigurations.TargetResourceConfiguration.1.TargetKmsKeyId",
+                "arn:aws:kms:us-east-1:000000000000:key/k",
+            ),
+        ],
+    ))
+    .expect("CreateBlueGreenDeployment");
+    let accounts = svc.state_handle().read();
+    let state = accounts.get("000000000000").unwrap();
+    let green = state.instances.get("green").unwrap();
+    assert!(!green.storage_encrypted);
+    assert_eq!(green.kms_key_id, None);
+}
+
+#[test]
 fn create_blue_green_deployment_with_cluster_source_provisions_green_cluster() {
     let svc = svc();
     // Create a source DBCluster (not a DBInstance).

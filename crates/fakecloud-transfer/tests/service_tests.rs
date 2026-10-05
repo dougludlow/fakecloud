@@ -865,3 +865,49 @@ async fn certificate_dates_populated_from_pem() {
         .clone();
     assert!(desc2.get("Serial").is_none());
 }
+
+#[tokio::test]
+async fn workflow_structured_log_destinations_round_trip() {
+    let s = svc();
+    let dest = "arn:aws:logs:us-east-1:000000000000:log-group:wf-logs:*";
+    let id = call(
+        &s,
+        "CreateWorkflow",
+        json!({
+            "Steps": [{"Type": "DELETE", "DeleteStepDetails": {"Name": "rm"}}],
+            "StructuredLogDestinations": [dest],
+        }),
+    )
+    .await["WorkflowId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wf = call(&s, "DescribeWorkflow", json!({ "WorkflowId": id })).await;
+    assert_eq!(wf["Workflow"]["StructuredLogDestinations"], json!([dest]));
+}
+
+#[tokio::test]
+async fn server_protocol_details_sftp_ports_round_trip() {
+    let s = svc();
+    let details = json!({
+        "PassiveIp": "AUTO",
+        "SftpPorts": [
+            {"SftpPort": 22, "CommunicationMode": "CLIENT_TALK_FIRST"},
+            {"SftpPort": 2222, "CommunicationMode": "SERVER_TALK_FIRST"}
+        ]
+    });
+    let id = call(
+        &s,
+        "CreateServer",
+        json!({"IdentityProviderType": "SERVICE_MANAGED", "ProtocolDetails": details}),
+    )
+    .await["ServerId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let server = call(&s, "DescribeServer", json!({ "ServerId": id })).await;
+    assert_eq!(
+        server["Server"]["ProtocolDetails"]["SftpPorts"],
+        details["SftpPorts"]
+    );
+}

@@ -115,6 +115,25 @@ pub struct ServiceRevision {
     pub task_definition_arn: String,
     pub launch_type: String,
     pub created_at: DateTime<Utc>,
+    /// Service configuration snapshotted when the revision was minted, so
+    /// DescribeServiceRevisions reports the revision's own configuration
+    /// rather than the service's current one.
+    #[serde(default)]
+    pub capacity_provider_strategy: Vec<Value>,
+    #[serde(default)]
+    pub platform_version: Option<String>,
+    #[serde(default)]
+    pub load_balancers: Vec<Value>,
+    #[serde(default)]
+    pub service_registries: Vec<Value>,
+    #[serde(default)]
+    pub network_configuration: Option<Value>,
+    #[serde(default)]
+    pub service_connect_configuration: Option<Value>,
+    #[serde(default)]
+    pub volume_configurations: Vec<Value>,
+    #[serde(default)]
+    pub vpc_lattice_configurations: Vec<Value>,
 }
 
 impl EcsState {
@@ -201,6 +220,14 @@ impl EcsState {
                 task_definition_arn: service.task_definition_arn.clone(),
                 launch_type: service.launch_type.clone(),
                 created_at: Utc::now(),
+                capacity_provider_strategy: service.capacity_provider_strategy.clone(),
+                platform_version: service.platform_version.clone(),
+                load_balancers: service.load_balancers.clone(),
+                service_registries: service.service_registries.clone(),
+                network_configuration: service.network_configuration.clone(),
+                service_connect_configuration: service.service_connect_configuration.clone(),
+                volume_configurations: service.volume_configurations.clone(),
+                vpc_lattice_configurations: service.vpc_lattice_configurations.clone(),
             },
         );
         arn
@@ -679,6 +706,12 @@ pub struct Service {
     /// round-trips on DescribeServices instead of silently dropping.
     #[serde(default)]
     pub service_connect_configuration: Option<Value>,
+    /// VPC Lattice configurations (`roleArn` / `targetGroupArn` /
+    /// `portName` / `advancedConfiguration`) supplied on Create/UpdateService,
+    /// preserved as raw JSON and echoed on the PRIMARY deployment and on
+    /// service revisions.
+    #[serde(default)]
+    pub vpc_lattice_configurations: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

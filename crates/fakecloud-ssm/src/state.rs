@@ -63,6 +63,12 @@ pub struct SsmDocument {
     pub permissions: BTreeMap<String, Vec<String>>, // permission_type -> account_ids
     #[serde(default)]
     pub reviews: Vec<DocumentReview>,
+    /// Accounts shared through custom sharing (`ModifyDocumentPermission`),
+    /// kept apart from the effective `Share` permission so removing a
+    /// resource policy cannot drop them. `None` for state written before
+    /// custom sharing was tracked separately.
+    #[serde(default)]
+    pub custom_shares: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -312,6 +318,12 @@ pub struct SsmResourcePolicy {
     pub policy_hash: String,
     pub policy: String,
     pub resource_arn: String,
+    /// For a `Document` policy: the consumer accounts the policy shares the
+    /// document with. The document's effective `Share` list is its custom
+    /// sharing plus every policy's grants, so deleting a policy removes only
+    /// the accounts no other source still grants.
+    #[serde(default)]
+    pub shared_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1155,6 +1167,7 @@ mod tests {
             policy_hash: "h".into(),
             policy: "{}".into(),
             resource_arn: "arn:aws:ssm:eu-west-1:123456789012:parameter/west".into(),
+            shared_account_ids: Vec::new(),
         });
         st.patch_baselines.insert(
             "pb-1".into(),

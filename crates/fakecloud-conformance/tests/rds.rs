@@ -1259,7 +1259,7 @@ async fn rds_route(server: &TestServer, action: &str, params: &[(&str, &str)]) {
 #[test_action("rds", "CopyDBParameterGroup", checksum = "e0eccdea")]
 #[test_action("rds", "CopyDBSnapshot", checksum = "c39cdbbd")]
 #[test_action("rds", "CopyOptionGroup", checksum = "1ef09200")]
-#[test_action("rds", "CreateBlueGreenDeployment", checksum = "f58bfeb5")]
+#[test_action("rds", "CreateBlueGreenDeployment", checksum = "60ebb354")]
 #[test_action("rds", "CreateCustomDBEngineVersion", checksum = "52cd54db")]
 #[test_action("rds", "CreateDBCluster", checksum = "fe7ee836")]
 #[test_action("rds", "CreateDBClusterEndpoint", checksum = "52145c35")]

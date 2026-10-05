@@ -6,7 +6,7 @@
 
 fakecloud emulates AWS locally for integration testing and development. It is a single Rust binary (~19 MB, ~300ms startup, ~10 MiB idle memory) — no Docker required to run fakecloud itself, no signup. Point any AWS SDK or the AWS CLI at `http://localhost:4566` with dummy credentials.
 
-**Coverage goal:** 100% of AWS services, each at 100% behavioral conformance, with 100% of cross-service integrations. Approach is depth-first — a service lands when it passes the full Smithy-model test variants and the cross-service wire-ups that matter for it, not when the API surface looks filled in. 106 services (7,543 operations) are shipped today, all at true 100% conformance — 249,449/249,449 generated Smithy variants pass on every commit; more land progressively as they hit the bar.
+**Coverage goal:** 100% of AWS services, each at 100% behavioral conformance, with 100% of cross-service integrations. Approach is depth-first — a service lands when it passes the full Smithy-model test variants and the cross-service wire-ups that matter for it, not when the API surface looks filled in. 106 services (7,551 operations) are shipped today, all at true 100% conformance — 249,449/249,449 generated Smithy variants pass on every commit; more land progressively as they hit the bar.
 
 Key design principles:
 - **Depth-first coverage**: every implemented service targets 100% conformance with real AWS, validated on every commit against AWS's own Smithy models — 249,449/249,449 generated test variants pass on every commit, true 100% across every implemented service. CI also runs upstream `hashicorp/terraform-provider-aws` `TestAcc*` suites against fakecloud.
@@ -645,7 +645,7 @@ Features: `primary` workgroup + `AwsDataCatalog` GLUE catalog auto-seeded on fir
 
 Protocol: JSON 1.1 (`X-Amz-Target: AmazonAthena.<Action>`)
 
-### EC2 (804 actions)
+### EC2 (807 actions)
 
 The complete EC2 control plane — the largest service surface in AWS, all at true 100% Smithy conformance.
 
@@ -653,7 +653,7 @@ The complete EC2 control plane — the largest service surface in AWS, all at tr
 **Compute & storage:** RunInstances + full lifecycle (start/stop/reboot/terminate/monitor), instance attributes/credit specs/metadata options, instance types + topology, key pairs, placement groups, EBS volumes (+ recycle bin), snapshots (+ copy/tier/lock/fast-restore/block-public-access), AMIs, EBS encryption defaults.
 **Scaling & capacity:** launch templates (+ versions), spot requests / fleets / EC2 fleets, capacity reservations (+ fleets), reserved instances, dedicated hosts.
 **Transit Gateway (74 ops):** gateways, attachments, route tables (+ associations/propagations/prefix-list refs), peering, Connect + Connect peers, policy tables, route-table announcements, multicast domains (+ group members/sources), metering policies, Client-VPN attachments.
-**VPN:** Site-to-Site (customer gateways, VPGs, connections + routes/tunnels/device configs, concentrators) + full Client VPN (endpoints, routes, authorization rules, target networks, connections, cert/config export-import).
+**VPN:** Site-to-Site (customer gateways, VPGs, connections + routes/tunnels/device configs, concentrators) + full Client VPN (endpoints, routes, authorization rules, Cedar authorization policies, device posture trust providers, target networks, connections, cert/config export-import).
 **IPAM:** IPAMs, scopes, pools, pool CIDRs + allocations, resource CIDRs, address history, resource discovery (+ associations + discovered getters), BYOASN, BYOIP-to-IPAM, external resource verification tokens, policies (+ allocation rules / org targets), prefix-list resolvers (+ targets / rules / versions).
 **Edge & access:** Verified Access (instances, trust providers, groups, endpoints, policies, logging, client config), Network Insights (paths + analyses, access scopes + scope analyses), Outpost / local-gateway / CoIP (carrier gateways, CoIP pools, LGW route tables/routes/associations/virtual interfaces), EC2 Instance Connect, fast launch, serial-console access, console output / screenshot, password data.
 

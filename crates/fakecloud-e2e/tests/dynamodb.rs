@@ -7606,3 +7606,150 @@ async fn dynamodb_update_item_set_then_remove_reports_shifted_value() {
         .unwrap();
     assert_eq!(list, &vec![AttributeValue::S("v".into())]);
 }
+
+/// ExportTableToPointInTime with a FilterSpecification writes only the
+/// matching items, projected, and DescribeExport reports the filter.
+#[tokio::test]
+async fn dynamodb_filtered_export_writes_matching_items() {
+    let server = TestServer::start().await;
+    let ddb = server.dynamodb_client().await;
+    let s3 = server.s3_client().await;
+    ddb.create_table()
+        .table_name("Orders")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    for (pk, status, total) in [
+        ("o1", "OPEN", "10"),
+        ("o2", "SHIPPED", "20"),
+        ("o3", "OPEN", "30"),
+    ] {
+        ddb.put_item()
+            .table_name("Orders")
+            .item("pk", AttributeValue::S(pk.into()))
+            .item("status", AttributeValue::S(status.into()))
+            .item("total", AttributeValue::N(total.into()))
+            .send()
+            .await
+            .unwrap();
+    }
+    s3.create_bucket().bucket("exports").send().await.unwrap();
+    let table_arn = ddb
+        .describe_table()
+        .table_name("Orders")
+        .send()
+        .await
+        .unwrap()
+        .table()
+        .unwrap()
+        .table_arn()
+        .unwrap()
+        .to_string();
+
+    // The pinned SDK predates FilterSpecification; send it on the wire.
+    let filter = serde_json::json!({
+        "FilterExpression": "#s = :open",
+        "ProjectionExpression": "pk, #t",
+        "ExpressionAttributeNames": {"#s": "status", "#t": "total"},
+        "ExpressionAttributeValues": {":open": {"S": "OPEN"}},
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/", server.endpoint()))
+        .header("Content-Type", "application/x-amz-json-1.0")
+        .header("X-Amz-Target", "DynamoDB_20120810.ExportTableToPointInTime")
+        .header(
+            "Authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIAIOSFODNN7EXAMPLE/20260501/us-east-1/dynamodb/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=deadbeef",
+        )
+        .body(
+            serde_json::json!({ "TableArn": table_arn, "S3Bucket": "exports",
+                                "FilterSpecification": filter })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let started: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(started["ExportDescription"]["FilterSpecification"], filter);
+    let export_arn = started["ExportDescription"]["ExportArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut desc = None;
+    for _ in 0..200 {
+        let d = ddb
+            .describe_export()
+            .export_arn(&export_arn)
+            .send()
+            .await
+            .unwrap();
+        let e = d.export_description().unwrap().clone();
+        if e.export_status() != Some(&aws_sdk_dynamodb::types::ExportStatus::InProgress) {
+            desc = Some(e);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let desc = desc.expect("export settled");
+    assert_eq!(
+        desc.export_status(),
+        Some(&aws_sdk_dynamodb::types::ExportStatus::Completed)
+    );
+    assert_eq!(desc.item_count(), Some(2));
+
+    let get = |key: String| {
+        let s3 = s3.clone();
+        async move {
+            s3.get_object()
+                .bucket("exports")
+                .key(&key)
+                .send()
+                .await
+                .unwrap()
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .to_vec()
+        }
+    };
+    let summary: serde_json::Value =
+        serde_json::from_slice(&get(desc.export_manifest().unwrap().to_string()).await).unwrap();
+    let files = get(summary["manifestFilesS3Key"].as_str().unwrap().to_string()).await;
+    let entry: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&files).unwrap().lines().next().unwrap()).unwrap();
+    let data = helpers::gunzip(&get(entry["dataFileS3Key"].as_str().unwrap().to_string()).await);
+    let mut items: Vec<serde_json::Value> = std::str::from_utf8(&data)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["Item"].clone())
+        .collect();
+    items.sort_by_key(|i| i["pk"]["S"].as_str().unwrap().to_string());
+    assert_eq!(
+        items,
+        vec![
+            serde_json::json!({"pk": {"S": "o1"}, "total": {"N": "10"}}),
+            serde_json::json!({"pk": {"S": "o3"}, "total": {"N": "30"}}),
+        ]
+    );
+}

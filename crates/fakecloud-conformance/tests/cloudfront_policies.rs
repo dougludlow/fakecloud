@@ -154,7 +154,7 @@ fn cdp_cfg() -> ContinuousDeploymentPolicyConfig {
 
 // ─── Origin Access Control ────────────────────────────────────────────
 
-#[test_action("cloudfront", "CreateOriginAccessControl", checksum = "b0d2363e")]
+#[test_action("cloudfront", "CreateOriginAccessControl", checksum = "5556a061")]
 #[tokio::test]
 async fn cloudfront_create_oac() {
     let server = TestServer::start().await;
@@ -166,7 +166,7 @@ async fn cloudfront_create_oac() {
         .unwrap();
 }
 
-#[test_action("cloudfront", "GetOriginAccessControl", checksum = "f20a62bc")]
+#[test_action("cloudfront", "GetOriginAccessControl", checksum = "d36ee34b")]
 #[tokio::test]
 async fn cloudfront_get_oac() {
     let server = TestServer::start().await;
@@ -181,7 +181,7 @@ async fn cloudfront_get_oac() {
     cf.get_origin_access_control().id(&id).send().await.unwrap();
 }
 
-#[test_action("cloudfront", "GetOriginAccessControlConfig", checksum = "39cb83c0")]
+#[test_action("cloudfront", "GetOriginAccessControlConfig", checksum = "ea69fd04")]
 #[tokio::test]
 async fn cloudfront_get_oac_config() {
     let server = TestServer::start().await;
@@ -200,7 +200,7 @@ async fn cloudfront_get_oac_config() {
         .unwrap();
 }
 
-#[test_action("cloudfront", "UpdateOriginAccessControl", checksum = "cbf68e2f")]
+#[test_action("cloudfront", "UpdateOriginAccessControl", checksum = "a2492e2d")]
 #[tokio::test]
 async fn cloudfront_update_oac() {
     let server = TestServer::start().await;
@@ -243,7 +243,7 @@ async fn cloudfront_delete_oac() {
         .unwrap();
 }
 
-#[test_action("cloudfront", "ListOriginAccessControls", checksum = "05e3e15f")]
+#[test_action("cloudfront", "ListOriginAccessControls", checksum = "d029db93")]
 #[tokio::test]
 async fn cloudfront_list_oac() {
     let server = TestServer::start().await;

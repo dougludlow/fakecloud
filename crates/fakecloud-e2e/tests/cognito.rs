@@ -6860,3 +6860,249 @@ async fn cognito_oauth2_token_rotates_refresh_when_enabled() {
     let rotated = json["refresh_token"].as_str().expect("rotated rt present");
     assert_ne!(rotated, refresh_token.as_str());
 }
+
+/// POST a Cognito user-pools JSON request directly, for members the pinned
+/// SDK predates (AcrConfiguration / AcrMapping).
+async fn cognito_raw(
+    server: &TestServer,
+    action: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/", server.endpoint()))
+        .header("Content-Type", "application/x-amz-json-1.1")
+        .header(
+            "X-Amz-Target",
+            format!("AWSCognitoIdentityProviderService.{action}"),
+        )
+        .header(
+            "Authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIAIOSFODNN7EXAMPLE/20260501/us-east-1/cognito-idp/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=deadbeef",
+        )
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+fn jwt_claims(jwt: &str) -> serde_json::Value {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1).unwrap();
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// ACR level names, identity-provider ACR mapping, and a step-up from a
+/// level-1 sign-in to level 4 (password + TOTP) through the real server.
+#[tokio::test]
+async fn cognito_acr_configuration_and_step_up_sign_in() {
+    use aws_sdk_cognitoidentityprovider::types::AuthFlowType;
+
+    let server = TestServer::start().await;
+    let client = server.cognito_client().await;
+
+    let (status, created) = cognito_raw(
+        &server,
+        "CreateUserPool",
+        serde_json::json!({ "PoolName": "acr-pool",
+            "AcrConfiguration": {"Level4": {"AcrValue": "https://example.com/gold"}} }),
+    )
+    .await;
+    assert_eq!(status, 200, "{created}");
+    let pool_id = created["UserPool"]["Id"].as_str().unwrap().to_string();
+    let (_, described) = cognito_raw(
+        &server,
+        "DescribeUserPool",
+        serde_json::json!({ "UserPoolId": pool_id }),
+    )
+    .await;
+    assert_eq!(
+        described["UserPool"]["AcrConfiguration"],
+        serde_json::json!({
+            "Level1": {"AcrValue": "urn:cognito:loa:1"},
+            "Level2": {"AcrValue": "urn:cognito:loa:2"},
+            "Level3": {"AcrValue": "urn:cognito:loa:3"},
+            "Level4": {"AcrValue": "https://example.com/gold"},
+        })
+    );
+
+    // ACR mapping on an OIDC identity provider.
+    let (status, idp) = cognito_raw(
+        &server,
+        "CreateIdentityProvider",
+        serde_json::json!({ "UserPoolId": pool_id, "ProviderName": "corp", "ProviderType": "OIDC",
+            "ProviderDetails": {"client_id": "c", "client_secret": "s",
+                "attributes_request_method": "GET", "oidc_issuer": "https://idp.example.com",
+                "authorize_scopes": "openid"},
+            "AcrMapping": {"Level4": "gold"} }),
+    )
+    .await;
+    assert_eq!(status, 200, "{idp}");
+    let (_, idp) = cognito_raw(
+        &server,
+        "DescribeIdentityProvider",
+        serde_json::json!({ "UserPoolId": pool_id, "ProviderName": "corp" }),
+    )
+    .await;
+    assert_eq!(idp["IdentityProvider"]["AcrMapping"]["Level4"], "gold");
+
+    let client_id = client
+        .create_user_pool_client()
+        .user_pool_id(&pool_id)
+        .client_name("app")
+        .explicit_auth_flows(ExplicitAuthFlowsType::AllowUserAuth)
+        .explicit_auth_flows(ExplicitAuthFlowsType::AllowRefreshTokenAuth)
+        .send()
+        .await
+        .unwrap()
+        .user_pool_client()
+        .unwrap()
+        .client_id()
+        .unwrap()
+        .to_string();
+    let password = "Step!Up9pass";
+    client
+        .admin_create_user()
+        .user_pool_id(&pool_id)
+        .username("alice")
+        .message_action(aws_sdk_cognitoidentityprovider::types::MessageActionType::Suppress)
+        .send()
+        .await
+        .unwrap();
+    client
+        .admin_set_user_password()
+        .user_pool_id(&pool_id)
+        .username("alice")
+        .password(password)
+        .permanent(true)
+        .send()
+        .await
+        .unwrap();
+
+    // Level 1: password only.
+    let select = client
+        .initiate_auth()
+        .client_id(&client_id)
+        .auth_flow(AuthFlowType::UserAuth)
+        .auth_parameters("USERNAME", "alice")
+        .auth_parameters("TARGET_ACR_VALUES", "urn:cognito:loa:1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        select.challenge_name(),
+        Some(&ChallengeNameType::SelectChallenge)
+    );
+    let level1 = client
+        .respond_to_auth_challenge()
+        .client_id(&client_id)
+        .challenge_name(ChallengeNameType::SelectChallenge)
+        .session(select.session().unwrap())
+        .challenge_responses("USERNAME", "alice")
+        .challenge_responses("ANSWER", "PASSWORD")
+        .challenge_responses("PASSWORD", password)
+        .send()
+        .await
+        .unwrap();
+    let result = level1.authentication_result().unwrap();
+    let access = result.access_token().unwrap().to_string();
+    let id = jwt_claims(result.id_token().unwrap());
+    assert_eq!(id["acr"], "urn:cognito:loa:1");
+    assert_eq!(id["amr"], serde_json::json!(["pwd"]));
+
+    // Enroll an authenticator app.
+    let secret = client
+        .associate_software_token()
+        .access_token(&access)
+        .send()
+        .await
+        .unwrap()
+        .secret_code()
+        .unwrap()
+        .to_string();
+    client
+        .verify_software_token()
+        .access_token(&access)
+        .user_code(fakecloud_cognito::totp::compute_totp_now(&secret).unwrap())
+        .send()
+        .await
+        .unwrap();
+
+    // Step up from the level-1 token: only the TOTP is asked for, and the
+    // new tokens report the pool's custom level-4 name.
+    let mfa = client
+        .initiate_auth()
+        .client_id(&client_id)
+        .auth_flow(AuthFlowType::UserAuth)
+        .auth_parameters("USERNAME", "alice")
+        .auth_parameters("TARGET_ACR_VALUES", "https://example.com/gold")
+        .auth_parameters("ACCESS_TOKEN", &access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        mfa.challenge_name(),
+        Some(&ChallengeNameType::SoftwareTokenMfa)
+    );
+    let level4 = client
+        .respond_to_auth_challenge()
+        .client_id(&client_id)
+        .challenge_name(ChallengeNameType::SoftwareTokenMfa)
+        .session(mfa.session().unwrap())
+        .challenge_responses("USERNAME", "alice")
+        .challenge_responses(
+            "SOFTWARE_TOKEN_MFA_CODE",
+            fakecloud_cognito::totp::compute_totp_now(&secret).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let result = level4.authentication_result().unwrap();
+    for token in [result.id_token().unwrap(), result.access_token().unwrap()] {
+        let c = jwt_claims(token);
+        assert_eq!(c["acr"], "https://example.com/gold");
+        assert_eq!(c["amr"], serde_json::json!(["pwd", "otp", "mfa"]));
+    }
+
+    // A refresh keeps the level reached.
+    let refreshed = client
+        .initiate_auth()
+        .client_id(&client_id)
+        .auth_flow(AuthFlowType::RefreshTokenAuth)
+        .auth_parameters("REFRESH_TOKEN", result.refresh_token().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let id = jwt_claims(
+        refreshed
+            .authentication_result()
+            .unwrap()
+            .id_token()
+            .unwrap(),
+    );
+    assert_eq!(id["acr"], "https://example.com/gold");
+
+    // Step-up and custom level names need the Essentials or Plus plan.
+    let (status, err) = cognito_raw(
+        &server,
+        "CreateUserPool",
+        serde_json::json!({ "PoolName": "lite", "UserPoolTier": "LITE",
+            "AcrConfiguration": {"Level4": {"AcrValue": "urn:x:4"}} }),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        err["__type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("FeatureUnavailableInTierException")),
+        "{err}"
+    );
+}

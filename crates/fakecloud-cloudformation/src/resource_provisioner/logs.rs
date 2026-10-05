@@ -208,6 +208,7 @@ impl ResourceProvisioner {
             delivery_destination_type,
             tags: BTreeMap::new(),
             delivery_destination_policy: policy,
+            role_arn: None,
         };
 
         let mut logs_accounts = self.logs_state.write();

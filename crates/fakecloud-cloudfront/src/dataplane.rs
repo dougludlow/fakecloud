@@ -635,7 +635,8 @@ fn is_s3_website_origin(domain: &str) -> bool {
 ///   distribution's account with origin type `s3`: sign as the
 ///   `cloudfront.amazonaws.com` service principal with `aws:SourceArn` = the
 ///   distribution ARN and `aws:SourceAccount` = its account, per the OAC's
-///   `SigningBehavior` (`always`, `no-override`; `never` is unsigned).
+///   `SigningBehavior` (`always`, `no-override`; `never` is unsigned, and
+///   `always-amz-auth` is only valid for Lambda-Web origins, so unsigned here).
 /// - Otherwise `S3OriginConfig.OriginAccessIdentity`
 ///   (`origin-access-identity/cloudfront/<id>`) names an origin access
 ///   identity of the account: sign as that OAI
@@ -1463,6 +1464,9 @@ mod tests {
             ("always", OriginAuth::Always(cloudfront_caller())),
             ("no-override", OriginAuth::NoOverride(cloudfront_caller())),
             ("never", OriginAuth::Anonymous),
+            // `always-amz-auth` is only valid for Lambda-Web origins; on an
+            // S3 origin it does not sign the fetch.
+            ("always-amz-auth", OriginAuth::Anonymous),
         ] {
             let account = account_with_access(Some(("OAC1", behavior, "s3")), None);
             let target = origin_target(&origin, "127.0.0.1:4566", &ctx_for(DIST_ARN, &account));

@@ -3282,9 +3282,14 @@ impl EksService {
             capability.role_arn = role.to_string();
             params.push(("RoleArn".to_string(), role.to_string()));
         }
-        if let Some(cfg) = normalize_capability_configuration(body.get("configuration")) {
-            params.push(("Configuration".to_string(), cfg.to_string()));
-            capability.configuration = Some(cfg);
+        if let Some(update) = body.get("configuration").filter(|v| !v.is_null()) {
+            params.push(("Configuration".to_string(), update.to_string()));
+            if let Some(cfg) = apply_capability_configuration_update(
+                capability.configuration.as_ref(),
+                Some(update),
+            ) {
+                capability.configuration = Some(cfg);
+            }
         }
         capability.modified_at = Utc::now();
 

@@ -327,12 +327,39 @@ impl CognitoState {
     }
 }
 
+/// The authentication level and methods a sign-in reached, reported as the
+/// `acr` / `amr` claims. Set when the sign-in requested a target level
+/// (`TARGET_ACR_VALUES`); carried unchanged onto tokens refreshed from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthContext {
+    /// The pool's name for the level reached when the tokens were issued.
+    pub acr: String,
+    /// The `amr` claim: the completed methods, plus `mfa` for two or more.
+    pub amr: Vec<String>,
+    /// Unix time of the authentication (the `auth_time` claim).
+    pub auth_time: i64,
+}
+
+/// A sign-in working toward a target ACR level, carried through the
+/// challenge sessions of a `USER_AUTH` flow that sent `TARGET_ACR_VALUES`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepUpContext {
+    /// The level (1-4) chosen from `TARGET_ACR_VALUES`.
+    pub target_level: u8,
+    /// Factors completed so far (`pwd`, `otp`, `sms`), including any credited
+    /// from the `ACCESS_TOKEN` the step-up started from.
+    pub completed: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefreshTokenData {
     pub user_pool_id: String,
     pub username: String,
     pub client_id: String,
     pub issued_at: DateTime<Utc>,
+    /// ACR/AMR of the sign-in that issued this token; refreshed tokens keep it.
+    #[serde(default)]
+    pub auth_context: Option<AuthContext>,
 }
 
 /// Single-use OAuth2 authorization code minted by `/oauth2/authorize`
@@ -372,6 +399,10 @@ pub struct AccessTokenData {
     /// to the fixed 1h TTL from `issued_at`.
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    /// ACR/AMR of the sign-in that issued this token, when it requested a
+    /// target level; a step-up from this token is credited with its methods.
+    #[serde(default)]
+    pub auth_context: Option<AuthContext>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -384,6 +415,9 @@ pub struct SessionData {
     pub challenge_results: Vec<ChallengeResult>,
     /// Metadata from the CreateAuthChallenge Lambda (passed back to client).
     pub challenge_metadata: Option<String>,
+    /// Target ACR level and completed factors of a step-up sign-in.
+    #[serde(default)]
+    pub step_up: Option<StepUpContext>,
 }
 
 /// Tracks the result of a single challenge round in a CUSTOM_AUTH flow.
@@ -453,6 +487,10 @@ pub struct UserPool {
     /// Username case-sensitivity preference.
     #[serde(default)]
     pub username_configuration: Option<serde_json::Value>,
+    /// Custom names for the ACR levels (`Level1`..`Level4` -> name). Only
+    /// the customized levels are stored; the rest keep their defaults.
+    #[serde(default)]
+    pub acr_configuration: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -706,6 +744,9 @@ pub struct IdentityProvider {
     pub idp_identifiers: Vec<String>,
     pub creation_date: DateTime<Utc>,
     pub last_modified_date: DateTime<Utc>,
+    /// Pool ACR level (`Level1`..`Level4`) -> the OIDC IdP's ACR value.
+    #[serde(default)]
+    pub acr_mapping: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -953,6 +994,7 @@ mod tests {
             client_id: "c".to_string(),
             issued_at,
             expires_at: None,
+            auth_context: None,
         };
         // Fresh token: accepted.
         state
@@ -977,6 +1019,7 @@ mod tests {
             client_id: "c".to_string(),
             issued_at: Utc::now() - chrono::Duration::hours(2),
             expires_at: Some(Utc::now() + chrono::Duration::hours(2)),
+            auth_context: None,
         };
         state.access_tokens.insert("long".to_string(), long);
         assert!(state.valid_access_token("long").is_some());
@@ -988,6 +1031,7 @@ mod tests {
             client_id: "c".to_string(),
             issued_at: Utc::now(),
             expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            auth_context: None,
         };
         state.access_tokens.insert("short".to_string(), short);
         assert!(state.valid_access_token("short").is_none());
@@ -1002,6 +1046,7 @@ mod tests {
             client_id: "c".to_string(),
             issued_at: Utc::now(),
             expires_at: Some(Utc::now()),
+            auth_context: None,
         };
         state
             .access_tokens

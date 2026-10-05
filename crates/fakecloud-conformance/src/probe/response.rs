@@ -236,6 +236,10 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // IPAM internet-registry associations: the probe addresses an
             // association by a synthetic id, which AWS answers with this code.
             "InvalidIpamInternetRegistryAssociationId.NotFound",
+            // Client VPN endpoints: Modify and the authorization-policy ops
+            // address an endpoint by the probe's synthetic id, which AWS
+            // answers with this code.
+            "InvalidClientVpnEndpointId.NotFound",
             // IAM instance-profile associations: Replace/Disassociate address
             // an association by the probe's synthetic id, which AWS answers
             // with this code. `IncorrectState` is the code AWS returns when the

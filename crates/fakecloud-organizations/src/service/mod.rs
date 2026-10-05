@@ -758,6 +758,7 @@ fn is_valid_policy_type(t: &str) -> bool {
             | "BEDROCK_POLICY"
             | "S3_POLICY"
             | "NETWORK_SECURITY_DIRECTOR_POLICY"
+            | "GUARDDUTY_POLICY"
     )
 }
 

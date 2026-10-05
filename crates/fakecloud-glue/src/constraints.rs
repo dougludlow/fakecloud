@@ -629,6 +629,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 range_max: None,
                 enum_values: &[],
             },
+            FieldConstraint {
+                field: "CatalogId",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
         ],
         "CreateCustomEntityType" => &[
             FieldConstraint {
@@ -1658,6 +1666,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 range_max: None,
                 enum_values: &[],
             },
+            FieldConstraint {
+                field: "CatalogID",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
         ],
         "DeleteConnection" => &[
             FieldConstraint {
@@ -2380,6 +2396,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 range_max: Some(1000),
                 enum_values: &[],
             },
+            FieldConstraint {
+                field: "CatalogID",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
         ],
         "GetColumnStatisticsTaskSettings" => &[
             FieldConstraint {
@@ -2392,6 +2416,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
             },
             FieldConstraint {
                 field: "TableName",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+            FieldConstraint {
+                field: "CatalogID",
                 len_min: Some(1),
                 len_max: Some(255),
                 range_min: None,
@@ -4692,6 +4724,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 range_max: None,
                 enum_values: &[],
             },
+            FieldConstraint {
+                field: "CatalogID",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
         ],
         "StartCrawler" => &[FieldConstraint {
             field: "Name",
@@ -4909,14 +4949,24 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
             range_max: None,
             enum_values: &[],
         }],
-        "StopColumnStatisticsTaskRun" => &[FieldConstraint {
-            field: "TableName",
-            len_min: Some(1),
-            len_max: Some(255),
-            range_min: None,
-            range_max: None,
-            enum_values: &[],
-        }],
+        "StopColumnStatisticsTaskRun" => &[
+            FieldConstraint {
+                field: "TableName",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+            FieldConstraint {
+                field: "CatalogID",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+        ],
         "StopColumnStatisticsTaskRunSchedule" => &[
             FieldConstraint {
                 field: "DatabaseName",
@@ -4928,6 +4978,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
             },
             FieldConstraint {
                 field: "TableName",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+            FieldConstraint {
+                field: "CatalogID",
                 len_min: Some(1),
                 len_max: Some(255),
                 range_min: None,
@@ -5292,6 +5350,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 field: "CrawlerSecurityConfiguration",
                 len_min: Some(0),
                 len_max: Some(128),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+            FieldConstraint {
+                field: "CatalogId",
+                len_min: Some(1),
+                len_max: Some(255),
                 range_min: None,
                 range_max: None,
                 enum_values: &[],

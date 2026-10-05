@@ -78,6 +78,41 @@ pub(crate) fn validate_serverless_engine(engine: &str) -> Result<(), AwsServiceE
     Ok(())
 }
 
+/// Validate a serverless cache `ConnectionType`: `vpc` (the default) or
+/// `public`, where `public` requires Valkey 9 or above.
+pub(crate) fn validate_serverless_connection_type(
+    connection_type: Option<&str>,
+    engine: &str,
+    major_engine_version: &str,
+) -> Result<(), AwsServiceError> {
+    match connection_type {
+        None | Some("vpc") => Ok(()),
+        Some("public") => {
+            let major = major_engine_version
+                .split('.')
+                .next()
+                .and_then(|m| m.parse::<u32>().ok())
+                .unwrap_or(0);
+            if engine == ENGINE_VALKEY && major >= 9 {
+                Ok(())
+            } else {
+                Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterCombination",
+                    format!(
+                        "ConnectionType public requires engine valkey with MajorEngineVersion 9 or above; got {engine} {major_engine_version}."
+                    ),
+                ))
+            }
+        }
+        Some(other) => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidParameterValue",
+            format!("Invalid value for ConnectionType: '{other}'. Valid values: vpc, public."),
+        )),
+    }
+}
+
 pub(crate) fn default_major_engine_version(engine: &str) -> &'static str {
     if engine == ENGINE_VALKEY {
         "8.0"
@@ -98,12 +133,14 @@ pub(crate) fn default_full_engine_version(
         ));
     }
 
-    // Valkey serverless/self-designed supports both 7.2 and 8.x on AWS; the
-    // gate previously accepted only 8.x and rejected a valid MajorEngineVersion
-    // of 7 / 7.2.
+    // Valkey serverless/self-designed supports 7.2, 8.x and 9.x on AWS (9 is
+    // the floor for `ConnectionType: public`); the gate previously accepted
+    // only 8.x and rejected a valid MajorEngineVersion of 7 / 7.2.
     if (engine == ENGINE_REDIS && !major_engine_version.starts_with('7'))
         || (engine == ENGINE_VALKEY
-            && !(major_engine_version.starts_with('7') || major_engine_version.starts_with('8')))
+            && !(major_engine_version.starts_with('7')
+                || major_engine_version.starts_with('8')
+                || major_engine_version.starts_with('9')))
     {
         return Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
@@ -1610,6 +1647,23 @@ pub(crate) fn serverless_cache_xml(cache: &ServerlessCache) -> String {
             )
         })
         .unwrap_or_default();
+    // Serverless caches are always encrypted at rest: with the caller's
+    // customer-managed KMS key when one was given, else a service-managed key.
+    let storage_encryption_type = if cache.kms_key_id.is_some() {
+        "sse-kms"
+    } else {
+        "sse-elasticache"
+    };
+    let network_type_xml = cache
+        .network_type
+        .as_ref()
+        .map(|v| format!("<NetworkType>{}</NetworkType>", xml_escape(v)))
+        .unwrap_or_default();
+    let connection_type_xml = cache
+        .connection_type
+        .as_ref()
+        .map(|v| format!("<ConnectionType>{}</ConnectionType>", xml_escape(v)))
+        .unwrap_or_default();
 
     format!(
         "<ServerlessCacheName>{}</ServerlessCacheName>\
@@ -1621,6 +1675,7 @@ pub(crate) fn serverless_cache_xml(cache: &ServerlessCache) -> String {
          <FullEngineVersion>{}</FullEngineVersion>\
          {cache_usage_limits_xml}\
          {kms_key_id_xml}\
+         <StorageEncryptionType>{storage_encryption_type}</StorageEncryptionType>\
          {security_group_ids_xml}\
          <Endpoint>{}</Endpoint>\
          <ReaderEndpoint>{}</ReaderEndpoint>\
@@ -1628,7 +1683,9 @@ pub(crate) fn serverless_cache_xml(cache: &ServerlessCache) -> String {
          {user_group_id_xml}\
          {subnet_ids_xml}\
          {snapshot_retention_limit_xml}\
-         {daily_snapshot_time_xml}",
+         {daily_snapshot_time_xml}\
+         {network_type_xml}\
+         {connection_type_xml}",
         xml_escape(&cache.serverless_cache_name),
         xml_escape(&cache.description),
         xml_escape(&cache.created_at),

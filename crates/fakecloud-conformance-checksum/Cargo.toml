@@ -1,0 +1,11 @@
+[package]
+name = "fakecloud-conformance-checksum"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+serde_json = { workspace = true }
+sha2 = "0.11"

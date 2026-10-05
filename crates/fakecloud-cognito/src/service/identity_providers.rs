@@ -35,6 +35,7 @@ impl CognitoService {
         if attribute_mapping.is_empty() {
             attribute_mapping = default_attribute_mapping(provider_type);
         }
+        let acr_mapping = parse_idp_acr_mapping(&body, provider_type)?;
         let idp_identifiers = body["IdpIdentifiers"]
             .as_array()
             .map(|arr| {
@@ -73,6 +74,7 @@ impl CognitoService {
             idp_identifiers,
             creation_date: now,
             last_modified_date: now,
+            acr_mapping: acr_mapping.unwrap_or_default(),
         };
 
         pool_providers.insert(provider_name.to_string(), idp.clone());
@@ -140,6 +142,9 @@ impl CognitoService {
                 )
             })?;
 
+        if let Some(mapping) = parse_idp_acr_mapping(&body, &idp.provider_type)? {
+            idp.acr_mapping = mapping;
+        }
         if body["ProviderDetails"].is_object() {
             idp.provider_details = parse_string_map(&body["ProviderDetails"]);
         }
@@ -280,4 +285,27 @@ impl CognitoService {
             "IdentityProvider": identity_provider_to_json(idp)
         })))
     }
+}
+
+/// Parse a Create/UpdateIdentityProvider `AcrMapping`. Only OIDC identity
+/// providers support ACR mapping; a non-empty mapping on any other provider
+/// type is rejected. `None` when the request leaves the member out.
+fn parse_idp_acr_mapping(
+    body: &Value,
+    provider_type: &str,
+) -> Result<Option<BTreeMap<String, String>>, AwsServiceError> {
+    let Some(v) = body.get("AcrMapping").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let mapping = crate::acr::parse_acr_mapping(v)?;
+    if !mapping.is_empty() && provider_type != "OIDC" {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidParameterException",
+            format!(
+                "AcrMapping is supported only for OIDC identity providers, not {provider_type}."
+            ),
+        ));
+    }
+    Ok(Some(mapping))
 }

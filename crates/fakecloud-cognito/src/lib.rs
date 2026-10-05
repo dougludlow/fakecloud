@@ -1,3 +1,4 @@
+pub(crate) mod acr;
 pub mod jwt;
 pub(crate) mod service;
 pub mod srp;
@@ -167,6 +168,7 @@ mod jwt_exp_tests {
                 user_attribute_update_settings: None,
                 user_pool_add_ons: None,
                 username_configuration: None,
+                acr_configuration: Default::default(),
             };
             s.user_pools.insert(POOL_ID.to_string(), pool);
         }

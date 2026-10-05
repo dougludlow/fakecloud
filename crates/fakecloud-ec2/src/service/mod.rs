@@ -557,6 +557,9 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "ExportClientVpnClientCertificateRevocationList",
     "ExportClientVpnClientConfiguration",
     "ImportClientVpnClientCertificateRevocationList",
+    "ModifyClientVpnEndpointAuthorizationPolicy",
+    "GetClientVpnEndpointAuthorizationPolicy",
+    "DeleteClientVpnEndpointAuthorizationPolicy",
     // IPAM core
     "CreateIpam",
     "DeleteIpam",
@@ -2259,6 +2262,15 @@ impl AwsService for Ec2Service {
             "DeleteClientVpnEndpoint" => cvpn::delete_client_vpn_endpoint(self, &request),
             "DescribeClientVpnEndpoints" => cvpn::describe_client_vpn_endpoints(self, &request),
             "ModifyClientVpnEndpoint" => cvpn::modify_client_vpn_endpoint(self, &request),
+            "ModifyClientVpnEndpointAuthorizationPolicy" => {
+                cvpn::modify_client_vpn_endpoint_authorization_policy(self, &request)
+            }
+            "GetClientVpnEndpointAuthorizationPolicy" => {
+                cvpn::get_client_vpn_endpoint_authorization_policy(self, &request)
+            }
+            "DeleteClientVpnEndpointAuthorizationPolicy" => {
+                cvpn::delete_client_vpn_endpoint_authorization_policy(self, &request)
+            }
             "CreateClientVpnRoute" => cvpn::create_client_vpn_route(self, &request),
             "DeleteClientVpnRoute" => cvpn::delete_client_vpn_route(self, &request),
             "DescribeClientVpnRoutes" => cvpn::describe_client_vpn_routes(self, &request),

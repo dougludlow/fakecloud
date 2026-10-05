@@ -10,7 +10,7 @@ use helpers::TestServer;
 #[test_action("cognito-idp", "AdminDeleteSoftwareToken", checksum = "25009e40")]
 #[test_action("cognito-idp", "DescribeTermsByClient", checksum = "a780f839")]
 #[test_action("cognito-idp", "GetClientToken", checksum = "6e91e741")]
-#[test_action("cognito-idp", "CreateUserPool", checksum = "685b8c93")]
+#[test_action("cognito-idp", "CreateUserPool", checksum = "b8728316")]
 #[tokio::test]
 async fn cognito_create_user_pool() {
     let server = TestServer::start().await;
@@ -28,7 +28,7 @@ async fn cognito_create_user_pool() {
     assert_eq!(pool.name().unwrap(), "conformance-pool");
 }
 
-#[test_action("cognito-idp", "DescribeUserPool", checksum = "55685da5")]
+#[test_action("cognito-idp", "DescribeUserPool", checksum = "1fd85f55")]
 #[tokio::test]
 async fn cognito_describe_user_pool() {
     let server = TestServer::start().await;
@@ -51,7 +51,7 @@ async fn cognito_describe_user_pool() {
     assert_eq!(resp.user_pool().unwrap().name().unwrap(), "desc-pool");
 }
 
-#[test_action("cognito-idp", "UpdateUserPool", checksum = "9582199d")]
+#[test_action("cognito-idp", "UpdateUserPool", checksum = "fe55a17b")]
 #[tokio::test]
 async fn cognito_update_user_pool() {
     let server = TestServer::start().await;
@@ -730,7 +730,7 @@ async fn cognito_admin_set_user_password() {
     assert_eq!(user.user_status().unwrap().as_str(), "CONFIRMED");
 }
 
-#[test_action("cognito-idp", "AdminInitiateAuth", checksum = "4434e3cf")]
+#[test_action("cognito-idp", "AdminInitiateAuth", checksum = "f3c9d484")]
 #[tokio::test]
 async fn cognito_admin_initiate_auth() {
     let server = TestServer::start().await;
@@ -802,7 +802,7 @@ async fn cognito_admin_initiate_auth() {
         .is_some());
 }
 
-#[test_action("cognito-idp", "InitiateAuth", checksum = "66f062ec")]
+#[test_action("cognito-idp", "InitiateAuth", checksum = "488f9ac2")]
 #[tokio::test]
 async fn cognito_initiate_auth() {
     let server = TestServer::start().await;
@@ -862,8 +862,8 @@ async fn cognito_initiate_auth() {
     assert!(resp.authentication_result().unwrap().id_token().is_some());
 }
 
-#[test_action("cognito-idp", "AdminRespondToAuthChallenge", checksum = "4b5be1a2")]
-#[test_action("cognito-idp", "RespondToAuthChallenge", checksum = "9019fe55")]
+#[test_action("cognito-idp", "AdminRespondToAuthChallenge", checksum = "8d41f1a0")]
+#[test_action("cognito-idp", "RespondToAuthChallenge", checksum = "2b734394")]
 #[tokio::test]
 async fn cognito_respond_to_auth_challenge() {
     let server = TestServer::start().await;
@@ -937,8 +937,8 @@ async fn cognito_respond_to_auth_challenge() {
     assert!(resp2.authentication_result().unwrap().id_token().is_some());
 }
 
-#[test_action("cognito-idp", "SignUp", checksum = "9c97e5a5")]
-#[test_action("cognito-idp", "ConfirmSignUp", checksum = "ea3c0f15")]
+#[test_action("cognito-idp", "SignUp", checksum = "d5014cb4")]
+#[test_action("cognito-idp", "ConfirmSignUp", checksum = "283fff5c")]
 #[tokio::test]
 async fn cognito_sign_up_and_confirm() {
     let server = TestServer::start().await;
@@ -2252,8 +2252,8 @@ async fn cognito_set_user_mfa_preference() {
         .unwrap();
 }
 
-#[test_action("cognito-idp", "AssociateSoftwareToken", checksum = "b926df4c")]
-#[test_action("cognito-idp", "VerifySoftwareToken", checksum = "08e97a2d")]
+#[test_action("cognito-idp", "AssociateSoftwareToken", checksum = "1cfb643e")]
+#[test_action("cognito-idp", "VerifySoftwareToken", checksum = "0ab4f1c3")]
 #[tokio::test]
 async fn cognito_associate_verify_software_token() {
     let server = TestServer::start().await;
@@ -2289,7 +2289,7 @@ async fn cognito_associate_verify_software_token() {
 // Identity Providers
 // ---------------------------------------------------------------------------
 
-#[test_action("cognito-idp", "CreateIdentityProvider", checksum = "59c9c181")]
+#[test_action("cognito-idp", "CreateIdentityProvider", checksum = "0e395cd5")]
 #[tokio::test]
 async fn cognito_create_identity_provider() {
     let server = TestServer::start().await;
@@ -2317,7 +2317,7 @@ async fn cognito_create_identity_provider() {
     assert_eq!(idp.provider_name().unwrap(), "TestOIDC");
 }
 
-#[test_action("cognito-idp", "DescribeIdentityProvider", checksum = "94a4d7f7")]
+#[test_action("cognito-idp", "DescribeIdentityProvider", checksum = "6dda6478")]
 #[tokio::test]
 async fn cognito_describe_identity_provider() {
     let server = TestServer::start().await;
@@ -2353,7 +2353,7 @@ async fn cognito_describe_identity_provider() {
     );
 }
 
-#[test_action("cognito-idp", "UpdateIdentityProvider", checksum = "7addfa0c")]
+#[test_action("cognito-idp", "UpdateIdentityProvider", checksum = "28ef08ee")]
 #[tokio::test]
 async fn cognito_update_identity_provider() {
     let server = TestServer::start().await;
@@ -3363,7 +3363,7 @@ async fn cognito_client_secrets() {
 #[test_action(
     "cognito-idp",
     "GetIdentityProviderByIdentifier",
-    checksum = "02bc980a"
+    checksum = "1d7dd9d2"
 )]
 #[tokio::test]
 async fn cognito_get_idp_by_identifier() {

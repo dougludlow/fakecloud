@@ -68,6 +68,42 @@ pub struct Domain {
     /// `NOT_ELIGIBLE` (no update in flight) is reported.
     #[serde(default)]
     pub service_software_status: Option<String>,
+    /// The most recent applied `UpdateDomainConfig` change, reported by
+    /// `DescribeDomainChangeProgress`.
+    #[serde(default)]
+    pub last_change: Option<ConfigChange>,
+    /// The most recent `UpdateDomainConfig` dry run, reported by
+    /// `DescribeDryRunProgress`.
+    #[serde(default)]
+    pub last_dry_run: Option<DryRunRecord>,
+    /// Earlier dry runs, oldest first and capped at `MAX_DRY_RUN_HISTORY`, so
+    /// `DescribeDryRunProgress` can report a specific `DryRunId`.
+    #[serde(default)]
+    pub dry_runs: Vec<DryRunRecord>,
+}
+
+/// How many dry runs a domain remembers for `DescribeDryRunProgress`.
+pub const MAX_DRY_RUN_HISTORY: usize = 100;
+
+/// One applied domain configuration change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigChange {
+    pub change_id: String,
+    pub start_time: DateTime<Utc>,
+    /// The config members the change touched (`ClusterConfig`, ...).
+    pub properties: Vec<String>,
+    /// Advisory warning codes the caller accepted (`AcceptedWarnings`).
+    #[serde(default)]
+    pub accepted_warnings: Vec<String>,
+}
+
+/// One `UpdateDomainConfig` dry run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunRecord {
+    pub dry_run_id: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub accepted_warnings: Vec<String>,
 }
 
 /// An installable package (dictionary / plugin / config) shared by both APIs.

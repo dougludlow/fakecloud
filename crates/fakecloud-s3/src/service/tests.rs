@@ -7375,6 +7375,28 @@ fn update_object_encryption_persists_reencrypted_body() {
 }
 
 #[test]
+fn inventory_optional_field_intelligent_tiering_reference_date_round_trips() {
+    let svc = make_service();
+    seed_bucket(&svc, "b");
+    let body = br#"<InventoryConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Id>inv1</Id><IsEnabled>true</IsEnabled><Destination><S3BucketDestination><Bucket>arn:aws:s3:::dest</Bucket><Format>CSV</Format></S3BucketDestination></Destination><Schedule><Frequency>Daily</Frequency></Schedule><IncludedObjectVersions>Current</IncludedObjectVersions><OptionalFields><Field>IntelligentTieringAccessTier</Field><Field>IntelligentTieringReferenceDate</Field></OptionalFields></InventoryConfiguration>"#;
+    let req = make_request(
+        Method::PUT,
+        "/b",
+        &[("inventory", ""), ("id", "inv1")],
+        body,
+    );
+    svc.put_bucket_inventory("123456789012", &req, "b").unwrap();
+
+    let req = make_request(Method::GET, "/b", &[("inventory", ""), ("id", "inv1")], b"");
+    let resp = svc.get_bucket_inventory("123456789012", &req, "b").unwrap();
+    let xml = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        xml.contains("<Field>IntelligentTieringReferenceDate</Field>"),
+        "{xml}"
+    );
+}
+
+#[test]
 fn update_metadata_inventory_table_persists_config() {
     let (svc, store) = make_recording_service();
     seed_bucket(&svc, "b");

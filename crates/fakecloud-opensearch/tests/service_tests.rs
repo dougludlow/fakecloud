@@ -392,6 +392,111 @@ async fn dry_run_config_update_does_not_persist() {
 }
 
 #[tokio::test]
+async fn accepted_warnings_are_reported_on_change_and_dry_run_progress() {
+    let svc = service();
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("{OS}/opensearch/domain"),
+            json!({"DomainName": "warn", "EngineVersion": "OpenSearch_2.9"}),
+        ),
+    )
+    .await;
+
+    // A dry run records its accepted warnings without applying the change.
+    let dry = json_of(
+        &call(
+            &svc,
+            req(
+                Method::POST,
+                &format!("{OS}/opensearch/domain/warn/config"),
+                json!({
+                    "EBSOptions": {"EBSEnabled": true, "VolumeSize": 20},
+                    "DryRun": true,
+                    "AcceptedWarnings": ["DryRunWarning"],
+                }),
+            ),
+        )
+        .await,
+    );
+    let dry_status = &dry["DryRunProgressStatus"];
+    assert_eq!(dry_status["AcceptedWarnings"], json!(["DryRunWarning"]));
+    assert_eq!(dry_status["ValidationFailures"], json!([]));
+    let dry_id = dry_status["DryRunId"].as_str().unwrap().to_string();
+    let progress = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/warn/dryRun"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(progress["DryRunProgressStatus"]["DryRunId"], dry_id);
+    assert_eq!(
+        progress["DryRunProgressStatus"]["AcceptedWarnings"],
+        json!(["DryRunWarning"])
+    );
+
+    // An applied change reports its accepted warnings and touched members,
+    // and AcceptedWarnings is not persisted as a domain config member.
+    let updated = json_of(
+        &call(
+            &svc,
+            req(
+                Method::POST,
+                &format!("{OS}/opensearch/domain/warn/config"),
+                json!({
+                    "EBSOptions": {"EBSEnabled": true, "VolumeSize": 20},
+                    "AcceptedWarnings": ["ShardCountWarning", "MemoryWarning"],
+                }),
+            ),
+        )
+        .await,
+    );
+    assert!(updated["DomainConfig"].get("AcceptedWarnings").is_none());
+    let change = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/warn/progress"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    let status = &change["ChangeProgressStatus"];
+    assert_eq!(
+        status["AcceptedWarnings"],
+        json!(["ShardCountWarning", "MemoryWarning"])
+    );
+    assert_eq!(status["CompletedProperties"], json!(["EBSOptions"]));
+    assert_eq!(status["ValidationFailures"], json!([]));
+    assert_eq!(status["ConfigChangeStatus"], "Completed");
+    assert_eq!(status["InitiatedBy"], "CUSTOMER");
+    // The change id is stable across reads.
+    let again = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/warn/progress"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        again["ChangeProgressStatus"]["ChangeId"],
+        status["ChangeId"]
+    );
+}
+
+#[tokio::test]
 async fn delete_domain_removes_it() {
     let svc = service();
     call(
@@ -2089,4 +2194,80 @@ async fn paged_lists_walk_by_next_token() {
     )
     .await;
     assert_eq!((status, code.as_str()), (400, "ValidationException"));
+}
+
+#[tokio::test]
+async fn dry_run_progress_reports_the_requested_dry_run() {
+    let svc = service();
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("{OS}/opensearch/domain"),
+            json!({"DomainName": "dry"}),
+        ),
+    )
+    .await;
+    let progress_path = format!("{OS}/opensearch/domain/dry/dryRun");
+    // No dry run yet: nothing to report rather than a made-up run.
+    assert_eq!(
+        call_err(&svc, req(Method::GET, &progress_path, json!({}))).await,
+        (409, "ResourceNotFoundException".to_string())
+    );
+
+    let mut ids = Vec::new();
+    for size in [20, 30] {
+        let dry = json_of(
+            &call(
+                &svc,
+                req(
+                    Method::POST,
+                    &format!("{OS}/opensearch/domain/dry/config"),
+                    json!({
+                        "EBSOptions": {"EBSEnabled": true, "VolumeSize": size},
+                        "DryRun": true,
+                    }),
+                ),
+            )
+            .await,
+        );
+        ids.push(dry["DryRunProgressStatus"]["DryRunId"].clone());
+    }
+    let progress = |id: Option<&str>| {
+        let r = req(Method::GET, &progress_path, json!({}));
+        match id {
+            Some(id) => with_query(r, "dryRunId", id),
+            None => r,
+        }
+    };
+    // No DryRunId: the latest run. A DryRunId: that run, even an older one.
+    let latest = json_of(&call(&svc, progress(None)).await);
+    assert_eq!(latest["DryRunProgressStatus"]["DryRunId"], ids[1]);
+    for id in &ids {
+        let got = json_of(&call(&svc, progress(id.as_str())).await);
+        assert_eq!(got["DryRunProgressStatus"]["DryRunId"], *id);
+    }
+    assert_eq!(
+        call_err(&svc, progress(Some("00000000-0000-4000-8000-000000000000"))).await,
+        (409, "ResourceNotFoundException".to_string())
+    );
+    // A DryRunId that is not a GUID fails validation before the lookup.
+    assert_eq!(
+        call_err(&svc, progress(Some("not-a-guid"))).await,
+        (400, "ValidationException".to_string())
+    );
+
+    // An unknown domain is not found.
+    assert_eq!(
+        call_err(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/ghost/dryRun"),
+                json!({}),
+            ),
+        )
+        .await,
+        (409, "ResourceNotFoundException".to_string())
+    );
 }

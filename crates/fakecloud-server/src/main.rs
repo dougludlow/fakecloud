@@ -4201,7 +4201,8 @@ async fn main() {
                                     fakecloud_glue::GLUE_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            if let Some(accounts) = snapshot.accounts {
+                            if let Some(mut accounts) = snapshot.accounts {
+                                accounts.upgrade_loaded();
                                 let account_count = accounts.accounts.len();
                                 *glue_state.write() = accounts;
                                 tracing::info!(
@@ -5719,8 +5720,24 @@ async fn main() {
         } else {
             None
         };
+    // The SSO Admin instances are the source of truth for which identity
+    // stores an account owns; the Identity Store service reads them through
+    // this lookup for ListIdentityStores / DescribeIdentityStore.
+    let ssoadmin_for_identitystore = ssoadmin_state.clone();
     let mut identitystore_service =
-        fakecloud_identitystore::IdentityStoreService::new(identitystore_state.clone());
+        fakecloud_identitystore::IdentityStoreService::new(identitystore_state.clone())
+            .with_instance_store_lookup(Arc::new(move |account: &str| {
+                ssoadmin_for_identitystore
+                    .read()
+                    .get(account)
+                    .map(|a| {
+                        a.instances
+                            .values()
+                            .map(|i| i.identity_store_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }));
     if let Some(store) = identitystore_snapshot_store {
         identitystore_service = identitystore_service.with_snapshot_store(store);
     }

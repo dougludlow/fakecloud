@@ -8,6 +8,32 @@ impl CognitoService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
+        // Choice-based sign-in (and step-up with TARGET_ACR_VALUES) runs the
+        // same USER_AUTH flow as InitiateAuth, with the challenges answered
+        // through AdminRespondToAuthChallenge.
+        if body["AuthFlow"].as_str() == Some("USER_AUTH") {
+            let pool_id = require_str(&body, "UserPoolId")?;
+            let client_id = require_str(&body, "ClientId")?;
+            let explicit_auth_flows = {
+                let accounts = self.state.read();
+                let empty = CognitoState::new(&req.account_id, &req.region);
+                let state = accounts.get(&req.account_id).unwrap_or(&empty);
+                ensure_user_pool_exists(state, pool_id)?;
+                state
+                    .user_pool_clients
+                    .get(client_id)
+                    .filter(|c| c.user_pool_id == pool_id)
+                    .map(|c| c.explicit_auth_flows.clone())
+                    .ok_or_else(|| {
+                        AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "ResourceNotFoundException",
+                            format!("User pool client {client_id} does not exist."),
+                        )
+                    })?
+            };
+            return self.initiate_user_auth(&body, client_id, pool_id, &explicit_auth_flows, req);
+        }
         let mut input = AdminAuthInput::from_request(&body)?;
 
         // Confidential clients must present a valid SECRET_HASH on
@@ -271,7 +297,7 @@ impl CognitoService {
                 )
             })?;
         self.require_secret_hash(client_id, username, auth_params.get("SECRET_HASH"))?;
-        self.build_srp_challenge(pool_id, client_id, username, srp_a, req)
+        self.build_srp_challenge(pool_id, client_id, username, srp_a, req, None)
     }
 
     /// `InitiateAuth(AuthFlow=USER_AUTH)` — the choice-based flow Amplify Gen2
@@ -324,6 +350,26 @@ impl CognitoService {
         };
         let username = resolved_username.as_str();
 
+        // Step-up: TARGET_ACR_VALUES (optionally with the ACCESS_TOKEN of an
+        // earlier sign-in and MAX_AGE) picks a target ACR level that the
+        // following challenges work toward.
+        let step_up = self.resolve_step_up(pool_id, client_id, username, auth_params, req)?;
+        if let Some(su) = step_up.as_ref() {
+            // The access token already proved the password: go straight to
+            // the factor the target still needs.
+            if su.completed.iter().any(|f| f == AMR_PWD) {
+                return self
+                    .maybe_mfa_challenge(pool_id, client_id, username, req, Some(su))
+                    .ok_or_else(|| {
+                        AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidParameterException",
+                            "The ACCESS_TOKEN already satisfies the requested ACR level.",
+                        )
+                    });
+            }
+        }
+
         let preferred = auth_params
             .get("PREFERRED_CHALLENGE")
             .and_then(|v| v.as_str());
@@ -338,7 +384,7 @@ impl CognitoService {
                         "SRP_A is required for the PASSWORD_SRP challenge",
                     )
                 })?;
-            return self.build_srp_challenge(pool_id, client_id, username, srp_a, req);
+            return self.build_srp_challenge(pool_id, client_id, username, srp_a, req, step_up);
         }
 
         // No preferred challenge resolvable inline: present the menu, filtered
@@ -376,6 +422,7 @@ impl CognitoService {
                     challenge_name: "SELECT_CHALLENGE".to_string(),
                     challenge_results: vec![],
                     challenge_metadata: None,
+                    step_up,
                 },
             );
         }
@@ -385,6 +432,171 @@ impl CognitoService {
             "AvailableChallenges": available,
             "ChallengeParameters": { "USERNAME": username },
         })))
+    }
+
+    /// Resolve the step-up parameters of a `USER_AUTH` request. Returns the
+    /// target level and the factors already credited, or `None` when the
+    /// request sends no `TARGET_ACR_VALUES`.
+    ///
+    /// - `TARGET_ACR_VALUES` lists ACR level names, highest priority first;
+    ///   names the pool doesn't define are ignored, and the first level the
+    ///   user has the factors for is the target. It needs the Essentials or
+    ///   Plus feature plan.
+    /// - `ACCESS_TOKEN` (which requires `TARGET_ACR_VALUES`) credits the
+    ///   methods of the sign-in that issued it, unless that sign-in is older
+    ///   than `MAX_AGE` seconds; a token that already meets the target is
+    ///   refused rather than re-issued.
+    pub(super) fn resolve_step_up(
+        &self,
+        pool_id: &str,
+        client_id: &str,
+        username: &str,
+        auth_params: &serde_json::Map<String, Value>,
+        req: &AwsRequest,
+    ) -> Result<Option<StepUpContext>, AwsServiceError> {
+        let invalid = |msg: &str| {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterException",
+                msg.to_string(),
+            )
+        };
+        let targets = auth_params
+            .get("TARGET_ACR_VALUES")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty());
+        let access_token = auth_params.get("ACCESS_TOKEN").and_then(Value::as_str);
+        let Some(targets) = targets else {
+            if access_token.is_some() {
+                return Err(invalid(
+                    "TARGET_ACR_VALUES is required when ACCESS_TOKEN is provided.",
+                ));
+            }
+            return Ok(None);
+        };
+        let max_age = match auth_params.get("MAX_AGE") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let parsed = match v {
+                    Value::String(s) => s.trim().parse::<i64>().ok(),
+                    other => other.as_i64(),
+                };
+                Some(
+                    parsed
+                        .filter(|n| *n >= 0)
+                        .ok_or_else(|| invalid("MAX_AGE must be a non-negative integer."))?,
+                )
+            }
+        };
+
+        let accounts = self.state.read();
+        let empty = CognitoState::new(&req.account_id, &req.region);
+        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let pool = state.user_pools.get(pool_id).ok_or_else(|| {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ResourceNotFoundException",
+                format!("User pool {pool_id} does not exist."),
+            )
+        })?;
+        if !crate::acr::tier_supports_acr(&pool.user_pool_tier) {
+            return Err(crate::acr::feature_unavailable(
+                "Step-up authentication with TARGET_ACR_VALUES requires the Essentials or Plus \
+                 feature plan.",
+            ));
+        }
+        let requested: Vec<u8> = targets
+            .split_whitespace()
+            .filter_map(|name| crate::acr::level_named(&pool.acr_configuration, name))
+            .collect();
+        if requested.is_empty() {
+            return Err(invalid(
+                "None of the TARGET_ACR_VALUES is an ACR level of this user pool.",
+            ));
+        }
+        let user = state
+            .users
+            .get(pool_id)
+            .and_then(|users| users.get(username))
+            .ok_or_else(|| {
+                // PreventUserExistenceErrors=ENABLED: an unknown user gets the
+                // same generic failure as a wrong password, so step-up does
+                // not reveal which usernames exist.
+                let masks_existence = state
+                    .user_pool_clients
+                    .get(client_id)
+                    .and_then(|c| c.prevent_user_existence_errors.as_deref())
+                    == Some("ENABLED");
+                if masks_existence {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "NotAuthorizedException",
+                        "Incorrect username or password.",
+                    )
+                } else {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "UserNotFoundException",
+                        "User does not exist.",
+                    )
+                }
+            })?;
+
+        let mut credited: Vec<String> = Vec::new();
+        if let Some(token) = access_token {
+            let now = Utc::now();
+            let data = state
+                .access_tokens
+                .get(token)
+                .filter(|d| d.user_pool_id == pool_id)
+                .filter(|d| {
+                    d.expires_at
+                        .unwrap_or(d.issued_at + chrono::Duration::hours(1))
+                        > now
+                })
+                .ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "NotAuthorizedException",
+                        "Invalid Access Token",
+                    )
+                })?;
+            if data.username != username {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "NotAuthorizedException",
+                    "The ACCESS_TOKEN was not issued to the user in USERNAME.",
+                ));
+            }
+            if let Some(ctx) = &data.auth_context {
+                let fresh = max_age.is_none_or(|age| now.timestamp() - ctx.auth_time <= age);
+                if fresh {
+                    credited = crate::acr::factors_of_amr(&ctx.amr);
+                }
+            }
+        }
+
+        let available = user_step_up_factors(user);
+        let has = |f: &&str| available.contains(f) || credited.iter().any(|c| c == f);
+        let target = requested
+            .iter()
+            .copied()
+            .find(|level| step_up_required_factors(*level).is_some_and(|req| req.iter().all(has)))
+            .ok_or_else(|| {
+                invalid(
+                    "The user has no authentication factors that satisfy any of the requested \
+                     ACR levels.",
+                )
+            })?;
+        if crate::acr::level_for_factors(&credited).is_some_and(|level| level >= target) {
+            return Err(invalid(
+                "The ACCESS_TOKEN already satisfies the requested ACR level.",
+            ));
+        }
+        Ok(Some(StepUpContext {
+            target_level: target,
+            completed: credited,
+        }))
     }
 
     /// Build the `PASSWORD_VERIFIER` challenge for an SRP handshake: derive the
@@ -398,6 +610,7 @@ impl CognitoService {
         username: &str,
         srp_a: &str,
         req: &AwsRequest,
+        step_up: Option<StepUpContext>,
     ) -> Result<AwsResponse, AwsServiceError> {
         use base64::Engine;
         use rand::RngCore;
@@ -492,6 +705,7 @@ impl CognitoService {
                     challenge_name: "PASSWORD_VERIFIER".to_string(),
                     challenge_results: vec![],
                     challenge_metadata: Some(stash),
+                    step_up,
                 },
             );
         }
@@ -693,6 +907,7 @@ impl CognitoService {
                         challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
                         challenge_results: vec![],
                         challenge_metadata: None,
+                        step_up: None,
                     },
                 );
                 return Ok(AwsResponse::ok_json(json!({
@@ -721,7 +936,7 @@ impl CognitoService {
         // second factor the pool/user configuration demands (fixes the sign-in
         // MFA bypass — tokens were previously issued straight after the
         // password check).
-        if let Some(resp) = self.maybe_mfa_challenge(pool_id, client_id, username, req) {
+        if let Some(resp) = self.maybe_mfa_challenge(pool_id, client_id, username, req, None) {
             return Ok(resp);
         }
 
@@ -794,6 +1009,7 @@ impl CognitoService {
                     username: username.to_string(),
                     client_id: client_id.to_string(),
                     issued_at: Utc::now(),
+                    auth_context: None,
                 },
             );
 
@@ -805,6 +1021,7 @@ impl CognitoService {
                     client_id: client_id.to_string(),
                     issued_at: Utc::now(),
                     expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                    auth_context: None,
                 },
             );
 
@@ -1051,6 +1268,7 @@ impl CognitoService {
                     challenge_name: challenge_name.clone(),
                     challenge_results,
                     challenge_metadata,
+                    step_up: None,
                 },
             );
         }
@@ -1177,8 +1395,11 @@ impl CognitoService {
                     .zip(pool.signing_kid.as_ref())
                     .map(|(p, k)| (p.clone(), k.clone()))
             });
-            let claims =
+            // A refresh keeps the acr / amr / auth_time of the original sign-in.
+            let auth_context = token_data.auth_context.clone();
+            let mut claims =
                 crate::service::token_claims_for(state, &token_pool_id, &token_username, client_id);
+            claims.auth_context = auth_context;
             (
                 token_pool_id,
                 token_username,
@@ -1258,6 +1479,7 @@ impl CognitoService {
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
                 expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                auth_context: claims.auth_context.clone(),
             },
         );
 

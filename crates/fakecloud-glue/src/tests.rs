@@ -2380,6 +2380,7 @@ fn federated_tables_and_view_definitions_round_trip() {
                 "LastAnalyzedTime": 1700000000.0,
                 "ViewDefinition": {
                     "IsProtected": true,
+                    "IsManaged": true,
                     "Representations": [{
                         "Dialect": "SPARK",
                         "DialectVersion": "3.5",
@@ -2406,6 +2407,7 @@ fn federated_tables_and_view_definitions_round_trip() {
     );
     let vd = &mv["Table"]["ViewDefinition"];
     assert_eq!(vd["SparkPipelineInfo"]["pipelineId"], "p-1");
+    assert_eq!(vd["IsManaged"], true);
     assert_eq!(vd["SubObjectsStatistics"][0]["FileCount"], 3);
     assert_eq!(vd["Representations"][0]["IsStale"], false);
     assert_eq!(mv["Table"]["IsMultiDialectView"], true);
@@ -2681,4 +2683,292 @@ fn crawler_schedule_round_trips_through_start_stop() {
         get(&svc),
         json!({"ScheduleExpression": "cron(0 1 * * ? *)", "State": "NOT_SCHEDULED"})
     );
+}
+
+#[test]
+fn crawler_catalog_id_round_trips_and_survives_update() {
+    let svc = GlueService::default();
+    svc.create_crawler(&req(
+        "CreateCrawler",
+        json!({"Name": "c", "Role": "r", "CatalogId": "111122223333",
+               "Targets": {"S3Targets": [{"Path": "s3://b"}]}}),
+    ))
+    .unwrap();
+    let got = |svc: &GlueService| {
+        body_of(
+            svc.get_crawler(&req("GetCrawler", json!({"Name": "c"})))
+                .unwrap(),
+        )["Crawler"]
+            .clone()
+    };
+    assert_eq!(got(&svc)["CatalogId"], "111122223333");
+
+    // An UpdateCrawler that omits CatalogId keeps the existing value.
+    svc.update_crawler(&req(
+        "UpdateCrawler",
+        json!({"Name": "c", "Description": "d"}),
+    ))
+    .unwrap();
+    assert_eq!(got(&svc)["CatalogId"], "111122223333");
+
+    svc.update_crawler(&req(
+        "UpdateCrawler",
+        json!({"Name": "c", "CatalogId": "444455556666"}),
+    ))
+    .unwrap();
+    assert_eq!(got(&svc)["CatalogId"], "444455556666");
+}
+
+#[test]
+fn column_statistics_task_settings_round_trip_scoped_by_catalog() {
+    let svc = GlueService::default();
+    svc.create_column_statistics_task_settings(&req(
+        "CreateColumnStatisticsTaskSettings",
+        json!({"DatabaseName": "db", "TableName": "t", "Role": "r",
+               "Schedule": "cron(0 1 * * ? *)", "ColumnNameList": ["a", "b"],
+               "SampleSize": 50.0, "SecurityConfiguration": "sec"}),
+    ))
+    .unwrap();
+    // A second catalog holds independent settings for the same db/table.
+    svc.create_column_statistics_task_settings(&req(
+        "CreateColumnStatisticsTaskSettings",
+        json!({"DatabaseName": "db", "TableName": "t", "Role": "other",
+               "CatalogID": "999988887777"}),
+    ))
+    .unwrap();
+    let dup = err_code(svc.create_column_statistics_task_settings(&req(
+        "CreateColumnStatisticsTaskSettings",
+        json!({"DatabaseName": "db", "TableName": "t", "Role": "r"}),
+    )));
+    assert_eq!(dup, "AlreadyExistsException");
+
+    let get = |svc: &GlueService, catalog: Option<&str>| {
+        let mut body = json!({"DatabaseName": "db", "TableName": "t"});
+        if let Some(c) = catalog {
+            body["CatalogID"] = json!(c);
+        }
+        svc.get_column_statistics_task_settings(&req("GetColumnStatisticsTaskSettings", body))
+            .map(|r| body_of(r)["ColumnStatisticsTaskSettings"].clone())
+    };
+    let own = get(&svc, None).unwrap();
+    assert_eq!(own["CatalogID"], "123456789012");
+    assert_eq!(own["Role"], "r");
+    assert_eq!(own["ColumnNameList"], json!(["a", "b"]));
+    assert_eq!(own["SampleSize"], 50.0);
+    assert_eq!(own["SecurityConfiguration"], "sec");
+    assert_eq!(own["ScheduleType"], "CRON");
+    assert_eq!(
+        own["Schedule"],
+        json!({"ScheduleExpression": "cron(0 1 * * ? *)", "State": "SCHEDULED"})
+    );
+    // The account id named explicitly is the same (default) catalog.
+    assert_eq!(get(&svc, Some("123456789012")).unwrap(), own);
+    let other = get(&svc, Some("999988887777")).unwrap();
+    assert_eq!(other["CatalogID"], "999988887777");
+    assert_eq!(other["Role"], "other");
+    assert!(other.get("Schedule").is_none());
+
+    // Update merges: members it omits keep their values.
+    svc.update_column_statistics_task_settings(&req(
+        "UpdateColumnStatisticsTaskSettings",
+        json!({"DatabaseName": "db", "TableName": "t", "SampleSize": 10.0}),
+    ))
+    .unwrap();
+    let own = get(&svc, None).unwrap();
+    assert_eq!(own["SampleSize"], 10.0);
+    assert_eq!(own["Role"], "r");
+
+    // Stop/start the schedule of one catalog only.
+    svc.stop_column_statistics_task_run_schedule(&req(
+        "StopColumnStatisticsTaskRunSchedule",
+        json!({"DatabaseName": "db", "TableName": "t"}),
+    ))
+    .unwrap();
+    assert_eq!(
+        get(&svc, None).unwrap()["Schedule"],
+        json!({"ScheduleExpression": "cron(0 1 * * ? *)", "State": "NOT_SCHEDULED"})
+    );
+    svc.start_column_statistics_task_run_schedule(&req(
+        "StartColumnStatisticsTaskRunSchedule",
+        json!({"DatabaseName": "db", "TableName": "t", "CatalogID": "999988887777"}),
+    ))
+    .unwrap();
+    assert_eq!(
+        get(&svc, Some("999988887777")).unwrap()["Schedule"],
+        json!({"State": "SCHEDULED"})
+    );
+    assert_eq!(
+        get(&svc, None).unwrap()["Schedule"]["State"],
+        "NOT_SCHEDULED"
+    );
+
+    // Delete targets one catalog; a missing table's settings are not found.
+    svc.delete_column_statistics_task_settings(&req(
+        "DeleteColumnStatisticsTaskSettings",
+        json!({"DatabaseName": "db", "TableName": "t", "CatalogID": "999988887777"}),
+    ))
+    .unwrap();
+    assert_eq!(
+        get(&svc, Some("999988887777"))
+            .err()
+            .map(|e| e.code().to_string()),
+        Some("EntityNotFoundException".to_string())
+    );
+    assert!(get(&svc, None).is_ok());
+    for (action, result) in [
+        (
+            "StartColumnStatisticsTaskRunSchedule",
+            svc.start_column_statistics_task_run_schedule(&req(
+                "StartColumnStatisticsTaskRunSchedule",
+                json!({"DatabaseName": "db", "TableName": "missing"}),
+            )),
+        ),
+        (
+            "DeleteColumnStatisticsTaskSettings",
+            svc.delete_column_statistics_task_settings(&req(
+                "DeleteColumnStatisticsTaskSettings",
+                json!({"DatabaseName": "db", "TableName": "missing"}),
+            )),
+        ),
+    ] {
+        assert_eq!(err_code(result), "EntityNotFoundException", "{action}");
+    }
+}
+
+#[test]
+fn column_statistics_task_settings_upgrade_legacy_stored_request() {
+    // Settings persisted before the read shape was stored hold the raw
+    // request, with the cron Schedule as a string.
+    let svc = GlueService::default();
+    {
+        let mut accounts = svc.state.write();
+        let st = accounts.get_or_create("123456789012", "us-east-1");
+        st.column_stats_task_settings.insert(
+            "db\u{1f}t".to_string(),
+            json!({"DatabaseName": "db", "TableName": "t", "Role": "r",
+                   "Schedule": "cron(0 2 * * ? *)"}),
+        );
+    }
+    let got = body_of(
+        svc.get_column_statistics_task_settings(&req(
+            "GetColumnStatisticsTaskSettings",
+            json!({"DatabaseName": "db", "TableName": "t"}),
+        ))
+        .unwrap(),
+    )["ColumnStatisticsTaskSettings"]
+        .clone();
+    assert_eq!(
+        got["Schedule"],
+        json!({"ScheduleExpression": "cron(0 2 * * ? *)", "State": "SCHEDULED"})
+    );
+    assert_eq!(got["CatalogID"], "123456789012");
+    assert_eq!(got["Role"], "r");
+}
+
+#[test]
+fn column_statistics_task_settings_legacy_other_catalog_rekeyed_on_load() {
+    // The old layout keyed every catalog's settings `db\x1ftable`; a record
+    // naming another catalog must move to that catalog's key on load.
+    let mut accounts = crate::GlueAccounts::new();
+    {
+        let st = accounts.get_or_create("123456789012", "us-east-1");
+        st.column_stats_task_settings.insert(
+            "db\u{1f}other".to_string(),
+            json!({"DatabaseName": "db", "TableName": "other", "Role": "r",
+                   "CatalogID": "999999999999", "Schedule": "cron(0 2 * * ? *)"}),
+        );
+        st.column_stats_task_settings.insert(
+            "db\u{1f}own".to_string(),
+            json!({"DatabaseName": "db", "TableName": "own", "Role": "r",
+                   "CatalogID": "123456789012"}),
+        );
+    }
+    let bytes = serde_json::to_vec(&crate::GlueSnapshot {
+        schema_version: crate::GLUE_SNAPSHOT_SCHEMA_VERSION,
+        accounts: Some(accounts),
+    })
+    .unwrap();
+    let mut loaded = serde_json::from_slice::<crate::GlueSnapshot>(&bytes)
+        .unwrap()
+        .accounts
+        .unwrap();
+    loaded.upgrade_loaded();
+    let svc = GlueService::default();
+    *svc.state.write() = loaded;
+
+    let get = |body: Value| {
+        svc.get_column_statistics_task_settings(&req("GetColumnStatisticsTaskSettings", body))
+    };
+    let got = body_of(
+        get(json!({"DatabaseName": "db", "TableName": "other", "CatalogID": "999999999999"}))
+            .unwrap(),
+    )["ColumnStatisticsTaskSettings"]
+        .clone();
+    assert_eq!(got["CatalogID"], "999999999999");
+    assert_eq!(got["Role"], "r");
+    // No longer reachable as the account's own catalog.
+    assert!(get(json!({"DatabaseName": "db", "TableName": "other"})).is_err());
+    // A legacy record in the account's own catalog keeps its key.
+    assert!(get(json!({"DatabaseName": "db", "TableName": "own"})).is_ok());
+}
+
+#[test]
+fn column_statistics_task_runs_scoped_by_catalog() {
+    let svc = GlueService::default();
+    let start = |catalog: Option<&str>| {
+        let mut body = json!({"DatabaseName": "db", "TableName": "t", "Role": "r",
+                              "ColumnNameList": ["a"], "SampleSize": 25.0,
+                              "SecurityConfiguration": "sec"});
+        if let Some(c) = catalog {
+            body["CatalogID"] = json!(c);
+        }
+        body_of(
+            svc.start_column_statistics_task_run(&req("StartColumnStatisticsTaskRun", body))
+                .unwrap(),
+        )["ColumnStatisticsTaskRunId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let own = start(None);
+    let other = start(Some("999988887777"));
+
+    let runs = |catalog: Option<&str>| {
+        let mut body = json!({"DatabaseName": "db", "TableName": "t"});
+        if let Some(c) = catalog {
+            body["CatalogID"] = json!(c);
+        }
+        body_of(
+            svc.get_column_statistics_task_runs(&req("GetColumnStatisticsTaskRuns", body))
+                .unwrap(),
+        )["ColumnStatisticsTaskRuns"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let mine = runs(None);
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0]["ColumnStatisticsTaskRunId"], own.as_str());
+    assert_eq!(mine[0]["CatalogID"], "123456789012");
+    assert_eq!(mine[0]["CustomerId"], "123456789012");
+    assert_eq!(mine[0]["ColumnNameList"], json!(["a"]));
+    assert_eq!(mine[0]["SampleSize"], 25.0);
+    assert_eq!(mine[0]["SecurityConfiguration"], "sec");
+    let theirs = runs(Some("999988887777"));
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(theirs[0]["ColumnStatisticsTaskRunId"], other.as_str());
+
+    // Stopping in the other catalog leaves this catalog's run running.
+    svc.stop_column_statistics_task_run(&req(
+        "StopColumnStatisticsTaskRun",
+        json!({"DatabaseName": "db", "TableName": "t", "CatalogID": "999988887777"}),
+    ))
+    .unwrap();
+    assert_eq!(runs(Some("999988887777"))[0]["Status"], "STOPPING");
+    assert_eq!(runs(None)[0]["Status"], "RUNNING");
+    let err = err_code(svc.stop_column_statistics_task_run(&req(
+        "StopColumnStatisticsTaskRun",
+        json!({"DatabaseName": "db", "TableName": "t", "CatalogID": "999988887777"}),
+    )));
+    assert_eq!(err, "ColumnStatisticsTaskNotRunningException");
 }

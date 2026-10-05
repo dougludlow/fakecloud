@@ -51,9 +51,9 @@ async fn create_member(client: &aws_sdk_organizations::Client, email: &str, name
     await_account(client, &request_id).await
 }
 
-#[test_action("organizations", "CreateOrganization", checksum = "ec60d87e")]
-#[test_action("organizations", "DescribeOrganization", checksum = "95bbec3c")]
-#[test_action("organizations", "ListRoots", checksum = "4dbc05ab")]
+#[test_action("organizations", "CreateOrganization", checksum = "309963a4")]
+#[test_action("organizations", "DescribeOrganization", checksum = "b20a3eff")]
+#[test_action("organizations", "ListRoots", checksum = "1b56ce96")]
 #[test_action("organizations", "EnableAllFeatures", checksum = "5f0d8a7e")]
 #[test_action("organizations", "DeleteOrganization", checksum = "a902a4bd")]
 #[tokio::test]
@@ -251,27 +251,27 @@ async fn organizations_account_lifecycle() {
         .await;
 }
 
-#[test_action("organizations", "CreatePolicy", checksum = "98aa2760")]
-#[test_action("organizations", "UpdatePolicy", checksum = "78a189df")]
-#[test_action("organizations", "DescribePolicy", checksum = "7af077ad")]
-#[test_action("organizations", "ListPolicies", checksum = "6e5b7425")]
+#[test_action("organizations", "CreatePolicy", checksum = "342e1816")]
+#[test_action("organizations", "UpdatePolicy", checksum = "ea1d878c")]
+#[test_action("organizations", "DescribePolicy", checksum = "bd32e076")]
+#[test_action("organizations", "ListPolicies", checksum = "65c091a8")]
 #[test_action("organizations", "AttachPolicy", checksum = "f093f2e9")]
-#[test_action("organizations", "ListPoliciesForTarget", checksum = "3e798227")]
+#[test_action("organizations", "ListPoliciesForTarget", checksum = "8f628e6f")]
 #[test_action("organizations", "ListTargetsForPolicy", checksum = "195ce5cf")]
 #[test_action("organizations", "DetachPolicy", checksum = "8d590bab")]
 #[test_action("organizations", "DeletePolicy", checksum = "389c2057")]
-#[test_action("organizations", "DescribeEffectivePolicy", checksum = "5dc453ad")]
-#[test_action("organizations", "EnablePolicyType", checksum = "26567e28")]
-#[test_action("organizations", "DisablePolicyType", checksum = "f283538b")]
+#[test_action("organizations", "DescribeEffectivePolicy", checksum = "ebc4ed5c")]
+#[test_action("organizations", "EnablePolicyType", checksum = "6667728d")]
+#[test_action("organizations", "DisablePolicyType", checksum = "84f1ae49")]
 #[test_action(
     "organizations",
     "ListAccountsWithInvalidEffectivePolicy",
-    checksum = "4e459933"
+    checksum = "0602cd73"
 )]
 #[test_action(
     "organizations",
     "ListEffectivePolicyValidationErrors",
-    checksum = "9b882de8"
+    checksum = "4c2188cc"
 )]
 #[tokio::test]
 async fn organizations_policy_lifecycle() {

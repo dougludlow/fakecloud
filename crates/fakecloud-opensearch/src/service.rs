@@ -1112,7 +1112,7 @@ impl OpenSearchService {
             "DescribeDomainChangeProgress" => self.describe_domain_change_progress(l, req),
             "DescribeDomainHealth" => self.describe_domain_health(l),
             "DescribeDomainNodes" => self.describe_domain_nodes(l),
-            "DescribeDryRunProgress" => self.describe_dry_run_progress(l),
+            "DescribeDryRunProgress" => self.describe_dry_run_progress(l, req),
             "CancelDomainConfigChange" => self.cancel_domain_config_change(l, req),
             // ---- Instance types / versions ----
             "DescribeInstanceTypeLimits" | "DescribeElasticsearchInstanceTypeLimits" => {
@@ -1233,6 +1233,9 @@ impl OpenSearchService {
             scheduled_actions: Default::default(),
             maintenances: Default::default(),
             service_software_status: None,
+            last_change: None,
+            last_dry_run: None,
+            dry_runs: Vec::new(),
         };
         // A domain's tags live on the domain itself (`d.tags`); `AddTags` /
         // `RemoveTags` / `ListTags` all operate there via `apply_tag_target`.
@@ -1355,6 +1358,20 @@ impl OpenSearchService {
         let name = label(l.domain.as_deref())?;
         let b = body(req);
         let dry_run = b.get("DryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+        let accepted_warnings: Vec<String> = b
+            .get("AcceptedWarnings")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if accepted_warnings.len() > 25 {
+            return Err(validation(
+                "AcceptedWarnings must contain at most 25 warning codes.",
+            ));
+        }
         let vpc_options = match b.get("VPCOptions").filter(|v| v.is_object()) {
             Some(v) => Some(self.derive_vpc_options(&req.account_id, v)?),
             None => None,
@@ -1365,12 +1382,19 @@ impl OpenSearchService {
             .domains
             .get_mut(&name)
             .ok_or_else(|| not_found_domain(&name))?;
+        let mut out = json!({});
         if !dry_run {
+            let mut properties = Vec::new();
             if let Some(obj) = b.as_object() {
                 for (k, v) in obj {
-                    if k == "DomainName" || k == "DryRun" || k == "DryRunMode" {
+                    if k == "DomainName"
+                        || k == "DryRun"
+                        || k == "DryRunMode"
+                        || k == "AcceptedWarnings"
+                    {
                         continue;
                     }
+                    properties.push(k.clone());
                     if k == "EngineVersion" || k == "ElasticsearchVersion" {
                         if let Some(s) = v.as_str() {
                             d.engine_version = s.to_string();
@@ -1382,12 +1406,30 @@ impl OpenSearchService {
             if let Some(v) = vpc_options {
                 d.config.insert("VPCOptions".into(), v);
             }
-        }
-        let cfg = domain_config(d, api);
-        let mut out = json!({ "DomainConfig": cfg });
-        if dry_run {
+            d.last_change = Some(crate::state::ConfigChange {
+                change_id: uuid::Uuid::new_v4().to_string(),
+                start_time: Utc::now(),
+                properties,
+                accepted_warnings,
+            });
+        } else {
+            let run = crate::state::DryRunRecord {
+                dry_run_id: uuid::Uuid::new_v4().to_string(),
+                created_at: Utc::now(),
+                accepted_warnings,
+            };
             out["DryRunResults"] = json!({"DeploymentType": "None", "Message": "No changes"});
+            out["DryRunProgressStatus"] = dry_run_progress_json(&run);
+            if let Some(prev) = d.last_dry_run.replace(run) {
+                d.dry_runs.push(prev);
+                let excess = d
+                    .dry_runs
+                    .len()
+                    .saturating_sub(crate::state::MAX_DRY_RUN_HISTORY - 1);
+                d.dry_runs.drain(..excess);
+            }
         }
+        out["DomainConfig"] = domain_config(d, api);
         Ok(ok(out))
     }
 
@@ -2837,13 +2879,39 @@ impl OpenSearchService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let dom = label(l.domain.as_deref())?;
         self.require_domain(&dom, &req.account_id)?;
+        let last_change = {
+            let accounts = self.state.read();
+            accounts
+                .get(&req.account_id)
+                .and_then(|st| st.domains.get(&dom))
+                .and_then(|d| d.last_change.clone())
+        };
+        let Some(change) = last_change else {
+            return Ok(ok(json!({ "ChangeProgressStatus": {
+                "ChangeId": short_id(),
+                "Status": "COMPLETED",
+                "PendingProperties": [],
+                "CompletedProperties": [],
+                "TotalNumberOfStages": 0,
+                "ChangeProgressStages": [],
+            }})));
+        };
+        // Config changes apply synchronously here, so the latest change is
+        // always complete; no advisory validation ever fails, so the
+        // accepted-warning list is echoed with an empty failure list.
         Ok(ok(json!({ "ChangeProgressStatus": {
-            "ChangeId": short_id(),
+            "ChangeId": change.change_id,
+            "StartTime": change.start_time.timestamp(),
             "Status": "COMPLETED",
             "PendingProperties": [],
-            "CompletedProperties": [],
+            "CompletedProperties": change.properties,
             "TotalNumberOfStages": 0,
             "ChangeProgressStages": [],
+            "LastUpdatedTime": change.start_time.timestamp(),
+            "ConfigChangeStatus": "Completed",
+            "InitiatedBy": "CUSTOMER",
+            "ValidationFailures": [],
+            "AcceptedWarnings": change.accepted_warnings,
         }})))
     }
 
@@ -2871,14 +2939,47 @@ impl OpenSearchService {
         Ok(ok(json!({ "DomainNodesStatusList": [] })))
     }
 
-    fn describe_dry_run_progress(&self, l: &Labels) -> Result<AwsResponse, AwsServiceError> {
-        let _ = label(l.domain.as_deref())?;
-        Ok(ok(json!({ "DryRunProgressStatus": {
-            "DryRunId": short_id(),
-            "DryRunStatus": "completed",
-            "CreationDate": Utc::now().to_rfc3339(),
-            "UpdateDate": Utc::now().to_rfc3339(),
-        }})))
+    fn describe_dry_run_progress(
+        &self,
+        l: &Labels,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let dom = label(l.domain.as_deref())?;
+        let dry_run_id = req.query_params.get("dryRunId").filter(|id| !id.is_empty());
+        if let Some(id) = dry_run_id {
+            if !is_guid(id) {
+                return Err(validation(format!(
+                    "1 validation error detected: Value '{id}' at 'dryRunId' failed to satisfy constraint: Member must satisfy regular expression pattern: \\p{{XDigit}}{{8}}-\\p{{XDigit}}{{4}}-\\p{{XDigit}}{{4}}-\\p{{XDigit}}{{4}}-\\p{{XDigit}}{{12}}"
+                )));
+            }
+        }
+        let accounts = self.state.read();
+        let d = accounts
+            .get(&req.account_id)
+            .and_then(|st| st.domains.get(&dom))
+            .ok_or_else(|| not_found_domain(&dom))?;
+        // The requested dry run, or the latest one when no DryRunId is given.
+        let run = match dry_run_id {
+            Some(id) => d
+                .last_dry_run
+                .iter()
+                .chain(d.dry_runs.iter().rev())
+                .find(|r| &r.dry_run_id == id),
+            None => d.last_dry_run.as_ref(),
+        }
+        .ok_or_else(|| {
+            AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "ResourceNotFoundException",
+                match dry_run_id {
+                    Some(id) => format!("Dry run {id} not found for domain {dom}."),
+                    None => format!("No dry run found for domain {dom}."),
+                },
+            )
+        })?;
+        Ok(ok(
+            json!({ "DryRunProgressStatus": dry_run_progress_json(run) }),
+        ))
     }
 
     fn cancel_domain_config_change(
@@ -3625,6 +3726,20 @@ fn decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Render a recorded dry run as `DryRunProgressStatus`. Dry runs validate
+/// synchronously here and nothing fails validation, so the run is complete
+/// with an empty failure list and the caller's accepted warnings echoed.
+fn dry_run_progress_json(run: &crate::state::DryRunRecord) -> Value {
+    json!({
+        "DryRunId": run.dry_run_id,
+        "DryRunStatus": "completed",
+        "CreationDate": run.created_at.to_rfc3339(),
+        "UpdateDate": run.created_at.to_rfc3339(),
+        "ValidationFailures": [],
+        "AcceptedWarnings": run.accepted_warnings,
+    })
+}
+
 fn short_id() -> String {
     fakecloud_core::ids::short_id(20)
 }
@@ -3714,6 +3829,16 @@ fn validate_domain_name(name: &str) -> Result<(), AwsServiceError> {
         return Err(validation("DomainName must match [a-z][a-z0-9\\-]+."));
     }
     Ok(())
+}
+
+/// Whether `s` matches the model's `GUID` shape (8-4-4-4-12 hex digits).
+fn is_guid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn validation(msg: impl Into<String>) -> AwsServiceError {
