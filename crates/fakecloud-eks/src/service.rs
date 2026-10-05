@@ -1630,11 +1630,14 @@ impl EksService {
         let id = uuid::Uuid::new_v4().to_string();
         let arn = addon_arn(&region, &account_id, cluster_name, &name, &id);
         let now = Utc::now();
-        let addon_version = body
-            .get("addonVersion")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| default_addon_version(&name, &cluster_version));
+        // Resolved before any state changes: an add-on (or requested version)
+        // EKS doesn't offer on the cluster's Kubernetes version is refused.
+        let addon_version = resolve_addon_version(
+            &name,
+            &cluster_version,
+            body.get("addonVersion").and_then(|v| v.as_str()),
+        )
+        .map_err(|e| invalid_parameter(e.to_string()))?;
         let namespace = body
             .get("namespaceConfig")
             .and_then(|v| v.get("namespace"))
@@ -1787,15 +1790,28 @@ impl EksService {
         let account_id = req.account_id.clone();
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if !state.clusters.contains_key(cluster_name) {
-            return Err(not_found_cluster(cluster_name)());
-        }
+        let cluster_version = state
+            .clusters
+            .get(cluster_name)
+            .ok_or_else(not_found_cluster(cluster_name))?
+            .version
+            .clone();
         let (addon_arn, namespace) = state
             .addons
             .get(cluster_name)
             .and_then(|m| m.get(name))
             .map(|a| (a.arn.clone(), a.namespace.clone()))
             .ok_or_else(not_found_addon(name))?;
+        // A new version must be offered for the cluster's Kubernetes version;
+        // checked before the pod identity associations are reconciled so a
+        // refused update changes nothing.
+        let new_version = match body.get("addonVersion").and_then(|v| v.as_str()) {
+            Some(v) => Some(
+                resolve_addon_version(name, &cluster_version, Some(v))
+                    .map_err(|e| invalid_parameter(e.to_string()))?,
+            ),
+            None => None,
+        };
         // The add-on's associations are reconciled in place: a service
         // account that stays keeps its association and ARN.
         let pod_identity_associations = match body.get("podIdentityAssociations") {
@@ -1824,9 +1840,9 @@ impl EksService {
             .ok_or_else(not_found_addon(name))?;
 
         let mut params = Vec::new();
-        if let Some(version) = body.get("addonVersion").and_then(|v| v.as_str()) {
-            addon.addon_version = version.to_string();
-            params.push(("AddonVersion".to_string(), version.to_string()));
+        if let Some(version) = new_version {
+            addon.addon_version = version.clone();
+            params.push(("AddonVersion".to_string(), version));
         }
         if let Some(role) = body.get("serviceAccountRoleArn").and_then(|v| v.as_str()) {
             addon.service_account_role_arn = Some(role.to_string());
@@ -3018,9 +3034,10 @@ impl EksService {
             }
             None => 100,
         };
-        // Enum query params reject values outside the model's declared members.
+        // Enum query params reject values outside the model's declared enum
+        // values (`ClusterVersionStatus` is `standard-support`, hyphenated).
         if let Some(status) = req.query_params.get("status") {
-            if !["unsupported", "standard_support", "extended_support"].contains(&status.as_str()) {
+            if !["unsupported", "standard-support", "extended-support"].contains(&status.as_str()) {
                 return Err(invalid_parameter(format!("Invalid status: {status}")));
             }
         }

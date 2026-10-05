@@ -560,6 +560,15 @@ impl ResourceProvisioner {
             .ok_or_else(|| format!("No cluster found for name: {cluster_name}"))?
             .version
             .clone();
+        // Resolved before any state changes, exactly as the direct CreateAddon:
+        // an add-on or AddonVersion EKS doesn't offer on the cluster's
+        // Kubernetes version fails the resource.
+        let addon_version = fakecloud_eks::resolve_addon_version(
+            &name,
+            &cluster_version,
+            props.get("AddonVersion").and_then(|v| v.as_str()),
+        )
+        .map_err(|e| e.to_string())?;
         // Each requested pod identity association becomes a real association
         // owned by the add-on, exactly as the direct CreateAddon does.
         let pod_identity_associations = match props.get("PodIdentityAssociations") {
@@ -582,11 +591,7 @@ impl ResourceProvisioner {
             name: name.clone(),
             arn: arn.clone(),
             cluster_name: cluster_name.clone(),
-            addon_version: props
-                .get("AddonVersion")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("v{cluster_version}-eksbuild.1")),
+            addon_version,
             status: "ACTIVE".to_string(),
             created_at: now,
             modified_at: now,
@@ -1164,6 +1169,22 @@ impl ResourceProvisioner {
             .and_then(|m| m.get(name))
             .map(|a| a.arn.clone())
             .ok_or_else(|| format!("No addon found: {physical_id}"))?;
+        // A new AddonVersion must be offered for the cluster's Kubernetes
+        // version; checked before anything is reconciled.
+        let new_version = match props.get("AddonVersion").and_then(|v| v.as_str()) {
+            Some(v) => {
+                let cluster_version = state
+                    .clusters
+                    .get(cluster_name)
+                    .map(|c| c.version.clone())
+                    .ok_or_else(|| format!("No cluster found for name: {cluster_name}"))?;
+                Some(
+                    fakecloud_eks::resolve_addon_version(name, &cluster_version, Some(v))
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+            None => None,
+        };
         let pod_identity_associations = match props.get("PodIdentityAssociations") {
             Some(v) => Some(
                 fakecloud_eks::addon_pod_identity::reconcile_addon_pod_identity_associations(
@@ -1188,8 +1209,8 @@ impl ResourceProvisioner {
         if let Some(arns) = pod_identity_associations {
             addon.pod_identity_associations = arns;
         }
-        if let Some(v) = props.get("AddonVersion").and_then(|v| v.as_str()) {
-            addon.addon_version = v.to_string();
+        if let Some(v) = new_version {
+            addon.addon_version = v;
         }
         if let Some(v) = props.get("ConfigurationValues").and_then(|v| v.as_str()) {
             addon.configuration_values = Some(v.to_string());

@@ -889,9 +889,14 @@ async fn unimplemented_subresource_falls_through() {
 // -----------------------------------------------------------------------
 
 fn addon_body(name: &str) -> String {
+    // A real build of each add-on offered on the default (1.31) cluster.
+    let version = match name {
+        "coredns" => "v1.11.4-eksbuild.24",
+        _ => "v1.18.3-eksbuild.2",
+    };
     json!({
         "addonName": name,
-        "addonVersion": "v1.18.3-eksbuild.2",
+        "addonVersion": version,
         "serviceAccountRoleArn": "arn:aws:iam::111122223333:role/eks-addon",
         "configurationValues": "{\"replicaCount\":2}",
         "tags": { "team": "core" }
@@ -1131,7 +1136,7 @@ async fn describe_addon_versions_lists_pod_identity_agent_for_cluster_version() 
     }
     assert_eq!(
         default_version_of(a, "1.32").as_deref(),
-        Some("v1.3.4-eksbuild.1")
+        Some("v1.3.10-eksbuild.1")
     );
 }
 
@@ -1196,7 +1201,7 @@ async fn describe_addon_versions_tracks_kubernetes_minor() {
     let kp = addon_versions(&svc, "addonName=kube-proxy&kubernetesVersion=1.33").await;
     assert_eq!(
         default_version_of(&kp[0], "1.33").as_deref(),
-        Some("v1.33.0-eksbuild.2")
+        Some("v1.33.3-eksbuild.4")
     );
     // Without a kubernetesVersion every catalog cluster version is covered.
     let all = addon_versions(&svc, "addonName=coredns").await;
@@ -1212,7 +1217,7 @@ async fn describe_addon_versions_tracks_kubernetes_minor() {
     }
     assert_eq!(
         default_version_of(&all[0], "1.34").as_deref(),
-        Some("v1.12.1-eksbuild.2")
+        Some("v1.12.3-eksbuild.1")
     );
 }
 
@@ -1229,7 +1234,119 @@ async fn create_addon_defaults_to_catalog_default_version() {
         .await
         .unwrap();
     let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    assert_eq!(v["addon"]["addonVersion"], "v1.3.4-eksbuild.1");
+    assert_eq!(v["addon"]["addonVersion"], "v1.3.10-eksbuild.1");
+}
+
+async fn create_cluster_on(svc: &EksService, name: &str, version: &str) {
+    let mut body: Value = serde_json::from_str(&create_body(name)).unwrap();
+    body["version"] = json!(version);
+    svc.handle(make_request(Method::POST, "/clusters", &body.to_string()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_addon_refuses_addon_without_a_build_for_the_cluster_version() {
+    let svc = EksService::new(make_state());
+    create_cluster_on(&svc, "c134", "1.34").await;
+    // adot has no 1.34 build: no fallback to another minor's default.
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c134/addons",
+            &json!({ "addonName": "adot" }).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(err.message(), "Addon specified is not supported");
+    let resp = svc
+        .handle(make_request(Method::GET, "/clusters/c134/addons", ""))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addons"], json!([]));
+
+    // The default for a non-default minor is that minor's own default.
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c134/addons",
+            &json!({ "addonName": "kube-proxy" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addon"]["addonVersion"], "v1.34.0-eksbuild.2");
+}
+
+#[tokio::test]
+async fn create_and_update_addon_refuse_versions_for_another_minor() {
+    // kube-proxy builds run on their own minor and newer ones, never older.
+    let svc = EksService::new(make_state());
+    create_cluster_on(&svc, "c133", "1.33").await;
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c133/addons",
+            &json!({ "addonName": "kube-proxy", "addonVersion": "v1.34.1-eksbuild.2" }).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(err.message(), "Addon version specified is not supported");
+
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c133/addons",
+        &json!({ "addonName": "kube-proxy", "addonVersion": "v1.33.3-eksbuild.10" }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c133/addons/kube-proxy/update",
+            &json!({ "addonVersion": "v1.34.1-eksbuild.2" }).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(err.message(), "Addon version specified is not supported");
+    // The refused update changed nothing.
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/clusters/c133/updates?addonName=kube-proxy",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["updateIds"], json!([]));
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/clusters/c133/addons/kube-proxy",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addon"]["addonVersion"], "v1.33.3-eksbuild.10");
+
+    // A compatible version goes through.
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c133/addons/kube-proxy/update",
+        &json!({ "addonVersion": "v1.33.5-eksbuild.2" }).to_string(),
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2128,6 +2245,101 @@ async fn describe_cluster_versions_rejects_bad_maxresults() {
         .unwrap();
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     assert_eq!(err.code(), "InvalidParameterException");
+}
+
+async fn cluster_versions(svc: &EksService, query: &str) -> Vec<Value> {
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            &format!("/cluster-versions?{query}"),
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    v["clusterVersions"].as_array().unwrap().clone()
+}
+
+fn row<'a>(rows: &'a [Value], version: &str) -> &'a Value {
+    rows.iter()
+        .find(|r| r["clusterVersion"] == version)
+        .unwrap_or_else(|| panic!("missing {version}"))
+}
+
+#[tokio::test]
+async fn describe_cluster_versions_reports_aws_dates_and_status_enum() {
+    let svc = EksService::new(make_state());
+    let rows = cluster_versions(&svc, "").await;
+    // Deprecated `status` uses the hyphenated `ClusterVersionStatus` values.
+    for r in &rows {
+        let expected = match r["versionStatus"].as_str().unwrap() {
+            "STANDARD_SUPPORT" => "standard-support",
+            "EXTENDED_SUPPORT" => "extended-support",
+            other => panic!("unexpected versionStatus {other}"),
+        };
+        assert_eq!(r["status"], expected, "{}", r["clusterVersion"]);
+    }
+    // 2025-10-02 / 2026-12-02 / 2027-12-02 at midnight UTC.
+    let v134 = row(&rows, "1.34");
+    assert_eq!(v134["releaseDate"], json!(1759363200.0));
+    assert_eq!(v134["endOfStandardSupportDate"], json!(1796169600.0));
+    assert_eq!(v134["endOfExtendedSupportDate"], json!(1827705600.0));
+    assert_eq!(v134["kubernetesPatchVersion"], "1.34.1");
+    // 2025-05-29 / 2026-07-29 / 2027-07-29.
+    let v133 = row(&rows, "1.33");
+    assert_eq!(v133["releaseDate"], json!(1748476800.0));
+    assert_eq!(v133["endOfStandardSupportDate"], json!(1785283200.0));
+    assert_eq!(v133["endOfExtendedSupportDate"], json!(1816819200.0));
+    // 1.30 left standard support on 2025-07-23.
+    assert_eq!(row(&rows, "1.30")["versionStatus"], "EXTENDED_SUPPORT");
+    assert_eq!(row(&rows, "1.30")["status"], "extended-support");
+    assert_eq!(row(&rows, "1.31")["status"], "standard-support");
+}
+
+#[tokio::test]
+async fn describe_cluster_versions_status_filter_uses_enum_values() {
+    let svc = EksService::new(make_state());
+    let extended = cluster_versions(&svc, "status=extended-support").await;
+    let names: Vec<&str> = extended
+        .iter()
+        .map(|r| r["clusterVersion"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["1.28", "1.29", "1.30"]);
+    let standard = cluster_versions(&svc, "status=standard-support").await;
+    assert!(standard.iter().all(|r| r["status"] == "standard-support"));
+    assert_eq!(standard.len(), 4);
+    // The member name is not a valid wire value.
+    let err = svc
+        .handle(make_request(
+            Method::GET,
+            "/cluster-versions?status=standard_support",
+            "",
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+}
+
+#[tokio::test]
+async fn describe_addon_configuration_external_dns_pod_identity() {
+    let svc = EksService::new(make_state());
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/addons/configuration-schemas?addonName=external-dns&addonVersion=v0.20.0-eksbuild.1",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        v["podIdentityConfiguration"],
+        json!([{
+            "serviceAccount": "external-dns",
+            "recommendedManagedPolicies": ["arn:aws:iam::aws:policy/AmazonRoute53FullAccess"],
+        }])
+    );
 }
 
 // -----------------------------------------------------------------------
