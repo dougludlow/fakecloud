@@ -191,20 +191,28 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         // Account settings and usage are per region on AWS: the concurrency
         // limit, code storage and function count of one region never count
-        // against another.
+        // against another. With Service Quotas attached, the concurrency and
+        // code storage limits are the account's applied quota values (read
+        // before the Lambda lock: the lookup takes Service Quotas' locks).
+        let concurrency_quota =
+            self.applied_quota(account_id, region, crate::quota::CONCURRENT_EXECUTIONS);
+        let storage_quota = self.applied_quota(account_id, region, crate::quota::CODE_STORAGE);
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, region);
         let state = accounts.regional(account_id, region).unwrap_or(&empty);
         let settings = state.account_settings.clone().unwrap_or(AccountSettings {
-            concurrent_executions: 1000,
+            concurrent_executions: concurrency_quota.map_or(1000, |v| v.max(0.0) as i64),
             code_size_zipped: 52_428_800,
             code_size_unzipped: 262_144_000,
-            total_code_size: 80_530_636_800,
+            total_code_size: storage_quota.map_or(80_530_636_800, |gb| {
+                (gb.max(0.0) * 1024.0 * 1024.0 * 1024.0) as i64
+            }),
         });
         // Real AccountUsage so clients monitoring deployment quotas see
-        // accurate numbers. AWS sums total code size across all functions.
+        // accurate numbers: AWS counts the code of every function, every
+        // published version and every layer version.
         let function_count = state.functions.len() as i64;
-        let total_code_size: i64 = state.functions.values().map(|f| f.code_size).sum();
+        let total_code_size = crate::quota::code_storage_used(state);
         // UnreservedConcurrentExecutions = the account limit minus the
         // concurrency reserved by individual functions (AWS decrements it as
         // reserved concurrency is allocated).

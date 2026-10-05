@@ -1476,12 +1476,14 @@ impl DynamoDbService {
         };
         let job = import_job(&req.account_id, &req.region, &imp, &table);
         let response = json!({ "ImportTableDescription": import_description_json(&imp, true) });
+        let table_limit = self.table_limit(&req.account_id, &req.region);
         {
             let mut accounts = self.state.write();
             let state = accounts.regional_mut(&req.account_id, &req.region);
             if state.tables.contains_key(&table_name) {
                 return Err(already_exists());
             }
+            crate::quota::check_new_table(table_limit, state.tables.len())?;
             state.tables.insert(table_name, table);
             state.imports.insert(import_arn, imp);
         }

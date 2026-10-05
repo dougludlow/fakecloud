@@ -22,6 +22,11 @@ impl LambdaService {
                 format!("ReservedConcurrentExecutions must be >= 0 (got {})", n),
             ));
         }
+        let applied = self.applied_quota(
+            &req.account_id,
+            &req.region,
+            crate::quota::CONCURRENT_EXECUTIONS,
+        );
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
         // AWS returns ResourceNotFoundException for a config-put against a
@@ -31,6 +36,8 @@ impl LambdaService {
         if !state.functions.contains_key(function_name) {
             return Err(not_found("Function", function_name));
         }
+        let limit = crate::quota::concurrency_limit(state, applied);
+        crate::quota::check_reservation(state, function_name, n, limit)?;
         state
             .function_concurrency
             .insert(function_name.to_string(), n);

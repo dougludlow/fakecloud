@@ -194,11 +194,13 @@ impl DynamoDbService {
             sse_kms_key_arn
         };
 
+        let table_limit = self.table_limit(&req.account_id, &req.region);
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
         if state.tables.contains_key(&table_name) {
             return Err(already_exists());
         }
+        crate::quota::check_new_table(table_limit, state.tables.len())?;
 
         let now = Utc::now();
         let stream_arn = if stream_enabled {
@@ -477,6 +479,18 @@ impl DynamoDbService {
             }
         }
 
+        // A replica is a table in its own region and counts toward that
+        // region's table quota.
+        let replica_limits: Vec<(String, Option<usize>)> = replica_updates
+            .iter()
+            .filter_map(|u| match u {
+                super::replicas::ReplicaUpdate::Create { region, .. } => {
+                    Some((region.clone(), self.table_limit(&req.account_id, region)))
+                }
+                _ => None,
+            })
+            .collect();
+
         let mut accounts = self.state.write();
         super::replicas::validate_replica_updates(
             &accounts,
@@ -485,6 +499,17 @@ impl DynamoDbService {
             super::resolve_table_name(table_name),
             &replica_updates,
         )?;
+        if accounts
+            .regional(&req.account_id, &req.region)
+            .is_some_and(|s| s.tables.contains_key(super::resolve_table_name(table_name)))
+        {
+            for (region, limit) in &replica_limits {
+                let existing = accounts
+                    .regional(&req.account_id, region)
+                    .map_or(0, |s| s.tables.len());
+                crate::quota::check_new_table(*limit, existing)?;
+            }
+        }
         let state = accounts.regional_mut(&req.account_id, &req.region);
         // Snapshot region + account before taking a mutable borrow of
         // `state.tables` — we need them to mint a new stream ARN when the
@@ -1303,6 +1328,7 @@ impl DynamoDbService {
         let body = Self::parse_body(req)?;
         let backup_arn = require_str(&body, "BackupArn")?;
         let target_table_name = require_str(&body, "TargetTableName")?;
+        let table_limit = self.table_limit(&req.account_id, &req.region);
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
@@ -1322,6 +1348,7 @@ impl DynamoDbService {
                 format!("Table already exists: {target_table_name}"),
             ));
         }
+        crate::quota::check_new_table(table_limit, state.tables.len())?;
 
         let now = Utc::now();
         let arn =
@@ -1406,6 +1433,7 @@ impl DynamoDbService {
         let target_table_name = require_str(&body, "TargetTableName")?;
         let source_table_name = body["SourceTableName"].as_str();
         let source_table_arn = body["SourceTableArn"].as_str();
+        let table_limit = self.table_limit(&req.account_id, &req.region);
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
@@ -1441,6 +1469,7 @@ impl DynamoDbService {
                 format!("Table already exists: {target_table_name}"),
             ));
         }
+        crate::quota::check_new_table(table_limit, state.tables.len())?;
 
         let now = Utc::now();
         let arn =

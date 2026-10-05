@@ -3,7 +3,21 @@
 //! the `impl ResourceProvisioner` block; the family slug is
 //! `iam`.
 
+use super::quota::{attached_after, check_iam};
 use super::*;
+use fakecloud_iam::quota::IamQuota;
+
+/// The managed policy ARNs a template lists under `ManagedPolicyArns`.
+fn managed_policy_arns(props: &serde_json::Value) -> Option<Vec<String>> {
+    props
+        .get("ManagedPolicyArns")
+        .and_then(|v| v.as_array())
+        .map(|arns| {
+            arns.iter()
+                .filter_map(|a| a.as_str().map(String::from))
+                .collect()
+        })
+}
 
 impl ResourceProvisioner {
     pub(super) fn get_att_iam_role(&self, physical_id: &str, attribute: &str) -> Option<String> {
@@ -57,9 +71,29 @@ impl ResourceProvisioner {
             .map(|v| v as i32)
             .unwrap_or(3600);
         let tags = parse_iam_tags(props.get("Tags"));
+        let roles_limit = self.iam_limit(IamQuota::Roles);
+        let trust_limit = self.iam_limit(IamQuota::RoleTrustPolicyLength);
+        let per_role_limit = self.iam_limit(IamQuota::ManagedPoliciesPerRole);
 
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        fakecloud_iam::quota::check_trust_policy(trust_limit, &assume_role_policy)
+            .map_err(|e| super::quota::refusal("Iam", e))?;
+        if !state.roles.contains_key(role_name) {
+            check_iam(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
+        }
+        if let Some(arns) = managed_policy_arns(props) {
+            let current = state
+                .role_policies
+                .get(role_name)
+                .cloned()
+                .unwrap_or_default();
+            check_iam(
+                IamQuota::ManagedPoliciesPerRole,
+                per_role_limit,
+                attached_after(&current, &arns),
+            )?;
+        }
         let role_id = format!(
             "FKIA{}",
             &Uuid::new_v4().to_string().replace('-', "").to_uppercase()[..16]
@@ -163,6 +197,8 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let arn = &existing.physical_id;
+        let trust_limit = self.iam_limit(IamQuota::RoleTrustPolicyLength);
+        let per_role_limit = self.iam_limit(IamQuota::ManagedPoliciesPerRole);
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let role_name = state
@@ -171,6 +207,22 @@ impl ResourceProvisioner {
             .find(|(_, r)| &r.arn == arn)
             .map(|(name, _)| name.clone())
             .ok_or_else(|| format!("IAM role {arn} not yet provisioned"))?;
+        if let Some(doc) = props.get("AssumeRolePolicyDocument") {
+            let doc = if doc.is_string() {
+                doc.as_str().unwrap_or("").to_string()
+            } else {
+                serde_json::to_string(doc).unwrap_or_default()
+            };
+            fakecloud_iam::quota::check_trust_policy(trust_limit, &doc)
+                .map_err(|e| super::quota::refusal("Iam", e))?;
+        }
+        if let Some(arns) = managed_policy_arns(props) {
+            check_iam(
+                IamQuota::ManagedPoliciesPerRole,
+                per_role_limit,
+                attached_after(&[], &arns),
+            )?;
+        }
 
         if let Some(role) = state.roles.get_mut(&role_name) {
             if let Some(doc) = props.get("AssumeRolePolicyDocument") {
@@ -438,11 +490,26 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let tags = parse_iam_tags(props.get("Tags"));
+        let users_limit = self.iam_limit(IamQuota::Users);
+        let per_user_limit = self.iam_limit(IamQuota::ManagedPoliciesPerUser);
 
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         if state.users.contains_key(&user_name) {
             return Err(format!("User {user_name} already exists"));
+        }
+        check_iam(IamQuota::Users, users_limit, state.users.len() + 1)?;
+        if let Some(arns) = managed_policy_arns(props) {
+            let current = state
+                .user_policies
+                .get(&user_name)
+                .cloned()
+                .unwrap_or_default();
+            check_iam(
+                IamQuota::ManagedPoliciesPerUser,
+                per_user_limit,
+                attached_after(&current, &arns),
+            )?;
         }
         let arn = format!(
             "arn:{}:iam::{}:user{}{}",
@@ -541,8 +608,16 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let user_name = existing.physical_id.clone();
+        let per_user_limit = self.iam_limit(IamQuota::ManagedPoliciesPerUser);
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        if let Some(arns) = managed_policy_arns(props) {
+            check_iam(
+                IamQuota::ManagedPoliciesPerUser,
+                per_user_limit,
+                attached_after(&[], &arns),
+            )?;
+        }
 
         let arn = {
             let user = state
@@ -621,10 +696,20 @@ impl ResourceProvisioner {
             .unwrap_or("/")
             .to_string();
 
+        let groups_limit = self.iam_limit(IamQuota::Groups);
+        let per_group_limit = self.iam_limit(IamQuota::ManagedPoliciesPerGroup);
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         if state.groups.contains_key(&group_name) {
             return Err(format!("Group {group_name} already exists"));
+        }
+        check_iam(IamQuota::Groups, groups_limit, state.groups.len() + 1)?;
+        if let Some(arns) = managed_policy_arns(props) {
+            check_iam(
+                IamQuota::ManagedPoliciesPerGroup,
+                per_group_limit,
+                attached_after(&[], &arns),
+            )?;
         }
         let arn = format!(
             "arn:{}:iam::{}:group{}{}",
@@ -694,6 +779,14 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let group_name = existing.physical_id.clone();
+        let per_group_limit = self.iam_limit(IamQuota::ManagedPoliciesPerGroup);
+        if let Some(arns) = managed_policy_arns(props) {
+            check_iam(
+                IamQuota::ManagedPoliciesPerGroup,
+                per_group_limit,
+                attached_after(&[], &arns),
+            )?;
+        }
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let group = state
@@ -770,6 +863,10 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let policies_limit = self.iam_limit(IamQuota::CustomerManagedPolicies);
+        let per_role_limit = self.iam_limit(IamQuota::ManagedPoliciesPerRole);
+        let per_user_limit = self.iam_limit(IamQuota::ManagedPoliciesPerUser);
+        let per_group_limit = self.iam_limit(IamQuota::ManagedPoliciesPerGroup);
 
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
@@ -782,6 +879,49 @@ impl ResourceProvisioner {
         );
         if state.policies.contains_key(&arn) {
             return Err(format!("Managed policy {policy_name} already exists"));
+        }
+        check_iam(
+            IamQuota::CustomerManagedPolicies,
+            policies_limit,
+            state.policies.len() + 1,
+        )?;
+        // Every principal the policy attaches to must have room for it.
+        let new_arn = [arn.clone()];
+        let names = |key: &str| -> Vec<String> {
+            props
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for name in names("Users") {
+            let current = state.user_policies.get(&name).cloned().unwrap_or_default();
+            check_iam(
+                IamQuota::ManagedPoliciesPerUser,
+                per_user_limit,
+                attached_after(&current, &new_arn),
+            )?;
+        }
+        for name in names("Roles") {
+            let current = state.role_policies.get(&name).cloned().unwrap_or_default();
+            check_iam(
+                IamQuota::ManagedPoliciesPerRole,
+                per_role_limit,
+                attached_after(&current, &new_arn),
+            )?;
+        }
+        for name in names("Groups") {
+            if let Some(group) = state.groups.get(&name) {
+                check_iam(
+                    IamQuota::ManagedPoliciesPerGroup,
+                    per_group_limit,
+                    attached_after(&group.attached_policies, &new_arn),
+                )?;
+            }
         }
         let policy_id = format!(
             "ANPA{}",
@@ -1009,11 +1149,17 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
 
+        let profiles_limit = self.iam_limit(IamQuota::InstanceProfiles);
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         if state.instance_profiles.contains_key(&name) {
             return Err(format!("InstanceProfile {name} already exists"));
         }
+        check_iam(
+            IamQuota::InstanceProfiles,
+            profiles_limit,
+            state.instance_profiles.len() + 1,
+        )?;
         // Force a retry pass when role refs haven't been resolved yet: a
         // logical-id placeholder won't match any real role, and silently
         // storing it would leave DescribeInstanceProfile returning an
@@ -1086,6 +1232,7 @@ impl ResourceProvisioner {
             created_at: Utc::now(),
             tags: parse_iam_tags(props.get("Tags")),
         };
+        let providers_limit = self.iam_limit(IamQuota::OpenIdConnectProviders);
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         // One provider per URL: a second stack declaring the same URL must not
@@ -1093,6 +1240,11 @@ impl ResourceProvisioner {
         if state.has_oidc_provider_for(&url_for_arn) {
             return Err(format!("OIDC provider for {url_for_arn} already exists."));
         }
+        check_iam(
+            IamQuota::OpenIdConnectProviders,
+            providers_limit,
+            state.oidc_providers.len() + 1,
+        )?;
         state.oidc_providers.insert(arn.clone(), provider);
         Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
     }
@@ -1294,8 +1446,12 @@ impl ResourceProvisioner {
             tags: Vec::new(),
             permissions_boundary: None,
         };
+        let roles_limit = self.iam_limit(IamQuota::Roles);
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
+        if !state.roles.contains_key(&role_name) {
+            check_iam(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
+        }
         state.roles.insert(role_name.clone(), role);
         Ok(ProvisionResult::new(role_name)
             .with("Arn", arn)

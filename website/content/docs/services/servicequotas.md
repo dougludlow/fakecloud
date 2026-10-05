@@ -9,9 +9,10 @@ from the AWS Smithy model ship, backed by account-partitioned state that
 persists across restarts in persistent mode. The wire protocol is awsJson1.1
 (x-amz-target `ServiceQuotasV20190624.<Op>`), signing as `servicequotas`.
 
-Quotas are not just reported. Once you switch enforcement on, EC2 reads the
-applied value of the security-group quotas from Service Quotas, so raising one
-with `RequestServiceQuotaIncrease` changes what EC2 accepts. Enforcement is
+Quotas are not just reported. Once you switch enforcement on, EC2, IAM,
+DynamoDB, KMS, S3 and Lambda read the applied value of the quotas they check
+from Service Quotas, so raising one with `RequestServiceQuotaIncrease` changes
+what the service accepts. Enforcement is
 **opt-in**: by default nothing is enforced, so a local test suite that creates
 more resources than a fresh AWS account allows keeps working. See
 [Enforcement](#enforcement).
@@ -109,9 +110,13 @@ reserved).
   **`UpdateAutoManagement`** and **`StopAutoManagement`** store the opt-in
   level and type, notification ARN and exclusion list per region.
 - **`StartQuotaUtilizationReport`** / **`GetQuotaUtilizationReport`** report
-  real usage for the quotas fakecloud can count from EC2 state (VPCs, internet
-  gateways, egress-only internet gateways, security groups, network interfaces
-  and Elastic IPs), as a percentage of the applied value.
+  real usage for the quotas fakecloud can count, as a percentage of the applied
+  value: from EC2 state (VPCs, internet gateways, egress-only internet
+  gateways, security groups, network interfaces and Elastic IPs), IAM (users,
+  roles, groups, customer managed policies, instance profiles, server
+  certificates, OIDC providers), DynamoDB tables per region, KMS customer
+  managed keys per region, S3 general purpose buckets, and Lambda function and
+  layer storage per region (in GB).
 
 ## Enforcement
 
@@ -143,6 +148,26 @@ persist across restarts in persistent mode.
 |---|---|
 | Security groups per network interface (`vpc`/`L-2AFB9258`) | `CreateNetworkInterface`, `ModifyNetworkInterfaceAttribute` (`SecurityGroupsPerInterfaceLimitExceeded`); `RunInstances`, `ModifyInstanceAttribute`, Auto Scaling and CloudFormation launches (`SecurityGroupsPerInstanceLimitExceeded`) |
 | Inbound or outbound rules per security group (`vpc`/`L-0EA8095F`) | `AuthorizeSecurityGroupIngress`, `AuthorizeSecurityGroupEgress`, `ModifySecurityGroupRules`, `ModifyManagedPrefixList`, CloudFormation security groups (`RulesPerSecurityGroupLimitExceeded`) |
+| Users per account (`iam`/`L-F55AF5E4`) | `CreateUser` (`LimitExceeded`, `Cannot exceed quota for UsersPerAccount: N`) |
+| Roles per account (`iam`/`L-FE177D64`) | `CreateRole`, `CreateServiceLinkedRole` (`LimitExceeded`, `RolesPerAccount`); the service-linked roles an account starts with count |
+| Groups per account (`iam`/`L-F4A5425F`) | `CreateGroup` (`LimitExceeded`, `GroupsPerAccount`) |
+| Customer managed policies per account (`iam`/`L-E95E4862`) | `CreatePolicy` (`LimitExceeded`, `PoliciesPerAccount`) |
+| Managed policies per role / user / group (`iam`/`L-0DA4ABF3`, `L-4019AD8B`, `L-384571C4`) | `AttachRolePolicy`, `AttachUserPolicy`, `AttachGroupPolicy` (`LimitExceeded`, `PoliciesPerRole` / `PoliciesPerUser` / `PoliciesPerGroup`); AWS managed and customer managed policies both count, and re-attaching an attached policy is not a new attachment |
+| Server certificates per account (`iam`/`L-BF35879D`) | `UploadServerCertificate` (`LimitExceeded`, `ServerCertificatesPerAccount`) |
+| OpenId connect providers per account (`iam`/`L-858F3967`) | `CreateOpenIDConnectProvider` (`LimitExceeded`, `OpenIdConnectProvidersPerAccount`) |
+| Instance profiles per account (`iam`/`L-6E65F664`) | `CreateInstanceProfile` (`LimitExceeded`, `InstanceProfilesPerAccount`) |
+| Role trust policy length (`iam`/`L-C07B4B0D`) | `CreateRole`, `UpdateAssumeRolePolicy` (`LimitExceeded`, `ACLSizePerRole`); characters of the trust policy, not counting white space |
+| Maximum number of tables (`dynamodb`/`L-F98FE922`) | `CreateTable`, `RestoreTableFromBackup`, `RestoreTableToPointInTime`, `ImportTable`, and `UpdateTable` adding a replica (counted in the replica's region) (`LimitExceededException`) |
+| Customer Master Keys (`kms`/`L-C2F1777E`) | `CreateKey`, `ReplicateKey` (counted in the replica's region) (`LimitExceededException`); customer managed keys in any key state count, including pending deletion, AWS managed keys do not |
+| General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); per account across all regions, with the applied value read from `us-east-1` (`us-gov-west-1` in GovCloud), where S3 manages it |
+| Function and layer storage (`lambda`/`L-2ACBD22F`) | `CreateFunction`, `UpdateFunctionCode`, `PublishVersion`, `PublishLayerVersion` (`CodeStorageExceededException`); the code of every function's `$LATEST`, published version and layer version counts, container images do not |
+
+IAM refusals are HTTP 409 with IAM's `Cannot exceed quota for <Name>: <limit>`
+message. Every count quota refuses the request that would take the count past
+the applied value, so with a value of N the Nth resource is created and the
+next one is refused. CloudFormation stacks (and Cloud Control API) creating
+these resources hit the same limits, failing the resource with the service's
+error.
 
 As on AWS, the rules quota applies to each direction separately and counts
 IPv4 and IPv6 rules separately. A rule that references a security group counts
@@ -200,7 +225,7 @@ maximum or the security-group product limit) is still `NOT_APPROVED` on
 submission, and approving a request that stopped being approvable while it
 waited returns 409; deny it instead.
 
-## IAM account summary
+## IAM account summary and Lambda account settings
 
 IAM `GetAccountSummary` reads its `UsersQuota`, `GroupsQuota`, `RolesQuota`,
 `PoliciesQuota`, `InstanceProfilesQuota`, `ServerCertificatesQuota`,
@@ -209,9 +234,20 @@ entries from the account's applied `iam` quotas, so a quota raised here shows
 up there. The other entries (policy sizes, access keys per user, ...) are fixed
 AWS limits.
 
+Lambda `GetAccountSettings` reports the applied "Concurrent executions"
+(`L-B99A9384`) as `AccountLimit.ConcurrentExecutions` and the applied
+"Function and layer storage" (`L-2ACBD22F`) as `AccountLimit.TotalCodeSize`,
+and `PutFunctionConcurrency` keeps the unreserved pool at 100 or more against
+that concurrency limit, as Lambda always does.
+
 ## Known limitations
 
-- Only the two security-group quotas are enforceable. Other catalog quotas are
-  reported and can be raised or lowered, but fakecloud does not refuse
-  requests that go past them.
+- Only the quotas in [Enforceable quotas](#enforceable-quotas) are
+  enforceable. Other catalog quotas are reported and can be raised or lowered,
+  but fakecloud does not refuse requests that go past them.
+- Lambda "Concurrent executions" (`L-B99A9384`) is not enforceable: invocations
+  from event source mappings, SNS, S3, EventBridge and other services run the
+  function without passing the `Invoke` concurrency gate, so fakecloud cannot
+  count in-flight executions account-wide. Reserved concurrency per function is
+  still enforced on `Invoke`.
 - The catalog covers the services above, not every AWS service.

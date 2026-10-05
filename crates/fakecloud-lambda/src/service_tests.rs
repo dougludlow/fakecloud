@@ -5084,3 +5084,210 @@ fn resource_policy_provider_reads_the_arn_region() {
         None
     );
 }
+
+// ---- Service Quotas: function and layer storage, concurrency ----
+
+/// A code storage quota of `bytes` bytes, in the quota's gigabytes.
+fn storage_gb(bytes: u64) -> f64 {
+    (bytes as f64 + 0.5) / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+}
+
+async fn lambda_call(
+    svc: &LambdaService,
+    method: Method,
+    path: &str,
+    body: Value,
+) -> Result<AwsResponse, AwsServiceError> {
+    svc.handle(make_request(method, path, &body.to_string()))
+        .await
+}
+
+fn assert_storage_exceeded(result: Result<AwsResponse, AwsServiceError>) {
+    let err = result.err().expect("deploy should be refused");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "CodeStorageExceededException");
+    assert_eq!(err.message(), "Code storage limit exceeded.");
+}
+
+#[tokio::test]
+async fn code_storage_is_not_enforced_without_a_provider() {
+    let svc = LambdaService::new(make_state());
+    for name in ["s1", "s2", "s3"] {
+        create_in_region(&svc, name, "us-east-1", "").await;
+    }
+}
+
+#[tokio::test]
+async fn code_storage_quota_counts_functions_versions_and_layers() {
+    let svc = LambdaService::new(make_state()).with_quota_provider(Some(Arc::new(
+        fakecloud_core::quota::FixedQuotas::default().with("lambda", "L-2ACBD22F", storage_gb(12)),
+    )));
+    // Each `create_in_region` stores a 3-byte package.
+    create_in_region(&svc, "f1", "us-east-1", "").await; // 3
+    lambda_call(
+        &svc,
+        Method::POST,
+        "/2015-03-31/functions/f1/versions",
+        json!({}),
+    )
+    .await
+    .unwrap(); // 6: the version keeps its own copy
+    lambda_call(
+        &svc,
+        Method::POST,
+        "/2018-10-31/layers/lib/versions",
+        json!({"Content": {"ZipFile": b64(b"abc")}}),
+    )
+    .await
+    .unwrap(); // 9
+    create_in_region(&svc, "f2", "us-east-1", "").await; // 12, exactly the limit
+
+    let create = json!({
+        "FunctionName": "f3",
+        "Runtime": "python3.12",
+        "Role": "arn:aws:iam::123456789012:role/r",
+        "Handler": "index.handler",
+        "Code": {"ZipFile": b64(b"zip")},
+    });
+    assert_storage_exceeded(lambda_call(&svc, Method::POST, "/2015-03-31/functions", create).await);
+    assert_storage_exceeded(
+        lambda_call(
+            &svc,
+            Method::POST,
+            "/2018-10-31/layers/lib/versions",
+            json!({"Content": {"ZipFile": b64(b"x")}}),
+        )
+        .await,
+    );
+    // A bigger package for f1's $LATEST is refused; a smaller one fits.
+    assert_storage_exceeded(
+        lambda_call(
+            &svc,
+            Method::PUT,
+            "/2015-03-31/functions/f1/code",
+            json!({"ZipFile": b64(b"four")}),
+        )
+        .await,
+    );
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2015-03-31/functions/f1/code",
+        json!({"ZipFile": b64(b"ab")}),
+    )
+    .await
+    .unwrap(); // 11
+               // Publishing the new code would store 2 more bytes.
+    assert_storage_exceeded(
+        lambda_call(
+            &svc,
+            Method::POST,
+            "/2015-03-31/functions/f1/versions",
+            json!({}),
+        )
+        .await,
+    );
+
+    // The usage source reports the same bytes, in gigabytes.
+    use fakecloud_core::quota::QuotaUsageSource;
+    let usage = crate::quota::LambdaQuotaUsage::new(svc.state.clone())
+        .usage("123456789012", "us-east-1", "lambda", "L-2ACBD22F")
+        .unwrap();
+    assert_eq!((usage * 1024.0 * 1024.0 * 1024.0).round(), 11.0);
+    // GetAccountSettings counts versions and layers too.
+    let settings = json_body(
+        &lambda_call(
+            &svc,
+            Method::GET,
+            "/2016-08-19/account-settings",
+            Value::Null,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(settings["AccountUsage"]["TotalCodeSize"], 11);
+    assert_eq!(settings["AccountLimit"]["TotalCodeSize"], 12);
+}
+
+#[tokio::test]
+async fn reserved_concurrency_keeps_100_unreserved() {
+    let svc = LambdaService::new(make_state());
+    create_in_region(&svc, "big", "us-east-1", "").await;
+    create_in_region(&svc, "small", "us-east-1", "").await;
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2017-10-31/functions/big/concurrency",
+        json!({"ReservedConcurrentExecutions": 900}),
+    )
+    .await
+    .unwrap();
+    let err = lambda_call(
+        &svc,
+        Method::PUT,
+        "/2017-10-31/functions/small/concurrency",
+        json!({"ReservedConcurrentExecutions": 1}),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "InvalidParameterValueException");
+    assert_eq!(
+        err.message(),
+        "Specified ReservedConcurrentExecutions for function decreases account's \
+         UnreservedConcurrentExecution below its minimum value of [100]."
+    );
+    // Re-setting the same function's reservation replaces it.
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2017-10-31/functions/big/concurrency",
+        json!({"ReservedConcurrentExecutions": 899}),
+    )
+    .await
+    .unwrap();
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2017-10-31/functions/small/concurrency",
+        json!({"ReservedConcurrentExecutions": 1}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn account_concurrency_limit_follows_the_applied_quota() {
+    let svc = LambdaService::new(make_state()).with_quota_provider(Some(Arc::new(
+        fakecloud_core::quota::FixedQuotas::default().with("lambda", "L-B99A9384", 2000.0),
+    )));
+    create_in_region(&svc, "big", "us-east-1", "").await;
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2017-10-31/functions/big/concurrency",
+        json!({"ReservedConcurrentExecutions": 1900}),
+    )
+    .await
+    .unwrap();
+    let settings = json_body(
+        &lambda_call(
+            &svc,
+            Method::GET,
+            "/2016-08-19/account-settings",
+            Value::Null,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(settings["AccountLimit"]["ConcurrentExecutions"], 2000);
+    assert_eq!(
+        settings["AccountLimit"]["UnreservedConcurrentExecutions"],
+        100
+    );
+}

@@ -355,6 +355,7 @@ impl IamService {
         }
 
         validate_oidc_provider_input(&url, &thumbprints, &client_ids)?;
+        let limit = self.enforced(req, crate::quota::IamQuota::OpenIdConnectProviders);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -376,6 +377,11 @@ impl IamService {
                 "Unknown".to_string(),
             ));
         }
+        crate::quota::check(
+            crate::quota::IamQuota::OpenIdConnectProviders,
+            limit,
+            state.oidc_providers.len() + 1,
+        )?;
 
         let provider = OidcProvider {
             arn: arn.clone(),
@@ -686,6 +692,7 @@ impl IamService {
             .unwrap_or_else(|| "/".to_string());
         let certificate_chain = req.query_params.get("CertificateChain").cloned();
         let tags = parse_tags(&req.query_params);
+        let limit = self.enforced(req, crate::quota::IamQuota::ServerCertificates);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -697,6 +704,11 @@ impl IamService {
                 format!("Server certificate {name} already exists."),
             ));
         }
+        crate::quota::check(
+            crate::quota::IamQuota::ServerCertificates,
+            limit,
+            state.server_certificates.len() + 1,
+        )?;
 
         let cert = ServerCertificate {
             server_certificate_id: format!("ASCA{}", generate_id()),

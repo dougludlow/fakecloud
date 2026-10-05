@@ -1282,6 +1282,7 @@ pub(crate) mod naming;
 mod opensearch;
 mod organizations;
 mod pipes;
+mod quota;
 mod rds;
 mod redshiftlike;
 mod route;

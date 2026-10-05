@@ -311,11 +311,14 @@ impl ResourceProvisioner {
                     .unwrap_or(-1),
             });
 
+        let table_limit = self.dynamodb_table_limit(&self.region);
         let mut __ddb_mas = self.dynamodb_state.write();
         let state = __ddb_mas.regional_mut(&self.account_id, &self.region);
         if state.tables.contains_key(table_name) {
             return Err(resource_already_exists("AWS::DynamoDB::Table", table_name));
         }
+        fakecloud_dynamodb::quota::check_new_table(table_limit, state.tables.len())
+            .map_err(|e| super::quota::refusal("DynamoDb", e))?;
         let arn = fakecloud_dynamodb::table_arn(&self.region, &self.account_id, table_name);
 
         let stream_arn = if stream_enabled {
@@ -523,6 +526,16 @@ impl ResourceProvisioner {
     /// region, configured from the shared properties plus this region's
     /// replica entry, and registered as a global table whose replication
     /// group lists every replica region. `Ref` returns the table name.
+    /// The enforced table limit of each region a GlobalTable replicates to
+    /// other than the stack's own: a new replica is a table there.
+    fn replica_table_limits(&self, replicas: &[serde_json::Value]) -> Vec<(String, Option<usize>)> {
+        replica_specs(replicas)
+            .iter()
+            .filter(|s| s.region != self.region)
+            .map(|s| (s.region.clone(), self.dynamodb_table_limit(&s.region)))
+            .collect()
+    }
+
     pub(super) fn create_dynamodb_global_table(
         &self,
         resource: &ResourceDefinition,
@@ -549,12 +562,14 @@ impl ResourceProvisioner {
             deletion_policy: resource.deletion_policy.clone(),
             update_replace_policy: resource.update_replace_policy.clone(),
         };
+        let replica_limits = self.replica_table_limits(replicas);
         let mut result = self.create_dynamodb_table(&table_def)?;
         let table_name = result.physical_id.clone();
 
         // The other replicas are real tables in their own regions, kept in
         // step with this one (DynamoDB global tables version 2019.11.21).
         let mut accounts = self.dynamodb_state.write();
+        check_replica_tables(&accounts, &self.account_id, &table_name, &replica_limits)?;
         fakecloud_dynamodb::set_table_replicas(
             &mut accounts,
             &self.account_id,
@@ -596,10 +611,17 @@ impl ResourceProvisioner {
             deletion_policy: resource.deletion_policy.clone(),
             update_replace_policy: resource.update_replace_policy.clone(),
         };
+        let replica_limits = self.replica_table_limits(&replicas);
         let result = self.update_dynamodb_table(existing, &table_def)?;
         let mut accounts = self.dynamodb_state.write();
         // Replicas added to or removed from the template are created or
         // deleted in their regions; the kept ones take their overrides.
+        check_replica_tables(
+            &accounts,
+            &self.account_id,
+            &result.physical_id,
+            &replica_limits,
+        )?;
         fakecloud_dynamodb::set_table_replicas(
             &mut accounts,
             &self.account_id,
@@ -734,4 +756,26 @@ fn global_table_local_props(
         );
     }
     serde_json::Value::Object(out)
+}
+
+/// Refuse a GlobalTable whose new replica would take a region past its
+/// enforced table limit. A region that already holds the table is not a new
+/// table there.
+fn check_replica_tables(
+    accounts: &fakecloud_core::multi_account::MultiRegionState<fakecloud_dynamodb::DynamoDbState>,
+    account_id: &str,
+    table_name: &str,
+    limits: &[(String, Option<usize>)],
+) -> Result<(), String> {
+    for (region, limit) in limits {
+        let tables = accounts.regional(account_id, region);
+        if !tables.is_some_and(|s| s.tables.contains_key(table_name)) {
+            fakecloud_dynamodb::quota::check_new_table(
+                *limit,
+                tables.map_or(0, |s| s.tables.len()),
+            )
+            .map_err(|e| super::quota::refusal("DynamoDb", e))?;
+        }
+    }
+    Ok(())
 }

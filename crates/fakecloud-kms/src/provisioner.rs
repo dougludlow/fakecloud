@@ -226,16 +226,37 @@ pub fn build_kms_key(
     })
 }
 
+/// Refuse a new customer managed key in `region` past the enforced quota,
+/// with the reason a stack reports for the failed `CreateKey`.
+fn check_key_quota(
+    s: &crate::state::KmsState,
+    region: &str,
+    key_limit: Option<usize>,
+) -> Result<(), String> {
+    crate::quota::check_new_key(key_limit, crate::quota::customer_keys_in(s, region)).map_err(|e| {
+        format!(
+            "{} (Service: Kms, Status Code: {}, Error Code: {})",
+            e.message(),
+            e.status().as_u16(),
+            e.code()
+        )
+    })
+}
+
 /// Build and insert a key into shared state. Returns
-/// `(key_id, arn)`.
+/// `(key_id, arn)`. `key_limit` is the enforced customer managed key quota of
+/// `region` (see [`crate::quota`]), resolved by the caller before this takes
+/// the KMS lock; `None` enforces nothing.
 pub fn provision_key(
     state: &SharedKmsState,
     account_id: &str,
     region: &str,
     input: &KeyCreationInput,
+    key_limit: Option<usize>,
 ) -> Result<(String, String), String> {
     let mut accounts = state.write();
     let s = accounts.get_or_create(account_id);
+    check_key_quota(s, region, key_limit)?;
     let key = build_kms_key(region, account_id, input)?;
     let key_id = key.key_id.clone();
     let arn = key.arn.clone();
@@ -248,7 +269,8 @@ pub fn provision_key(
 /// it's `MultiRegion=true`, mints a `mrk-replica-` id (fakecloud is
 /// single-region so colliding IDs would overwrite the primary), and
 /// inserts the replica with `primary_region` set so `DescribeKey`
-/// reports `MultiRegionKeyType=REPLICA`.
+/// reports `MultiRegionKeyType=REPLICA`. `key_limit` is the enforced
+/// customer managed key quota of `region`, as for [`provision_key`].
 #[allow(clippy::too_many_arguments)]
 pub fn provision_replica_key(
     state: &SharedKmsState,
@@ -259,6 +281,7 @@ pub fn provision_replica_key(
     enabled: bool,
     policy: Option<String>,
     tags: BTreeMap<String, String>,
+    key_limit: Option<usize>,
 ) -> Result<(String, String), String> {
     let parts: Vec<&str> = primary_arn.split(':').collect();
     if parts.len() < 6 {
@@ -285,6 +308,7 @@ pub fn provision_replica_key(
             "Primary key {primary_arn} is not a multi-region key"
         ));
     }
+    check_key_quota(s, region, key_limit)?;
 
     let replica_key_id = format!("mrk-replica-{}", Uuid::new_v4().as_simple());
     let replica_arn = kms_key_arn(region, account_id, &replica_key_id);
@@ -460,7 +484,8 @@ mod tests {
         // eu-central-1 must mint an eu-central-1 key ARN.
         let state = make_state();
         let input = KeyCreationInput::default();
-        let (key_id, arn) = provision_key(&state, "123456789012", "eu-central-1", &input).unwrap();
+        let (key_id, arn) =
+            provision_key(&state, "123456789012", "eu-central-1", &input, None).unwrap();
         assert_eq!(
             arn,
             format!("arn:aws:kms:eu-central-1:123456789012:key/{key_id}")
@@ -471,7 +496,8 @@ mod tests {
     fn provisioned_alias_arn_carries_request_region() {
         let state = make_state();
         let input = KeyCreationInput::default();
-        let (key_id, _) = provision_key(&state, "123456789012", "eu-central-1", &input).unwrap();
+        let (key_id, _) =
+            provision_key(&state, "123456789012", "eu-central-1", &input, None).unwrap();
         provision_alias(
             &state,
             "123456789012",
@@ -497,7 +523,8 @@ mod tests {
             multi_region: true,
             ..Default::default()
         };
-        let (_, primary_arn) = provision_key(&state, "123456789012", "us-east-1", &input).unwrap();
+        let (_, primary_arn) =
+            provision_key(&state, "123456789012", "us-east-1", &input, None).unwrap();
         let (_, replica_arn) = provision_replica_key(
             &state,
             "123456789012",
@@ -507,6 +534,7 @@ mod tests {
             true,
             None,
             BTreeMap::new(),
+            None,
         )
         .unwrap();
         assert!(

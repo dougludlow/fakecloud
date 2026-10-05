@@ -8472,3 +8472,72 @@ async fn upload_part_copy_reads_the_object_its_authorization_names() {
     let part = &mas.default_ref().buckets["dst"].multipart_uploads[&upload_id].parts[&1];
     assert_eq!(part.size, b"question".len() as u64);
 }
+
+// ---- Service Quotas: general purpose buckets ----
+
+/// Enforces the bucket quota only as managed from `us-east-1`, like Service
+/// Quotas does for S3.
+struct UsEast1BucketQuota(f64);
+
+impl fakecloud_core::quota::QuotaProvider for UsEast1BucketQuota {
+    fn applied_value(&self, _: &str, region: &str, service: &str, code: &str) -> Option<f64> {
+        (region == "us-east-1" && service == "s3" && code == "L-DC2B2D3D").then_some(self.0)
+    }
+
+    fn enforced_limit(
+        &self,
+        account: &str,
+        region: &str,
+        service: &str,
+        code: &str,
+    ) -> Option<f64> {
+        self.applied_value(account, region, service, code)
+    }
+}
+
+fn create_in(svc: &S3Service, bucket: &str, region: &str) -> Result<AwsResponse, AwsServiceError> {
+    let mut req = make_request(Method::PUT, &format!("/{bucket}"), &[], b"");
+    req.region = region.to_string();
+    svc.create_bucket("123456789012", &req, bucket)
+}
+
+#[test]
+fn bucket_quota_is_not_enforced_without_a_provider() {
+    let svc = make_service();
+    for i in 0..3 {
+        create_in(&svc, &format!("free-{i}"), "us-east-1").unwrap();
+    }
+}
+
+#[test]
+fn bucket_quota_counts_buckets_in_every_region_against_the_us_east_1_value() {
+    let svc = make_service().with_quota_provider(Some(Arc::new(UsEast1BucketQuota(2.0))));
+    create_in(&svc, "quota-a", "us-east-1").unwrap();
+    // A bucket created from another Region counts toward the same quota.
+    let mut req = make_request(
+        Method::PUT,
+        "/quota-b",
+        &[],
+        b"<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>",
+    );
+    req.region = "eu-west-1".to_string();
+    svc.create_bucket("123456789012", &req, "quota-b").unwrap();
+
+    let err = create_in(&svc, "quota-c", "us-east-1").err().unwrap();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "TooManyBuckets");
+    assert_eq!(
+        err.message(),
+        "You have attempted to create more buckets than allowed"
+    );
+    // Re-creating an owned bucket in us-east-1 is still the idempotent no-op.
+    create_in(&svc, "quota-a", "us-east-1").unwrap();
+
+    use fakecloud_core::quota::QuotaUsageSource;
+    let usage = crate::quota::S3QuotaUsage::new(svc.state.clone());
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "s3", "L-DC2B2D3D"),
+        Some(2.0)
+    );
+    assert_eq!(usage.usage("123456789012", "us-east-1", "s3", "L-0"), None);
+}

@@ -1205,6 +1205,11 @@ pub struct LambdaService {
     /// validated there and its `VpcId` resolved. `None` in memory-only unit
     /// tests, where the config is stored as given.
     pub(crate) ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// Service Quotas: the applied concurrency and code storage values
+    /// `GetAccountSettings` reports, and the code storage quota once the user
+    /// switched its enforcement on. Without one the AWS defaults are reported
+    /// and nothing is enforced.
+    pub(crate) quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 mod functions;
@@ -1225,7 +1230,30 @@ impl LambdaService {
             s3_delivery: None,
             inflight_invocations: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             ec2_state: None,
+            quota_provider: None,
         }
+    }
+
+    /// Attach Service Quotas (see the `quota_provider` field).
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
+        self
+    }
+
+    /// The enforced code storage limit of `region`, in bytes. Resolved
+    /// before the Lambda lock is taken.
+    pub(crate) fn code_storage_limit(&self, account_id: &str, region: &str) -> Option<i64> {
+        crate::quota::enforced_storage_limit(self.quota_provider.as_ref(), account_id, region)
+    }
+
+    /// The applied value of a Lambda quota, when Service Quotas is attached.
+    pub(crate) fn applied_quota(&self, account_id: &str, region: &str, code: &str) -> Option<f64> {
+        self.quota_provider
+            .as_ref()
+            .and_then(|p| p.applied_value(account_id, region, crate::quota::SERVICE_CODE, code))
     }
 
     pub fn with_ec2_state(mut self, ec2_state: fakecloud_ec2::SharedEc2State) -> Self {

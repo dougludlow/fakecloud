@@ -8,6 +8,8 @@ use fakecloud_core::validation::*;
 use crate::state::{IamRole, IamState, ServiceLinkedRoleDeletion};
 use crate::xml_responses;
 
+use crate::quota::IamQuota;
+
 use super::{
     empty_response, generate_id, paginated_tags_response, parse_tag_keys, parse_tags,
     partition_for_region, title_case_service, url_encode, validate_tags, validate_untag_keys,
@@ -126,6 +128,8 @@ fn derive_service_linked_role_name(aws_service_name: &str, custom_suffix: Option
 impl IamService {
     pub(super) fn create_role(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let input = CreateRoleInput::from_query(&req.query_params)?;
+        let roles_limit = self.enforced(req, IamQuota::Roles);
+        let trust_limit = self.enforced(req, IamQuota::RoleTrustPolicyLength);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -137,6 +141,8 @@ impl IamService {
                 format!("Role with name {} already exists.", input.role_name),
             ));
         }
+        crate::quota::check_trust_policy(trust_limit, &input.assume_role_policy)?;
+        crate::quota::check(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
 
         let partition = partition_for_region(&req.region);
 
@@ -404,6 +410,7 @@ impl IamService {
             }
         }
 
+        let trust_limit = self.enforced(req, IamQuota::RoleTrustPolicyLength);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
@@ -414,6 +421,7 @@ impl IamService {
                 format!("Role {role_name} not found"),
             )
         })?;
+        crate::quota::check_trust_policy(trust_limit, &policy_document)?;
 
         role.assume_role_policy_document = policy_document;
 
@@ -578,6 +586,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let role_name = required_param(&req.query_params, "RoleName")?;
         let policy_arn = required_param(&req.query_params, "PolicyArn")?;
+        let limit = self.enforced(req, IamQuota::ManagedPoliciesPerRole);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -609,6 +618,7 @@ impl IamService {
 
         let arns = state.role_policies.entry(role_name).or_default();
         if !arns.contains(&policy_arn) {
+            crate::quota::check(IamQuota::ManagedPoliciesPerRole, limit, arns.len() + 1)?;
             arns.push(policy_arn.clone());
             // Increment attachment count
             if let Some(p) = state.policies.get_mut(&policy_arn) {
@@ -904,6 +914,7 @@ impl IamService {
             "InvalidInput",
         )?;
 
+        let roles_limit = self.enforced(req, IamQuota::Roles);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
@@ -926,6 +937,9 @@ impl IamService {
                 ),
             ));
         }
+        // A service-linked role is an IAM role and counts toward the account's
+        // roles quota (`GetAccountSummary` `Roles` includes it too).
+        crate::quota::check(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
 
         // Derive the ARN partition from the request region so gov/cn/iso
         // deployments get the right partition (aws-us-gov / aws-cn / ...)

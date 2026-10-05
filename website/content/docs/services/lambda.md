@@ -25,6 +25,7 @@ fakecloud implements **73 of 73** Lambda operations at 100% Smithy conformance. 
 - **Warm container reuse**: subsequent invocations of the same function reuse the container; each version has its own warm pool, and a configuration change (environment, memory, timeout, role, handler, tags) starts a fresh instance once the old one finishes any in-flight invocation
 - **Async invoke destinations** — `OnSuccess` / `OnFailure` routes the invocation result to SQS, SNS, EventBridge, or another Lambda by ARN scheme; record matches the AWS destinations schema (`requestContext`, `requestPayload`, `responseContext`, `responsePayload`)
 - **`InvocationType` honored** — `Event` returns 202 and runs in the background, `RequestResponse` blocks for the result, `DryRun` validates without executing
+- **Service Quotas**: with "Function and layer storage" (`L-2ACBD22F`) enforced in [Service Quotas](@/docs/services/servicequotas.md#enforceable-quotas), `CreateFunction`, `UpdateFunctionCode`, `PublishVersion` and `PublishLayerVersion` are refused with `CodeStorageExceededException` when the code of every `$LATEST`, published version and layer version in the region would pass the applied value (off by default). `GetAccountSettings` reports the applied concurrency and storage quotas, and `PutFunctionConcurrency` keeps at least 100 executions unreserved
 
 ## Protocol
 

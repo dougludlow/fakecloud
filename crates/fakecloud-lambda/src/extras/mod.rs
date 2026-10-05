@@ -530,6 +530,7 @@ impl LambdaService {
         });
         let dry_run = body["DryRun"].as_bool().unwrap_or(false);
         let publish = body["Publish"].as_bool().unwrap_or(false);
+        let storage_limit = self.code_storage_limit(&req.account_id, &req.region);
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
@@ -592,6 +593,28 @@ impl LambdaService {
         if dry_run {
             return ok(self.function_config_json(func));
         }
+
+        // The new package replaces `$LATEST`'s copy of the code.
+        if storage_limit.is_some() {
+            let new_size = if let Some(bytes) = new_zip.as_ref() {
+                Some(bytes.len() as i64)
+            } else if let Some(descriptor) = new_s3_descriptor.as_ref() {
+                Some(descriptor.len() as i64)
+            } else if new_image_uri.is_some() {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(new_size) = new_size {
+                let old_size = crate::quota::stored_code_size(func);
+                let before = crate::quota::code_storage_used(state);
+                crate::quota::check_storage(storage_limit, before, before - old_size + new_size)?;
+            }
+        }
+        let func = state
+            .functions
+            .get_mut(function_name)
+            .ok_or_else(|| not_found("Function", function_name))?;
 
         let mut changed = false;
         if let Some(bytes) = new_zip {

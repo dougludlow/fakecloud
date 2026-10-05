@@ -9830,3 +9830,167 @@ async fn point_in_time_recovery_is_per_region() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// ---- Service Quotas: maximum number of tables ----
+
+fn quota_service(limit: f64) -> DynamoDbService {
+    make_service().with_quota_provider(Some(Arc::new(
+        fakecloud_core::quota::FixedQuotas::default().with("dynamodb", "L-F98FE922", limit),
+    )))
+}
+
+fn assert_table_limit(err: AwsServiceError, limit: usize) {
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "LimitExceededException");
+    assert_eq!(
+        err.message(),
+        format!("Subscriber limit exceeded: There is a limit of {limit} tables per subscriber")
+    );
+}
+
+#[test]
+fn table_quota_is_not_enforced_without_a_provider() {
+    let svc = make_service();
+    for i in 0..3 {
+        svc.create_table(&make_request(
+            "CreateTable",
+            simple_table(&format!("tbl{i}")),
+        ))
+        .unwrap();
+    }
+}
+
+#[test]
+fn table_quota_refuses_creates_and_restores_past_the_limit() {
+    let svc = quota_service(2.0);
+    svc.create_table(&make_request("CreateTable", simple_table("tbl1")))
+        .unwrap();
+    svc.create_table(&make_request("CreateTable", simple_table("tbl2")))
+        .unwrap();
+    assert_table_limit(
+        svc.create_table(&make_request("CreateTable", simple_table("tbl3")))
+            .err()
+            .unwrap(),
+        2,
+    );
+    // An existing name still answers ResourceInUseException.
+    assert_eq!(
+        svc.create_table(&make_request("CreateTable", simple_table("tbl1")))
+            .err()
+            .unwrap()
+            .code(),
+        "ResourceInUseException"
+    );
+
+    // Restores create tables too.
+    let backup = body_json(
+        &svc.create_backup(&make_request(
+            "CreateBackup",
+            json!({"TableName": "tbl1", "BackupName": "b"}),
+        ))
+        .unwrap(),
+    );
+    let backup_arn = backup["BackupDetails"]["BackupArn"].as_str().unwrap();
+    assert_table_limit(
+        svc.restore_table_from_backup(&make_request(
+            "RestoreTableFromBackup",
+            json!({"BackupArn": backup_arn, "TargetTableName": "rst1"}),
+        ))
+        .err()
+        .unwrap(),
+        2,
+    );
+    assert_table_limit(
+        svc.restore_table_to_point_in_time(&make_request(
+            "RestoreTableToPointInTime",
+            json!({"SourceTableName": "tbl1", "TargetTableName": "rst2"}),
+        ))
+        .err()
+        .unwrap(),
+        2,
+    );
+
+    // Deleting a table frees the slot.
+    svc.delete_table(&make_request("DeleteTable", json!({"TableName": "tbl2"})))
+        .unwrap();
+    svc.restore_table_from_backup(&make_request(
+        "RestoreTableFromBackup",
+        json!({"BackupArn": backup_arn, "TargetTableName": "rst1"}),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn table_quota_is_per_region() {
+    let svc = quota_service(1.0);
+    svc.create_table(&make_request("CreateTable", simple_table("tbl1")))
+        .unwrap();
+    let mut west = make_request("CreateTable", simple_table("tbl2"));
+    west.region = "us-west-2".to_string();
+    svc.create_table(&west).unwrap();
+}
+
+#[tokio::test]
+async fn table_quota_counts_a_new_replica_in_its_own_region() {
+    let svc = quota_service(1.0);
+    call_in(&svc, "us-east-1", "CreateTable", simple_table("Glob")).await;
+    call_in(&svc, "eu-west-1", "CreateTable", simple_table("Other")).await;
+    let (status, body) = call_in(
+        &svc,
+        "us-east-1",
+        "UpdateTable",
+        json!({"TableName": "Glob", "ReplicaUpdates": [{"Create": {"RegionName": "eu-west-1"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["__type"], "LimitExceededException");
+    // Nothing changed: eu-west-1 still holds only its own table.
+    let (_, list) = call_in(&svc, "eu-west-1", "ListTables", json!({})).await;
+    assert_eq!(list["TableNames"], json!(["Other"]));
+}
+
+#[test]
+fn table_usage_source_counts_tables_per_region() {
+    use fakecloud_core::quota::QuotaUsageSource;
+    let svc = make_service();
+    svc.create_table(&make_request("CreateTable", simple_table("tbl1")))
+        .unwrap();
+    svc.create_table(&make_request("CreateTable", simple_table("tbl2")))
+        .unwrap();
+    let usage = crate::quota::DynamoDbQuotaUsage::new(svc.state.clone());
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "dynamodb", "L-F98FE922"),
+        Some(2.0)
+    );
+    assert_eq!(
+        usage.usage("123456789012", "us-west-2", "dynamodb", "L-F98FE922"),
+        Some(0.0)
+    );
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "dynamodb", "L-0000"),
+        None
+    );
+}
+
+#[test]
+fn table_quota_refuses_an_import_into_a_new_table_past_the_limit() {
+    let svc = quota_service(1.0);
+    svc.create_table(&make_request("CreateTable", simple_table("tbl1")))
+        .unwrap();
+    let err = svc
+        .import_table(&make_request(
+            "ImportTable",
+            json!({
+                "InputFormat": "DYNAMODB_JSON",
+                "S3BucketSource": { "S3Bucket": "import-bucket" },
+                "TableCreationParameters": {
+                    "TableName": "imported-table",
+                    "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                    "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }]
+                }
+            }),
+        ))
+        .err()
+        .unwrap();
+    assert_table_limit(err, 1);
+}

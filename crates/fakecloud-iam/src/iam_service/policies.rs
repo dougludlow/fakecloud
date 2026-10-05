@@ -42,6 +42,7 @@ impl IamService {
         let input = CreatePolicyInput::from_query(&req.query_params)?;
 
         let partition = partition_for_region(&req.region);
+        let limit = self.enforced(req, crate::quota::IamQuota::CustomerManagedPolicies);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -61,6 +62,11 @@ impl IamService {
                 ),
             ));
         }
+        crate::quota::check(
+            crate::quota::IamQuota::CustomerManagedPolicies,
+            limit,
+            state.policies.len() + 1,
+        )?;
 
         let now = Utc::now();
         let version = PolicyVersion {

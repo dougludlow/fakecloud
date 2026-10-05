@@ -1,6 +1,7 @@
 pub mod api;
 pub mod blob;
 pub mod hook;
+pub mod quota;
 pub mod resource_policy;
 pub(crate) mod service;
 pub(crate) mod state;

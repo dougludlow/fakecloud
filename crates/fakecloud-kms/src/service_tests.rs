@@ -4345,3 +4345,96 @@ fn alias_in_replica_region_targets_the_replica() {
         assert_eq!(mrk[0]["TargetKeyId"], json!(key_id), "filter {filter:?}");
     }
 }
+
+// ---- Service Quotas: customer managed keys ----
+
+fn quota_service(limit: f64) -> KmsService {
+    make_service().with_quota_provider(Some(Arc::new(
+        fakecloud_core::quota::FixedQuotas::default().with("kms", "L-C2F1777E", limit),
+    )))
+}
+
+fn in_region(action: &str, body: Value, region: &str) -> AwsRequest {
+    let mut req = make_request(action, body);
+    req.region = region.to_string();
+    req
+}
+
+fn assert_key_limit(result: Result<AwsResponse, AwsServiceError>) {
+    let err = result.err().expect("CreateKey should be refused");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "LimitExceededException");
+}
+
+#[test]
+fn key_quota_is_not_enforced_without_a_provider() {
+    let svc = make_service();
+    for _ in 0..3 {
+        create_key(&svc);
+    }
+}
+
+#[test]
+fn key_quota_counts_customer_keys_in_any_state_per_region() {
+    let svc = quota_service(2.0);
+    // AWS managed keys (minted for the `alias/aws/*` aliases) do not count.
+    svc.list_aliases(&make_request("ListAliases", json!({})))
+        .unwrap();
+    let first = create_key(&svc);
+    create_key(&svc);
+    assert_key_limit(svc.create_key(&make_request("CreateKey", json!({}))));
+
+    // A key pending deletion still counts.
+    svc.schedule_key_deletion(&make_request(
+        "ScheduleKeyDeletion",
+        json!({"KeyId": first, "PendingWindowInDays": 7}),
+    ))
+    .unwrap();
+    assert_key_limit(svc.create_key(&make_request("CreateKey", json!({}))));
+
+    // The quota is per Region.
+    svc.create_key(&in_region("CreateKey", json!({}), "eu-west-1"))
+        .unwrap();
+}
+
+#[test]
+fn key_quota_counts_a_replica_in_its_own_region() {
+    let svc = quota_service(1.0);
+    let resp = svc
+        .create_key(&make_request("CreateKey", json!({"MultiRegion": true})))
+        .unwrap();
+    let key_id = body_json(resp)["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    svc.create_key(&in_region("CreateKey", json!({}), "eu-west-1"))
+        .unwrap();
+    assert_key_limit(svc.replicate_key(&make_request(
+        "ReplicateKey",
+        json!({"KeyId": key_id, "ReplicaRegion": "eu-west-1"}),
+    )));
+    svc.replicate_key(&make_request(
+        "ReplicateKey",
+        json!({"KeyId": key_id, "ReplicaRegion": "us-west-2"}),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn key_usage_source_counts_customer_keys_per_region() {
+    use fakecloud_core::quota::QuotaUsageSource;
+    let svc = make_service();
+    svc.list_aliases(&make_request("ListAliases", json!({})))
+        .unwrap();
+    create_key(&svc);
+    create_key(&svc);
+    let usage = crate::quota::KmsQuotaUsage::new(svc.state.clone());
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "kms", "L-C2F1777E"),
+        Some(2.0)
+    );
+    assert_eq!(
+        usage.usage("123456789012", "eu-west-1", "kms", "L-C2F1777E"),
+        Some(0.0)
+    );
+}

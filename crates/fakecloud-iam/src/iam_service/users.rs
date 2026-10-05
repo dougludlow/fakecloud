@@ -198,6 +198,7 @@ impl IamService {
         let permissions_boundary = req.query_params.get("PermissionsBoundary").cloned();
 
         let partition = partition_for_region(&req.region);
+        let limit = self.enforced(req, crate::quota::IamQuota::Users);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -209,6 +210,7 @@ impl IamService {
                 format!("User {user_name} already exists"),
             ));
         }
+        crate::quota::check(crate::quota::IamQuota::Users, limit, state.users.len() + 1)?;
         let user = IamUser {
             user_id: format!("AIDA{}", generate_id()),
             arn: format!(
@@ -1599,6 +1601,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let user_name = required_param(&req.query_params, "UserName")?;
         let policy_arn = required_param(&req.query_params, "PolicyArn")?;
+        let limit = self.enforced(req, crate::quota::IamQuota::ManagedPoliciesPerUser);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -1630,6 +1633,11 @@ impl IamService {
 
         let arns = state.user_policies.entry(user_name).or_default();
         if !arns.contains(&policy_arn) {
+            crate::quota::check(
+                crate::quota::IamQuota::ManagedPoliciesPerUser,
+                limit,
+                arns.len() + 1,
+            )?;
             arns.push(policy_arn.clone());
             if let Some(p) = state.policies.get_mut(&policy_arn) {
                 p.attachment_count += 1;

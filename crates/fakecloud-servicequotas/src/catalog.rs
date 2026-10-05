@@ -365,24 +365,30 @@ pub const QUOTAS: &[QuotaDef] = &[
         true,
     ),
     // ---- IAM (global) ----
-    global(q("iam", "L-F55AF5E4", "Users per account", 5000.0, false)),
-    global(max(
+    enforceable(global(q(
+        "iam",
+        "L-F55AF5E4",
+        "Users per account",
+        5000.0,
+        false,
+    ))),
+    enforceable(global(max(
         q("iam", "L-FE177D64", "Roles per account", 1000.0, true),
         10000.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q("iam", "L-F4A5425F", "Groups per account", 300.0, true),
         500.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q("iam", "L-0DA4ABF3", "Managed policies per role", 20.0, true),
         25.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q("iam", "L-4019AD8B", "Managed policies per user", 10.0, true),
         20.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q(
             "iam",
             "L-384571C4",
@@ -391,8 +397,8 @@ pub const QUOTAS: &[QuotaDef] = &[
             false,
         ),
         10.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q(
             "iam",
             "L-E95E4862",
@@ -401,8 +407,8 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         10000.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q(
             "iam",
             "L-BF35879D",
@@ -411,8 +417,8 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         20.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q(
             "iam",
             "L-858F3967",
@@ -421,8 +427,8 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         700.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q(
             "iam",
             "L-6E65F664",
@@ -431,8 +437,8 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         10000.0,
-    )),
-    global(max(
+    ))),
+    enforceable(global(max(
         q(
             "iam",
             "L-C07B4B0D",
@@ -441,7 +447,7 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         8192.0,
-    )),
+    ))),
     // ---- Lambda ----
     unit(
         q(
@@ -453,7 +459,7 @@ pub const QUOTAS: &[QuotaDef] = &[
         ),
         "Count",
     ),
-    unit(
+    enforceable(unit(
         q(
             "lambda",
             "L-2ACBD22F",
@@ -462,25 +468,31 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         "Gigabytes",
-    ),
+    )),
     // ---- S3 ----
-    q("s3", "L-DC2B2D3D", "General purpose buckets", 10000.0, true),
+    enforceable(q(
+        "s3",
+        "L-DC2B2D3D",
+        "General purpose buckets",
+        10000.0,
+        true,
+    )),
     // ---- DynamoDB ----
-    q(
+    enforceable(q(
         "dynamodb",
         "L-F98FE922",
         "Maximum number of tables",
         2500.0,
         true,
-    ),
+    )),
     // ---- KMS ----
-    q(
+    enforceable(q(
         "kms",
         "L-C2F1777E",
         "Customer Master Keys (CMKs)",
         100000.0,
         true,
-    ),
+    )),
 ];
 
 /// Parse a `service_code/quota_code` reference (as the CLI flags and the
@@ -576,6 +588,43 @@ mod tests {
             assert!(q.global, "{}", s.quota_code);
             assert_eq!(q.default, s.default, "{}", s.summary_key);
         }
+    }
+
+    /// The IAM, DynamoDB, KMS, S3 and Lambda quotas their services check.
+    /// Lambda concurrency stays unenforced: cross-service invocations bypass
+    /// the `Invoke` concurrency gate, so in-flight executions cannot be
+    /// counted account-wide.
+    #[test]
+    fn service_quotas_enforced_by_iam_dynamodb_kms_s3_and_lambda() {
+        let enforced: Vec<&str> = QUOTAS
+            .iter()
+            .filter(|q| {
+                ["iam", "dynamodb", "kms", "s3", "lambda"].contains(&q.service_code)
+                    && q.enforceable
+            })
+            .map(|q| q.quota_code)
+            .collect();
+        assert_eq!(
+            enforced,
+            [
+                "L-F55AF5E4",
+                "L-FE177D64",
+                "L-F4A5425F",
+                "L-0DA4ABF3",
+                "L-4019AD8B",
+                "L-384571C4",
+                "L-E95E4862",
+                "L-BF35879D",
+                "L-858F3967",
+                "L-6E65F664",
+                "L-C07B4B0D",
+                "L-2ACBD22F",
+                "L-DC2B2D3D",
+                "L-F98FE922",
+                "L-C2F1777E",
+            ]
+        );
+        assert!(!quota("lambda", "L-B99A9384").unwrap().enforceable);
     }
 
     #[test]

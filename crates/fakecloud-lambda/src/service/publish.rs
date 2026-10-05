@@ -16,6 +16,7 @@ impl LambdaService {
         let supplied_revision = body["RevisionId"].as_str().map(String::from);
         let supplied_sha = body["CodeSha256"].as_str().map(String::from);
         let description_override = body["Description"].as_str().map(String::from);
+        let storage_limit = self.code_storage_limit(account_id, &req.region);
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(account_id, &req.region);
@@ -94,6 +95,14 @@ impl LambdaService {
 
         let next: u64 = latest_version.unwrap_or(0) + 1;
         let next_str = next.to_string();
+
+        // The new version stores its own copy of the code.
+        let storage_before = crate::quota::code_storage_used(state);
+        crate::quota::check_storage(
+            storage_limit,
+            storage_before,
+            storage_before + crate::quota::stored_code_size(func),
+        )?;
 
         // Snapshot the function config + code for the new immutable version.
         let mut snapshot = func.clone();
