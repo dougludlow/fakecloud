@@ -1542,23 +1542,40 @@ impl SesV2Service {
     }
 
     pub(super) fn list_tenants(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let params =
+            Self::list_request_params(req, &["TENANT_NAME_CONTAINS", "SENDING_STATUS"], None)?;
         let accounts = self.state.read();
         let empty = SesState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
-        let tenants: Vec<Value> = state
+        let tenants: Vec<(String, Value)> = state
             .tenants
             .values()
-            .map(|t| {
-                json!({
-                    "TenantName": t.tenant_name,
-                    "TenantId": t.tenant_id,
-                    "TenantArn": t.tenant_arn,
-                    "CreatedTimestamp": t.created_timestamp.timestamp() as f64,
+            .filter(|t| {
+                params.filter.iter().all(|(key, want)| match key.as_str() {
+                    "TENANT_NAME_CONTAINS" => t.tenant_name.contains(want.as_str()),
+                    "SENDING_STATUS" => t.sending_status == *want,
+                    _ => true,
                 })
             })
+            .map(|t| {
+                (
+                    t.tenant_name.clone(),
+                    json!({
+                        "TenantName": t.tenant_name,
+                        "TenantId": t.tenant_id,
+                        "TenantArn": t.tenant_arn,
+                        "CreatedTimestamp": t.created_timestamp.timestamp() as f64,
+                        "SendingStatus": t.sending_status,
+                    }),
+                )
+            })
             .collect();
+        let (tenants, next_token) = params.page(tenants);
 
-        let response = json!({ "Tenants": tenants });
+        let mut response = json!({ "Tenants": tenants });
+        if let Some(next) = next_token {
+            response["NextToken"] = json!(next);
+        }
         Ok(AwsResponse::json(StatusCode::OK, response.to_string()))
     }
 

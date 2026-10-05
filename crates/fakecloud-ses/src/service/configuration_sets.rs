@@ -141,18 +141,25 @@ impl SesV2Service {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let params = Self::list_request_params(req, &["CONFIGURATION_SET_NAME_CONTAINS"], None)?;
+        let name_contains = params.filter.get("CONFIGURATION_SET_NAME_CONTAINS");
         let accounts = self.state.read();
         let empty = SesState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
-        let sets: Vec<Value> = state
+        let sets: Vec<(String, Value)> = state
             .configuration_sets
             .keys()
-            .map(|name| json!(name))
+            .filter(|name| name_contains.is_none_or(|needle| name.contains(needle.as_str())))
+            .map(|name| (name.clone(), json!(name)))
             .collect();
+        let (sets, next_token) = params.page(sets);
 
-        let response = json!({
+        let mut response = json!({
             "ConfigurationSets": sets,
         });
+        if let Some(next) = next_token {
+            response["NextToken"] = json!(next);
+        }
 
         Ok(AwsResponse::json(StatusCode::OK, response.to_string()))
     }

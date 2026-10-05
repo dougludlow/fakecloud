@@ -5311,3 +5311,175 @@ async fn china_region_resource_arns_use_the_aws_cn_partition() {
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(body["Tags"][0]["Value"], "cn");
 }
+
+async fn post_json(svc: &SesV2Service, path: &str, body: Value) -> (StatusCode, Value) {
+    let resp = svc
+        .handle(make_request(Method::POST, path, &body.to_string()))
+        .await
+        .unwrap();
+    let status = resp.status;
+    let json: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    (status, json)
+}
+
+#[tokio::test]
+async fn list_configuration_sets_filters_by_name_and_pages() {
+    let svc = SesV2Service::new(make_state());
+    for name in ["alpha-prod", "beta-prod", "gamma-dev", "delta-prod"] {
+        let (status, _) = post_json(
+            &svc,
+            "/v2/email/configuration-sets",
+            json!({"ConfigurationSetName": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (_, body) = post_json(
+        &svc,
+        "/v2/email/list-configuration-sets",
+        json!({"Filter": {"CONFIGURATION_SET_NAME_CONTAINS": "prod"}}),
+    )
+    .await;
+    assert_eq!(
+        body["ConfigurationSets"],
+        json!(["alpha-prod", "beta-prod", "delta-prod"])
+    );
+    assert!(body.get("NextToken").is_none());
+
+    // Paged: two per page, the token resumes where the first page stopped.
+    let (_, page1) = post_json(
+        &svc,
+        "/v2/email/list-configuration-sets",
+        json!({"PageSize": 2, "Filter": {"CONFIGURATION_SET_NAME_CONTAINS": "prod"}}),
+    )
+    .await;
+    assert_eq!(
+        page1["ConfigurationSets"],
+        json!(["alpha-prod", "beta-prod"])
+    );
+    let token = page1["NextToken"].as_str().unwrap().to_string();
+    let (_, page2) = post_json(
+        &svc,
+        "/v2/email/list-configuration-sets",
+        json!({"PageSize": 2, "NextToken": token,
+               "Filter": {"CONFIGURATION_SET_NAME_CONTAINS": "prod"}}),
+    )
+    .await;
+    assert_eq!(page2["ConfigurationSets"], json!(["delta-prod"]));
+    assert!(page2.get("NextToken").is_none());
+
+    // The legacy GET binding still lists everything.
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/v2/email/configuration-sets",
+            "",
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ConfigurationSets"].as_array().unwrap().len(), 4);
+
+    // An unknown filter key is rejected.
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/v2/email/list-configuration-sets",
+            &json!({"Filter": {"NAME_EQUALS": "x"}}).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "BadRequestException");
+}
+
+#[tokio::test]
+async fn list_email_identities_filters_by_name_type_and_verification_status() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    seed_identity(&state, "ops@example.com");
+    seed_identity(&state, "example.com");
+    seed_identity(&state, "pending.example.org");
+    state
+        .write()
+        .get_or_create("123456789012")
+        .identities
+        .get_mut("pending.example.org")
+        .unwrap()
+        .verified = false;
+
+    let list = |filter: Value| {
+        let svc = &svc;
+        async move {
+            post_json(svc, "/v2/email/list-identities", json!({"Filter": filter}))
+                .await
+                .1
+        }
+    };
+    let names = |body: &Value| -> Vec<String> {
+        body["EmailIdentities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["IdentityName"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let body = list(json!({"IDENTITY_TYPE": "DOMAIN"})).await;
+    assert_eq!(names(&body), vec!["example.com", "pending.example.org"]);
+
+    let body = list(json!({"IDENTITY_NAME_CONTAINS": "example.com"})).await;
+    assert_eq!(names(&body), vec!["example.com", "ops@example.com"]);
+
+    let body = list(json!({"VERIFICATION_STATUS": "PENDING"})).await;
+    assert_eq!(names(&body), vec!["pending.example.org"]);
+    assert_eq!(body["EmailIdentities"][0]["VerificationStatus"], "PENDING");
+
+    // Filters combine (AND).
+    let body = list(json!({"IDENTITY_TYPE": "DOMAIN", "VERIFICATION_STATUS": "SUCCESS"})).await;
+    assert_eq!(names(&body), vec!["example.com"]);
+
+    let (_, page) = post_json(&svc, "/v2/email/list-identities", json!({"PageSize": 1})).await;
+    assert_eq!(page["EmailIdentities"].as_array().unwrap().len(), 1);
+    assert_eq!(page["NextToken"], "ops@example.com");
+}
+
+#[tokio::test]
+async fn list_tenants_filters_and_reports_sending_status() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    for name in ["acme-eu", "acme-us", "globex"] {
+        post_json(&svc, "/v2/email/tenants", json!({"TenantName": name})).await;
+    }
+    state
+        .write()
+        .get_or_create("123456789012")
+        .tenants
+        .get_mut("acme-us")
+        .unwrap()
+        .sending_status = "DISABLED".to_string();
+
+    let (_, body) = post_json(&svc, "/v2/email/tenants/list", json!({})).await;
+    assert_eq!(body["Tenants"].as_array().unwrap().len(), 3);
+    assert_eq!(body["Tenants"][0]["SendingStatus"], "ENABLED");
+
+    let (_, body) = post_json(
+        &svc,
+        "/v2/email/tenants/list",
+        json!({"Filter": {"TENANT_NAME_CONTAINS": "acme"}}),
+    )
+    .await;
+    assert_eq!(body["Tenants"].as_array().unwrap().len(), 2);
+
+    let (_, body) = post_json(
+        &svc,
+        "/v2/email/tenants/list",
+        json!({"Filter": {"SENDING_STATUS": "DISABLED"}}),
+    )
+    .await;
+    let tenants = body["Tenants"].as_array().unwrap();
+    assert_eq!(tenants.len(), 1);
+    assert_eq!(tenants[0]["TenantName"], "acme-us");
+    assert_eq!(tenants[0]["SendingStatus"], "DISABLED");
+}

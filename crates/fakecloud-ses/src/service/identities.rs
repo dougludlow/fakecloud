@@ -192,24 +192,50 @@ impl SesV2Service {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let params = Self::list_request_params(
+            req,
+            &[
+                "IDENTITY_NAME_CONTAINS",
+                "IDENTITY_TYPE",
+                "VERIFICATION_STATUS",
+            ],
+            Some(1000),
+        )?;
         let accounts = self.state.read();
         let empty = SesState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
-        let identities: Vec<Value> = state
+        let identities: Vec<(String, Value)> = state
             .identities
             .values()
-            .map(|id| {
-                json!({
-                    "IdentityType": id.identity_type,
-                    "IdentityName": id.identity_name,
-                    "SendingEnabled": true,
+            .filter_map(|id| {
+                let verification_status = if id.verified { "SUCCESS" } else { "PENDING" };
+                let keep = params.filter.iter().all(|(key, want)| match key.as_str() {
+                    "IDENTITY_NAME_CONTAINS" => id.identity_name.contains(want.as_str()),
+                    "IDENTITY_TYPE" => id.identity_type == *want,
+                    "VERIFICATION_STATUS" => verification_status == want,
+                    _ => true,
+                });
+                keep.then(|| {
+                    (
+                        id.identity_name.clone(),
+                        json!({
+                            "IdentityType": id.identity_type,
+                            "IdentityName": id.identity_name,
+                            "SendingEnabled": true,
+                            "VerificationStatus": verification_status,
+                        }),
+                    )
                 })
             })
             .collect();
+        let (identities, next_token) = params.page(identities);
 
-        let response = json!({
+        let mut response = json!({
             "EmailIdentities": identities,
         });
+        if let Some(next) = next_token {
+            response["NextToken"] = json!(next);
+        }
 
         Ok(AwsResponse::json(StatusCode::OK, response.to_string()))
     }

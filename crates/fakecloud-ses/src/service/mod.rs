@@ -221,6 +221,12 @@ impl SesV2Service {
             "update-configuration-sets" if segs.len() == 3 && *method == Method::POST => {
                 Some(("UpdateConfigurationSet", None, None))
             }
+            "list-configuration-sets" if segs.len() == 3 && *method == Method::POST => {
+                Some(("ListConfigurationSets", None, None))
+            }
+            "list-identities" if segs.len() == 3 && *method == Method::POST => {
+                Some(("ListEmailIdentities", None, None))
+            }
             "identity" => resolve_identity_certificates_action(method, segs),
             "templates" => resolve_templates_action(method, segs, resource),
             "contact-lists" => resolve_contact_lists_action(method, segs, resource),
@@ -274,6 +280,76 @@ impl SesV2Service {
             }
             _ => None,
         }
+    }
+
+    /// The paging and `Filter` members of a v2 list request
+    /// (`ListConfigurationSets`, `ListEmailIdentities`, `ListTenants`).
+    /// Current SDKs POST them as a JSON body; older SDKs sent `NextToken` /
+    /// `PageSize` as GET query parameters, which are still honored. Filter
+    /// keys must be one of `filter_keys`; `max_page_size` bounds `PageSize`
+    /// where the operation documents a ceiling.
+    fn list_request_params(
+        req: &AwsRequest,
+        filter_keys: &[&str],
+        max_page_size: Option<i64>,
+    ) -> Result<ListRequestParams, AwsServiceError> {
+        let bad = |msg: String| {
+            AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "BadRequestException", msg)
+        };
+        let body: Value = if req.body.is_empty() {
+            Value::Null
+        } else {
+            Self::parse_body(req)?
+        };
+        let next_token = body["NextToken"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| req.query_params.get("NextToken").cloned());
+        let page_size = match body.get("PageSize").filter(|v| !v.is_null()) {
+            Some(v) => Some(
+                v.as_i64()
+                    .ok_or_else(|| bad("PageSize must be an integer".to_string()))?,
+            ),
+            None => match req.query_params.get("PageSize") {
+                Some(raw) => Some(
+                    raw.parse::<i64>()
+                        .map_err(|_| bad("PageSize must be an integer".to_string()))?,
+                ),
+                None => None,
+            },
+        };
+        let page_size = match page_size {
+            Some(n) if n < 0 || max_page_size.is_some_and(|max| n > max) => {
+                return Err(bad(match max_page_size {
+                    Some(max) => format!("PageSize must be between 0 and {max}"),
+                    None => "PageSize must not be negative".to_string(),
+                }));
+            }
+            // A zero page size carries no limit.
+            Some(0) | None => None,
+            Some(n) => Some(n as usize),
+        };
+        let mut filter = std::collections::BTreeMap::new();
+        if let Some(map) = body.get("Filter").and_then(Value::as_object) {
+            for (key, value) in map {
+                if !filter_keys.contains(&key.as_str()) {
+                    return Err(bad(format!(
+                        "Invalid filter key {key}. Valid keys: {}",
+                        filter_keys.join(", ")
+                    )));
+                }
+                let value = value.as_str().unwrap_or_default();
+                if value.is_empty() {
+                    return Err(bad(format!("Filter value for {key} must not be empty")));
+                }
+                filter.insert(key.clone(), value.to_string());
+            }
+        }
+        Ok(ListRequestParams {
+            next_token,
+            page_size,
+            filter,
+        })
     }
 
     fn parse_body(req: &AwsRequest) -> Result<Value, AwsServiceError> {
@@ -708,6 +784,36 @@ impl fakecloud_core::service::AwsService for SesV2Service {
             // but excluded from the conformance audit because there is no SES v1
             // Smithy model (only sesv2.json exists) to generate checksums from.
         ]
+    }
+}
+
+/// Parsed paging / filter members of a v2 list request; see
+/// [`SesV2Service::list_request_params`].
+pub(super) struct ListRequestParams {
+    pub next_token: Option<String>,
+    pub page_size: Option<usize>,
+    pub filter: std::collections::BTreeMap<String, String>,
+}
+
+impl ListRequestParams {
+    /// Page through `items` (already filtered, in name order). The token is
+    /// the name of the first item on the next page (an inclusive cursor), so
+    /// a deletion between pages still advances the listing.
+    pub fn page<T>(&self, items: Vec<(String, T)>) -> (Vec<T>, Option<String>) {
+        let start = match self.next_token {
+            Some(ref token) => items
+                .iter()
+                .position(|(name, _)| name.as_str() >= token.as_str())
+                .unwrap_or(items.len()),
+            None => 0,
+        };
+        let mut rest = items.into_iter().skip(start);
+        let Some(size) = self.page_size else {
+            return (rest.map(|(_, v)| v).collect(), None);
+        };
+        let page: Vec<T> = rest.by_ref().take(size).map(|(_, v)| v).collect();
+        let next = rest.next().map(|(name, _)| name);
+        (page, next)
     }
 }
 
