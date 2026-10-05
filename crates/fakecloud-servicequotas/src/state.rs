@@ -146,8 +146,4 @@ pub type SharedServiceQuotasState = Arc<RwLock<MultiAccountState<ServiceQuotasDa
 pub struct ServiceQuotasSnapshot {
     pub schema_version: u32,
     pub accounts: MultiAccountState<ServiceQuotasData>,
-    /// Server-wide enforcement and approval settings, as last changed through
-    /// the introspection API. Absent in snapshots written before they existed.
-    #[serde(default)]
-    pub settings: Option<crate::settings::QuotaSettings>,
 }

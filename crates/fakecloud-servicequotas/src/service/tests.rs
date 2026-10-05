@@ -959,23 +959,18 @@ fn manual_approval_leaves_template_entries_pending() {
 }
 
 #[test]
-fn reset_restores_the_startup_settings() {
-    let baseline = QuotaSettings {
-        enforce_all: true,
-        ..Default::default()
-    };
-    let shared = Arc::new(RwLock::new(baseline.clone()));
-    let s = svc().with_settings(shared, baseline.clone());
+fn approving_never_lowers_a_quota_set_higher_meanwhile() {
+    let s = svc();
     s.introspect_set_request_approval("manual").unwrap();
-    s.introspect_put_enforcement(&PutEnforcementRequest {
-        enforce_all: Some(false),
-        overrides: vec![],
-    })
-    .unwrap();
-    let body: PutQuotaRequest = serde_json::from_value(json!({ "value": 1.0 })).unwrap();
-    s.introspect_put_quota("vpc", "L-2AFB9258", &body).unwrap();
-    s.reset();
-    assert_eq!(*s.settings().read(), baseline);
-    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
-    assert_eq!(q["Quota"]["Value"], 5.0);
+    let mut body = sg_quota("L-0EA8095F");
+    body["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let raise: PutQuotaRequest = serde_json::from_value(json!({ "value": 150.0 })).unwrap();
+    s.introspect_put_quota("vpc", "L-0EA8095F", &raise).unwrap();
+    s.introspect_decide_request(&id, Decision::Approve).unwrap();
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 150.0);
 }

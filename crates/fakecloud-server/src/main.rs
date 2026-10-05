@@ -224,8 +224,9 @@ async fn main() {
         Ok(cfg) => cfg,
         Err(err) => fatal_exit(format_args!("invalid persistence configuration: {err}")),
     };
-    // Which Service Quotas quotas are enforced, and how increase requests are
-    // decided, at startup (and after a reset).
+    // Which Service Quotas quotas are enforced server-wide, and how increase
+    // requests are decided. These come from the flags at every start (they are
+    // not persisted); runtime changes last until a restart or reset.
     let quota_baseline = match cli.quota_settings() {
         Ok(settings) => settings,
         Err(err) => fatal_exit(format_args!("invalid quota configuration: {err}")),
@@ -4526,18 +4527,9 @@ async fn main() {
                 .clone();
             let path = data_path.join("servicequotas").join("snapshot.json");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
-            match fakecloud_servicequotas::persistence::load_into(
-                &store,
-                &servicequotas_state,
-                &servicequotas_settings,
-            ) {
+            match fakecloud_servicequotas::persistence::load_into(&store, &servicequotas_state) {
                 Ok(fakecloud_servicequotas::persistence::LoadOutcome::Loaded(accounts)) => {
                     tracing::info!(accounts, "loaded servicequotas persistence snapshot");
-                    // Settings changed at runtime were restored; the startup
-                    // flags still win for the settings they name.
-                    if let Err(err) = cli.apply_quota_flags(&mut servicequotas_settings.write()) {
-                        fatal_exit(format_args!("invalid quota configuration: {err}"));
-                    }
                 }
                 Ok(fakecloud_servicequotas::persistence::LoadOutcome::Empty) => {
                     tracing::info!("no servicequotas persistence snapshot found; starting empty");
@@ -4552,7 +4544,7 @@ async fn main() {
         servicequotas_state.clone(),
         organizations_state.clone(),
     )
-    .with_settings(servicequotas_settings.clone(), quota_baseline.clone())
+    .with_settings(servicequotas_settings.clone())
     .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()))
     // Associating the template enables trusted access in Organizations.
     .with_organizations_snapshot_hook(cfn_snapshot_hooks.get("organizations").cloned());

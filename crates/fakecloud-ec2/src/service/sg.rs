@@ -636,17 +636,7 @@ fn authorize(
             .ok_or_else(|| sg_not_found(&group_id))?;
         let after: Vec<SecurityGroupRule> =
             sg.rules.iter().chain(new_rules.iter()).cloned().collect();
-        if let Some((rule_limit, (count, direction))) = rule_limit.and_then(|l| {
-            weights
-                .side_grown_past(&sg.rules, &after, l)
-                .map(|g| (l, g))
-        }) {
-            return Err(rules_limit_exceeded(format!(
-                "The maximum number of rules per security group has been reached: the \
-                 security group '{group_id}' would have {count} {direction} rules, limit \
-                 {rule_limit}"
-            )));
-        }
+        weights.check_edit(&group_id, &sg.rules, &after, rule_limit)?;
         sg.rules = after;
     }
     // New rules change what traffic is allowed — re-apply the firewall (ph3).
@@ -834,17 +824,7 @@ pub(crate) fn modify_security_group_rules(
             }
             n += 1;
         }
-        if let Some((rule_limit, (count, direction))) = rule_limit.and_then(|l| {
-            weights
-                .side_grown_past(&sg.rules, &rules, l)
-                .map(|g| (l, g))
-        }) {
-            return Err(rules_limit_exceeded(format!(
-                "The maximum number of rules per security group has been reached: the \
-                 security group '{group_id}' would have {count} {direction} rules, limit \
-                 {rule_limit}"
-            )));
-        }
+        weights.check_edit(&group_id, &sg.rules, &rules, rule_limit)?;
         sg.rules = rules;
     }
     // Rule changes alter allowed traffic — re-apply the firewall (ph3).

@@ -128,10 +128,12 @@ when, in order of precedence:
 | `--quota-requests auto\|manual` | `FAKECLOUD_QUOTA_REQUESTS` | How increase requests are decided (default `auto`) |
 
 The server refuses to start on an unknown quota code, or on `--enforce-quota`
-for a quota no fakecloud service checks. Settings changed at runtime through
-the introspection API persist in persistent mode; on restart the flags still
-win for the settings they name. `POST /_fakecloud/reset` puts quotas back to
-the startup configuration.
+for a quota no fakecloud service checks. The server-wide settings (the global
+switch, server-wide overrides and the approval mode) come from these flags at
+every start: changes made at runtime through the introspection API last until
+a restart or `POST /_fakecloud/reset`, which puts them back to the flags.
+Applied values, per-account overrides and requests are account data and
+persist across restarts in persistent mode.
 
 ### Enforceable quotas
 

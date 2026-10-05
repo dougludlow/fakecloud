@@ -646,7 +646,7 @@ async fn reset_restores_the_startup_quota_settings() {
 }
 
 #[tokio::test]
-async fn quota_settings_survive_a_restart() {
+async fn account_quota_data_survives_a_restart_but_server_settings_follow_the_flags() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().display().to_string();
     let mut server = TestServer::start_full(
@@ -655,16 +655,30 @@ async fn quota_settings_survive_a_restart() {
     )
     .await;
     let fc = FakeCloud::new(server.endpoint());
+    let account = fc
+        .service_quotas()
+        .get_quotas(None, None, Some(VPC))
+        .await
+        .unwrap()
+        .account_id;
     fc.service_quotas()
         .put_quota(
             VPC,
             SGS_PER_ENI,
             &PutServiceQuotaRequest {
+                account_id: Some(account.clone()),
                 value: Some(2.0),
                 enforce: Some(QuotaEnforcement::Enforce),
                 ..Default::default()
             },
         )
+        .await
+        .unwrap();
+    fc.service_quotas()
+        .put_enforcement(&PutQuotaEnforcementRequest {
+            enforce_all: Some(true),
+            overrides: vec![],
+        })
         .await
         .unwrap();
     fc.service_quotas()
@@ -684,14 +698,24 @@ async fn quota_settings_survive_a_restart() {
         .iter()
         .find(|q| q.quota_code == SGS_PER_ENI)
         .unwrap();
+    // The applied value and the account's override are account data.
     assert_eq!(q.applied_value, 2.0);
     assert!(q.enforced);
+    assert_eq!(q.enforcement_source, "account_override");
+    // The server-wide settings come from the (absent) flags again.
+    assert!(
+        !fc.service_quotas()
+            .get_enforcement()
+            .await
+            .unwrap()
+            .enforce_all
+    );
     assert_eq!(
         fc.service_quotas()
             .get_request_approval()
             .await
             .unwrap()
             .mode,
-        "manual"
+        "auto"
     );
 }

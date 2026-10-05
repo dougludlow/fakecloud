@@ -309,16 +309,18 @@ impl Cli {
         })
     }
 
-    /// Apply the quota flags to `settings`: the flags win over whatever a
-    /// persisted snapshot holds for the settings they name.
-    pub fn apply_quota_flags(
-        &self,
-        settings: &mut fakecloud_servicequotas::QuotaSettings,
-    ) -> Result<(), String> {
+    /// The server-wide quota settings the flags describe: what the server
+    /// starts with and what a reset restores.
+    pub fn quota_settings(&self) -> Result<fakecloud_servicequotas::QuotaSettings, String> {
         let resolve = |reference: &str| {
             fakecloud_servicequotas::catalog::parse_ref(reference.trim()).ok_or_else(|| {
                 format!("unknown quota {reference:?}: expected SERVICE_CODE/QUOTA_CODE from the Service Quotas catalog")
             })
+        };
+        let mut settings = fakecloud_servicequotas::QuotaSettings {
+            enforce_all: self.enforce_quotas,
+            request_approval: self.quota_requests.map(Into::into).unwrap_or_default(),
+            ..Default::default()
         };
         for reference in &self.enforce_quota {
             let def = resolve(reference)?;
@@ -328,38 +330,18 @@ impl Cli {
                     def.name
                 ));
             }
-            if self
-                .ignore_quota
-                .iter()
-                .any(|i| resolve(i).is_ok_and(|d| std::ptr::eq(d, def)))
-            {
-                return Err(format!(
-                    "quota {reference} is given to both --enforce-quota and --ignore-quota"
-                ));
-            }
             settings
                 .overrides
                 .insert(fakecloud_servicequotas::settings::quota_ref(def), true);
         }
         for reference in &self.ignore_quota {
-            let def = resolve(reference)?;
-            settings
-                .overrides
-                .insert(fakecloud_servicequotas::settings::quota_ref(def), false);
+            let key = fakecloud_servicequotas::settings::quota_ref(resolve(reference)?);
+            if settings.overrides.insert(key, false) == Some(true) {
+                return Err(format!(
+                    "quota {reference} is given to both --enforce-quota and --ignore-quota"
+                ));
+            }
         }
-        if self.enforce_quotas {
-            settings.enforce_all = true;
-        }
-        if let Some(mode) = self.quota_requests {
-            settings.request_approval = mode.into();
-        }
-        Ok(())
-    }
-
-    /// The quota settings the server starts with (and a reset restores).
-    pub fn quota_settings(&self) -> Result<fakecloud_servicequotas::QuotaSettings, String> {
-        let mut settings = fakecloud_servicequotas::QuotaSettings::default();
-        self.apply_quota_flags(&mut settings)?;
         Ok(settings)
     }
 
@@ -561,21 +543,6 @@ mod tests {
             s.request_approval,
             fakecloud_servicequotas::RequestApproval::Manual
         );
-    }
-
-    #[test]
-    fn quota_flags_override_persisted_settings_they_name() {
-        let cli = Cli::try_parse_from(["fakecloud", "--ignore-quota", "vpc/L-2AFB9258"]).unwrap();
-        let mut persisted = fakecloud_servicequotas::QuotaSettings {
-            enforce_all: true,
-            ..Default::default()
-        };
-        persisted
-            .overrides
-            .insert("vpc/L-2AFB9258".to_string(), true);
-        cli.apply_quota_flags(&mut persisted).unwrap();
-        assert!(persisted.enforce_all, "unnamed settings are kept");
-        assert_eq!(persisted.overrides.get("vpc/L-2AFB9258"), Some(&false));
     }
 
     #[test]

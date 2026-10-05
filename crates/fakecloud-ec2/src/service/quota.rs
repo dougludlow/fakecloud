@@ -183,6 +183,29 @@ impl<'a> RuleWeights<'a> {
         }
         None
     }
+
+    /// `RulesPerSecurityGroupLimitExceeded` when an edit of `group_id`'s rules
+    /// grows a side past `limit`. A `None` limit (the quota is not enforced)
+    /// accepts any edit.
+    pub(crate) fn check_edit(
+        &self,
+        group_id: &str,
+        before: &[SecurityGroupRule],
+        after: &[SecurityGroupRule],
+        limit: Option<usize>,
+    ) -> Result<(), AwsServiceError> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        match self.side_grown_past(before, after, limit) {
+            Some((count, direction)) => Err(rules_limit_exceeded(format!(
+                "The maximum number of rules per security group has been reached: the \
+                 security group '{group_id}' would have {count} {direction} rules, limit \
+                 {limit}"
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 fn bad_request(code: &str, message: String) -> AwsServiceError {

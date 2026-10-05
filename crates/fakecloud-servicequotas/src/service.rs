@@ -100,11 +100,9 @@ pub struct ServiceQuotasService {
     state: SharedServiceQuotasState,
     orgs: SharedOrganizationsState,
     /// Server-wide enforcement and approval settings, shared with the
-    /// [`crate::ServiceQuotasProvider`].
+    /// [`crate::ServiceQuotasProvider`]. They come from the startup flags and
+    /// last until a restart or reset; they are not persisted.
     settings: SharedQuotaSettings,
-    /// The settings the server started with (from the CLI), which a reset
-    /// restores.
-    baseline: QuotaSettings,
     usage_sources: Vec<Arc<dyn QuotaUsageSource>>,
     /// Persists Organizations state, which associating the template changes
     /// (it enables trusted access for Service Quotas).
@@ -119,7 +117,6 @@ impl ServiceQuotasService {
             state,
             orgs,
             settings: Arc::new(parking_lot::RwLock::new(QuotaSettings::default())),
-            baseline: QuotaSettings::default(),
             usage_sources: Vec::new(),
             orgs_snapshot_hook: None,
             snapshot_store: None,
@@ -127,22 +124,10 @@ impl ServiceQuotasService {
         }
     }
 
-    /// Share `settings` with the [`crate::ServiceQuotasProvider`]; `baseline`
-    /// is what a reset restores them to.
-    pub fn with_settings(mut self, settings: SharedQuotaSettings, baseline: QuotaSettings) -> Self {
+    /// Share `settings` with the [`crate::ServiceQuotasProvider`].
+    pub fn with_settings(mut self, settings: SharedQuotaSettings) -> Self {
         self.settings = settings;
-        self.baseline = baseline;
         self
-    }
-
-    pub fn settings(&self) -> &SharedQuotaSettings {
-        &self.settings
-    }
-
-    /// Clear every account's quota state and restore the startup settings.
-    pub fn reset(&self) {
-        self.state.write().reset();
-        *self.settings.write() = self.baseline.clone();
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -198,15 +183,13 @@ impl ServiceQuotasService {
     pub fn snapshot_hook(&self) -> Option<fakecloud_persistence::SnapshotHook> {
         let store = self.snapshot_store.clone()?;
         let state = self.state.clone();
-        let settings = self.settings.clone();
         let lock = self.snapshot_lock.clone();
         Some(Arc::new(move || {
             let state = state.clone();
-            let settings = settings.clone();
             let store = store.clone();
             let lock = lock.clone();
             Box::pin(async move {
-                save_snapshot(&state, &settings, Some(store), &lock).await;
+                save_snapshot(&state, Some(store), &lock).await;
             })
         }))
     }
@@ -215,7 +198,6 @@ impl ServiceQuotasService {
     pub async fn save(&self) {
         save_snapshot(
             &self.state,
-            &self.settings,
             self.snapshot_store.clone(),
             &self.snapshot_lock,
         )

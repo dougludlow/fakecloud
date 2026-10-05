@@ -494,7 +494,10 @@ impl ServiceQuotasService {
         }
         let status = match decision {
             Decision::Approve => {
+                // An approved increase raises the quota to the requested value;
+                // it never lowers one set higher in the meantime.
                 if let Some(def) = catalog::quota(&request.service_code, &request.quota_code) {
+                    let current = applied_value(Some(data), &request.region, def);
                     data.applied.insert(
                         applied_key(
                             &request.region,
@@ -502,7 +505,7 @@ impl ServiceQuotasService {
                             def.service_code,
                             def.quota_code,
                         ),
-                        request.desired_value,
+                        current.max(request.desired_value),
                     );
                 }
                 "APPROVED"
