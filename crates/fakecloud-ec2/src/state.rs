@@ -1289,11 +1289,12 @@ pub struct IpamInternetRegistryAssociation {
 /// on every call rather than only on retries: these records are written far
 /// more often than they are read, and they are cloned with the association
 /// into every snapshot. They are therefore aged out and capped -- see
-/// `CLIENT_TOKEN_TTL_SECONDS` in the handler module.
+/// `CLIENT_TOKEN_TTL_SECONDS` in the `ipam_registry` handler module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpamIdempotencyRecord {
-    /// The delta the original call produced, or the association's own id for
-    /// Enable, which produces no delta.
+    /// The result the original call produced: for an IPAM registry
+    /// association, the delta (or the association's own id for Enable, which
+    /// produces no delta); for a Client VPN authorization policy, the status.
     pub result_id: String,
     /// A fingerprint of the parameters the original call carried. A token
     /// reused with different parameters is not a retry.
@@ -1569,10 +1570,12 @@ pub struct ClientVpnAuthorizationPolicy {
     pub shadow_mode: String,
     /// `ClientVpnAuthorizationPolicyStatus`.
     pub status: String,
-    /// `ClientToken` -> (request fingerprint, status that call returned), so a
-    /// retried Modify replays its original answer.
+    /// `ClientToken` -> the call it served (`result_id` holds the status that
+    /// call returned), so a retried Modify replays its original answer. Aged
+    /// out and capped like the IPAM registry's records, since SDKs mint a
+    /// fresh token on every call.
     #[serde(default)]
-    pub client_tokens: BTreeMap<String, (String, String)>,
+    pub client_tokens: BTreeMap<String, IpamIdempotencyRecord>,
 }
 
 /// A Transit Gateway peering attachment.

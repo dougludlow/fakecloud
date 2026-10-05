@@ -19,7 +19,7 @@
 //! than a success for a change nobody made, and a timestamp, so the records do
 //! not accumulate in the association forever.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 
@@ -152,14 +152,14 @@ fn client_token(req: &AwsRequest) -> Option<String> {
 /// How long a served idempotency token keeps replaying. EC2 documents a
 /// 24-hour idempotency window for these tokens, so a record older than that
 /// can no longer serve a retry and is only weight in the snapshot.
-const CLIENT_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
+pub(super) const CLIENT_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// How many records one association keeps at most. The window alone is not a
 /// bound: `ClientToken` is an `@idempotencyToken`, so an SDK fills a fresh
 /// UUID in on every call and a tight create/delete loop would leave hundreds
 /// of thousands of live records inside the window. The oldest go first, which
 /// is the order they stop being useful in.
-const CLIENT_TOKEN_MAX_RECORDS: usize = 1000;
+pub(super) const CLIENT_TOKEN_MAX_RECORDS: usize = 1000;
 
 /// Idempotency records are scoped to the operation, so a token a caller reuses
 /// across two different calls cannot replay the other one's result.
@@ -212,7 +212,7 @@ fn idempotent_parameter_mismatch(token: &str) -> AwsServiceError {
 /// Whether a record has fallen out of the idempotency window. A record whose
 /// timestamp cannot be read cannot be aged, so it is treated as expired rather
 /// than kept forever.
-fn token_expired(record: &IpamIdempotencyRecord) -> bool {
+pub(super) fn token_expired(record: &IpamIdempotencyRecord) -> bool {
     match chrono::DateTime::parse_from_rfc3339(&record.recorded_at) {
         Ok(t) => {
             Utc::now()
@@ -276,7 +276,7 @@ fn record_client_token(
     let Some(token) = token else {
         return;
     };
-    prune_client_tokens(a);
+    prune_client_tokens(&mut a.client_tokens);
     a.client_tokens.insert(
         token_key(action, token),
         IpamIdempotencyRecord {
@@ -287,20 +287,20 @@ fn record_client_token(
     );
 }
 
-/// Drop the records that can no longer serve a retry, so what the association
+/// Drop the records that can no longer serve a retry, so what the resource
 /// carries into every snapshot stays bounded: the aged-out ones first, then
-/// the oldest survivors while the association is still at the cap.
-fn prune_client_tokens(a: &mut IpamInternetRegistryAssociation) {
-    a.client_tokens.retain(|_, r| !token_expired(r));
-    while a.client_tokens.len() >= CLIENT_TOKEN_MAX_RECORDS {
-        let oldest = a
-            .client_tokens
+/// the oldest survivors while the map is still at the cap. Called before
+/// recording a new token, so the new record always fits.
+pub(super) fn prune_client_tokens(tokens: &mut BTreeMap<String, IpamIdempotencyRecord>) {
+    tokens.retain(|_, r| !token_expired(r));
+    while tokens.len() >= CLIENT_TOKEN_MAX_RECORDS {
+        let oldest = tokens
             .iter()
             .min_by(|(ak, ar), (bk, br)| ar.recorded_at.cmp(&br.recorded_at).then(ak.cmp(bk)))
             .map(|(k, _)| k.clone());
         match oldest {
             Some(key) => {
-                a.client_tokens.remove(&key);
+                tokens.remove(&key);
             }
             None => break,
         }
@@ -334,7 +334,7 @@ fn cidr_prefix_len(cidr: &str) -> Option<i64> {
         .and_then(|(_, len)| len.parse::<i64>().ok())
 }
 
-fn now_rfc3339() -> String {
+pub(super) fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use fakecloud_aws::ec2query::{ec2_elem, ec2_elem_opt, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::ipam_registry::{now_rfc3339, prune_client_tokens, token_expired};
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     gen_id, invalid_parameter_value, missing_parameter, require, validate_enum,
@@ -13,7 +14,7 @@ use crate::service_helpers::{
 };
 use crate::state::{
     ClientVpnAuthorizationPolicy, ClientVpnConnectionLog, ClientVpnEndpoint,
-    ClientVpnTrustProvider, Ec2State, Tag,
+    ClientVpnTrustProvider, Ec2State, IpamIdempotencyRecord, Tag,
 };
 
 const FIXED_TIME: &str = "2024-01-01T00:00:00.000Z";
@@ -385,8 +386,12 @@ pub(crate) fn modify_client_vpn_endpoint_authorization_policy(
         .ok_or_else(|| endpoint_not_found(&id))?;
 
     if let (Some(token), Some(policy)) = (&token, &e.authorization_policy) {
-        if let Some((recorded, status)) = policy.client_tokens.get(token) {
-            if *recorded != fingerprint {
+        if let Some(record) = policy
+            .client_tokens
+            .get(token)
+            .filter(|r| !token_expired(r))
+        {
+            if record.fingerprint != fingerprint {
                 return Err(AwsServiceError::aws_error(
                     http::StatusCode::BAD_REQUEST,
                     "IdempotentParameterMismatch",
@@ -398,7 +403,7 @@ pub(crate) fn modify_client_vpn_endpoint_authorization_policy(
             return Ok(Ec2Service::respond(
                 ACTION,
                 &req.request_id,
-                &ec2_elem("status", status),
+                &ec2_elem("status", &record.result_id),
             ));
         }
     }
@@ -436,9 +441,15 @@ pub(crate) fn modify_client_vpn_endpoint_authorization_policy(
         }
     };
     if let (Some(token), Some(policy)) = (token, &mut e.authorization_policy) {
-        policy
-            .client_tokens
-            .insert(token, (fingerprint, status.to_string()));
+        prune_client_tokens(&mut policy.client_tokens);
+        policy.client_tokens.insert(
+            token,
+            IpamIdempotencyRecord {
+                result_id: status.to_string(),
+                fingerprint,
+                recorded_at: now_rfc3339(),
+            },
+        );
     }
     Ok(Ec2Service::respond(
         ACTION,
@@ -1180,6 +1191,58 @@ mod tests {
             ],
         ));
         assert_eq!(err.code(), "IdempotentParameterMismatch");
+    }
+
+    #[test]
+    fn authorization_policy_client_tokens_are_aged_out_and_capped() {
+        use crate::service::ipam_registry::{CLIENT_TOKEN_MAX_RECORDS, CLIENT_TOKEN_TTL_SECONDS};
+        let svc = Ec2Service::new();
+        let id = create(&svc, &[]);
+        modify_policy(
+            &svc,
+            &id,
+            &[("PolicyDocument", POLICY), ("ClientToken", "old")],
+        )
+        .unwrap();
+        // Age the first record past the idempotency window.
+        {
+            let mut accounts = svc.state.write();
+            let policy = accounts
+                .get_or_create("000000000000")
+                .client_vpn_endpoints
+                .get_mut(&id)
+                .unwrap()
+                .authorization_policy
+                .as_mut()
+                .unwrap();
+            let stale =
+                chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TOKEN_TTL_SECONDS + 60);
+            policy.client_tokens.get_mut("old").unwrap().recorded_at = stale.to_rfc3339();
+        }
+        // An expired token no longer replays: the call is applied as new.
+        let again = body(
+            modify_policy(
+                &svc,
+                &id,
+                &[("PolicyDocument", POLICY), ("ClientToken", "old")],
+            )
+            .unwrap(),
+        );
+        assert!(again.contains("<status>updating</status>"), "{again}");
+
+        // SDKs mint a fresh token per call; the records stay capped.
+        for i in 0..CLIENT_TOKEN_MAX_RECORDS + 50 {
+            let token = format!("tok-{i}");
+            modify_policy(&svc, &id, &[("ClientToken", token.as_str())]).unwrap();
+        }
+        let accounts = svc.state.read();
+        let kept = accounts.get("000000000000").unwrap().client_vpn_endpoints[&id]
+            .authorization_policy
+            .as_ref()
+            .unwrap()
+            .client_tokens
+            .len();
+        assert!(kept <= CLIENT_TOKEN_MAX_RECORDS, "{kept} records kept");
     }
 
     #[test]
