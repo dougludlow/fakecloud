@@ -418,7 +418,7 @@ enum ExportContent {
         changes: Vec<ItemChange>,
         /// The export's `FilterSpecification`, applied to each item's final
         /// state once its changes are compacted.
-        filter: Option<ExportFilter>,
+        filter: Option<Box<ExportFilter>>,
     },
     /// The request cannot be served from the table's history; the job fails
     /// with this error code and message.
@@ -614,7 +614,7 @@ fn run_export(ctx: &JobContext, job: &ExportJob) {
             filter,
             ..
         } => {
-            let records = incremental_records(changes, view_type, filter.as_ref());
+            let records = incremental_records(changes, view_type, filter.as_deref());
             for rec in &records {
                 data.push_str(&if ion {
                     import_formats::ion_record_line(rec)
@@ -961,7 +961,7 @@ fn export_content(exp: &ExportDescription, table: &DynamoTable) -> ExportContent
             .filter(|c| c.at >= from && c.at < to)
             .cloned()
             .collect(),
-        filter,
+        filter: filter.map(Box::new),
     }
 }
 
