@@ -889,9 +889,14 @@ async fn unimplemented_subresource_falls_through() {
 // -----------------------------------------------------------------------
 
 fn addon_body(name: &str) -> String {
+    // A real build of each add-on offered on the default (1.31) cluster.
+    let version = match name {
+        "coredns" => "v1.11.4-eksbuild.24",
+        _ => "v1.18.3-eksbuild.2",
+    };
     json!({
         "addonName": name,
-        "addonVersion": "v1.18.3-eksbuild.2",
+        "addonVersion": version,
         "serviceAccountRoleArn": "arn:aws:iam::111122223333:role/eks-addon",
         "configurationValues": "{\"replicaCount\":2}",
         "tags": { "team": "core" }
@@ -1230,6 +1235,118 @@ async fn create_addon_defaults_to_catalog_default_version() {
         .unwrap();
     let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(v["addon"]["addonVersion"], "v1.3.10-eksbuild.1");
+}
+
+async fn create_cluster_on(svc: &EksService, name: &str, version: &str) {
+    let mut body: Value = serde_json::from_str(&create_body(name)).unwrap();
+    body["version"] = json!(version);
+    svc.handle(make_request(Method::POST, "/clusters", &body.to_string()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_addon_refuses_addon_without_a_build_for_the_cluster_version() {
+    let svc = EksService::new(make_state());
+    create_cluster_on(&svc, "c134", "1.34").await;
+    // adot has no 1.34 build: no fallback to another minor's default.
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c134/addons",
+            &json!({ "addonName": "adot" }).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(err.message(), "Addon specified is not supported");
+    let resp = svc
+        .handle(make_request(Method::GET, "/clusters/c134/addons", ""))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addons"], json!([]));
+
+    // The default for a non-default minor is that minor's own default.
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c134/addons",
+            &json!({ "addonName": "kube-proxy" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addon"]["addonVersion"], "v1.34.0-eksbuild.2");
+}
+
+#[tokio::test]
+async fn create_and_update_addon_refuse_versions_for_another_minor() {
+    // kube-proxy builds run on their own minor and newer ones, never older.
+    let svc = EksService::new(make_state());
+    create_cluster_on(&svc, "c133", "1.33").await;
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c133/addons",
+            &json!({ "addonName": "kube-proxy", "addonVersion": "v1.34.1-eksbuild.2" }).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(err.message(), "Addon version specified is not supported");
+
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c133/addons",
+        &json!({ "addonName": "kube-proxy", "addonVersion": "v1.33.3-eksbuild.10" }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let err = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c133/addons/kube-proxy/update",
+            &json!({ "addonVersion": "v1.34.1-eksbuild.2" }).to_string(),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(err.message(), "Addon version specified is not supported");
+    // The refused update changed nothing.
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/clusters/c133/updates?addonName=kube-proxy",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["updateIds"], json!([]));
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/clusters/c133/addons/kube-proxy",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(v["addon"]["addonVersion"], "v1.33.3-eksbuild.10");
+
+    // A compatible version goes through.
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c133/addons/kube-proxy/update",
+        &json!({ "addonVersion": "v1.33.5-eksbuild.2" }).to_string(),
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

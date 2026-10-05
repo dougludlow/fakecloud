@@ -12,7 +12,7 @@ use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsServiceError};
 
 pub(crate) use crate::addon_catalog::{
-    addon_catalog, default_addon_version, pod_identity_configuration,
+    addon_catalog, pod_identity_configuration, resolve_addon_version,
 };
 use crate::service::LOG_TYPES;
 use crate::state::*;

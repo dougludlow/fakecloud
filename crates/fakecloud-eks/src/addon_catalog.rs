@@ -16,8 +16,6 @@ use serde_json::{json, Value};
 
 use fakecloud_aws::arn::Arn;
 
-use crate::state::DEFAULT_K8S_VERSION;
-
 const CATALOG_JSON: &str = include_str!("addon_catalog.json");
 
 #[derive(Deserialize)]
@@ -140,17 +138,58 @@ fn catalog_default(addon_name: &str, cluster_version: &str) -> Option<&'static s
         .map(|ver| ver.addon_version.as_str())
 }
 
-/// The AWS default add-on version for an add-on at a given cluster version:
-/// the catalog version flagged `defaultVersion` for that Kubernetes minor.
-/// When the add-on has no default there (a cluster version outside the
-/// catalog, or one the add-on does not support) the default cluster version's
-/// default is used, and add-ons outside the catalog fall back to a generic
-/// `v1.0.0-eksbuild.1`, so CreateAddon always echoes a plausible version.
-pub fn default_addon_version(addon_name: &str, cluster_version: &str) -> String {
-    catalog_default(addon_name, cluster_version)
-        .or_else(|| catalog_default(addon_name, DEFAULT_K8S_VERSION))
-        .unwrap_or("v1.0.0-eksbuild.1")
-        .to_string()
+/// Why an add-on version can't be installed on a cluster. Both surface as
+/// `InvalidParameterException` with the message EKS returns.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AddonVersionError {
+    /// The add-on has no build for the cluster's Kubernetes version.
+    #[error("Addon specified is not supported")]
+    AddonNotSupported,
+    /// The requested `addonVersion` is not offered for the cluster's
+    /// Kubernetes version.
+    #[error("Addon version specified is not supported")]
+    VersionNotSupported,
+}
+
+/// The version `CreateAddon` / `UpdateAddon` (and CloudFormation's
+/// `AWS::EKS::Addon`) install for `addon_name` on a cluster running
+/// `cluster_version`, as EKS resolves it:
+///
+/// - no `requested` version: the catalog version flagged `defaultVersion` for
+///   that Kubernetes minor, or `AddonNotSupported` when the add-on has no
+///   build for it (adot on 1.34, or any add-on on a minor EKS no longer
+///   offers);
+/// - a `requested` version: accepted only when the catalog lists it as
+///   compatible with that minor, else `VersionNotSupported`.
+///
+/// Add-ons outside the catalog (AWS Marketplace listings, which depend on a
+/// third-party subscription) are not modeled, so their requested version is
+/// echoed and an omitted one becomes `v1.0.0-eksbuild.1`.
+pub fn resolve_addon_version(
+    addon_name: &str,
+    cluster_version: &str,
+    requested: Option<&str>,
+) -> Result<String, AddonVersionError> {
+    let Some(addon) = catalog().iter().find(|a| a.addon_name == addon_name) else {
+        return Ok(requested.unwrap_or("v1.0.0-eksbuild.1").to_string());
+    };
+    let compatible = |ver: &&AddonVersionEntry| {
+        ver.compatibilities
+            .iter()
+            .any(|c| c.cluster_version == cluster_version)
+    };
+    match requested {
+        Some(v) => addon
+            .addon_versions
+            .iter()
+            .filter(compatible)
+            .find(|ver| ver.addon_version == v)
+            .map(|ver| ver.addon_version.clone())
+            .ok_or(AddonVersionError::VersionNotSupported),
+        None => catalog_default(addon_name, cluster_version)
+            .map(str::to_string)
+            .ok_or(AddonVersionError::AddonNotSupported),
+    }
 }
 
 /// The recommended pod-identity configuration for an add-on, returned by
@@ -262,7 +301,7 @@ mod tests {
         // The generated `v<minor>.0-eksbuild.2` line never existed for 1.31.
         assert!(!versions_on("kube-proxy", "1.31").contains(&"v1.31.0-eksbuild.3".to_string()));
         assert_eq!(
-            default_addon_version("kube-proxy", "1.34"),
+            resolve_addon_version("kube-proxy", "1.34", None).unwrap(),
             "v1.34.0-eksbuild.2"
         );
     }
@@ -274,11 +313,11 @@ mod tests {
         }
         assert_eq!(versions_on("coredns", "1.28")[0], "v1.10.1-eksbuild.38");
         assert_eq!(
-            default_addon_version("coredns", "1.34"),
+            resolve_addon_version("coredns", "1.34", None).unwrap(),
             "v1.12.3-eksbuild.1"
         );
         assert_eq!(
-            default_addon_version("coredns", "1.33"),
+            resolve_addon_version("coredns", "1.33", None).unwrap(),
             "v1.12.1-eksbuild.2"
         );
     }
@@ -291,7 +330,7 @@ mod tests {
             assert_eq!(v["computeTypes"], json!(["ec2"]));
         }
         assert_eq!(
-            default_addon_version("vpc-cni", "1.32"),
+            resolve_addon_version("vpc-cni", "1.32", None).unwrap(),
             "v1.20.4-eksbuild.2"
         );
     }
@@ -320,13 +359,57 @@ mod tests {
     }
 
     #[test]
-    fn default_falls_back_when_addon_skips_the_cluster_version() {
-        // adot has no 1.34 build in the snapshot; CreateAddon still resolves.
+    fn addon_without_a_build_for_the_minor_is_not_supported() {
+        // adot has no 1.34 build in the snapshot: no fallback to another
+        // minor's default, EKS refuses the add-on.
         assert!(versions_on_opt("adot", "1.34").is_none());
-        assert_eq!(default_addon_version("adot", "1.34"), "v0.131.0-eksbuild.1");
         assert_eq!(
-            default_addon_version("not-an-addon", "1.31"),
-            "v1.0.0-eksbuild.1"
+            resolve_addon_version("adot", "1.34", None),
+            Err(AddonVersionError::AddonNotSupported)
+        );
+        assert_eq!(
+            resolve_addon_version("adot", "1.33", None).as_deref(),
+            Ok("v0.131.0-eksbuild.1")
+        );
+        // A minor EKS does not offer has no builds of anything.
+        assert_eq!(
+            resolve_addon_version("vpc-cni", "1.18", None),
+            Err(AddonVersionError::AddonNotSupported)
+        );
+        assert_eq!(
+            AddonVersionError::AddonNotSupported.to_string(),
+            "Addon specified is not supported"
+        );
+    }
+
+    #[test]
+    fn requested_version_must_be_compatible_with_the_minor() {
+        // A real build for another minor (kube-proxy skew) is refused.
+        assert_eq!(
+            resolve_addon_version("kube-proxy", "1.31", Some("v1.32.9-eksbuild.2")),
+            Err(AddonVersionError::VersionNotSupported)
+        );
+        // A string that never existed is refused.
+        assert_eq!(
+            resolve_addon_version("kube-proxy", "1.31", Some("v1.31.0-eksbuild.3")),
+            Err(AddonVersionError::VersionNotSupported)
+        );
+        assert_eq!(
+            resolve_addon_version("kube-proxy", "1.31", Some("v1.31.13-eksbuild.2")).as_deref(),
+            Ok("v1.31.13-eksbuild.2")
+        );
+        assert_eq!(
+            AddonVersionError::VersionNotSupported.to_string(),
+            "Addon version specified is not supported"
+        );
+        // Add-ons outside the catalog are not modeled.
+        assert_eq!(
+            resolve_addon_version("vendor_addon", "1.31", Some("v9.9.9")).as_deref(),
+            Ok("v9.9.9")
+        );
+        assert_eq!(
+            resolve_addon_version("vendor_addon", "1.31", None).as_deref(),
+            Ok("v1.0.0-eksbuild.1")
         );
     }
 

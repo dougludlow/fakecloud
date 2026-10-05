@@ -259,3 +259,91 @@ async fn eks_addon_catalog_matches_aws_snapshot() {
         ["arn:aws:iam::aws:policy/AmazonRoute53FullAccess".to_string()]
     );
 }
+
+/// EKS refuses an add-on with no build for the cluster's Kubernetes version
+/// and a requested version not offered for it, rather than installing a build
+/// for another minor.
+#[tokio::test]
+async fn eks_addon_versions_are_checked_against_cluster_version() {
+    use aws_sdk_eks::error::ProvideErrorMetadata;
+
+    let server = TestServer::start().await;
+    let client = server.eks_client().await;
+
+    client
+        .create_cluster()
+        .name("k134")
+        .role_arn("arn:aws:iam::000000000000:role/eks")
+        .version("1.34")
+        .resources_vpc_config(
+            aws_sdk_eks::types::VpcConfigRequest::builder()
+                .subnet_ids("subnet-12345678")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // adot has no 1.34 build.
+    let err = client
+        .create_addon()
+        .cluster_name("k134")
+        .addon_name("adot")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_invalid_parameter_exception(), "{err:?}");
+    assert_eq!(err.message(), Some("Addon specified is not supported"));
+
+    // The 1.34 default, not the default cluster version's.
+    let created = client
+        .create_addon()
+        .cluster_name("k134")
+        .addon_name("kube-proxy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created.addon().and_then(|a| a.addon_version()),
+        Some("v1.34.0-eksbuild.2")
+    );
+
+    // A build that never existed is refused on update; the add-on keeps its
+    // version.
+    let err = client
+        .update_addon()
+        .cluster_name("k134")
+        .addon_name("kube-proxy")
+        .addon_version("v1.34.0-eksbuild.3")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_invalid_parameter_exception(), "{err:?}");
+    assert_eq!(
+        err.message(),
+        Some("Addon version specified is not supported")
+    );
+    let described = client
+        .describe_addon()
+        .cluster_name("k134")
+        .addon_name("kube-proxy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        described.addon().and_then(|a| a.addon_version()),
+        Some("v1.34.0-eksbuild.2")
+    );
+
+    let updated = client
+        .update_addon()
+        .cluster_name("k134")
+        .addon_name("kube-proxy")
+        .addon_version("v1.34.1-eksbuild.2")
+        .send()
+        .await
+        .unwrap();
+    assert!(updated.update().is_some());
+}

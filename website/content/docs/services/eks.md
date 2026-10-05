@@ -59,7 +59,10 @@ in persistent mode.
   flagging the default version. `kubernetesVersion`, `addonName`, `types`,
   `owners`, and `publishers` filter it, and `CreateAddon` (or an
   `AWS::EKS::Addon` without `AddonVersion`) installs the default for the
-  cluster's version. `DescribeAddonConfiguration` recommends the documented
+  cluster's version. An add-on with no build for the cluster's Kubernetes
+  version, or an `addonVersion` not offered for it (on create or update), is
+  refused with `InvalidParameterException` ("Addon specified is not supported"
+  / "Addon version specified is not supported"). `DescribeAddonConfiguration` recommends the documented
   pod identity service account and managed policies (for example
   `external-dns` -> `AmazonRoute53FullAccess`). An add-on's
   `podIdentityAssociations` become real pod identity associations in the
