@@ -2091,7 +2091,7 @@ pub(super) fn invalid_path_error(value: &str) -> AwsServiceError {
 
 /// Validate ParameterFilters for DescribeParameters.
 pub(super) fn validate_parameter_filters(filters: &[Value]) -> Result<(), AwsServiceError> {
-    let valid_keys = ["Path", "Name", "Type", "KeyId", "Tier"];
+    let valid_keys = ["Path", "Name", "Type", "KeyId", "Tier", "DataType"];
     let valid_key_pattern = "tag:.+|Name|Type|KeyId|Path|Label|Tier";
 
     // Collect structural validation errors first
@@ -2443,6 +2443,10 @@ pub(super) fn apply_parameter_filters(param: &SsmParameter, filters: Option<&Vec
                     }
                 }
             }
+            "DataType" => match option {
+                "BeginsWith" => values.iter().any(|v| param.data_type.starts_with(v)),
+                _ => values.iter().any(|v| param.data_type == *v),
+            },
             "KeyId" => {
                 // For SecureString params without explicit KeyId, default is alias/aws/ssm
                 let effective_key_id = if param.param_type == "SecureString" {

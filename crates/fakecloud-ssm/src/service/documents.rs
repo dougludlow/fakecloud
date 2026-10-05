@@ -972,6 +972,29 @@ impl SsmService {
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
 
+        // A Document policy shares the document with the policy's principal
+        // accounts (RAM-backed sharing), on top of any custom sharing.
+        let shared_document = document_name_from_arn(&resource_arn).map(str::to_string);
+        let shared_account_ids = match shared_document {
+            Some(ref doc_name) => {
+                if !state.documents.contains_key(doc_name) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ResourceNotFoundException",
+                        format!("Document {doc_name} does not exist."),
+                    ));
+                }
+                policy_principal_accounts(&policy).ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedResourcePolicyDocumentException",
+                        "The resource policy is not valid JSON.".to_string(),
+                    )
+                })?
+            }
+            None => Vec::new(),
+        };
+
         // If PolicyId is provided, update existing
         if let Some(ref pid) = policy_id {
             if let Some(existing) = state
@@ -992,6 +1015,15 @@ impl SsmService {
                 existing.policy = policy;
                 let new_hash = format!("{:x}", md5::compute(existing.policy.as_bytes()));
                 existing.policy_hash = new_hash.clone();
+                let previously_shared =
+                    std::mem::replace(&mut existing.shared_account_ids, shared_account_ids.clone());
+                if let Some(doc) = shared_document
+                    .as_ref()
+                    .and_then(|n| state.documents.get_mut(n))
+                {
+                    unshare_document(doc, &previously_shared);
+                    share_document(doc, &shared_account_ids);
+                }
                 return Ok(AwsResponse::ok_json(json!({
                     "PolicyId": pid,
                     "PolicyHash": new_hash,
@@ -1002,11 +1034,18 @@ impl SsmService {
         // Create new
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_hash = format!("{:x}", md5::compute(policy.as_bytes()));
+        if let Some(doc) = shared_document
+            .as_ref()
+            .and_then(|n| state.documents.get_mut(n))
+        {
+            share_document(doc, &shared_account_ids);
+        }
         state.resource_policies.push(SsmResourcePolicy {
             policy_id: new_id.clone(),
             policy_hash: new_hash.clone(),
             policy,
             resource_arn,
+            shared_account_ids,
         });
 
         Ok(AwsResponse::ok_json(json!({
@@ -1061,6 +1100,25 @@ impl SsmService {
         let policy_hash = body["PolicyHash"]
             .as_str()
             .ok_or_else(|| missing("PolicyHash"))?;
+        // DeletionMode applies only to Document policies (ignored otherwise):
+        // RemoveSharing (default) drops the policy's sharing with it;
+        // RollbackMigration reverts the document to custom sharing, keeping
+        // the consumers' access.
+        let rollback_migration = match body["DeletionMode"].as_str() {
+            None | Some("RemoveSharing") => false,
+            Some("RollbackMigration") => true,
+            Some(other) => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    format!(
+                        "1 validation error detected: Value '{other}' at 'deletionMode' \
+                         failed to satisfy constraint: Member must satisfy enum value set: \
+                         [RemoveSharing, RollbackMigration]"
+                    ),
+                ));
+            }
+        };
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
@@ -1078,7 +1136,14 @@ impl SsmService {
                         "The policy hash does not match.".to_string(),
                     ));
                 }
-                state.resource_policies.remove(i);
+                let removed = state.resource_policies.remove(i);
+                if !rollback_migration {
+                    if let Some(doc) = document_name_from_arn(&removed.resource_arn)
+                        .and_then(|n| state.documents.get_mut(n))
+                    {
+                        unshare_document(doc, &removed.shared_account_ids);
+                    }
+                }
                 Ok(AwsResponse::ok_json(json!({})))
             }
             None => Err(AwsServiceError::aws_error(
@@ -1087,6 +1152,75 @@ impl SsmService {
                 "The resource policy was not found.".to_string(),
             )),
         }
+    }
+}
+
+/// The document name a Systems Manager document ARN
+/// (`arn:<partition>:ssm:<region>:<account>:document/<name>`) names.
+fn document_name_from_arn(arn: &str) -> Option<&str> {
+    let mut parts = arn.splitn(6, ':');
+    let (Some("arn"), Some(_), Some("ssm"), Some(_), Some(_), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    resource.strip_prefix("document/").filter(|n| !n.is_empty())
+}
+
+/// The account ids a resource policy's `Principal.AWS` entries name (bare
+/// 12-digit ids or `arn:<partition>:iam::<id>:root`-style ARNs), in order and
+/// de-duplicated. `None` when the policy is not valid JSON.
+fn policy_principal_accounts(policy: &str) -> Option<Vec<String>> {
+    let doc: Value = serde_json::from_str(policy).ok()?;
+    let statements = match &doc["Statement"] {
+        Value::Array(a) => a.clone(),
+        Value::Object(_) => vec![doc["Statement"].clone()],
+        _ => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for st in statements {
+        let principals = match &st["Principal"]["AWS"] {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for p in principals {
+            let account = if p.starts_with("arn:") {
+                p.split(':').nth(4).unwrap_or_default().to_string()
+            } else {
+                p
+            };
+            if account.len() == 12
+                && account.chars().all(|c| c.is_ascii_digit())
+                && !out.contains(&account)
+            {
+                out.push(account);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn share_document(doc: &mut crate::state::SsmDocument, account_ids: &[String]) {
+    let entry = doc.permissions.entry("Share".to_string()).or_default();
+    for id in account_ids {
+        if !entry.contains(id) {
+            entry.push(id.clone());
+        }
+    }
+}
+
+fn unshare_document(doc: &mut crate::state::SsmDocument, account_ids: &[String]) {
+    if let Some(entry) = doc.permissions.get_mut("Share") {
+        entry.retain(|id| !account_ids.contains(id));
     }
 }
 

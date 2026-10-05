@@ -312,6 +312,11 @@ pub struct SsmResourcePolicy {
     pub policy_hash: String,
     pub policy: String,
     pub resource_arn: String,
+    /// For a `Document` policy: the consumer accounts the policy shared the
+    /// document with (added to its `Share` permission list), so deleting the
+    /// policy can remove exactly that sharing.
+    #[serde(default)]
+    pub shared_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1155,6 +1160,7 @@ mod tests {
             policy_hash: "h".into(),
             policy: "{}".into(),
             resource_arn: "arn:aws:ssm:eu-west-1:123456789012:parameter/west".into(),
+            shared_account_ids: Vec::new(),
         });
         st.patch_baselines.insert(
             "pb-1".into(),
