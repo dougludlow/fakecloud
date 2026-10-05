@@ -1417,8 +1417,8 @@ async fn dynamodb_contributor_insights() {
 // Import / Export
 // ---------------------------------------------------------------------------
 
-#[test_action("dynamodb", "ExportTableToPointInTime", checksum = "64935ebe")]
-#[test_action("dynamodb", "DescribeExport", checksum = "ac49b997")]
+#[test_action("dynamodb", "ExportTableToPointInTime", checksum = "6c7bafca")]
+#[test_action("dynamodb", "DescribeExport", checksum = "d8d384b7")]
 #[test_action("dynamodb", "ListExports", checksum = "c6c96b48")]
 #[tokio::test]
 async fn dynamodb_export_lifecycle() {

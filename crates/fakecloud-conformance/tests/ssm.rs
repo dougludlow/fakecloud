@@ -72,7 +72,7 @@ async fn ssm_get_parameters() {
 
 // -- GetParametersByPath --
 
-#[test_action("ssm", "GetParametersByPath", checksum = "1617e5a0")]
+#[test_action("ssm", "GetParametersByPath", checksum = "1b6cfd6a")]
 #[tokio::test]
 async fn ssm_get_parameters_by_path() {
     let server = TestServer::start().await;
@@ -120,7 +120,7 @@ async fn ssm_delete_parameters() {
 
 // -- DescribeParameters --
 
-#[test_action("ssm", "DescribeParameters", checksum = "bd157747")]
+#[test_action("ssm", "DescribeParameters", checksum = "da7b6220")]
 #[tokio::test]
 async fn ssm_describe_parameters() {
     let server = TestServer::start().await;
@@ -679,11 +679,11 @@ async fn ssm_patch_groups() {
 
 // -- Association lifecycle --
 
-#[test_action("ssm", "CreateAssociation", checksum = "cbc39baf")]
-#[test_action("ssm", "DescribeAssociation", checksum = "1952f426")]
-#[test_action("ssm", "UpdateAssociation", checksum = "a0995d8e")]
-#[test_action("ssm", "ListAssociations", checksum = "5c740b80")]
-#[test_action("ssm", "ListAssociationVersions", checksum = "13d3cd38")]
+#[test_action("ssm", "CreateAssociation", checksum = "65230022")]
+#[test_action("ssm", "DescribeAssociation", checksum = "38c09497")]
+#[test_action("ssm", "UpdateAssociation", checksum = "0a8418f0")]
+#[test_action("ssm", "ListAssociations", checksum = "2aace6ef")]
+#[test_action("ssm", "ListAssociationVersions", checksum = "024afda8")]
 #[test_action("ssm", "DeleteAssociation", checksum = "89e9a7ab")]
 #[tokio::test]
 async fn ssm_association_lifecycle() {
@@ -745,7 +745,7 @@ async fn ssm_association_lifecycle() {
 
 // -- UpdateAssociationStatus --
 
-#[test_action("ssm", "UpdateAssociationStatus", checksum = "9b4daf9e")]
+#[test_action("ssm", "UpdateAssociationStatus", checksum = "715d8add")]
 #[tokio::test]
 async fn ssm_update_association_status() {
     let server = TestServer::start().await;
@@ -819,7 +819,7 @@ async fn ssm_start_associations_once() {
 
 // -- CreateAssociationBatch --
 
-#[test_action("ssm", "CreateAssociationBatch", checksum = "21591ce7")]
+#[test_action("ssm", "CreateAssociationBatch", checksum = "ce371108")]
 #[tokio::test]
 async fn ssm_create_association_batch() {
     let server = TestServer::start().await;
@@ -847,7 +847,7 @@ async fn ssm_create_association_batch() {
 
 // -- DescribeAssociationExecutions + Targets --
 
-#[test_action("ssm", "DescribeAssociationExecutions", checksum = "6b36f591")]
+#[test_action("ssm", "DescribeAssociationExecutions", checksum = "cefeb0c1")]
 #[tokio::test]
 async fn ssm_describe_association_executions() {
     let server = TestServer::start().await;
@@ -881,7 +881,7 @@ async fn ssm_describe_association_executions() {
     assert!(resp.association_executions().is_empty());
 }
 
-#[test_action("ssm", "DescribeAssociationExecutionTargets", checksum = "10258e0d")]
+#[test_action("ssm", "DescribeAssociationExecutionTargets", checksum = "cfe4e456")]
 #[tokio::test]
 async fn ssm_describe_association_execution_targets() {
     let server = TestServer::start().await;
@@ -1050,7 +1050,7 @@ async fn ssm_update_document_metadata() {
 
 #[test_action("ssm", "PutResourcePolicy", checksum = "7ee6b0bd")]
 #[test_action("ssm", "GetResourcePolicies", checksum = "303e2bb5")]
-#[test_action("ssm", "DeleteResourcePolicy", checksum = "df09409d")]
+#[test_action("ssm", "DeleteResourcePolicy", checksum = "8641764e")]
 #[tokio::test]
 async fn ssm_resource_policies() {
     let server = TestServer::start().await;
@@ -1305,10 +1305,10 @@ async fn ssm_inventory_lifecycle() {
 
 // -- Compliance --
 
-#[test_action("ssm", "PutComplianceItems", checksum = "0aa021e4")]
-#[test_action("ssm", "ListComplianceItems", checksum = "2df340a8")]
-#[test_action("ssm", "ListComplianceSummaries", checksum = "926a1629")]
-#[test_action("ssm", "ListResourceComplianceSummaries", checksum = "ca169aac")]
+#[test_action("ssm", "PutComplianceItems", checksum = "aed52bd0")]
+#[test_action("ssm", "ListComplianceItems", checksum = "f5e9f590")]
+#[test_action("ssm", "ListComplianceSummaries", checksum = "677d5f96")]
+#[test_action("ssm", "ListResourceComplianceSummaries", checksum = "5ca8566e")]
 #[tokio::test]
 async fn ssm_compliance_lifecycle() {
     use aws_sdk_ssm::types::{
@@ -1867,10 +1867,10 @@ async fn ssm_ops_metadata_lifecycle() {
 
 // -- Automation --
 
-#[test_action("ssm", "StartAutomationExecution", checksum = "c2a57055")]
-#[test_action("ssm", "GetAutomationExecution", checksum = "c826ee26")]
-#[test_action("ssm", "DescribeAutomationExecutions", checksum = "51108e09")]
-#[test_action("ssm", "DescribeAutomationStepExecutions", checksum = "ae6a9ba6")]
+#[test_action("ssm", "StartAutomationExecution", checksum = "6752f744")]
+#[test_action("ssm", "GetAutomationExecution", checksum = "aad16b2c")]
+#[test_action("ssm", "DescribeAutomationExecutions", checksum = "7c7f03e2")]
+#[test_action("ssm", "DescribeAutomationStepExecutions", checksum = "e180ddf1")]
 #[test_action("ssm", "SendAutomationSignal", checksum = "d85c40bb")]
 #[test_action("ssm", "StopAutomationExecution", checksum = "4200ac33")]
 #[tokio::test]
@@ -1928,7 +1928,7 @@ async fn ssm_automation_execution_lifecycle() {
         .unwrap();
 }
 
-#[test_action("ssm", "StartChangeRequestExecution", checksum = "d73d6135")]
+#[test_action("ssm", "StartChangeRequestExecution", checksum = "576d8222")]
 #[tokio::test]
 async fn ssm_start_change_request_execution() {
     let server = TestServer::start().await;
@@ -1948,7 +1948,7 @@ async fn ssm_start_change_request_execution() {
     assert!(resp.automation_execution_id().is_some());
 }
 
-#[test_action("ssm", "StartExecutionPreview", checksum = "5cd68605")]
+#[test_action("ssm", "StartExecutionPreview", checksum = "e1370ad1")]
 #[test_action("ssm", "GetExecutionPreview", checksum = "91faf997")]
 #[tokio::test]
 async fn ssm_execution_preview() {
@@ -2215,7 +2215,7 @@ async fn ssm_list_nodes_summary() {
     assert!(resp.summary().is_empty());
 }
 
-#[test_action("ssm", "DescribeEffectiveInstanceAssociations", checksum = "20fc257d")]
+#[test_action("ssm", "DescribeEffectiveInstanceAssociations", checksum = "d5673c7c")]
 #[tokio::test]
 async fn ssm_describe_effective_instance_associations() {
     let server = TestServer::start().await;
@@ -2230,7 +2230,7 @@ async fn ssm_describe_effective_instance_associations() {
     assert!(resp.associations().is_empty());
 }
 
-#[test_action("ssm", "DescribeInstanceAssociationsStatus", checksum = "309b1833")]
+#[test_action("ssm", "DescribeInstanceAssociationsStatus", checksum = "77d901a1")]
 #[tokio::test]
 async fn ssm_describe_instance_associations_status() {
     let server = TestServer::start().await;

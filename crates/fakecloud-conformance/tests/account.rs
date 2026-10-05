@@ -9,7 +9,7 @@ use helpers::TestServer;
 #[test_action("account", "EnableRegion", checksum = "0450bf5c")]
 #[test_action("account", "GetAccountInformation", checksum = "fa3f9583")]
 #[test_action("account", "GetAlternateContact", checksum = "ff5c6fd2")]
-#[test_action("account", "GetContactInformation", checksum = "2d4b8256")]
+#[test_action("account", "GetContactInformation", checksum = "63465977")]
 #[test_action("account", "GetGovCloudAccountInformation", checksum = "85e05e5a")]
 #[test_action("account", "GetPrimaryEmail", checksum = "ab6ac0a2")]
 #[test_action("account", "GetRegionOptStatus", checksum = "5a2bd2e5")]

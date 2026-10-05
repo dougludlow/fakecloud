@@ -90,18 +90,18 @@ async fn database_lifecycle() {
     assert!(glue.get_database().name("db1").send().await.is_err());
 }
 
-#[test_action("glue", "CreateTable", checksum = "df3e16e2")]
-#[test_action("glue", "GetTable", checksum = "3a08f5e9")]
-#[test_action("glue", "GetTables", checksum = "bc9e57ca")]
-#[test_action("glue", "UpdateTable", checksum = "20496b98")]
+#[test_action("glue", "CreateTable", checksum = "7c199a41")]
+#[test_action("glue", "GetTable", checksum = "78029ca4")]
+#[test_action("glue", "GetTables", checksum = "15b153e1")]
+#[test_action("glue", "UpdateTable", checksum = "03d09ed7")]
 #[test_action("glue", "DeleteTable", checksum = "6e87f081")]
-#[test_action("glue", "SearchTables", checksum = "157c668b")]
-#[test_action("glue", "GetTableVersion", checksum = "8e3049a2")]
-#[test_action("glue", "GetTableVersions", checksum = "e2a41398")]
+#[test_action("glue", "SearchTables", checksum = "bf213b9f")]
+#[test_action("glue", "GetTableVersion", checksum = "f8c663c5")]
+#[test_action("glue", "GetTableVersions", checksum = "5c7e00bd")]
 #[test_action("glue", "DeleteTableVersion", checksum = "6b333c1a")]
 #[test_action("glue", "BatchDeleteTableVersion", checksum = "4ee84752")]
-#[test_action("glue", "BatchDeleteTable", checksum = "aa2ccbd9")]
-#[test_action("glue", "GetUnfilteredTableMetadata", checksum = "109f842b")]
+#[test_action("glue", "BatchDeleteTable", checksum = "88fe68f8")]
+#[test_action("glue", "GetUnfilteredTableMetadata", checksum = "6c1562be")]
 #[tokio::test]
 async fn table_lifecycle() {
     let server = TestServer::start().await;
@@ -206,10 +206,10 @@ async fn table_lifecycle() {
 #[test_action("glue", "GetPartitions", checksum = "9b353d95")]
 #[test_action("glue", "UpdatePartition", checksum = "f96df395")]
 #[test_action("glue", "DeletePartition", checksum = "5e78ea41")]
-#[test_action("glue", "BatchCreatePartition", checksum = "2fc3c915")]
+#[test_action("glue", "BatchCreatePartition", checksum = "c9233790")]
 #[test_action("glue", "BatchGetPartition", checksum = "c0b95df9")]
-#[test_action("glue", "BatchDeletePartition", checksum = "0800ac97")]
-#[test_action("glue", "BatchUpdatePartition", checksum = "e2ee4ca9")]
+#[test_action("glue", "BatchDeletePartition", checksum = "180a661f")]
+#[test_action("glue", "BatchUpdatePartition", checksum = "a8e27ee9")]
 #[test_action("glue", "CreatePartitionIndex", checksum = "01fd93bd")]
 #[test_action("glue", "GetPartitionIndexes", checksum = "8f7574e1")]
 #[test_action("glue", "DeletePartitionIndex", checksum = "c50c13cc")]
@@ -481,12 +481,12 @@ async fn job_lifecycle() {
 // Crawlers, classifiers, schedules, metrics
 // ----------------------------------------------------------------------------
 
-#[test_action("glue", "CreateCrawler", checksum = "6c456b1f")]
-#[test_action("glue", "GetCrawler", checksum = "99cf6212")]
-#[test_action("glue", "GetCrawlers", checksum = "0cc49d46")]
+#[test_action("glue", "CreateCrawler", checksum = "d45e8cb7")]
+#[test_action("glue", "GetCrawler", checksum = "217970f4")]
+#[test_action("glue", "GetCrawlers", checksum = "243dc2b5")]
 #[test_action("glue", "ListCrawlers", checksum = "de25ef30")]
-#[test_action("glue", "BatchGetCrawlers", checksum = "575fbdb3")]
-#[test_action("glue", "UpdateCrawler", checksum = "dca23ced")]
+#[test_action("glue", "BatchGetCrawlers", checksum = "77f48951")]
+#[test_action("glue", "UpdateCrawler", checksum = "5c1409ee")]
 #[test_action("glue", "StartCrawler", checksum = "e534d606")]
 #[test_action("glue", "StopCrawler", checksum = "94561b04")]
 #[test_action("glue", "DeleteCrawler", checksum = "46533da3")]
@@ -631,13 +631,13 @@ async fn classifier_lifecycle() {
 // Connections, connection types, security configs, encryption, policies, tags
 // ----------------------------------------------------------------------------
 
-#[test_action("glue", "CreateConnection", checksum = "2b11ffb9")]
-#[test_action("glue", "GetConnection", checksum = "4671d727")]
-#[test_action("glue", "GetConnections", checksum = "9fb2845e")]
-#[test_action("glue", "UpdateConnection", checksum = "c04c9677")]
+#[test_action("glue", "CreateConnection", checksum = "8c4d39b4")]
+#[test_action("glue", "GetConnection", checksum = "51c28ea2")]
+#[test_action("glue", "GetConnections", checksum = "ec461064")]
+#[test_action("glue", "UpdateConnection", checksum = "2aa41fd1")]
 #[test_action("glue", "DeleteConnection", checksum = "6a3c81db")]
 #[test_action("glue", "BatchDeleteConnection", checksum = "b282ad29")]
-#[test_action("glue", "TestConnection", checksum = "f82f784b")]
+#[test_action("glue", "TestConnection", checksum = "7571b550")]
 #[test_action("glue", "RegisterConnectionType", checksum = "03537fad")]
 #[test_action("glue", "DescribeConnectionType", checksum = "d3a63942")]
 #[test_action("glue", "ListConnectionTypes", checksum = "a33ad5a1")]
@@ -2309,17 +2309,17 @@ async fn identity_center_lifecycle() {
 #[test_action("glue", "UpdateColumnStatisticsForPartition", checksum = "3a0074b2")]
 #[test_action("glue", "GetColumnStatisticsForPartition", checksum = "745d762a")]
 #[test_action("glue", "DeleteColumnStatisticsForPartition", checksum = "588192a3")]
-#[test_action("glue", "StartColumnStatisticsTaskRun", checksum = "d97e910f")]
+#[test_action("glue", "StartColumnStatisticsTaskRun", checksum = "f2e6b7ef")]
 #[test_action("glue", "GetColumnStatisticsTaskRun", checksum = "d1c4abca")]
-#[test_action("glue", "GetColumnStatisticsTaskRuns", checksum = "479f6e5e")]
+#[test_action("glue", "GetColumnStatisticsTaskRuns", checksum = "f18234bc")]
 #[test_action("glue", "ListColumnStatisticsTaskRuns", checksum = "f493ef1b")]
-#[test_action("glue", "StopColumnStatisticsTaskRun", checksum = "a708b098")]
-#[test_action("glue", "CreateColumnStatisticsTaskSettings", checksum = "ead04ff2")]
-#[test_action("glue", "GetColumnStatisticsTaskSettings", checksum = "b6143b1c")]
-#[test_action("glue", "UpdateColumnStatisticsTaskSettings", checksum = "38dfd0f0")]
-#[test_action("glue", "DeleteColumnStatisticsTaskSettings", checksum = "17108951")]
-#[test_action("glue", "StartColumnStatisticsTaskRunSchedule", checksum = "07e8de46")]
-#[test_action("glue", "StopColumnStatisticsTaskRunSchedule", checksum = "9bb01c83")]
+#[test_action("glue", "StopColumnStatisticsTaskRun", checksum = "b7560a58")]
+#[test_action("glue", "CreateColumnStatisticsTaskSettings", checksum = "e8e294de")]
+#[test_action("glue", "GetColumnStatisticsTaskSettings", checksum = "ccf894f1")]
+#[test_action("glue", "UpdateColumnStatisticsTaskSettings", checksum = "999c3cf9")]
+#[test_action("glue", "DeleteColumnStatisticsTaskSettings", checksum = "1c0427a8")]
+#[test_action("glue", "StartColumnStatisticsTaskRunSchedule", checksum = "2828cbdd")]
+#[test_action("glue", "StopColumnStatisticsTaskRunSchedule", checksum = "e40d94b5")]
 #[tokio::test]
 async fn column_statistics_lifecycle() {
     let server = TestServer::start().await;
@@ -2469,10 +2469,10 @@ async fn column_statistics_lifecycle() {
 // Materialized view refresh, entities, script/plan/mapping, catalog import
 // ----------------------------------------------------------------------------
 
-#[test_action("glue", "StartMaterializedViewRefreshTaskRun", checksum = "bfa4db21")]
-#[test_action("glue", "GetMaterializedViewRefreshTaskRun", checksum = "0f102bd4")]
-#[test_action("glue", "ListMaterializedViewRefreshTaskRuns", checksum = "6d185f38")]
-#[test_action("glue", "StopMaterializedViewRefreshTaskRun", checksum = "678d5e53")]
+#[test_action("glue", "StartMaterializedViewRefreshTaskRun", checksum = "e99cd471")]
+#[test_action("glue", "GetMaterializedViewRefreshTaskRun", checksum = "939eb4cf")]
+#[test_action("glue", "ListMaterializedViewRefreshTaskRuns", checksum = "8265d059")]
+#[test_action("glue", "StopMaterializedViewRefreshTaskRun", checksum = "89c8d5b3")]
 #[tokio::test]
 async fn materialized_view_lifecycle() {
     let server = TestServer::start().await;

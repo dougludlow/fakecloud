@@ -32,7 +32,7 @@ async fn ses_get_account() {
 
 #[test_action("ses", "CreateEmailIdentity", checksum = "324e567e")]
 #[test_action("ses", "GetEmailIdentity", checksum = "340d7732")]
-#[test_action("ses", "ListEmailIdentities", checksum = "3301504d")]
+#[test_action("ses", "ListEmailIdentities", checksum = "81735be0")]
 #[test_action("ses", "DeleteEmailIdentity", checksum = "7b850c25")]
 #[tokio::test]
 async fn ses_identity_lifecycle() {
@@ -82,7 +82,7 @@ async fn ses_identity_lifecycle() {
 
 #[test_action("ses", "CreateConfigurationSet", checksum = "e952eb8e")]
 #[test_action("ses", "GetConfigurationSet", checksum = "0ac4f609")]
-#[test_action("ses", "ListConfigurationSets", checksum = "31486196")]
+#[test_action("ses", "ListConfigurationSets", checksum = "a27bb1db")]
 #[test_action("ses", "DeleteConfigurationSet", checksum = "3c50e07a")]
 #[tokio::test]
 async fn ses_configuration_set_lifecycle() {
@@ -1659,7 +1659,7 @@ async fn ses_export_job_lifecycle() {
 
 #[test_action("ses", "CreateTenant", checksum = "3ba0dcf6")]
 #[test_action("ses", "GetTenant", checksum = "8167f8fd")]
-#[test_action("ses", "ListTenants", checksum = "75f62d1f")]
+#[test_action("ses", "ListTenants", checksum = "fa9f105c")]
 #[test_action("ses", "DeleteTenant", checksum = "c7010419")]
 #[test_action("ses", "CreateTenantResourceAssociation", checksum = "d10a9bd3")]
 #[test_action("ses", "DeleteTenantResourceAssociation", checksum = "586fc271")]

@@ -507,9 +507,9 @@ async fn logs_export_tasks() {
 
 // -- Delivery destinations --
 
-#[test_action("logs", "PutDeliveryDestination", checksum = "5b7e444e")]
-#[test_action("logs", "GetDeliveryDestination", checksum = "bcd70ca0")]
-#[test_action("logs", "DescribeDeliveryDestinations", checksum = "04c820de")]
+#[test_action("logs", "PutDeliveryDestination", checksum = "22cddc87")]
+#[test_action("logs", "GetDeliveryDestination", checksum = "703ebe0d")]
+#[test_action("logs", "DescribeDeliveryDestinations", checksum = "2bf29d90")]
 #[test_action("logs", "DeleteDeliveryDestination", checksum = "260fbf3b")]
 #[tokio::test]
 async fn logs_delivery_destinations() {

@@ -1204,8 +1204,8 @@ async fn s3_bucket_ownership_controls() {
 
 // -- Bucket inventory configuration --
 
-#[test_action("s3", "PutBucketInventoryConfiguration", checksum = "5379f8ec")]
-#[test_action("s3", "GetBucketInventoryConfiguration", checksum = "5d84300c")]
+#[test_action("s3", "PutBucketInventoryConfiguration", checksum = "db3acfd7")]
+#[test_action("s3", "GetBucketInventoryConfiguration", checksum = "c34eed11")]
 #[test_action("s3", "DeleteBucketInventoryConfiguration", checksum = "5fb3b7de")]
 #[tokio::test]
 async fn s3_bucket_inventory() {
@@ -1657,7 +1657,7 @@ async fn s3_metrics_configuration_lifecycle() {
         .unwrap();
 }
 
-#[test_action("s3", "ListBucketInventoryConfigurations", checksum = "b97f3ee2")]
+#[test_action("s3", "ListBucketInventoryConfigurations", checksum = "04cabd02")]
 #[tokio::test]
 async fn s3_list_bucket_inventory_configurations() {
     let server = TestServer::start().await;

@@ -5221,7 +5221,7 @@ async fn make_cr(c: &aws_sdk_ec2::Client) -> String {
         .to_string()
 }
 
-#[test_action("ec2", "CreateCapacityReservation", checksum = "035f5b44")]
+#[test_action("ec2", "CreateCapacityReservation", checksum = "e2862364")]
 #[tokio::test]
 async fn ec2_create_capacity_reservation() {
     let s = TestServer::start().await;
@@ -5242,7 +5242,7 @@ async fn ec2_create_capacity_reservation() {
         .starts_with("cr-"));
 }
 
-#[test_action("ec2", "DescribeCapacityReservations", checksum = "43078756")]
+#[test_action("ec2", "DescribeCapacityReservations", checksum = "6847c4e1")]
 #[tokio::test]
 async fn ec2_describe_capacity_reservations() {
     let s = TestServer::start().await;
@@ -5414,7 +5414,7 @@ async fn ec2_modify_instance_capacity_reservation_attributes() {
     assert_eq!(r.r#return(), Some(true));
 }
 
-#[test_action("ec2", "CreateCapacityReservationBySplitting", checksum = "cdf50fd0")]
+#[test_action("ec2", "CreateCapacityReservationBySplitting", checksum = "ec70937d")]
 #[tokio::test]
 async fn ec2_create_capacity_reservation_by_splitting() {
     let s = TestServer::start().await;
@@ -5430,7 +5430,7 @@ async fn ec2_create_capacity_reservation_by_splitting() {
     assert!(r.destination_capacity_reservation().is_some());
 }
 
-#[test_action("ec2", "MoveCapacityReservationInstances", checksum = "486352ef")]
+#[test_action("ec2", "MoveCapacityReservationInstances", checksum = "4e3ee5a9")]
 #[tokio::test]
 async fn ec2_move_capacity_reservation_instances() {
     let s = TestServer::start().await;
@@ -5561,7 +5561,7 @@ async fn ec2_describe_capacity_blocks() {
     assert!(r.capacity_blocks().is_empty());
 }
 
-#[test_action("ec2", "PurchaseCapacityBlock", checksum = "91101b3b")]
+#[test_action("ec2", "PurchaseCapacityBlock", checksum = "0797b82f")]
 #[tokio::test]
 async fn ec2_purchase_capacity_block() {
     let s = TestServer::start().await;
@@ -7786,7 +7786,7 @@ async fn make_cvpn(c: &aws_sdk_ec2::Client) -> String {
         .to_string()
 }
 
-#[test_action("ec2", "CreateClientVpnEndpoint", checksum = "5a763226")]
+#[test_action("ec2", "CreateClientVpnEndpoint", checksum = "869e8d5d")]
 #[tokio::test]
 async fn ec2_create_client_vpn_endpoint() {
     let s = TestServer::start().await;
@@ -7795,7 +7795,7 @@ async fn ec2_create_client_vpn_endpoint() {
     assert!(id.starts_with("cvpn-endpoint-"));
 }
 
-#[test_action("ec2", "DescribeClientVpnEndpoints", checksum = "bde17783")]
+#[test_action("ec2", "DescribeClientVpnEndpoints", checksum = "4b665e9e")]
 #[tokio::test]
 async fn ec2_describe_client_vpn_endpoints() {
     let s = TestServer::start().await;
@@ -7823,7 +7823,7 @@ async fn ec2_delete_client_vpn_endpoint() {
         .unwrap();
 }
 
-#[test_action("ec2", "ModifyClientVpnEndpoint", checksum = "9404f05d")]
+#[test_action("ec2", "ModifyClientVpnEndpoint", checksum = "4014ee1c")]
 #[tokio::test]
 async fn ec2_modify_client_vpn_endpoint() {
     let s = TestServer::start().await;
@@ -8032,7 +8032,7 @@ async fn ec2_apply_security_groups_to_client_vpn_target_network() {
     assert!(!r.security_group_ids().is_empty());
 }
 
-#[test_action("ec2", "DescribeClientVpnConnections", checksum = "bdd2a91d")]
+#[test_action("ec2", "DescribeClientVpnConnections", checksum = "c00e1d14")]
 #[tokio::test]
 async fn ec2_describe_client_vpn_connections() {
     let s = TestServer::start().await;
@@ -13248,14 +13248,14 @@ async fn make_enabled_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> S
     id
 }
 
-#[test_action("ec2", "CreateIpamInternetRegistryAssociation", checksum = "48403cfc")]
+#[test_action("ec2", "CreateIpamInternetRegistryAssociation", checksum = "6a648c82")]
 #[test_action(
     "ec2",
     "DescribeIpamInternetRegistryAssociations",
-    checksum = "e794060d"
+    checksum = "a6820ccc"
 )]
-#[test_action("ec2", "EnableIpamInternetRegistryAssociation", checksum = "bd31da14")]
-#[test_action("ec2", "DeleteIpamInternetRegistryAssociation", checksum = "4b0b5e55")]
+#[test_action("ec2", "EnableIpamInternetRegistryAssociation", checksum = "556a91e4")]
+#[test_action("ec2", "DeleteIpamInternetRegistryAssociation", checksum = "a00ac1cd")]
 #[tokio::test]
 async fn ec2_ipam_internet_registry_association_lifecycle() {
     let s = TestServer::start().await;
