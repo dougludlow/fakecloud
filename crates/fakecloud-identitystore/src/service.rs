@@ -318,8 +318,10 @@ fn check_len(b: &Value, field: &str, min: usize, max: usize) -> Result<(), AwsSe
 /// Read the required `IdentityStoreId`. The model accepts either the bare id
 /// (`d-1234567890`) or the store's ARN
 /// (`arn:aws:identitystore::111122223333:identitystore/d-1234567890`); both
-/// resolve to the bare id that keys the directory.
-fn store_id(b: &Value) -> Result<String, AwsServiceError> {
+/// resolve to the bare id that keys the directory. Stores are per-account, so
+/// an ARN naming another account's store never resolves to the caller's
+/// directory of the same id: it is `ResourceNotFoundException`.
+fn store_id(b: &Value, account: &str) -> Result<String, AwsServiceError> {
     let s = req_str(b, "IdentityStoreId")?;
     // IdentityStoreId @length 1..=93.
     if s.chars().count() > 93 {
@@ -328,25 +330,62 @@ fn store_id(b: &Value) -> Result<String, AwsServiceError> {
         ));
     }
     if s.starts_with("arn:") {
-        return arn_resource(s, "identitystore")
-            .and_then(|r| r.rsplit_once(":identitystore/"))
-            .map(|(_, id)| id)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| validation("IdentityStoreId is not a valid identity store ARN."));
+        let (arn_account, id) = arn_resource(s, "identitystore")
+            .and_then(|r| r.strip_prefix(':'))
+            .and_then(|r| r.split_once(":identitystore/"))
+            .filter(|(acct, id)| !acct.is_empty() && !id.is_empty())
+            .ok_or_else(|| validation("IdentityStoreId is not a valid identity store ARN."))?;
+        if arn_account != account {
+            return Err(store_not_found(id));
+        }
+        return Ok(id.to_string());
     }
     Ok(s.to_string())
 }
 
-/// Read a required `ResourceId` field (`@length 1..=47`).
-fn resource_id<'a>(b: &'a Value, field: &str) -> Result<&'a str, AwsServiceError> {
-    let s = req_str(b, field)?;
-    if s.chars().count() > 47 {
+/// `ResourceNotFoundException` for an identity store (`IDENTITY_STORE`).
+fn store_not_found(sid: &str) -> AwsServiceError {
+    AwsServiceError::aws_error_with_fields(
+        StatusCode::NOT_FOUND,
+        "ResourceNotFoundException",
+        format!("Identity store {sid} not found."),
+        vec![
+            ("ResourceType".to_string(), "IDENTITY_STORE".to_string()),
+            ("ResourceId".to_string(), sid.to_string()),
+        ],
+    )
+}
+
+/// Resolve a `ResourceId` value (`@length 1..=100`) to the bare id. The model
+/// accepts the bare id or the resource's account-less ARN
+/// (`arn:aws:identitystore:::<kind>/<id>`); an ARN must name a resource of the
+/// `kind` the field expects (`user`, `group` or `membership`).
+fn parse_resource_id(s: &str, field: &str, kind: &str) -> Result<String, AwsServiceError> {
+    let n = s.chars().count();
+    if n == 0 || n > 100 {
         return Err(validation(&format!(
-            "{field} must have length between 1 and 47, inclusive."
+            "{field} must have length between 1 and 100, inclusive."
         )));
     }
-    Ok(s)
+    if !s.starts_with("arn:") {
+        return Ok(s.to_string());
+    }
+    let (arn_kind, id) = arn_resource(s, "identitystore")
+        .and_then(|r| r.strip_prefix("::"))
+        .and_then(|r| r.split_once('/'))
+        .filter(|(_, id)| !id.is_empty())
+        .ok_or_else(|| validation(&format!("{field} is not a valid identity store ARN.")))?;
+    if arn_kind != kind {
+        return Err(validation(&format!(
+            "{field} must identify a {kind}, but the ARN names a {arn_kind}."
+        )));
+    }
+    Ok(id.to_string())
+}
+
+/// Read a required `ResourceId` field naming a resource of `kind`.
+fn resource_id(b: &Value, field: &str, kind: &str) -> Result<String, AwsServiceError> {
+    parse_resource_id(req_str(b, field)?, field, kind)
 }
 
 /// Validate the `MaxResults` (@range 1..=100) and `NextToken` (@length
@@ -368,7 +407,7 @@ fn epoch(dt: &DateTime<Utc>) -> Value {
 }
 
 /// `MemberId` is a union; only the `UserId` member is modeled today. Its value
-/// is a `ResourceId` (@length 1..=47).
+/// is a `ResourceId` (bare user id or user ARN).
 fn member_user_id(b: &Value) -> Result<String, AwsServiceError> {
     let id = b
         .get("MemberId")
@@ -376,12 +415,7 @@ fn member_user_id(b: &Value) -> Result<String, AwsServiceError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| validation("MemberId.UserId must be specified."))?;
-    if id.chars().count() > 47 {
-        return Err(validation(
-            "MemberId.UserId must have length between 1 and 47, inclusive.",
-        ));
-    }
-    Ok(id.to_string())
+    parse_resource_id(id, "MemberId.UserId", "user")
 }
 
 /// Validate pagination inputs, then window an ordered slice of result rows.
@@ -564,7 +598,7 @@ impl IdentityStoreService {
 
     fn create_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         // UserName @length 1..=128; the free-form profile attributes are all
         // `SensitiveStringType` @length 1..=1024.
         check_len(&b, "UserName", 1, 128)?;
@@ -619,8 +653,8 @@ impl IdentityStoreService {
 
     fn describe_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let user_id = resource_id(&b, "UserId")?;
+        let sid = store_id(&b, &req.account_id)?;
+        let user_id = resource_id(&b, "UserId", "user")?;
         let guard = self.state.read();
         let dir = guard
             .get(&req.account_id)
@@ -628,15 +662,15 @@ impl IdentityStoreService {
             .ok_or_else(|| not_found("USER not found."))?;
         let u = dir
             .users
-            .get(user_id)
+            .get(&user_id)
             .ok_or_else(|| not_found("USER not found."))?;
         ok(build_user(u, &sid, &req.region))
     }
 
     fn update_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let user_id = resource_id(&b, "UserId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let user_id = resource_id(&b, "UserId", "user")?;
         let revision = req_revision(&b)?;
         let ops = b
             .get("Operations")
@@ -670,8 +704,8 @@ impl IdentityStoreService {
 
     fn delete_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let user_id = resource_id(&b, "UserId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let user_id = resource_id(&b, "UserId", "user")?;
         let revision = req_revision(&b)?;
         let mut guard = self.state.write();
         if let Some(dir) = guard
@@ -689,7 +723,7 @@ impl IdentityStoreService {
 
     fn get_user_id(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         let (path, want) = alternate_identifier(&b)?;
         let guard = self.state.read();
         let dir = guard
@@ -715,7 +749,7 @@ impl IdentityStoreService {
 
     fn list_users(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         let guard = self.state.read();
         let rows: Vec<Value> = guard
             .get(&req.account_id)
@@ -740,7 +774,7 @@ impl IdentityStoreService {
 
     fn create_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         // DisplayName is `GroupDisplayName` @length 1..=1024; Description is
         // `SensitiveStringType` @length 1..=1024.
         check_len(&b, "DisplayName", 1, 1024)?;
@@ -792,21 +826,21 @@ impl IdentityStoreService {
 
     fn describe_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let group_id = resource_id(&b, "GroupId")?;
+        let sid = store_id(&b, &req.account_id)?;
+        let group_id = resource_id(&b, "GroupId", "group")?;
         let guard = self.state.read();
         let g = guard
             .get(&req.account_id)
             .and_then(|a| a.stores.get(&sid))
-            .and_then(|d| d.groups.get(group_id))
+            .and_then(|d| d.groups.get(&group_id))
             .ok_or_else(|| not_found("GROUP not found."))?;
         ok(build_group(g, &sid, &req.region))
     }
 
     fn update_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let group_id = resource_id(&b, "GroupId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let group_id = resource_id(&b, "GroupId", "group")?;
         let revision = req_revision(&b)?;
         let ops = b
             .get("Operations")
@@ -837,8 +871,8 @@ impl IdentityStoreService {
 
     fn delete_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let group_id = resource_id(&b, "GroupId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let group_id = resource_id(&b, "GroupId", "group")?;
         let revision = req_revision(&b)?;
         let mut guard = self.state.write();
         if let Some(dir) = guard
@@ -856,7 +890,7 @@ impl IdentityStoreService {
 
     fn get_group_id(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         let (path, want) = alternate_identifier(&b)?;
         let guard = self.state.read();
         let dir = guard
@@ -882,7 +916,7 @@ impl IdentityStoreService {
 
     fn list_groups(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         let guard = self.state.read();
         let rows: Vec<Value> = guard
             .get(&req.account_id)
@@ -907,8 +941,8 @@ impl IdentityStoreService {
 
     fn create_group_membership(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let group_id = resource_id(&b, "GroupId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let group_id = resource_id(&b, "GroupId", "group")?;
         let member = member_user_id(&b)?;
         let mut guard = self.state.write();
         let acct = guard.get_or_create(&req.account_id);
@@ -950,21 +984,21 @@ impl IdentityStoreService {
 
     fn describe_group_membership(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let membership_id = resource_id(&b, "MembershipId")?;
+        let sid = store_id(&b, &req.account_id)?;
+        let membership_id = resource_id(&b, "MembershipId", "membership")?;
         let guard = self.state.read();
         let m = guard
             .get(&req.account_id)
             .and_then(|a| a.stores.get(&sid))
-            .and_then(|d| d.memberships.get(membership_id))
+            .and_then(|d| d.memberships.get(&membership_id))
             .ok_or_else(|| not_found("MEMBERSHIP not found."))?;
         ok(build_membership(m, &sid, &req.region))
     }
 
     fn delete_group_membership(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let membership_id = resource_id(&b, "MembershipId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let membership_id = resource_id(&b, "MembershipId", "membership")?;
         let mut guard = self.state.write();
         if let Some(dir) = guard
             .get_mut(&req.account_id)
@@ -977,8 +1011,8 @@ impl IdentityStoreService {
 
     fn get_group_membership_id(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let group_id = resource_id(&b, "GroupId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let group_id = resource_id(&b, "GroupId", "group")?;
         let member = member_user_id(&b)?;
         let guard = self.state.read();
         let m = guard
@@ -999,8 +1033,8 @@ impl IdentityStoreService {
 
     fn list_group_memberships(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
-        let group_id = resource_id(&b, "GroupId")?.to_string();
+        let sid = store_id(&b, &req.account_id)?;
+        let group_id = resource_id(&b, "GroupId", "group")?;
         let guard = self.state.read();
         let rows: Vec<Value> = guard
             .get(&req.account_id)
@@ -1026,7 +1060,7 @@ impl IdentityStoreService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         let member = member_user_id(&b)?;
         let guard = self.state.read();
         let rows: Vec<Value> = guard
@@ -1050,7 +1084,7 @@ impl IdentityStoreService {
 
     fn is_member_in_groups(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
-        let sid = store_id(&b)?;
+        let sid = store_id(&b, &req.account_id)?;
         let member = member_user_id(&b)?;
         let group_ids: Vec<String> = b
             .get("GroupIds")
@@ -1061,15 +1095,11 @@ impl IdentityStoreService {
                     .collect()
             })
             .ok_or_else(|| validation("GroupIds must be specified."))?;
-        // Each element is a `GroupId` (`ResourceId` @length 1..=47).
-        if let Some(bad) = group_ids
+        // Each element is a `GroupId` (`ResourceId`: bare id or group ARN).
+        let group_ids = group_ids
             .iter()
-            .find(|g| g.is_empty() || g.chars().count() > 47)
-        {
-            return Err(validation(&format!(
-                "GroupId `{bad}` must have length between 1 and 47, inclusive."
-            )));
-        }
+            .map(|g| parse_resource_id(g, "GroupIds", "group"))
+            .collect::<Result<Vec<_>, _>>()?;
         let guard = self.state.read();
         let dir = guard.get(&req.account_id).and_then(|a| a.stores.get(&sid));
         let results: Vec<Value> = group_ids
@@ -1095,19 +1125,11 @@ impl IdentityStoreService {
     /// Resolve the request's `IdentityStoreId` (id or ARN) to a store the
     /// account owns, or `ResourceNotFoundException` (`IDENTITY_STORE`).
     fn existing_store(&self, b: &Value, account: &str) -> Result<String, AwsServiceError> {
-        let sid = store_id(b)?;
+        let sid = store_id(b, account)?;
         if self.known_stores(account).contains(&sid) {
             Ok(sid)
         } else {
-            Err(AwsServiceError::aws_error_with_fields(
-                StatusCode::NOT_FOUND,
-                "ResourceNotFoundException",
-                format!("Identity store {sid} not found."),
-                vec![
-                    ("ResourceType".to_string(), "IDENTITY_STORE".to_string()),
-                    ("ResourceId".to_string(), sid.clone()),
-                ],
-            ))
+            Err(store_not_found(&sid))
         }
     }
 
@@ -1919,6 +1941,108 @@ mod tests {
             &s,
             "ListUsers",
             json!({ "IdentityStoreId": "arn:aws:s3:::bucket" }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+    }
+
+    #[test]
+    fn identity_store_arn_of_another_account_is_not_found() {
+        let s = svc();
+        call(
+            &s,
+            "CreateUser",
+            json!({ "IdentityStoreId": "d-1234567890", "UserName": "a" }),
+        );
+        let other = "arn:aws:identitystore::111122223333:identitystore/d-1234567890";
+        let err = call_err(&s, "ListUsers", json!({ "IdentityStoreId": other }));
+        assert_eq!(err.code(), "ResourceNotFoundException");
+        assert_eq!(field(&err, "ResourceType"), Some("IDENTITY_STORE"));
+        // An account-less store ARN is malformed.
+        let err = call_err(
+            &s,
+            "ListUsers",
+            json!({ "IdentityStoreId": "arn:aws:identitystore:::identitystore/d-1234567890" }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+    }
+
+    #[test]
+    fn resource_ids_accept_arn_form() {
+        let s = svc();
+        let sid = "d-1234567890";
+        let uid = call(
+            &s,
+            "CreateUser",
+            json!({ "IdentityStoreId": sid, "UserName": "u" }),
+        )["UserId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let gid = call(
+            &s,
+            "CreateGroup",
+            json!({ "IdentityStoreId": sid, "DisplayName": "g" }),
+        )["GroupId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let uarn = format!("arn:aws:identitystore:::user/{uid}");
+        let garn = format!("arn:aws:identitystore:::group/{gid}");
+        // 81 chars: over the old 47 cap, within the model's 100.
+        assert!(uarn.len() > 47 && uarn.len() <= 100);
+
+        let desc = call(
+            &s,
+            "DescribeUser",
+            json!({ "IdentityStoreId": sid, "UserId": uarn }),
+        );
+        assert_eq!(desc["UserId"], json!(uid));
+
+        let mid = call(
+            &s,
+            "CreateGroupMembership",
+            json!({ "IdentityStoreId": sid, "GroupId": garn, "MemberId": { "UserId": uarn } }),
+        )["MembershipId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let m = call(
+            &s,
+            "DescribeGroupMembership",
+            json!({
+                "IdentityStoreId": sid,
+                "MembershipId": format!("arn:aws:identitystore:::membership/{mid}"),
+            }),
+        );
+        // Stored under the bare ids, not the ARNs.
+        assert_eq!(m["GroupId"], json!(gid));
+        assert_eq!(m["MemberId"]["UserId"], json!(uid));
+
+        let res = call(
+            &s,
+            "IsMemberInGroups",
+            json!({ "IdentityStoreId": sid, "MemberId": { "UserId": uarn }, "GroupIds": [garn] }),
+        );
+        assert_eq!(res["Results"][0]["MembershipExists"], json!(true));
+
+        // An ARN of the wrong resource type is rejected.
+        let err = call_err(
+            &s,
+            "DescribeUser",
+            json!({ "IdentityStoreId": sid, "UserId": garn }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+        let err = call_err(
+            &s,
+            "IsMemberInGroups",
+            json!({ "IdentityStoreId": sid, "MemberId": { "UserId": uid }, "GroupIds": [uarn] }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+        // Over the model's 100-char cap.
+        let err = call_err(
+            &s,
+            "DescribeUser",
+            json!({ "IdentityStoreId": sid, "UserId": "a".repeat(101) }),
         );
         assert_eq!(err.code(), "ValidationException");
     }
