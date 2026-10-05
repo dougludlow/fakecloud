@@ -2239,3 +2239,57 @@ fn legacy_edge_stage_records_fold_into_plan() {
     let stages = d.get_resource("EdgeDeploymentPlan", "p").unwrap()["Stages"].clone();
     assert_eq!(stages, json!([{"StageName": "s1"}, {"StageName": "s2"}]));
 }
+
+#[test]
+fn cluster_slurm_accounting_database_round_trips() {
+    let s = svc();
+    let orchestrator = json!({"Slurm": {
+        "SlurmConfigStrategy": "Managed",
+        "AccountingDatabase": {
+            "Endpoint": "slurmdb.cluster-abc.us-east-1.rds.amazonaws.com",
+            "Port": 3306,
+            "Name": "slurm_acct_db",
+            "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:slurmdb-AbCdEf"
+        }
+    }});
+    run(
+        &s,
+        "CreateCluster",
+        json!({
+            "ClusterName": "slurm1",
+            "InstanceGroups": [],
+            "NodeProvisioningMode": "Continuous",
+            "Orchestrator": orchestrator,
+        }),
+    )
+    .unwrap();
+    let described =
+        resp_json(&run(&s, "DescribeCluster", json!({"ClusterName": "slurm1"})).unwrap());
+    assert_eq!(described["Orchestrator"], orchestrator);
+}
+
+#[test]
+fn describe_training_plan_accepts_name_or_arn() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateTrainingPlan",
+            json!({"TrainingPlanName": "plan1", "TrainingPlanOfferingId": "tpo-1"}),
+        )
+        .unwrap(),
+    );
+    let arn = created["TrainingPlanArn"].as_str().unwrap().to_string();
+    let by_name = resp_json(
+        &run(
+            &s,
+            "DescribeTrainingPlan",
+            json!({"TrainingPlanName": "plan1"}),
+        )
+        .unwrap(),
+    );
+    let by_arn =
+        resp_json(&run(&s, "DescribeTrainingPlan", json!({"TrainingPlanName": arn})).unwrap());
+    assert_eq!(by_name["TrainingPlanArn"], by_arn["TrainingPlanArn"]);
+    assert_eq!(by_arn["TrainingPlanName"], "plan1");
+}
