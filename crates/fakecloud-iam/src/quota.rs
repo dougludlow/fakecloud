@@ -76,9 +76,13 @@ pub fn enforced_limit(
     region: &str,
     quota: IamQuota,
 ) -> Option<usize> {
-    provider
-        .and_then(|p| p.enforced_limit(account_id, region, IAM_SERVICE_CODE, quota.code()))
-        .map(|v| v.max(0.0) as usize)
+    fakecloud_core::quota::enforced_count(
+        provider,
+        account_id,
+        region,
+        IAM_SERVICE_CODE,
+        quota.code(),
+    )
 }
 
 /// `LimitExceeded` for `quota` at `limit`.
@@ -101,6 +105,49 @@ pub fn check(
         Some(limit) if count_after > limit => Err(limit_exceeded(quota, limit)),
         _ => Ok(()),
     }
+}
+
+/// Refuse one more entity of an account-level `quota` (users, roles, groups,
+/// customer managed policies, instance profiles, server certificates, OIDC
+/// providers) when `state` already holds as many as the enforced `limit`.
+/// The IAM API and CloudFormation both create through here. A `None` limit
+/// accepts anything.
+pub fn check_new(
+    state: &IamState,
+    quota: IamQuota,
+    limit: Option<usize>,
+) -> Result<(), AwsServiceError> {
+    if limit.is_none() {
+        return Ok(());
+    }
+    check(quota, limit, account_usage(state, quota).unwrap_or(0) + 1)
+}
+
+/// The managed policies a principal holds after attaching `adding` to
+/// `current`, counting a policy already attached (or listed twice) once.
+pub fn attached_after(current: &[String], adding: &[String]) -> usize {
+    let mut all: Vec<&String> = current.iter().collect();
+    for a in adding {
+        if !all.contains(&a) {
+            all.push(a);
+        }
+    }
+    all.len()
+}
+
+/// Refuse attaching `adding` to a principal holding `current` when that takes
+/// it past the enforced per-principal `quota` (managed policies per role,
+/// user or group). A `None` limit accepts anything.
+pub fn check_attachments(
+    quota: IamQuota,
+    limit: Option<usize>,
+    current: &[String],
+    adding: &[String],
+) -> Result<(), AwsServiceError> {
+    if limit.is_none() {
+        return Ok(());
+    }
+    check(quota, limit, attached_after(current, adding))
 }
 
 /// The size of a trust policy as IAM counts it against the role trust policy
@@ -205,6 +252,27 @@ mod tests {
         assert!(check(IamQuota::Users, None, 10_000).is_ok());
         assert!(check(IamQuota::Users, Some(2), 2).is_ok());
         assert!(check(IamQuota::Users, Some(2), 3).is_err());
+    }
+
+    #[test]
+    fn attached_after_counts_a_repeated_policy_once() {
+        let current = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(attached_after(&current, &["b".into(), "c".into()]), 3);
+        assert_eq!(attached_after(&[], &["a".into(), "a".into()]), 1);
+        assert!(check_attachments(
+            IamQuota::ManagedPoliciesPerRole,
+            Some(2),
+            &current,
+            &["a".into()]
+        )
+        .is_ok());
+        assert!(check_attachments(
+            IamQuota::ManagedPoliciesPerRole,
+            Some(2),
+            &current,
+            &["c".into()]
+        )
+        .is_err());
     }
 
     #[test]

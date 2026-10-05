@@ -41,7 +41,11 @@ pub fn enforced_storage_limit(
 ) -> Option<i64> {
     provider
         .and_then(|p| p.enforced_limit(account_id, region, SERVICE_CODE, CODE_STORAGE))
-        .map(|gb| (gb.max(0.0) * BYTES_PER_GB) as i64)
+        .map(gb_to_bytes)
+}
+
+fn gb_to_bytes(gb: f64) -> i64 {
+    (gb.max(0.0) * BYTES_PER_GB) as i64
 }
 
 /// The bytes of code a function record stores: its package size, or nothing
@@ -73,33 +77,90 @@ pub fn code_storage_used(state: &LambdaState) -> i64 {
     functions + versions + layers
 }
 
-/// Refuse a deploy that grows code storage from `before` to `after` bytes
-/// past the enforced `limit`. A `None` limit, or a deploy that does not grow
-/// storage, is accepted.
-pub fn check_storage(limit: Option<i64>, before: i64, after: i64) -> Result<(), AwsServiceError> {
-    match limit {
-        Some(limit) if after > limit && after > before => Err(AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "CodeStorageExceededException",
-            "Code storage limit exceeded.",
-        )),
-        _ => Ok(()),
+fn storage_exceeded() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "CodeStorageExceededException",
+        "Code storage limit exceeded.",
+    )
+}
+
+/// Refuse a deploy that stores `added` more bytes of code in `state` when that
+/// takes the region past the enforced `limit`. Every path that stores new
+/// code (a new function, a published version, a layer version) goes through
+/// here; a `None` limit accepts anything without measuring.
+pub fn check_new_code(
+    state: &LambdaState,
+    limit: Option<i64>,
+    added: i64,
+) -> Result<(), AwsServiceError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    if added > 0 && code_storage_used(state) + added > limit {
+        return Err(storage_exceeded());
     }
+    Ok(())
+}
+
+/// Refuse replacing the `$LATEST` record `old` with `new` (and, when
+/// `publish_copy`, also storing `new`'s code as a published version) when
+/// that grows storage past the enforced `limit`. Both `UpdateFunctionCode`
+/// and a CloudFormation function update build the updated record first and
+/// check it here, so S3-sourced code and container images count the same.
+pub fn check_replaced_code(
+    state: &LambdaState,
+    limit: Option<i64>,
+    old: &LambdaFunction,
+    new: &LambdaFunction,
+    publish_copy: bool,
+) -> Result<(), AwsServiceError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let before = code_storage_used(state);
+    let new_size = stored_code_size(new);
+    let after = before - stored_code_size(old) + new_size + if publish_copy { new_size } else { 0 };
+    if after > limit && after > before {
+        return Err(storage_exceeded());
+    }
+    Ok(())
 }
 
 /// "Concurrent executions", the account concurrency limit.
 pub const CONCURRENT_EXECUTIONS: &str = "L-B99A9384";
 
-/// The concurrency limit of `state`'s Region: the stored account settings,
-/// else `applied` (the Service Quotas value, when attached), else the AWS
-/// default of 1000.
+/// The AWS default account concurrency limit.
+pub const DEFAULT_CONCURRENT_EXECUTIONS: i64 = 1000;
+/// The AWS default "Function and layer storage", in bytes (300 GB).
+pub const DEFAULT_CODE_STORAGE_BYTES: i64 = 300 * 1024 * 1024 * 1024;
+
+/// A stored account setting, unless it is unset (0, as a state migrated from
+/// an older snapshot carries).
+fn stored(
+    state: &LambdaState,
+    pick: impl Fn(&crate::state::AccountSettings) -> i64,
+) -> Option<i64> {
+    state.account_settings.as_ref().map(pick).filter(|v| *v > 0)
+}
+
+/// The concurrency limit of `state`'s Region: the applied Service Quotas
+/// value when Service Quotas is attached (`applied`, so an approved increase
+/// counts), else a stored account setting, else the AWS default of 1000.
 pub fn concurrency_limit(state: &LambdaState, applied: Option<f64>) -> i64 {
-    state
-        .account_settings
-        .as_ref()
-        .map(|s| s.concurrent_executions)
-        .or_else(|| applied.map(|v| v.max(0.0) as i64))
-        .unwrap_or(1000)
+    applied
+        .map(|v| v.max(0.0) as i64)
+        .or_else(|| stored(state, |s| s.concurrent_executions))
+        .unwrap_or(DEFAULT_CONCURRENT_EXECUTIONS)
+}
+
+/// The code storage limit of `state`'s Region in bytes, resolved like
+/// [`concurrency_limit`] from the applied quota (in GB).
+pub fn code_storage_limit(state: &LambdaState, applied_gb: Option<f64>) -> i64 {
+    applied_gb
+        .map(gb_to_bytes)
+        .or_else(|| stored(state, |s| s.total_code_size))
+        .unwrap_or(DEFAULT_CODE_STORAGE_BYTES)
 }
 
 /// Lambda always leaves part of the account's concurrency unreserved for the
@@ -170,16 +231,31 @@ impl QuotaUsageSource for LambdaQuotaUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AccountSettings;
 
     #[test]
-    fn storage_is_checked_only_when_it_grows_past_the_limit() {
-        assert!(check_storage(None, 0, i64::MAX).is_ok());
-        assert!(check_storage(Some(10), 0, 10).is_ok());
-        let err = check_storage(Some(10), 0, 11).err().unwrap();
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(err.code(), "CodeStorageExceededException");
-        assert_eq!(err.message(), "Code storage limit exceeded.");
-        // Shrinking an over-limit account is not refused.
-        assert!(check_storage(Some(10), 20, 15).is_ok());
+    fn concurrency_limit_prefers_the_applied_quota_and_ignores_a_zero_setting() {
+        let mut state = LambdaState::new("123456789012", "us-east-1");
+        // A state migrated from an older snapshot carries all-zero settings.
+        state.account_settings = Some(AccountSettings::default());
+        assert_eq!(concurrency_limit(&state, None), 1000);
+        assert_eq!(code_storage_limit(&state, None), DEFAULT_CODE_STORAGE_BYTES);
+        assert_eq!(concurrency_limit(&state, Some(3000.0)), 3000);
+        state.account_settings = Some(AccountSettings {
+            concurrent_executions: 500,
+            ..Default::default()
+        });
+        assert_eq!(concurrency_limit(&state, None), 500);
+        // An applied (possibly raised) quota wins over the stored setting.
+        assert_eq!(concurrency_limit(&state, Some(2000.0)), 2000);
+    }
+
+    #[test]
+    fn reservation_against_a_migrated_zero_setting_uses_the_default_limit() {
+        let mut state = LambdaState::new("123456789012", "us-east-1");
+        state.account_settings = Some(AccountSettings::default());
+        let limit = concurrency_limit(&state, None);
+        assert!(check_reservation(&state, "f", 900, limit).is_ok());
+        assert!(check_reservation(&state, "f", 901, limit).is_err());
     }
 }

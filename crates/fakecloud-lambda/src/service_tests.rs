@@ -5291,3 +5291,83 @@ async fn account_concurrency_limit_follows_the_applied_quota() {
         100
     );
 }
+
+#[tokio::test]
+async fn update_function_code_with_publish_needs_room_for_the_version_copy_too() {
+    let svc = LambdaService::new(make_state()).with_quota_provider(Some(Arc::new(
+        fakecloud_core::quota::FixedQuotas::default().with("lambda", "L-2ACBD22F", storage_gb(8)),
+    )));
+    create_in_region(&svc, "pub", "us-east-1", "").await; // 3 bytes
+                                                          // A 5-byte $LATEST fits (5), but publishing it would store 5 more (10).
+    let err = lambda_call(
+        &svc,
+        Method::PUT,
+        "/2015-03-31/functions/pub/code",
+        json!({"ZipFile": b64(b"fives"), "Publish": true}),
+    )
+    .await
+    .err()
+    .expect("the published copy does not fit");
+    assert_eq!(err.code(), "CodeStorageExceededException");
+    // Nothing changed: $LATEST keeps its 3-byte package and no version exists.
+    let func = json_body(
+        &lambda_call(&svc, Method::GET, "/2015-03-31/functions/pub", Value::Null)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(func["Configuration"]["CodeSize"], 3);
+    let versions = json_body(
+        &lambda_call(
+            &svc,
+            Method::GET,
+            "/2015-03-31/functions/pub/versions",
+            Value::Null,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(versions["Versions"].as_array().unwrap().len(), 1);
+    // Without Publish the same package fits.
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2015-03-31/functions/pub/code",
+        json!({"ZipFile": b64(b"fives")}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_migrated_zero_account_setting_does_not_block_reservations() {
+    let svc = LambdaService::new(make_state());
+    create_in_region(&svc, "legacy", "us-east-1", "").await;
+    svc.state
+        .write()
+        .regional_mut("123456789012", "us-east-1")
+        .account_settings = Some(crate::state::AccountSettings::default());
+    lambda_call(
+        &svc,
+        Method::PUT,
+        "/2017-10-31/functions/legacy/concurrency",
+        json!({"ReservedConcurrentExecutions": 10}),
+    )
+    .await
+    .unwrap();
+    let settings = json_body(
+        &lambda_call(
+            &svc,
+            Method::GET,
+            "/2016-08-19/account-settings",
+            Value::Null,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(settings["AccountLimit"]["ConcurrentExecutions"], 1000);
+    assert_eq!(
+        settings["AccountLimit"]["UnreservedConcurrentExecutions"],
+        990
+    );
+    assert_eq!(settings["AccountLimit"]["CodeSizeZipped"], 52_428_800);
+}

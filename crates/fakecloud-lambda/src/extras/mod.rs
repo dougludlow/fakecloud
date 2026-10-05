@@ -571,7 +571,7 @@ impl LambdaService {
 
         let func = state
             .functions
-            .get_mut(function_name)
+            .get(function_name)
             .ok_or_else(|| not_found("Function", function_name))?;
 
         // Optimistic-concurrency precondition: when the caller supplies
@@ -594,27 +594,11 @@ impl LambdaService {
             return ok(self.function_config_json(func));
         }
 
-        // The new package replaces `$LATEST`'s copy of the code.
-        if storage_limit.is_some() {
-            let new_size = if let Some(bytes) = new_zip.as_ref() {
-                Some(bytes.len() as i64)
-            } else if let Some(descriptor) = new_s3_descriptor.as_ref() {
-                Some(descriptor.len() as i64)
-            } else if new_image_uri.is_some() {
-                Some(0)
-            } else {
-                None
-            };
-            if let Some(new_size) = new_size {
-                let old_size = crate::quota::stored_code_size(func);
-                let before = crate::quota::code_storage_used(state);
-                crate::quota::check_storage(storage_limit, before, before - old_size + new_size)?;
-            }
-        }
-        let func = state
-            .functions
-            .get_mut(function_name)
-            .ok_or_else(|| not_found("Function", function_name))?;
+        // The update is built on a copy and checked against the code storage
+        // quota before it replaces `$LATEST`, so a refused update changes
+        // nothing.
+        let original = func.clone();
+        let mut func = original.clone();
 
         let mut changed = false;
         if let Some(bytes) = new_zip {
@@ -698,6 +682,20 @@ impl LambdaService {
         func.last_update_status_reason = None;
         func.last_update_status_reason_code = None;
 
+        // With Publish=true the new code is also stored as a published
+        // version (unless publishing would return the latest version
+        // unchanged), so both copies must fit before `$LATEST` changes.
+        let publish_copy = publish
+            && crate::service::publish_creates_version(
+                state,
+                function_name,
+                &func,
+                body["Description"].as_str(),
+            );
+        crate::quota::check_replaced_code(state, storage_limit, &original, &func, publish_copy)?;
+        let response = self.function_config_json(&func);
+        state.functions.insert(function_name.to_string(), func);
+
         // Publish=true mints a new immutable version snapshot off the
         // freshly updated $LATEST and returns that version's config.
         if publish {
@@ -705,7 +703,7 @@ impl LambdaService {
             return self.publish_version(function_name, &req.account_id, req);
         }
 
-        ok(self.function_config_json(func))
+        ok(response)
     }
 
     // ── Versions ──

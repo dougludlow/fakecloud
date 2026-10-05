@@ -3,7 +3,7 @@
 //! the `impl ResourceProvisioner` block; the family slug is
 //! `iam`.
 
-use super::quota::{attached_after, check_iam};
+use super::quota::iam_refusal;
 use super::*;
 use fakecloud_iam::quota::IamQuota;
 
@@ -78,9 +78,10 @@ impl ResourceProvisioner {
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         fakecloud_iam::quota::check_trust_policy(trust_limit, &assume_role_policy)
-            .map_err(|e| super::quota::refusal("Iam", e))?;
+            .map_err(iam_refusal)?;
         if !state.roles.contains_key(role_name) {
-            check_iam(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
+            fakecloud_iam::quota::check_new(state, IamQuota::Roles, roles_limit)
+                .map_err(iam_refusal)?;
         }
         if let Some(arns) = managed_policy_arns(props) {
             let current = state
@@ -88,11 +89,13 @@ impl ResourceProvisioner {
                 .get(role_name)
                 .cloned()
                 .unwrap_or_default();
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerRole,
                 per_role_limit,
-                attached_after(&current, &arns),
-            )?;
+                &current,
+                &arns,
+            )
+            .map_err(iam_refusal)?;
         }
         let role_id = format!(
             "FKIA{}",
@@ -213,15 +216,16 @@ impl ResourceProvisioner {
             } else {
                 serde_json::to_string(doc).unwrap_or_default()
             };
-            fakecloud_iam::quota::check_trust_policy(trust_limit, &doc)
-                .map_err(|e| super::quota::refusal("Iam", e))?;
+            fakecloud_iam::quota::check_trust_policy(trust_limit, &doc).map_err(iam_refusal)?;
         }
         if let Some(arns) = managed_policy_arns(props) {
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerRole,
                 per_role_limit,
-                attached_after(&[], &arns),
-            )?;
+                &[],
+                &arns,
+            )
+            .map_err(iam_refusal)?;
         }
 
         if let Some(role) = state.roles.get_mut(&role_name) {
@@ -498,18 +502,21 @@ impl ResourceProvisioner {
         if state.users.contains_key(&user_name) {
             return Err(format!("User {user_name} already exists"));
         }
-        check_iam(IamQuota::Users, users_limit, state.users.len() + 1)?;
+        fakecloud_iam::quota::check_new(state, IamQuota::Users, users_limit)
+            .map_err(iam_refusal)?;
         if let Some(arns) = managed_policy_arns(props) {
             let current = state
                 .user_policies
                 .get(&user_name)
                 .cloned()
                 .unwrap_or_default();
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerUser,
                 per_user_limit,
-                attached_after(&current, &arns),
-            )?;
+                &current,
+                &arns,
+            )
+            .map_err(iam_refusal)?;
         }
         let arn = format!(
             "arn:{}:iam::{}:user{}{}",
@@ -612,11 +619,13 @@ impl ResourceProvisioner {
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         if let Some(arns) = managed_policy_arns(props) {
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerUser,
                 per_user_limit,
-                attached_after(&[], &arns),
-            )?;
+                &[],
+                &arns,
+            )
+            .map_err(iam_refusal)?;
         }
 
         let arn = {
@@ -703,13 +712,16 @@ impl ResourceProvisioner {
         if state.groups.contains_key(&group_name) {
             return Err(format!("Group {group_name} already exists"));
         }
-        check_iam(IamQuota::Groups, groups_limit, state.groups.len() + 1)?;
+        fakecloud_iam::quota::check_new(state, IamQuota::Groups, groups_limit)
+            .map_err(iam_refusal)?;
         if let Some(arns) = managed_policy_arns(props) {
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerGroup,
                 per_group_limit,
-                attached_after(&[], &arns),
-            )?;
+                &[],
+                &arns,
+            )
+            .map_err(iam_refusal)?;
         }
         let arn = format!(
             "arn:{}:iam::{}:group{}{}",
@@ -781,11 +793,13 @@ impl ResourceProvisioner {
         let group_name = existing.physical_id.clone();
         let per_group_limit = self.iam_limit(IamQuota::ManagedPoliciesPerGroup);
         if let Some(arns) = managed_policy_arns(props) {
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerGroup,
                 per_group_limit,
-                attached_after(&[], &arns),
-            )?;
+                &[],
+                &arns,
+            )
+            .map_err(iam_refusal)?;
         }
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
@@ -880,11 +894,8 @@ impl ResourceProvisioner {
         if state.policies.contains_key(&arn) {
             return Err(format!("Managed policy {policy_name} already exists"));
         }
-        check_iam(
-            IamQuota::CustomerManagedPolicies,
-            policies_limit,
-            state.policies.len() + 1,
-        )?;
+        fakecloud_iam::quota::check_new(state, IamQuota::CustomerManagedPolicies, policies_limit)
+            .map_err(iam_refusal)?;
         // Every principal the policy attaches to must have room for it.
         let new_arn = [arn.clone()];
         let names = |key: &str| -> Vec<String> {
@@ -900,27 +911,33 @@ impl ResourceProvisioner {
         };
         for name in names("Users") {
             let current = state.user_policies.get(&name).cloned().unwrap_or_default();
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerUser,
                 per_user_limit,
-                attached_after(&current, &new_arn),
-            )?;
+                &current,
+                &new_arn,
+            )
+            .map_err(iam_refusal)?;
         }
         for name in names("Roles") {
             let current = state.role_policies.get(&name).cloned().unwrap_or_default();
-            check_iam(
+            fakecloud_iam::quota::check_attachments(
                 IamQuota::ManagedPoliciesPerRole,
                 per_role_limit,
-                attached_after(&current, &new_arn),
-            )?;
+                &current,
+                &new_arn,
+            )
+            .map_err(iam_refusal)?;
         }
         for name in names("Groups") {
             if let Some(group) = state.groups.get(&name) {
-                check_iam(
+                fakecloud_iam::quota::check_attachments(
                     IamQuota::ManagedPoliciesPerGroup,
                     per_group_limit,
-                    attached_after(&group.attached_policies, &new_arn),
-                )?;
+                    &group.attached_policies,
+                    &new_arn,
+                )
+                .map_err(iam_refusal)?;
             }
         }
         let policy_id = format!(
@@ -1155,11 +1172,8 @@ impl ResourceProvisioner {
         if state.instance_profiles.contains_key(&name) {
             return Err(format!("InstanceProfile {name} already exists"));
         }
-        check_iam(
-            IamQuota::InstanceProfiles,
-            profiles_limit,
-            state.instance_profiles.len() + 1,
-        )?;
+        fakecloud_iam::quota::check_new(state, IamQuota::InstanceProfiles, profiles_limit)
+            .map_err(iam_refusal)?;
         // Force a retry pass when role refs haven't been resolved yet: a
         // logical-id placeholder won't match any real role, and silently
         // storing it would leave DescribeInstanceProfile returning an
@@ -1240,11 +1254,8 @@ impl ResourceProvisioner {
         if state.has_oidc_provider_for(&url_for_arn) {
             return Err(format!("OIDC provider for {url_for_arn} already exists."));
         }
-        check_iam(
-            IamQuota::OpenIdConnectProviders,
-            providers_limit,
-            state.oidc_providers.len() + 1,
-        )?;
+        fakecloud_iam::quota::check_new(state, IamQuota::OpenIdConnectProviders, providers_limit)
+            .map_err(iam_refusal)?;
         state.oidc_providers.insert(arn.clone(), provider);
         Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
     }
@@ -1450,7 +1461,8 @@ impl ResourceProvisioner {
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         if !state.roles.contains_key(&role_name) {
-            check_iam(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
+            fakecloud_iam::quota::check_new(state, IamQuota::Roles, roles_limit)
+                .map_err(iam_refusal)?;
         }
         state.roles.insert(role_name.clone(), role);
         Ok(ProvisionResult::new(role_name)

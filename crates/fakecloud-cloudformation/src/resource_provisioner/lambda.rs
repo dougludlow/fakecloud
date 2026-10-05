@@ -187,11 +187,10 @@ impl ResourceProvisioner {
                 &function_name,
             ));
         }
-        let storage_before = fakecloud_lambda::quota::code_storage_used(state);
-        fakecloud_lambda::quota::check_storage(
+        fakecloud_lambda::quota::check_new_code(
+            state,
             storage_limit,
-            storage_before,
-            storage_before + fakecloud_lambda::quota::stored_code_size(&func),
+            fakecloud_lambda::quota::stored_code_size(&func),
         )
         .map_err(|e| super::quota::refusal("Lambda", e))?;
         if let Some(reserved) = cfg.reserved_concurrent_executions {
@@ -280,31 +279,16 @@ impl ResourceProvisioner {
         let concurrency_quota = self.lambda_concurrency_quota();
         let mut accounts = self.lambda_state.write();
         let state = accounts.regional_mut(&self.account_id, &self.region);
-        let old_size = state
+        // The update is built on a copy and checked against the quotas
+        // before it replaces `$LATEST`, so a refused update changes nothing.
+        let original = state
             .functions
             .get(&function_name)
-            .map(fakecloud_lambda::quota::stored_code_size)
+            .cloned()
             .ok_or_else(|| {
                 format!("Cannot update {function_name}: function does not exist in lambda state")
             })?;
-        // New code replaces `$LATEST`'s copy.
-        if let Some(bytes) = &new_code_zip {
-            let before = fakecloud_lambda::quota::code_storage_used(state);
-            fakecloud_lambda::quota::check_storage(
-                storage_limit,
-                before,
-                before - old_size + bytes.len() as i64,
-            )
-            .map_err(|e| super::quota::refusal("Lambda", e))?;
-        }
-        if let Some(reserved) = cfg.reserved_concurrent_executions {
-            let limit = fakecloud_lambda::quota::concurrency_limit(state, concurrency_quota);
-            fakecloud_lambda::quota::check_reservation(state, &function_name, reserved, limit)
-                .map_err(|e| super::quota::refusal("Lambda", e))?;
-        }
-        let func = state.functions.get_mut(&function_name).ok_or_else(|| {
-            format!("Cannot update {function_name}: function does not exist in lambda state")
-        })?;
+        let mut func = original.clone();
 
         func.runtime = cfg.runtime;
         func.role = cfg.role;
@@ -339,7 +323,17 @@ impl ResourceProvisioner {
         func.last_modified = Utc::now();
         func.revision_id = Uuid::new_v4().to_string();
 
+        // The same check `UpdateFunctionCode` runs on its updated record, so
+        // S3-sourced code and container images count alike.
+        fakecloud_lambda::quota::check_replaced_code(state, storage_limit, &original, &func, false)
+            .map_err(|e| super::quota::refusal("Lambda", e))?;
+        if let Some(reserved) = cfg.reserved_concurrent_executions {
+            let limit = fakecloud_lambda::quota::concurrency_limit(state, concurrency_quota);
+            fakecloud_lambda::quota::check_reservation(state, &function_name, reserved, limit)
+                .map_err(|e| super::quota::refusal("Lambda", e))?;
+        }
         let function_arn = func.function_arn.clone();
+        state.functions.insert(function_name.clone(), func);
         // Reserved concurrency follows the template: set it when present,
         // remove it (DeleteFunctionConcurrency) when the property is dropped.
         match cfg.reserved_concurrent_executions {
@@ -646,13 +640,8 @@ impl ResourceProvisioner {
 
         let mut accounts = self.lambda_state.write();
         let state = accounts.regional_mut(&self.account_id, &self.region);
-        let storage_before = fakecloud_lambda::quota::code_storage_used(state);
-        fakecloud_lambda::quota::check_storage(
-            storage_limit,
-            storage_before,
-            storage_before + code_size,
-        )
-        .map_err(|e| super::quota::refusal("Lambda", e))?;
+        fakecloud_lambda::quota::check_new_code(state, storage_limit, code_size)
+            .map_err(|e| super::quota::refusal("Lambda", e))?;
         let layer_arn = fakecloud_lambda::layer_arn(&self.region, &self.account_id, &layer_name);
         let layer = state
             .layers
@@ -1013,11 +1002,10 @@ impl ResourceProvisioner {
             .ok_or_else(|| format!("Function {function_name} does not exist yet — retry once it has been provisioned"))?
             .clone();
         // The version stores its own copy of the code.
-        let storage_before = fakecloud_lambda::quota::code_storage_used(state);
-        fakecloud_lambda::quota::check_storage(
+        fakecloud_lambda::quota::check_new_code(
+            state,
             storage_limit,
-            storage_before,
-            storage_before + fakecloud_lambda::quota::stored_code_size(&func),
+            fakecloud_lambda::quota::stored_code_size(&func),
         )
         .map_err(|e| super::quota::refusal("Lambda", e))?;
         if let Some(expected) = &expected_sha {

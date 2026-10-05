@@ -142,7 +142,7 @@ impl IamService {
             ));
         }
         crate::quota::check_trust_policy(trust_limit, &input.assume_role_policy)?;
-        crate::quota::check(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
+        crate::quota::check_new(state, crate::quota::IamQuota::Roles, roles_limit)?;
 
         let partition = partition_for_region(&req.region);
 
@@ -618,7 +618,12 @@ impl IamService {
 
         let arns = state.role_policies.entry(role_name).or_default();
         if !arns.contains(&policy_arn) {
-            crate::quota::check(IamQuota::ManagedPoliciesPerRole, limit, arns.len() + 1)?;
+            crate::quota::check_attachments(
+                crate::quota::IamQuota::ManagedPoliciesPerRole,
+                limit,
+                arns,
+                std::slice::from_ref(&policy_arn),
+            )?;
             arns.push(policy_arn.clone());
             // Increment attachment count
             if let Some(p) = state.policies.get_mut(&policy_arn) {
@@ -939,7 +944,7 @@ impl IamService {
         }
         // A service-linked role is an IAM role and counts toward the account's
         // roles quota (`GetAccountSummary` `Roles` includes it too).
-        crate::quota::check(IamQuota::Roles, roles_limit, state.roles.len() + 1)?;
+        crate::quota::check_new(state, crate::quota::IamQuota::Roles, roles_limit)?;
 
         // Derive the ARN partition from the request region so gov/cn/iso
         // deployments get the right partition (aws-us-gov / aws-cn / ...)

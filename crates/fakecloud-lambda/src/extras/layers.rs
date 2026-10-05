@@ -83,8 +83,7 @@ impl LambdaService {
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
-        let storage_before = crate::quota::code_storage_used(state);
-        crate::quota::check_storage(storage_limit, storage_before, storage_before + code_size)?;
+        crate::quota::check_new_code(state, storage_limit, code_size)?;
         let account_id = state.account_id.clone();
         let layer = state
             .layers

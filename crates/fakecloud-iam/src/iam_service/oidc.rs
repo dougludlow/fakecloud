@@ -377,11 +377,7 @@ impl IamService {
                 "Unknown".to_string(),
             ));
         }
-        crate::quota::check(
-            crate::quota::IamQuota::OpenIdConnectProviders,
-            limit,
-            state.oidc_providers.len() + 1,
-        )?;
+        crate::quota::check_new(state, crate::quota::IamQuota::OpenIdConnectProviders, limit)?;
 
         let provider = OidcProvider {
             arn: arn.clone(),
@@ -704,11 +700,7 @@ impl IamService {
                 format!("Server certificate {name} already exists."),
             ));
         }
-        crate::quota::check(
-            crate::quota::IamQuota::ServerCertificates,
-            limit,
-            state.server_certificates.len() + 1,
-        )?;
+        crate::quota::check_new(state, crate::quota::IamQuota::ServerCertificates, limit)?;
 
         let cert = ServerCertificate {
             server_certificate_id: format!("ASCA{}", generate_id()),

@@ -13,29 +13,12 @@ use super::ResourceProvisioner;
 /// The status reason of a resource a quota refused: the service's error
 /// message, code and status, as a handler reports a failed API call.
 pub(super) fn refusal(service: &str, err: AwsServiceError) -> String {
-    format!(
-        "{} (Service: {service}, Status Code: {}, Error Code: {})",
-        err.message(),
-        err.status().as_u16(),
-        err.code()
-    )
+    fakecloud_core::quota::refusal_reason(service, &err)
 }
 
-/// `check(quota, limit, count)` for IAM, as a resource failure.
-pub(super) fn check_iam(quota: IamQuota, limit: Option<usize>, count: usize) -> Result<(), String> {
-    fakecloud_iam::quota::check(quota, limit, count).map_err(|e| refusal("Iam", e))
-}
-
-/// The managed policies a principal would hold after attaching `adding` to
-/// `current`, counting a policy already attached once.
-pub(super) fn attached_after(current: &[String], adding: &[String]) -> usize {
-    let mut all: Vec<&String> = current.iter().collect();
-    for a in adding {
-        if !all.contains(&a) {
-            all.push(a);
-        }
-    }
-    all.len()
+/// An IAM refusal as a resource failure.
+pub(super) fn iam_refusal(err: AwsServiceError) -> String {
+    refusal("Iam", err)
 }
 
 impl ResourceProvisioner {
@@ -231,13 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn attached_after_counts_a_repeated_policy_once() {
-        let current = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(attached_after(&current, &["b".into(), "c".into()]), 3);
-        assert_eq!(attached_after(&[], &["a".into(), "a".into()]), 1);
-    }
-
-    #[test]
     fn refusal_carries_the_error_code_and_status() {
         let err = fakecloud_iam::quota::limit_exceeded(IamQuota::Roles, 3);
         assert_eq!(
@@ -245,5 +221,137 @@ mod tests {
             "Cannot exceed quota for RolesPerAccount: 3 (Service: Iam, Status Code: 409, \
              Error Code: LimitExceeded)"
         );
+    }
+
+    fn global_table(replicas: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "TableName": "glob",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+            "Replicas": replicas.iter().map(|r| serde_json::json!({"Region": r})).collect::<Vec<_>>(),
+        })
+    }
+
+    /// A table limit of 1 in every region, with eu-west-1 already full.
+    fn full_west() -> ResourceProvisioner {
+        let prov = enforcing(fakecloud_core::quota::FixedQuotas::default().with(
+            "dynamodb",
+            "L-F98FE922",
+            1.0,
+        ));
+        let mut accounts = prov.dynamodb_state.write();
+        let west = accounts.regional_mut(&prov.account_id, "eu-west-1");
+        west.tables.insert(
+            "occupant".to_string(),
+            fakecloud_dynamodb::DynamoTable::new(
+                "occupant".to_string(),
+                "arn:aws:dynamodb:eu-west-1:123456789012:table/occupant".to_string(),
+                "id".to_string(),
+                Vec::new(),
+                Vec::new(),
+                fakecloud_dynamodb::ProvisionedThroughput {
+                    read_capacity_units: 0,
+                    write_capacity_units: 0,
+                },
+                "PAY_PER_REQUEST".to_string(),
+                chrono::Utc::now(),
+            ),
+        );
+        drop(accounts);
+        prov
+    }
+
+    fn local_tables(prov: &ResourceProvisioner) -> Vec<String> {
+        prov.dynamodb_state
+            .read()
+            .regional(&prov.account_id, &prov.region)
+            .map(|s| s.tables.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_refused_global_table_replica_leaves_no_local_table() {
+        let prov = full_west();
+        let region = prov.region.clone();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::DynamoDB::GlobalTable",
+                "G",
+                global_table(&[&region, "eu-west-1"]),
+            ))
+            .expect_err("the eu-west-1 replica is over the quota");
+        assert!(err.contains("LimitExceededException"), "{err}");
+        assert!(local_tables(&prov).is_empty(), "no orphaned local table");
+    }
+
+    #[test]
+    fn a_refused_replica_addition_leaves_the_global_table_unchanged() {
+        let prov = full_west();
+        let region = prov.region.clone();
+        let created = prov
+            .create_resource(&make_resource(
+                "AWS::DynamoDB::GlobalTable",
+                "G",
+                global_table(&[&region]),
+            ))
+            .expect("a single-region global table fits");
+        let mut props = global_table(&[&region, "eu-west-1"]);
+        props["DeletionProtectionEnabled"] = serde_json::json!(true);
+        let err = prov
+            .update_resource(
+                &created,
+                &make_resource("AWS::DynamoDB::GlobalTable", "G", props),
+            )
+            .expect_err("the eu-west-1 replica is over the quota");
+        assert!(err.contains("LimitExceededException"), "{err}");
+        let accounts = prov.dynamodb_state.read();
+        let table = &accounts.regional(&prov.account_id, &region).unwrap().tables["glob"];
+        assert!(
+            !table.deletion_protection_enabled,
+            "local table not updated"
+        );
+        assert!(table.replica_regions.is_empty());
+    }
+
+    fn function(code: &str) -> serde_json::Value {
+        serde_json::json!({
+            "FunctionName": "sized",
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Role": "arn:aws:iam::123456789012:role/r",
+            "Code": {"ZipFile": code},
+        })
+    }
+
+    #[test]
+    fn a_refused_function_code_update_leaves_the_function_unchanged() {
+        // 10 bytes of code storage, in the quota's gigabytes.
+        let prov = enforcing(fakecloud_core::quota::FixedQuotas::default().with(
+            "lambda",
+            "L-2ACBD22F",
+            10.5 / (1024.0 * 1024.0 * 1024.0),
+        ));
+        let created = prov
+            .create_resource(&make_resource(
+                "AWS::Lambda::Function",
+                "F",
+                function("eight888"),
+            ))
+            .expect("8 bytes fit");
+        let err = prov
+            .update_resource(
+                &created,
+                &make_resource("AWS::Lambda::Function", "F", function("eleven11111")),
+            )
+            .expect_err("11 bytes do not fit");
+        assert!(err.contains("CodeStorageExceededException"), "{err}");
+        let accounts = prov.lambda_state.read();
+        let func = &accounts
+            .regional(&prov.account_id, &prov.region)
+            .unwrap()
+            .functions["sized"];
+        assert_eq!(func.code_size, 8, "$LATEST keeps its package");
     }
 }

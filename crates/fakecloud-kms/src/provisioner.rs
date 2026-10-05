@@ -233,14 +233,8 @@ fn check_key_quota(
     region: &str,
     key_limit: Option<usize>,
 ) -> Result<(), String> {
-    crate::quota::check_new_key(key_limit, crate::quota::customer_keys_in(s, region)).map_err(|e| {
-        format!(
-            "{} (Service: Kms, Status Code: {}, Error Code: {})",
-            e.message(),
-            e.status().as_u16(),
-            e.code()
-        )
-    })
+    crate::quota::check_new_key(s, region, key_limit)
+        .map_err(|e| fakecloud_core::quota::refusal_reason("Kms", &e))
 }
 
 /// Build and insert a key into shared state. Returns

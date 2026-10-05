@@ -200,14 +200,16 @@ impl LambdaService {
         let accounts = self.state.read();
         let empty = LambdaState::new(account_id, region);
         let state = accounts.regional(account_id, region).unwrap_or(&empty);
-        let settings = state.account_settings.clone().unwrap_or(AccountSettings {
-            concurrent_executions: concurrency_quota.map_or(1000, |v| v.max(0.0) as i64),
-            code_size_zipped: 52_428_800,
-            code_size_unzipped: 262_144_000,
-            total_code_size: storage_quota.map_or(80_530_636_800, |gb| {
-                (gb.max(0.0) * 1024.0 * 1024.0 * 1024.0) as i64
-            }),
-        });
+        // A stored setting of 0 is unset (a state migrated from an older
+        // snapshot carries all-zero settings), not a limit of 0.
+        let stored = state.account_settings.clone().unwrap_or_default();
+        let positive_or = |v: i64, default: i64| if v > 0 { v } else { default };
+        let settings = AccountSettings {
+            concurrent_executions: crate::quota::concurrency_limit(state, concurrency_quota),
+            code_size_zipped: positive_or(stored.code_size_zipped, 52_428_800),
+            code_size_unzipped: positive_or(stored.code_size_unzipped, 262_144_000),
+            total_code_size: crate::quota::code_storage_limit(state, storage_quota),
+        };
         // Real AccountUsage so clients monitoring deployment quotas see
         // accurate numbers: AWS counts the code of every function, every
         // published version and every layer version.

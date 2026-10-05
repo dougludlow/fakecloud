@@ -413,7 +413,7 @@ impl S3Service {
                 vec![("BucketName".to_string(), bucket.to_string())],
             ));
         }
-        crate::quota::check_new_bucket(bucket_limit, state.buckets.len())?;
+        crate::quota::check_new_bucket(state, bucket_limit)?;
         let object_lock_enabled = req
             .headers
             .get("x-amz-bucket-object-lock-enabled")

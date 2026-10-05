@@ -210,7 +210,7 @@ impl IamService {
                 format!("User {user_name} already exists"),
             ));
         }
-        crate::quota::check(crate::quota::IamQuota::Users, limit, state.users.len() + 1)?;
+        crate::quota::check_new(state, crate::quota::IamQuota::Users, limit)?;
         let user = IamUser {
             user_id: format!("AIDA{}", generate_id()),
             arn: format!(
@@ -1633,10 +1633,11 @@ impl IamService {
 
         let arns = state.user_policies.entry(user_name).or_default();
         if !arns.contains(&policy_arn) {
-            crate::quota::check(
+            crate::quota::check_attachments(
                 crate::quota::IamQuota::ManagedPoliciesPerUser,
                 limit,
-                arns.len() + 1,
+                arns,
+                std::slice::from_ref(&policy_arn),
             )?;
             arns.push(policy_arn.clone());
             if let Some(p) = state.policies.get_mut(&policy_arn) {

@@ -599,10 +599,7 @@ impl KmsService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        crate::quota::check_new_key(
-            key_limit,
-            crate::quota::customer_keys_in(state, &req.region),
-        )?;
+        crate::quota::check_new_key(state, &req.region, key_limit)?;
 
         let key_id = if input.multi_region {
             format!("mrk-{}", Uuid::new_v4().as_simple())
@@ -1478,10 +1475,7 @@ impl KmsService {
 
         // The replica is a customer managed key of its own Region.
         if !state.keys.contains_key(&replica_storage_key) {
-            crate::quota::check_new_key(
-                replica_limit,
-                crate::quota::customer_keys_in(state, &replica_region),
-            )?;
+            crate::quota::check_new_key(state, &replica_region, replica_limit)?;
         }
         state.keys.insert(replica_storage_key, replica_key);
 

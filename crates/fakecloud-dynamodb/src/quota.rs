@@ -12,7 +12,9 @@ use fakecloud_core::quota::{QuotaProvider, QuotaUsageSource};
 use fakecloud_core::service::AwsServiceError;
 use http::StatusCode;
 
-use crate::state::SharedDynamoDbState;
+use fakecloud_core::multi_account::MultiRegionState;
+
+use crate::state::{DynamoDbState, SharedDynamoDbState};
 
 /// Service code of the DynamoDB quotas.
 pub const SERVICE_CODE: &str = "dynamodb";
@@ -26,9 +28,7 @@ pub fn enforced_table_limit(
     account_id: &str,
     region: &str,
 ) -> Option<usize> {
-    provider
-        .and_then(|p| p.enforced_limit(account_id, region, SERVICE_CODE, TABLES))
-        .map(|v| v.max(0.0) as usize)
+    fakecloud_core::quota::enforced_count(provider, account_id, region, SERVICE_CODE, TABLES)
 }
 
 /// `LimitExceededException` for a table create past `limit`, with the
@@ -41,13 +41,42 @@ pub fn table_limit_exceeded(limit: usize) -> AwsServiceError {
     )
 }
 
-/// Refuse a new table in a region that already holds `existing` tables when
-/// that reaches the enforced `limit`. A `None` limit accepts anything.
-pub fn check_new_table(limit: Option<usize>, existing: usize) -> Result<(), AwsServiceError> {
-    match limit {
-        Some(limit) if existing >= limit => Err(table_limit_exceeded(limit)),
-        _ => Ok(()),
+/// Refuse a new table in the region `state` holds when it already has as many
+/// tables as the enforced `limit`. Every path that creates a table (the API
+/// creates and restores, imports, CloudFormation) goes through here. A `None`
+/// limit accepts anything.
+pub fn check_new_table(state: &DynamoDbState, limit: Option<usize>) -> Result<(), AwsServiceError> {
+    check_room(limit, state.tables.len())
+}
+
+fn check_room(limit: Option<usize>, existing: usize) -> Result<(), AwsServiceError> {
+    if fakecloud_core::quota::has_room(limit, existing) {
+        return Ok(());
     }
+    Err(table_limit_exceeded(limit.unwrap_or_default()))
+}
+
+/// Refuse new replicas of the table named `table_name` that would take a
+/// region past its enforced table limit. `limits` holds each target region
+/// with its limit, resolved before the DynamoDB lock; a region that already
+/// holds a table of that name gets no new table there. `table_name` is `None`
+/// for a table whose name is not decided yet, which no region holds. Used by
+/// `UpdateTable` `ReplicaUpdates` and CloudFormation global tables alike.
+pub fn check_new_replicas(
+    accounts: &MultiRegionState<DynamoDbState>,
+    account_id: &str,
+    table_name: Option<&str>,
+    limits: &[(String, Option<usize>)],
+) -> Result<(), AwsServiceError> {
+    for (region, limit) in limits {
+        let state = accounts.regional(account_id, region);
+        let holds_table =
+            table_name.is_some_and(|name| state.is_some_and(|s| s.tables.contains_key(name)));
+        if !holds_table {
+            check_room(*limit, state.map_or(0, |s| s.tables.len()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Counts the tables behind the table quota, so Service Quotas utilization

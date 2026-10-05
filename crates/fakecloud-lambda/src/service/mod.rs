@@ -1053,6 +1053,35 @@ impl Drop for ConcurrencyGuard {
 /// the `effective_description` (caller-supplied override wins over
 /// the live `$LATEST` description, matching real PublishVersion
 /// semantics).
+/// Whether publishing `func` (the `$LATEST` record of `function_name`) would
+/// store a new version: false when the latest published version already has
+/// the same code and configuration, in which case `PublishVersion` returns
+/// that version instead. `description_override` is the request's
+/// `Description`.
+pub(crate) fn publish_creates_version(
+    state: &LambdaState,
+    function_name: &str,
+    func: &LambdaFunction,
+    description_override: Option<&str>,
+) -> bool {
+    let Some(latest) = state
+        .function_versions
+        .get(function_name)
+        .and_then(|versions| versions.iter().filter_map(|v| v.parse::<u64>().ok()).max())
+    else {
+        return true;
+    };
+    let Some(prev_snap) = state
+        .function_version_snapshots
+        .get(function_name)
+        .and_then(|m| m.get(&latest.to_string()))
+    else {
+        return true;
+    };
+    let effective_desc = description_override.unwrap_or(&func.description);
+    !function_config_unchanged_for_publish(prev_snap, func, effective_desc)
+}
+
 fn function_config_unchanged_for_publish(
     prev: &LambdaFunction,
     live: &LambdaFunction,

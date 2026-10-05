@@ -159,7 +159,7 @@ persist across restarts in persistent mode.
 | Role trust policy length (`iam`/`L-C07B4B0D`) | `CreateRole`, `UpdateAssumeRolePolicy` (`LimitExceeded`, `ACLSizePerRole`); characters of the trust policy, not counting white space |
 | Maximum number of tables (`dynamodb`/`L-F98FE922`) | `CreateTable`, `RestoreTableFromBackup`, `RestoreTableToPointInTime`, `ImportTable`, and `UpdateTable` adding a replica (counted in the replica's region) (`LimitExceededException`) |
 | Customer Master Keys (`kms`/`L-C2F1777E`) | `CreateKey`, `ReplicateKey` (counted in the replica's region) (`LimitExceededException`); customer managed keys in any key state count, including pending deletion, AWS managed keys do not |
-| General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); per account across all regions, with the applied value read from `us-east-1` (`us-gov-west-1` in GovCloud), where S3 manages it |
+| General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); per account across all regions, with the applied value read from the partition's primary region, where S3 manages it (`us-east-1`; `us-gov-west-1` in GovCloud, `cn-north-1` in China) |
 | Function and layer storage (`lambda`/`L-2ACBD22F`) | `CreateFunction`, `UpdateFunctionCode`, `PublishVersion`, `PublishLayerVersion` (`CodeStorageExceededException`); the code of every function's `$LATEST`, published version and layer version counts, container images do not |
 
 IAM refusals are HTTP 409 with IAM's `Cannot exceed quota for <Name>: <limit>`

@@ -62,7 +62,7 @@ impl ResourceProvisioner {
             return Err(resource_already_exists("AWS::S3::Bucket", bucket_name));
         }
         let state = __s3_mas.get_or_create(&self.account_id);
-        fakecloud_s3::quota::check_new_bucket(bucket_limit, state.buckets.len())
+        fakecloud_s3::quota::check_new_bucket(state, bucket_limit)
             .map_err(|e| super::quota::refusal("S3", e))?;
         let region = self.region.clone();
         let mut bucket = S3Bucket::new(bucket_name, &self.region, &state.account_id);

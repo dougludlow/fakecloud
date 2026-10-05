@@ -114,12 +114,7 @@ impl LambdaService {
             last_update_status_reason: None,
             last_update_status_reason_code: None,
         };
-        let storage_before = crate::quota::code_storage_used(state);
-        crate::quota::check_storage(
-            storage_limit,
-            storage_before,
-            storage_before + crate::quota::stored_code_size(&func),
-        )?;
+        crate::quota::check_new_code(state, storage_limit, crate::quota::stored_code_size(&func))?;
 
         let response = self.function_config_json(&func);
 

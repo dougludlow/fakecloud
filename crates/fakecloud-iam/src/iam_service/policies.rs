@@ -62,10 +62,10 @@ impl IamService {
                 ),
             ));
         }
-        crate::quota::check(
+        crate::quota::check_new(
+            state,
             crate::quota::IamQuota::CustomerManagedPolicies,
             limit,
-            state.policies.len() + 1,
         )?;
 
         let now = Utc::now();

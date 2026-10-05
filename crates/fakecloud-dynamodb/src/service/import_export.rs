@@ -1483,7 +1483,7 @@ impl DynamoDbService {
             if state.tables.contains_key(&table_name) {
                 return Err(already_exists());
             }
-            crate::quota::check_new_table(table_limit, state.tables.len())?;
+            crate::quota::check_new_table(state, table_limit)?;
             state.tables.insert(table_name, table);
             state.imports.insert(import_arn, imp);
         }

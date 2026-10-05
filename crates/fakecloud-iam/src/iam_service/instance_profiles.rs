@@ -38,11 +38,7 @@ impl IamService {
                 format!("Instance Profile {name} already exists."),
             ));
         }
-        crate::quota::check(
-            crate::quota::IamQuota::InstanceProfiles,
-            limit,
-            state.instance_profiles.len() + 1,
-        )?;
+        crate::quota::check_new(state, crate::quota::IamQuota::InstanceProfiles, limit)?;
 
         let partition = partition_for_region(&req.region);
         let arn = format!(

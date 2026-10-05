@@ -200,7 +200,7 @@ impl DynamoDbService {
         if state.tables.contains_key(&table_name) {
             return Err(already_exists());
         }
-        crate::quota::check_new_table(table_limit, state.tables.len())?;
+        crate::quota::check_new_table(state, table_limit)?;
 
         let now = Utc::now();
         let stream_arn = if stream_enabled {
@@ -503,12 +503,12 @@ impl DynamoDbService {
             .regional(&req.account_id, &req.region)
             .is_some_and(|s| s.tables.contains_key(super::resolve_table_name(table_name)))
         {
-            for (region, limit) in &replica_limits {
-                let existing = accounts
-                    .regional(&req.account_id, region)
-                    .map_or(0, |s| s.tables.len());
-                crate::quota::check_new_table(*limit, existing)?;
-            }
+            crate::quota::check_new_replicas(
+                &accounts,
+                &req.account_id,
+                Some(super::resolve_table_name(table_name)),
+                &replica_limits,
+            )?;
         }
         let state = accounts.regional_mut(&req.account_id, &req.region);
         // Snapshot region + account before taking a mutable borrow of
@@ -1348,7 +1348,7 @@ impl DynamoDbService {
                 format!("Table already exists: {target_table_name}"),
             ));
         }
-        crate::quota::check_new_table(table_limit, state.tables.len())?;
+        crate::quota::check_new_table(state, table_limit)?;
 
         let now = Utc::now();
         let arn =
@@ -1469,7 +1469,7 @@ impl DynamoDbService {
                 format!("Table already exists: {target_table_name}"),
             ));
         }
-        crate::quota::check_new_table(table_limit, state.tables.len())?;
+        crate::quota::check_new_table(state, table_limit)?;
 
         let now = Utc::now();
         let arn =

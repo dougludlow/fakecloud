@@ -37,11 +37,7 @@ impl IamService {
                 format!("Group {group_name} already exists"),
             ));
         }
-        crate::quota::check(
-            crate::quota::IamQuota::Groups,
-            limit,
-            state.groups.len() + 1,
-        )?;
+        crate::quota::check_new(state, crate::quota::IamQuota::Groups, limit)?;
 
         let group = IamGroup {
             group_id: format!("AGPA{}", generate_id()),
@@ -688,10 +684,11 @@ impl IamService {
             .get_mut(&group_name)
             .expect("group presence checked above");
         if !group.attached_policies.contains(&policy_arn) {
-            crate::quota::check(
+            crate::quota::check_attachments(
                 crate::quota::IamQuota::ManagedPoliciesPerGroup,
                 limit,
-                group.attached_policies.len() + 1,
+                &group.attached_policies,
+                std::slice::from_ref(&policy_arn),
             )?;
             group.attached_policies.push(policy_arn.clone());
             if let Some(p) = state.policies.get_mut(&policy_arn) {

@@ -97,12 +97,7 @@ impl LambdaService {
         let next_str = next.to_string();
 
         // The new version stores its own copy of the code.
-        let storage_before = crate::quota::code_storage_used(state);
-        crate::quota::check_storage(
-            storage_limit,
-            storage_before,
-            storage_before + crate::quota::stored_code_size(func),
-        )?;
+        crate::quota::check_new_code(state, storage_limit, crate::quota::stored_code_size(func))?;
 
         // Snapshot the function config + code for the new immutable version.
         let mut snapshot = func.clone();

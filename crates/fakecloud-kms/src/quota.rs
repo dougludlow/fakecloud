@@ -29,9 +29,7 @@ pub fn enforced_key_limit(
     account_id: &str,
     region: &str,
 ) -> Option<usize> {
-    provider
-        .and_then(|p| p.enforced_limit(account_id, region, SERVICE_CODE, CUSTOMER_KEYS))
-        .map(|v| v.max(0.0) as usize)
+    fakecloud_core::quota::enforced_count(provider, account_id, region, SERVICE_CODE, CUSTOMER_KEYS)
 }
 
 /// Customer managed keys of `state` that live in `region`, in any key state.
@@ -44,21 +42,29 @@ pub fn customer_keys_in(state: &KmsState, region: &str) -> usize {
         .count()
 }
 
-/// Refuse one more customer managed key in a Region that already holds
-/// `existing` when that reaches the enforced `limit`. A `None` limit accepts
-/// anything.
-pub fn check_new_key(limit: Option<usize>, existing: usize) -> Result<(), AwsServiceError> {
-    match limit {
-        Some(limit) if existing >= limit => Err(AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "LimitExceededException",
-            format!(
-                "The request was rejected because the quota of {limit} customer managed KMS \
-                 keys in this Region was exceeded."
-            ),
-        )),
-        _ => Ok(()),
+/// Refuse one more customer managed key in `region` when `state` already
+/// holds as many there as the enforced `limit`. `CreateKey`, `ReplicateKey`
+/// and the CloudFormation key provisioners all go through here; a `None`
+/// limit accepts anything without counting.
+pub fn check_new_key(
+    state: &KmsState,
+    region: &str,
+    limit: Option<usize>,
+) -> Result<(), AwsServiceError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    if fakecloud_core::quota::has_room(Some(limit), customer_keys_in(state, region)) {
+        return Ok(());
     }
+    Err(AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "LimitExceededException",
+        format!(
+            "The request was rejected because the quota of {limit} customer managed KMS keys \
+             in this Region was exceeded."
+        ),
+    ))
 }
 
 /// Counts customer managed keys per Region, so Service Quotas utilization
