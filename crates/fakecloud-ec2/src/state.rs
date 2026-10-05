@@ -756,10 +756,6 @@ pub struct VpcPeering {
     /// Accepter-side DNS-resolution-from-remote-VPC option.
     #[serde(default)]
     pub accepter_allow_dns: bool,
-    /// `PeerOwnerId`: the account owning the accepter VPC, when it is not
-    /// the requester's (the account holding the connection).
-    #[serde(default)]
-    pub accepter_owner_id: Option<String>,
 }
 
 /// A VPC endpoint.

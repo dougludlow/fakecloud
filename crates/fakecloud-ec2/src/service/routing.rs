@@ -292,37 +292,26 @@ pub(crate) fn describe_route_tables(
     ))
 }
 
-/// The destination a route request names, as `(query parameter, value)`:
-/// the IPv4 CIDR, the IPv6 CIDR or the prefix list.
-fn route_destination(route: &Route) -> Option<(&'static str, &str)> {
-    route
-        .destination_cidr_block
-        .as_deref()
-        .map(|d| ("DestinationCidrBlock", d))
-        .or_else(|| {
-            route
-                .destination_ipv6_cidr_block
-                .as_deref()
-                .map(|d| ("DestinationIpv6CidrBlock", d))
-        })
-        .or_else(|| {
-            route
-                .destination_prefix_list_id
-                .as_deref()
-                .map(|d| ("DestinationPrefixListId", d))
-        })
+/// Whether two routes have the same destination: IPv4 CIDR, IPv6 CIDR and
+/// prefix list compared directly.
+fn same_destination(a: &Route, b: &Route) -> bool {
+    a.destination_cidr_block == b.destination_cidr_block
+        && a.destination_ipv6_cidr_block == b.destination_ipv6_cidr_block
+        && a.destination_prefix_list_id == b.destination_prefix_list_id
 }
 
-/// Whether `existing` has the destination `route` names.
-fn same_destination(existing: &Route, route: &Route) -> bool {
-    match route_destination(route) {
-        Some(("DestinationCidrBlock", d)) => existing.destination_cidr_block.as_deref() == Some(d),
-        Some(("DestinationIpv6CidrBlock", d)) => {
-            existing.destination_ipv6_cidr_block.as_deref() == Some(d)
-        }
-        Some((_, d)) => existing.destination_prefix_list_id.as_deref() == Some(d),
-        None => false,
-    }
+/// The destination a route names, for messages.
+fn destination_of(r: &Route) -> &str {
+    r.destination_cidr_block
+        .as_deref()
+        .or(r.destination_ipv6_cidr_block.as_deref())
+        .or(r.destination_prefix_list_id.as_deref())
+        .unwrap_or_default()
+}
+
+/// Whether a route is the table's `local` route.
+fn is_local(r: &Route) -> bool {
+    r.gateway_id.as_deref() == Some("local") || r.origin == "CreateRouteTable"
 }
 
 fn route_mutate(
@@ -341,15 +330,27 @@ fn route_mutate(
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let route = parse_route(&req.query_params);
-        if limit.is_some() {
+        let mut route = parse_route(&req.query_params);
+        if !replace {
             if let Some(rt) = state.route_tables.get(&rt_id) {
-                let prefix_lists = &state.managed_prefix_lists;
-                rq::check_routes(
-                    limit,
-                    rq::route_counts(rt, prefix_lists, &req.region),
-                    rq::route_weight(&route, prefix_lists, &req.region),
-                )?;
+                if rt.routes.iter().any(|r| same_destination(r, &route)) {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "RouteAlreadyExists",
+                        format!(
+                            "The route identified by {} already exists.",
+                            destination_of(&route)
+                        ),
+                    ));
+                }
+                if limit.is_some() {
+                    let prefix_lists = &state.managed_prefix_lists;
+                    rq::check_routes(
+                        limit,
+                        rq::route_counts(rt, prefix_lists, &req.region),
+                        rq::route_weight(&route, prefix_lists, &req.region),
+                    )?;
+                }
             }
         }
         if let Some(rt) = state.route_tables.get_mut(&rt_id) {
@@ -357,15 +358,22 @@ fn route_mutate(
                 // AWS replaces the route with the destination the request
                 // names, whichever kind it is, and refuses when there is none.
                 match rt.routes.iter_mut().find(|r| same_destination(r, &route)) {
-                    Some(existing) => *existing = route,
+                    Some(existing) => {
+                        // A replaced local route (retargeted to an appliance,
+                        // say) is still the table's local route.
+                        if is_local(existing) {
+                            route.origin = "CreateRouteTable".to_string();
+                        }
+                        *existing = route;
+                    }
                     None => {
-                        let dest = route_destination(&route).map_or("", |(_, d)| d);
                         return Err(AwsServiceError::aws_error(
                             http::StatusCode::BAD_REQUEST,
                             "InvalidParameterValue",
                             format!(
-                                "There is no route defined for '{dest}' in the route table. \
-                                 Use CreateRoute instead."
+                                "There is no route defined for '{}' in the route table. \
+                                 Use CreateRoute instead.",
+                                destination_of(&route)
                             ),
                         ));
                     }

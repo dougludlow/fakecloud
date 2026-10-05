@@ -146,7 +146,7 @@ persist across restarts in persistent mode.
 |---|---|
 | Security groups per network interface (`vpc`/`L-2AFB9258`) | `CreateNetworkInterface`, `ModifyNetworkInterfaceAttribute` (`SecurityGroupsPerInterfaceLimitExceeded`); `RunInstances`, `ModifyInstanceAttribute`, Auto Scaling and CloudFormation launches (`SecurityGroupsPerInstanceLimitExceeded`) |
 | Inbound or outbound rules per security group (`vpc`/`L-0EA8095F`) | `AuthorizeSecurityGroupIngress`, `AuthorizeSecurityGroupEgress`, `ModifySecurityGroupRules`, `ModifyManagedPrefixList`, CloudFormation security groups (`RulesPerSecurityGroupLimitExceeded`) |
-| VPCs per Region (`vpc`/`L-F678F1CE`) | `CreateVpc`, `CreateDefaultVpc` when it re-creates a deleted default VPC (`VpcLimitExceeded`). `CreateVpc` also checks the quotas of the default security group, network ACL and main route table it creates, before creating anything |
+| VPCs per Region (`vpc`/`L-F678F1CE`) | `CreateVpc`, `CreateDefaultVpc` when it re-creates a deleted default VPC (`VpcLimitExceeded`) |
 | Internet gateways per Region (`vpc`/`L-A4707A72`) | `CreateInternetGateway` (`InternetGatewayLimitExceeded`) |
 | Subnets per VPC (`vpc`/`L-407747CB`) | `CreateSubnet`, `CreateDefaultSubnet` when it creates one (`SubnetLimitExceeded`) |
 | VPC security groups per Region (`vpc`/`L-E79EC296`) | `CreateSecurityGroup` (`SecurityGroupLimitExceeded`) |
@@ -157,7 +157,7 @@ persist across restarts in persistent mode.
 | NAT gateways per Availability Zone (`vpc`/`L-FE5A380F`) | `CreateNatGateway` (`NatGatewayLimitExceeded`) |
 | Network interfaces per Region (`vpc`/`L-DF5E4CA3`) | `CreateNetworkInterface`, the secondary interfaces `RunInstances` creates (`NetworkInterfaceLimitExceeded`) |
 | IPv4 CIDR blocks per VPC (`vpc`/`L-83CA0A9D`) | `AssociateVpcCidrBlock` (`CidrLimitExceeded`) |
-| Active VPC peering connections per VPC (`vpc`/`L-7E9ECCDB`) | `AcceptVpcPeeringConnection`, each VPC against its owner account's limit (`ActiveVpcPeeringConnectionPerVpcLimitExceeded`) |
+| Active VPC peering connections per VPC (`vpc`/`L-7E9ECCDB`) | `AcceptVpcPeeringConnection`, for both of the connection's VPCs (`ActiveVpcPeeringConnectionPerVpcLimitExceeded`) |
 | Outstanding VPC peering connection requests (`vpc`/`L-DC9F7029`) | `CreateVpcPeeringConnection` (`OutstandingVpcPeeringConnectionLimitExceeded`) |
 | Gateway VPC endpoints per Region (`vpc`/`L-1B52E74A`), Interface VPC endpoints per VPC (`vpc`/`L-29B6F2EB`) | `CreateVpcEndpoint` (`VpcEndpointLimitExceeded`) |
 | EC2-VPC Elastic IPs (`ec2`/`L-0263D0A3`) | `AllocateAddress` (`AddressLimitExceeded`) |
@@ -181,7 +181,9 @@ Each count follows the AWS quota's scope and rules:
 
 - The VPC, security group and network ACL counts include the defaults every
   account and VPC ships with: the default VPC, each VPC's default security
-  group and default network ACL, and its main route table.
+  group and default network ACL, and its main route table. A new VPC's
+  default security group counts toward VPC security groups per Region usage,
+  but `CreateVpc` itself is only held to VPCs per Region.
 - Routes per route table is enforced separately for IPv4 and IPv6 routes.
   It covers non-propagated routes (fakecloud does not propagate routes into VPC
   route tables); the table's implicit `local` route is not counted, and a route
@@ -276,9 +278,9 @@ AWS limits.
   target's, for example) count toward the quota but those services do not
   refuse a create past it.
 - vCPU counts come from a table of the instance types EC2 offered when it was
-  generated. While a vCPU quota is enforced, launching (or starting, or
-  requesting as Spot) an instance type missing from the table, such as one
-  newer than the table, is refused with `InvalidParameterValue`; while it is
-  not enforced, such a type is accepted and counts 0 vCPUs. The Trn, DL, HPC
+  generated. While a vCPU quota is enforced, launching or requesting as Spot
+  an instance type missing from the table, such as one newer than the table,
+  is refused with `InvalidParameterValue`; while it is not enforced, such a
+  type is accepted and counts 0 vCPUs, also when it is started later. The Trn, DL, HPC
   and Mac families have quotas outside the catalog.
 - The catalog covers the services above, not every AWS service.

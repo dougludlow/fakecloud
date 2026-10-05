@@ -1739,8 +1739,7 @@ async fn change_state(
                 .map(|state| {
                     ids.iter()
                         .filter_map(|id| state.instances.get(id))
-                        .filter(|i| !rq::occupies_vcpus(i))
-                        .filter_map(rq::instance_vcpu_quota)
+                        .filter_map(rq::starting_vcpu_quota)
                         .map(|q| q.code)
                         .collect()
                 })
@@ -1787,21 +1786,16 @@ async fn change_state(
         // The instances this start brings up must fit their vCPU quotas
         // together with every instance already running.
         if !vcpu_limits.is_empty() {
+            // StartInstances names no instance type, so a stored type with no
+            // vCPU data counts 0 rather than being refused.
             let mut adding: BTreeMap<&str, usize> = BTreeMap::new();
             let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
             for inst in unique.into_iter().filter_map(|id| state.instances.get(id)) {
-                let Some(quota) =
-                    rq::instance_vcpu_quota(inst).filter(|_| !rq::occupies_vcpus(inst))
-                else {
-                    continue;
-                };
-                let limit = vcpu_limits
-                    .iter()
-                    .find(|(q, _)| *q == quota)
-                    .and_then(|(_, l)| *l);
-                let vcpus = rq::launch_vcpus(&inst.instance_type, limit)?;
-                let total = adding.entry(quota.code).or_insert(0);
-                *total = total.saturating_add(vcpus);
+                if let Some(quota) = rq::starting_vcpu_quota(inst) {
+                    let vcpus = rq::vcpus_of(&inst.instance_type).unwrap_or(0);
+                    let total = adding.entry(quota.code).or_insert(0);
+                    *total = total.saturating_add(vcpus);
+                }
             }
             for (quota, limit) in &vcpu_limits {
                 let starting = adding.get(quota.code).copied().unwrap_or(0);

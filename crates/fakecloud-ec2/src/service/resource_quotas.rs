@@ -18,12 +18,7 @@ use fakecloud_core::quota::VPC_SERVICE_CODE as VPC;
 use fakecloud_core::service::AwsServiceError;
 
 use crate::service::Ec2Service;
-use crate::state::{
-    Ec2State, Instance, ManagedPrefixList, NetworkAcl, Route, RouteTable, Vpc, VpcPeering,
-};
-
-/// Every account's EC2 state.
-pub(crate) type Accounts = fakecloud_core::multi_account::MultiAccountState<Ec2State>;
+use crate::state::{Ec2State, Instance, ManagedPrefixList, NetworkAcl, Route, RouteTable, Vpc};
 
 /// A quota by service code and quota code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,7 +223,9 @@ pub(crate) fn route_weight(
     prefix_lists: &BTreeMap<String, ManagedPrefixList>,
     region: &str,
 ) -> [usize; 2] {
-    if r.gateway_id.as_deref() == Some("local") {
+    // The local route, also once ReplaceRoute retargeted it (it keeps the
+    // `CreateRouteTable` origin).
+    if r.gateway_id.as_deref() == Some("local") || r.origin == "CreateRouteTable" {
         return [0, 0];
     }
     if let Some(id) = &r.destination_prefix_list_id {
@@ -352,25 +349,25 @@ pub(crate) fn ipv4_cidr_blocks(vpc: &Vpc) -> usize {
         .count()
 }
 
-/// The account that owns a peering connection's accepter VPC. `stored_in`
-/// is the requester's account, which holds the connection.
-pub(crate) fn accepter_owner<'a>(p: &'a VpcPeering, stored_in: &'a str) -> &'a str {
-    p.accepter_owner_id.as_deref().unwrap_or(stored_in)
+/// Active peering connections per VPC, either side counting. A connection
+/// of a VPC with itself counts once.
+pub(crate) fn active_peerings_by_vpc(state: &Ec2State) -> BTreeMap<&str, usize> {
+    let mut out = BTreeMap::new();
+    for p in state.vpc_peerings.values().filter(|p| p.status == "active") {
+        *out.entry(p.requester_vpc_id.as_str()).or_insert(0) += 1;
+        if p.accepter_vpc_id != p.requester_vpc_id {
+            *out.entry(p.accepter_vpc_id.as_str()).or_insert(0) += 1;
+        }
+    }
+    out
 }
 
-/// Active peering connections of `owner`'s VPC `vpc_id`, on either side. A
-/// connection is held by the requester's account, so a cross-account one is
-/// found in the other account's state.
-pub(crate) fn active_peerings_of(accounts: &Accounts, owner: &str, vpc_id: &str) -> usize {
-    accounts
-        .iter()
-        .flat_map(|(acct, st)| st.vpc_peerings.values().map(move |p| (acct, p)))
-        .filter(|(_, p)| p.status == "active")
-        .filter(|(acct, p)| {
-            (*acct == owner && p.requester_vpc_id == vpc_id)
-                || (accepter_owner(p, acct) == owner && p.accepter_vpc_id == vpc_id)
-        })
-        .count()
+/// Active peering connections with `vpc_id` on either side.
+pub(crate) fn active_peerings_of(state: &Ec2State, vpc_id: &str) -> usize {
+    active_peerings_by_vpc(state)
+        .get(vpc_id)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Peering connection requests this account made that still await
@@ -498,6 +495,19 @@ pub(crate) fn occupies_vcpus(i: &Instance) -> bool {
     matches!(i.state_code, 0 | 16) && i.placement_tenancy.as_deref() != Some("host")
 }
 
+/// The vCPU quota a start of `i` adds vCPUs to: only a stopped instance
+/// that does not sit on a Dedicated Host. One already pending or running
+/// holds its vCPUs already.
+pub(crate) fn starting_vcpu_quota(i: &Instance) -> Option<CountQuota> {
+    let stopped = !matches!(i.state_code, 0 | 16);
+    let on_host = i.placement_tenancy.as_deref() == Some("host");
+    if stopped && !on_host {
+        instance_vcpu_quota(i)
+    } else {
+        None
+    }
+}
+
 /// The vCPU quota an instance counts toward.
 pub(crate) fn instance_vcpu_quota(i: &Instance) -> Option<CountQuota> {
     vcpu_quota(
@@ -563,15 +573,7 @@ pub(crate) fn check_vcpus(
 /// Usage of a count-based quota, `None` for a quota not counted here.
 /// "Network interfaces per Region" reports its busiest Availability Zone,
 /// the scope AWS enforces it in.
-///
-/// `state` is `account_id`'s state (its default network when EC2 has not
-/// stored the account yet); `accounts` resolves cross-account peering.
-pub(crate) fn usage(
-    accounts: &Accounts,
-    account_id: &str,
-    state: &Ec2State,
-    quota: CountQuota,
-) -> Option<usize> {
+pub(crate) fn usage(state: &Ec2State, quota: CountQuota) -> Option<usize> {
     let region = state.region.as_str();
     let per_vpc = |count: &dyn Fn(&str) -> usize| busiest(state.vpcs.keys().map(|v| count(v)));
     let n = match quota {
@@ -582,7 +584,7 @@ pub(crate) fn usage(
         ROUTE_TABLES_PER_VPC => per_vpc(&|v| route_tables_in_vpc(state, v)),
         NETWORK_ACLS_PER_VPC => per_vpc(&|v| network_acls_in_vpc(state, v)),
         INTERFACE_ENDPOINTS_PER_VPC => per_vpc(&|v| interface_endpoints_in_vpc(state, v)),
-        ACTIVE_PEERINGS_PER_VPC => per_vpc(&|v| active_peerings_of(accounts, account_id, v)),
+        ACTIVE_PEERINGS_PER_VPC => busiest(active_peerings_by_vpc(state).into_values()),
         IPV6_CIDR_BLOCKS_PER_VPC => busiest(
             state
                 .vpcs

@@ -151,11 +151,14 @@ pub(crate) fn create_vpc(
     }
 
     let owner = req.account_id.clone();
-    let limits = NewVpcLimits::resolve(svc, &req.account_id, &req.region);
+    // Only "VPCs per Region" holds CreateVpc back; the default security
+    // group, network ACL and main route table it provisions count toward
+    // their quotas' usage without refusing the VPC.
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::VPCS_PER_REGION);
     let body = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        limits.check(state)?;
+        check_vpc_count(state, limit)?;
         crate::service::tags::apply_tag_specifications(state, &req.query_params, &vpc_id, "vpc");
         let tags = state.tags_for(&vpc_id).to_vec();
         state.vpcs.insert(vpc_id.clone(), vpc.clone());
@@ -209,49 +212,6 @@ fn check_vpc_count(state: &Ec2State, limit: Option<usize>) -> Result<(), AwsServ
     rq::check(limit, rq::vpcs(state), 1, "VpcLimitExceeded", |_| {
         "The maximum number of VPCs has been reached.".to_string()
     })
-}
-
-/// The enforced limits of the quotas a new VPC counts toward: the VPC
-/// itself, and the default security group, default network ACL and main
-/// route table AWS provisions with it.
-struct NewVpcLimits {
-    vpcs: Option<usize>,
-    security_groups: Option<usize>,
-    network_acls: Option<usize>,
-    route_tables: Option<usize>,
-}
-
-impl NewVpcLimits {
-    /// Resolved before the EC2 state lock.
-    fn resolve(svc: &Ec2Service, account_id: &str, region: &str) -> Self {
-        let limit = |q| svc.enforced_count_quota(account_id, region, q);
-        Self {
-            vpcs: limit(rq::VPCS_PER_REGION),
-            security_groups: limit(rq::SECURITY_GROUPS_PER_REGION),
-            network_acls: limit(rq::NETWORK_ACLS_PER_VPC),
-            route_tables: limit(rq::ROUTE_TABLES_PER_VPC),
-        }
-    }
-
-    /// Refuse the VPC, before anything is created, when it or one of its
-    /// default resources would go past its quota. The per-VPC quotas start
-    /// from an empty VPC, so they only refuse at a limit of 0.
-    fn check(&self, state: &Ec2State) -> Result<(), AwsServiceError> {
-        check_vpc_count(state, self.vpcs)?;
-        rq::check(
-            self.security_groups,
-            rq::security_groups(state),
-            1,
-            "SecurityGroupLimitExceeded",
-            |_| "The maximum number of security groups has been reached.".to_string(),
-        )?;
-        rq::check(self.network_acls, 0, 1, "NetworkAclLimitExceeded", |_| {
-            "The maximum number of network ACLs has been reached.".to_string()
-        })?;
-        rq::check(self.route_tables, 0, 1, "RouteTableLimitExceeded", |_| {
-            "The maximum number of route tables has been reached.".to_string()
-        })
-    }
 }
 
 fn build_vpc(cidr: String, tenancy: String, is_default: bool) -> Vpc {
