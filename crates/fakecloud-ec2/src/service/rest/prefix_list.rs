@@ -155,9 +155,9 @@ pub(crate) fn describe_managed_prefix_lists(
     let owner = req.account_id.clone();
     let region = region_of(req);
     let filters = parse_filters(&req.query_params);
-    // `prefix-list-id`, `prefix-list-name`, `owner-id`, `tag:<key>` and
-    // `tag-key` select lists; a filter on another name matches nothing, as no
-    // list carries it.
+    // `prefix-list-id`, `prefix-list-name`, `owner-id`, `tag:<key>`,
+    // `tag-key` and `tag-value` select lists. An unknown filter name matches
+    // nothing, as in the other EC2 describes.
     let selected = |id: &str, name: &str, owner_id: &str, tags: &[Tag]| {
         (wanted.is_empty() || wanted.iter().any(|w| w == id))
             && filters.iter().all(|f| {
@@ -166,6 +166,7 @@ pub(crate) fn describe_managed_prefix_lists(
                     "prefix-list-name" => vec![name],
                     "owner-id" => vec![owner_id],
                     "tag-key" => tags.iter().map(|t| t.key.as_str()).collect(),
+                    "tag-value" => tags.iter().map(|t| t.value.as_str()).collect(),
                     other => match other.strip_prefix("tag:") {
                         Some(key) => tags
                             .iter()
@@ -247,7 +248,7 @@ pub(crate) fn describe_prefix_lists(
 ) -> Result<AwsResponse, AwsServiceError> {
     let region = region_of(req);
     let wanted = indexed_list(&req.query_params, "PrefixListId");
-    // The gateway-endpoint AWS-managed lists (representative CIDR sets).
+    // The gateway-endpoint AWS-managed lists, with their published ranges.
     let mut items: Vec<String> = Vec::new();
     for list in GATEWAY_ENDPOINT_SERVICES
         .iter()
@@ -255,8 +256,11 @@ pub(crate) fn describe_prefix_lists(
     {
         let id = list.id_in(&region);
         if wanted.is_empty() || wanted.contains(&id) {
-            let cidrs: Vec<String> = list.cidrs.iter().map(|c| c.to_string()).collect();
-            items.push(legacy_pl_xml(&id, &list.name_in(&region), &cidrs));
+            items.push(legacy_pl_xml(
+                &id,
+                &list.name_in(&region),
+                &list.cidrs_in(&region),
+            ));
         }
     }
     // Customer-managed prefix lists also appear here, with their entry CIDRs.
@@ -306,14 +310,16 @@ pub(crate) fn get_managed_prefix_list_entries(
     let accounts = svc.state.read();
     let empty = Ec2State::new(&req.account_id, &req.region);
     let state = accounts.get(&req.account_id).unwrap_or(&empty);
-    // An AWS-managed list reports the ranges fakecloud holds for it; any
-    // other unknown id an empty entry set (EC2 models no error for this op).
-    let aws_entries: Vec<PrefixListEntry> = aws_prefix_lists::by_id(&region_of(req), &id)
+    // An AWS-managed list reports its published address ranges (from AWS's
+    // ip-ranges.json); any other unknown id an empty entry set (EC2 models no
+    // error for this op).
+    let region = region_of(req);
+    let aws_entries: Vec<PrefixListEntry> = aws_prefix_lists::by_id(&region, &id)
         .map(|l| {
-            l.cidrs
-                .iter()
-                .map(|c| PrefixListEntry {
-                    cidr: c.to_string(),
+            l.cidrs_in(&region)
+                .into_iter()
+                .map(|cidr| PrefixListEntry {
+                    cidr,
                     description: None,
                 })
                 .collect()
@@ -564,6 +570,68 @@ mod tests {
             referenced_user_id: None,
             description: String::new(),
         }
+    }
+
+    fn describe(params: &[(&str, &str)]) -> String {
+        body(
+            describe_managed_prefix_lists(
+                &Ec2Service::new(),
+                &ec2_request("DescribeManagedPrefixLists", params),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn aws_managed_lists_are_described_and_filtered() {
+        let all = describe(&[]);
+        assert!(all.contains("com.amazonaws.global.cloudfront.origin-facing"));
+        assert!(all.contains("<ownerId>AWS</ownerId>"));
+
+        let cf = describe(&[
+            ("Filter.1.Name", "prefix-list-name"),
+            (
+                "Filter.1.Value.1",
+                "com.amazonaws.global.cloudfront.origin-facing",
+            ),
+        ]);
+        assert_eq!(cf.matches("<prefixListId>").count(), 1, "{cf}");
+
+        let wildcard = describe(&[
+            ("Filter.1.Name", "prefix-list-name"),
+            ("Filter.1.Value.1", "*cloudfront*"),
+        ]);
+        assert_eq!(wildcard.matches("<prefixListId>").count(), 2, "{wildcard}");
+
+        // An unknown filter name matches nothing, as in the other describes.
+        let unknown = describe(&[
+            ("Filter.1.Name", "no-such-filter"),
+            ("Filter.1.Value.1", "x"),
+        ]);
+        assert_eq!(unknown.matches("<prefixListId>").count(), 0, "{unknown}");
+    }
+
+    #[test]
+    fn aws_managed_list_entries_are_its_published_ranges() {
+        let svc = Ec2Service::new();
+        let cf = aws_prefix_lists::AWS_MANAGED_PREFIX_LISTS
+            .iter()
+            .find(|l| l.name_in("us-east-1") == "com.amazonaws.global.cloudfront.origin-facing")
+            .unwrap();
+        let id = cf.id_in("us-east-1");
+        let entries = body(
+            get_managed_prefix_list_entries(
+                &svc,
+                &ec2_request(
+                    "GetManagedPrefixListEntries",
+                    &[("PrefixListId", id.as_str())],
+                ),
+            )
+            .unwrap(),
+        );
+        let n = entries.matches("<cidr>").count();
+        assert!(n > 0 && n <= cf.weight, "{entries}");
+        assert_eq!(n, cf.cidrs_in("us-east-1").len());
     }
 
     #[test]

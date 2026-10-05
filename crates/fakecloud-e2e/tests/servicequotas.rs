@@ -476,6 +476,30 @@ async fn aws_managed_prefix_list_rule_counts_its_weight() {
     assert_eq!(cf.owner_id(), Some("AWS"));
     let pl_id = cf.prefix_list_id().unwrap().to_string();
 
+    // The list holds CloudFront's published origin-facing ranges, no more
+    // than its weight.
+    let entries = ec2
+        .get_managed_prefix_list_entries()
+        .prefix_list_id(&pl_id)
+        .send()
+        .await
+        .unwrap();
+    let n = entries.entries().len();
+    assert!(n > 0 && n <= 55, "{n} entries");
+    assert!(entries
+        .entries()
+        .iter()
+        .all(|e| e.cidr().is_some_and(|c| c.contains('.'))));
+
+    // An unknown filter name matches nothing, as in the other EC2 describes.
+    let none = ec2
+        .describe_managed_prefix_lists()
+        .filters(Filter::builder().name("no-such-filter").values("x").build())
+        .send()
+        .await
+        .unwrap();
+    assert!(none.prefix_lists().is_empty());
+
     let vpc = ec2
         .create_vpc()
         .cidr_block("10.0.0.0/16")
