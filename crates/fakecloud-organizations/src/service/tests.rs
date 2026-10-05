@@ -4274,3 +4274,84 @@ async fn an_expiry_noticed_by_a_read_is_persisted() {
         "EXPIRED"
     );
 }
+
+#[tokio::test]
+async fn guardduty_policy_type_is_a_valid_policy_type() {
+    let (svc, _state) = OrganizationsService::shared();
+    let mgmt = "111111111111";
+    svc.handle(req_with(mgmt, "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let roots = body_json(
+        &svc.handle(req_with(mgmt, "ListRoots", json!({})))
+            .await
+            .unwrap(),
+    );
+    let root_id = roots["Roots"][0]["Id"].as_str().unwrap().to_string();
+
+    // ListPolicies accepts the new enum value as a filter.
+    let listed = body_json(
+        &svc.handle(req_with(
+            mgmt,
+            "ListPolicies",
+            json!({"Filter": "GUARDDUTY_POLICY"}),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(listed["Policies"], json!([]));
+
+    // Enabling it on the root round-trips on the response and ListRoots.
+    let enabled = body_json(
+        &svc.handle(req_with(
+            mgmt,
+            "EnablePolicyType",
+            json!({"RootId": root_id, "PolicyType": "GUARDDUTY_POLICY"}),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(enabled["Root"]["PolicyTypes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"Type": "GUARDDUTY_POLICY", "Status": "ENABLED"})));
+    let roots = body_json(
+        &svc.handle(req_with(mgmt, "ListRoots", json!({})))
+            .await
+            .unwrap(),
+    );
+    assert!(roots["Roots"][0]["PolicyTypes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"Type": "GUARDDUTY_POLICY", "Status": "ENABLED"})));
+
+    // DisablePolicyType removes it again.
+    svc.handle(req_with(
+        mgmt,
+        "DisablePolicyType",
+        json!({"RootId": root_id, "PolicyType": "GUARDDUTY_POLICY"}),
+    ))
+    .await
+    .unwrap();
+    let roots = body_json(
+        &svc.handle(req_with(mgmt, "ListRoots", json!({})))
+            .await
+            .unwrap(),
+    );
+    assert!(!roots["Roots"][0]["PolicyTypes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["Type"] == "GUARDDUTY_POLICY"));
+
+    // An out-of-enum type is a malformed request.
+    let err = expect_err(
+        svc.handle(req_with(
+            mgmt,
+            "EnablePolicyType",
+            json!({"RootId": root_id, "PolicyType": "NOT_A_POLICY"}),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "InvalidInputException");
+}

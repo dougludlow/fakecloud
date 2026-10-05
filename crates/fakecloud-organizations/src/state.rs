@@ -822,6 +822,17 @@ impl OrganizationState {
             };
             out.push((t.to_string(), status.to_string()));
         }
+        // Any other type enabled on the root (e.g. GUARDDUTY_POLICY) is
+        // reported too, so EnablePolicyType round-trips on ListRoots.
+        let mut extra: Vec<&String> = self
+            .enabled_policy_types
+            .iter()
+            .filter(|t| !known.contains(&t.as_str()))
+            .collect();
+        extra.sort();
+        for t in extra {
+            out.push((t.clone(), "ENABLED".to_string()));
+        }
         out
     }
 
