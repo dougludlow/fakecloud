@@ -7,9 +7,11 @@ use uuid::Uuid;
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::acr::{AMR_OTP, AMR_PWD, AMR_SMS};
 use crate::state::{
-    AccessTokenData, AuthEvent, ChallengeResult, CognitoState, PreTokenGenInvocation,
-    RefreshTokenData, SessionData, SharedCognitoState, User, UserAttribute, UserPool,
+    AccessTokenData, AuthContext, AuthEvent, ChallengeResult, CognitoState, PreTokenGenInvocation,
+    RefreshTokenData, SessionData, SharedCognitoState, StepUpContext, User, UserAttribute,
+    UserPool,
 };
 use crate::triggers::{self, TriggerSource};
 use crate::user_status;
@@ -145,6 +147,76 @@ fn required_mfa_challenge(pool: &UserPool, user: &User) -> Option<&'static str> 
         // No usable factor enrolled: a mandatory pool forces setup; an
         // OPTIONAL pool lets the user through.
         (false, false) => (cfg == "ON").then_some("MFA_SETUP"),
+    }
+}
+
+/// The factors a user can complete toward an ACR level in the `USER_AUTH`
+/// flow: their password, a verified authenticator-app TOTP (unless disabled
+/// with SetUserMFAPreference), and SMS codes when SMS MFA is enabled and the
+/// user has a phone number to deliver to.
+fn user_step_up_factors(user: &User) -> Vec<&'static str> {
+    let prefs = user.mfa_preferences.as_ref();
+    let mut factors = Vec::new();
+    if user.password.is_some() || user.temporary_password.is_some() {
+        factors.push(AMR_PWD);
+    }
+    if user.totp_verified && prefs.map(|p| p.software_token_enabled).unwrap_or(true) {
+        factors.push(AMR_OTP);
+    }
+    if prefs.map(|p| p.sms_enabled).unwrap_or(false)
+        && user.attributes.iter().any(|a| a.name == "phone_number")
+    {
+        factors.push(AMR_SMS);
+    }
+    factors
+}
+
+/// The password-based factor combination that reaches `level`: level 1 is a
+/// password, level 3 a password plus an SMS code, level 4 a password plus a
+/// TOTP. Level 2 is a lone passwordless one-time password (`SMS_OTP` /
+/// `EMAIL_OTP` as the first factor), which this `USER_AUTH` flow does not
+/// offer, so no user can be stepped to it here.
+fn step_up_required_factors(level: u8) -> Option<&'static [&'static str]> {
+    match level {
+        1 => Some(&[AMR_PWD]),
+        3 => Some(&[AMR_PWD, AMR_SMS]),
+        4 => Some(&[AMR_PWD, AMR_OTP]),
+        _ => None,
+    }
+}
+
+/// The second-factor challenge a step-up still owes once its password factor
+/// is done, or `None` when the target's factors are all complete.
+fn step_up_next_challenge(step_up: &StepUpContext) -> Option<&'static str> {
+    step_up_required_factors(step_up.target_level)?
+        .iter()
+        .find(|f| !step_up.completed.iter().any(|c| c == *f))
+        .and_then(|f| match *f {
+            AMR_OTP => Some("SOFTWARE_TOKEN_MFA"),
+            AMR_SMS => Some("SMS_MFA"),
+            _ => None,
+        })
+}
+
+/// Record a completed factor on a step-up context.
+fn complete_factor(step_up: &mut Option<StepUpContext>, factor: &str) {
+    if let Some(su) = step_up.as_mut() {
+        if !su.completed.iter().any(|c| c == factor) {
+            su.completed.push(factor.to_string());
+        }
+    }
+}
+
+/// The `acr` / `amr` / `auth_time` of a finished step-up sign-in: the level
+/// its completed factors reach, named the way the pool names it.
+fn step_up_auth_context(pool: Option<&UserPool>, step_up: &StepUpContext) -> AuthContext {
+    let level = crate::acr::level_for_factors(&step_up.completed).unwrap_or(1);
+    let empty = std::collections::BTreeMap::new();
+    let names = pool.map(|p| &p.acr_configuration).unwrap_or(&empty);
+    AuthContext {
+        acr: crate::acr::level_name(names, level),
+        amr: crate::acr::amr_claim(&step_up.completed),
+        auth_time: Utc::now().timestamp(),
     }
 }
 

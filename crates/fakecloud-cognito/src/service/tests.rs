@@ -845,6 +845,7 @@ fn access_token_lookup() {
                 client_id: "testclient123".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
     }
@@ -1184,6 +1185,7 @@ fn self_service_get_user_via_access_token() {
                 client_id: "test-client".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
     }
@@ -1315,6 +1317,7 @@ fn self_service_delete_user_cleans_up_tokens() {
                 client_id: "test-client".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
         s.refresh_tokens.insert(
@@ -1324,6 +1327,7 @@ fn self_service_delete_user_cleans_up_tokens() {
                 username: "deluser".to_string(),
                 client_id: "test-client".to_string(),
                 issued_at: Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -1438,6 +1442,7 @@ fn verify_user_attribute_with_correct_code() {
                 client_id: "test-client".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
     }
@@ -3287,6 +3292,7 @@ fn custom_challenge_response_fails_without_delivery_context() {
                 challenge_name: "CUSTOM_CHALLENGE".to_string(),
                 challenge_results: vec![],
                 challenge_metadata: None,
+                step_up: None,
             },
         );
     }
@@ -3354,6 +3360,7 @@ fn custom_challenge_response_requires_answer() {
                 challenge_name: "CUSTOM_CHALLENGE".to_string(),
                 challenge_results: vec![],
                 challenge_metadata: None,
+                step_up: None,
             },
         );
     }
@@ -3391,6 +3398,7 @@ fn session_data_stores_challenge_results() {
         challenge_name: "CUSTOM_CHALLENGE".to_string(),
         challenge_results: vec![cr.clone()],
         challenge_metadata: Some("meta".to_string()),
+        step_up: None,
     };
     assert_eq!(session.challenge_results.len(), 1);
     assert!(session.challenge_results[0].challenge_result);
@@ -6344,6 +6352,7 @@ fn issue_access_token(
             client_id: client_id.to_string(),
             issued_at: chrono::Utc::now(),
             expires_at: None,
+            auth_context: None,
         },
     );
     token
@@ -6590,6 +6599,7 @@ fn issue_access_token_for(
             client_id: client_id.to_string(),
             issued_at: chrono::Utc::now(),
             expires_at: None,
+            auth_context: None,
         },
     );
     token
@@ -7047,6 +7057,7 @@ fn issue_at_for_users(
             client_id: client_id.to_string(),
             issued_at: chrono::Utc::now(),
             expires_at: None,
+            auth_context: None,
         },
     );
     token
@@ -7330,6 +7341,7 @@ fn revoke_token_removes_refresh_token() {
                 username: "alice".to_string(),
                 client_id: client_id.clone(),
                 issued_at: chrono::Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -7379,6 +7391,7 @@ fn get_tokens_from_refresh_token_client_mismatch_errors() {
                 username: "may".to_string(),
                 client_id: client_a,
                 issued_at: chrono::Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -7404,6 +7417,7 @@ fn get_tokens_from_refresh_token_returns_new_tokens() {
                 username: "oli".to_string(),
                 client_id: client_id.clone(),
                 issued_at: chrono::Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -7447,6 +7461,7 @@ fn get_tokens_from_refresh_token_rotation_makes_old_token_single_use() {
                 username: "rox".to_string(),
                 client_id: client_id.clone(),
                 issued_at: chrono::Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -7493,6 +7508,7 @@ fn issue_at(
             client_id: client_id.to_string(),
             issued_at: chrono::Utc::now(),
             expires_at: None,
+            auth_context: None,
         },
     );
     token
@@ -8326,6 +8342,7 @@ fn custom_challenge_completion_applies_pretoken_overrides_to_access_token() {
                 challenge_name: "CUSTOM_CHALLENGE".to_string(),
                 challenge_results: vec![],
                 challenge_metadata: None,
+                step_up: None,
             },
         );
     }
@@ -8382,6 +8399,7 @@ fn custom_auth_issue_tokens_applies_pretoken_overrides_on_current_thread_runtime
                 challenge_name: "SELECT_CHALLENGE".to_string(),
                 challenge_results: vec![],
                 challenge_metadata: None,
+                step_up: None,
             },
         );
     }
@@ -8504,6 +8522,7 @@ fn oauth_refresh_token_grant_applies_pretoken_overrides_to_access_token() {
                 username: "alice".to_string(),
                 client_id: client_id.clone(),
                 issued_at: Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -8906,6 +8925,7 @@ fn oauth_token_maps_survive_snapshot_roundtrip() {
                 client_id: "client-1".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
         acct.authorization_codes.insert(
@@ -9341,6 +9361,7 @@ fn get_user_response_matches_aws_shape() {
                 client_id: "c".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
     }
@@ -9669,6 +9690,7 @@ fn sub_cannot_be_deleted_via_attribute_delete() {
                 client_id: "c".to_string(),
                 issued_at: Utc::now(),
                 expires_at: None,
+                auth_context: None,
             },
         );
     }
@@ -10018,6 +10040,7 @@ fn verify_software_token_validates_real_totp() {
                 client_id: "c".to_string(),
                 issued_at: chrono::Utc::now(),
                 expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                auth_context: None,
             },
         );
     }
@@ -10057,6 +10080,7 @@ fn change_password_rejects_expired_token() {
                 client_id: "c".to_string(),
                 issued_at: chrono::Utc::now() - chrono::Duration::hours(2),
                 expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                auth_context: None,
             },
         );
         st.access_tokens.insert(
@@ -10067,6 +10091,7 @@ fn change_password_rejects_expired_token() {
                 client_id: "c".to_string(),
                 issued_at: chrono::Utc::now(),
                 expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                auth_context: None,
             },
         );
     }
@@ -10128,6 +10153,7 @@ fn refresh_token_expiry_enforced() {
                 username: "rtuser".to_string(),
                 client_id: client_id.clone(),
                 issued_at: chrono::Utc::now() - chrono::Duration::days(2),
+                auth_context: None,
             },
         );
         st.refresh_tokens.insert(
@@ -10137,6 +10163,7 @@ fn refresh_token_expiry_enforced() {
                 username: "rtuser".to_string(),
                 client_id: client_id.clone(),
                 issued_at: chrono::Utc::now(),
+                auth_context: None,
             },
         );
     }
@@ -10308,6 +10335,7 @@ fn oauth2_userinfo_rejects_expired_token() {
                     client_id: "c".to_string(),
                     issued_at: chrono::Utc::now(),
                     expires_at: Some(exp),
+                    auth_context: None,
                 },
             );
         }

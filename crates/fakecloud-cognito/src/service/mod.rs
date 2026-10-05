@@ -1170,6 +1170,9 @@ fn identity_provider_to_json(idp: &IdentityProvider) -> Value {
     if !idp.idp_identifiers.is_empty() {
         val["IdpIdentifiers"] = json!(idp.idp_identifiers);
     }
+    if !idp.acr_mapping.is_empty() {
+        val["AcrMapping"] = json!(idp.acr_mapping);
+    }
     val
 }
 
@@ -1417,6 +1420,7 @@ fn user_pool_to_json(pool: &UserPool) -> Value {
         "EstimatedNumberOfUsers": pool.estimated_number_of_users,
         "UserPoolTags": pool.user_pool_tags,
         "UserPoolTier": pool.user_pool_tier,
+        "AcrConfiguration": crate::acr::acr_configuration_json(&pool.acr_configuration),
         "SchemaAttributes": pool.schema_attributes.iter().map(|a| {
             let mut attr = json!({
                 "Name": a.name,
@@ -1779,6 +1783,9 @@ pub(crate) struct TokenClaims {
     pub access_validity_secs: Option<i64>,
     /// Id-token lifetime in seconds. `None` -> AWS default of 3600s.
     pub id_validity_secs: Option<i64>,
+    /// The `acr` / `amr` / `auth_time` of a sign-in that requested a target
+    /// authentication level (or of the sign-in a refresh descends from).
+    pub auth_context: Option<crate::state::AuthContext>,
 }
 
 impl TokenClaims {
@@ -2007,6 +2014,7 @@ pub(crate) fn token_claims_for(
         groups,
         access_validity_secs,
         id_validity_secs,
+        auth_context: None,
     }
 }
 
@@ -2169,6 +2177,11 @@ fn generate_tokens_with_overrides(
     let pem = owned_signing.0.as_str();
     let kid = owned_signing.1.as_str();
 
+    // A refresh keeps the original sign-in's auth_time.
+    let auth_time = claims
+        .auth_context
+        .as_ref()
+        .map_or(now, |ctx| ctx.auth_time);
     let id_header = json!({"kid": kid, "alg": "RS256", "typ": "JWT"});
     let mut id_payload = json!({
         "sub": sub,
@@ -2176,7 +2189,7 @@ fn generate_tokens_with_overrides(
         "aud": client_id,
         "cognito:username": username,
         "token_use": "id",
-        "auth_time": now,
+        "auth_time": auth_time,
         "exp": now + id_ttl,
         "iat": now,
         "jti": jti,
@@ -2204,6 +2217,7 @@ fn generate_tokens_with_overrides(
         "username": username,
         "token_use": "access",
         "scope": access_scope,
+        "auth_time": auth_time,
         "jti": access_jti,
         "exp": now + access_ttl,
         "iat": now,
@@ -2278,6 +2292,16 @@ fn generate_tokens_with_overrides(
                 let merged = format!("{} {}", access_scope, extra.join(" "));
                 access_payload["scope"] = Value::String(merged);
             }
+        }
+    }
+
+    // `acr` / `amr` are computed from the authentication flow; a
+    // PreTokenGeneration trigger cannot add, override or suppress them, so
+    // they are applied after the trigger's overrides.
+    if let Some(ctx) = &claims.auth_context {
+        for payload in [&mut id_payload, &mut access_payload] {
+            payload["acr"] = json!(ctx.acr);
+            payload["amr"] = json!(ctx.amr);
         }
     }
 
@@ -2879,6 +2903,7 @@ async fn handle_authorization_code_grant(
                     username: consumed.username.clone(),
                     client_id: client_id.to_string(),
                     issued_at: Utc::now(),
+                    auth_context: None,
                 },
             );
             account.access_tokens.insert(
@@ -2889,6 +2914,7 @@ async fn handle_authorization_code_grant(
                     client_id: client_id.to_string(),
                     issued_at: Utc::now(),
                     expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                    auth_context: None,
                 },
             );
             break;
@@ -2916,7 +2942,7 @@ async fn handle_refresh_token_grant(
         .get("refresh_token")
         .map(String::as_str)
         .ok_or(OAuthTokenError::InvalidRequest("refresh_token is required"))?;
-    let (username, sub) = {
+    let (username, sub, auth_context) = {
         let mas = state.read();
         let mut found = Err(OAuthTokenError::InvalidGrant);
         for (_, account) in mas.iter() {
@@ -2943,7 +2969,7 @@ async fn handle_refresh_token_grant(
                     .and_then(|users| users.get(&rt.username))
                     .map(|u| u.sub.clone())
                     .unwrap_or_default();
-                found = Ok((rt.username.clone(), sub));
+                found = Ok((rt.username.clone(), sub, rt.auth_context.clone()));
                 break;
             }
         }
@@ -2951,7 +2977,9 @@ async fn handle_refresh_token_grant(
     };
     let signing = ensure_pool_signing_key(state, pool_id).await;
     let signing_ref = signing.as_ref().map(|(p, k)| (p.as_str(), k.as_str()));
-    let claims = collect_token_claims(state, pool_id, &username, client_id);
+    // A refresh keeps the acr / amr / auth_time of the original sign-in.
+    let mut claims = collect_token_claims(state, pool_id, &username, client_id);
+    claims.auth_context = auth_context.clone();
     let overrides =
         oauth_pre_token_overrides(state, delivery_ctx, pool_id, client_id, &username).await;
     let tokens = generate_tokens_with_overrides(
@@ -2989,6 +3017,7 @@ async fn handle_refresh_token_grant(
                             username: old.username,
                             client_id: old.client_id,
                             issued_at: Utc::now(),
+                            auth_context: old.auth_context,
                         },
                     );
                     account.refresh_tokens.remove(refresh_token);
@@ -3003,6 +3032,7 @@ async fn handle_refresh_token_grant(
                     client_id: client_id.to_string(),
                     issued_at: Utc::now(),
                     expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                    auth_context: auth_context.clone(),
                 },
             );
             break;
@@ -3098,6 +3128,7 @@ async fn handle_client_credentials_grant(
                     client_id: client_id.to_string(),
                     issued_at: Utc::now(),
                     expires_at: Some(Utc::now() + chrono::Duration::seconds(access_ttl)),
+                    auth_context: None,
                 },
             );
             break;
@@ -3253,6 +3284,7 @@ impl CognitoService {
                         client_id: client_id.clone(),
                         issued_at: Utc::now(),
                         expires_at: Some(Utc::now() + chrono::Duration::seconds(access_ttl)),
+                        auth_context: None,
                     },
                 );
                 break;
@@ -3824,6 +3856,7 @@ pub async fn handle_oauth2_authorize(
                             expires_at: Some(
                                 Utc::now() + chrono::Duration::seconds(tokens.expires_in),
                             ),
+                            auth_context: None,
                         },
                     );
                     break;
@@ -3944,5 +3977,7 @@ fn urlencoding_encode(input: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod acr_tests;
 #[cfg(test)]
 mod tests;

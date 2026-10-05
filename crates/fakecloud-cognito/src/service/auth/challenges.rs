@@ -14,6 +14,24 @@ impl CognitoService {
         region: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        self.issue_sign_in_tokens(pool_id, client_id, username, region, req, None)
+            .await
+    }
+
+    /// Mint and persist the tokens that end a sign-in. A sign-in that asked
+    /// for a target ACR level (`step_up`) gets `acr` / `amr` claims for the
+    /// level its completed factors reached; the context is stored with the
+    /// refresh and access tokens so refreshes keep it and a later step-up is
+    /// credited with its methods.
+    pub(super) async fn issue_sign_in_tokens(
+        &self,
+        pool_id: &str,
+        client_id: &str,
+        username: &str,
+        region: &str,
+        req: &AwsRequest,
+        step_up: Option<&StepUpContext>,
+    ) -> Result<AwsResponse, AwsServiceError> {
         // Resolve everything under the state lock, then release the guard (it is
         // not `Send` and must not be held across the trigger `await` below).
         let (user_attributes, sub, account_id, pool_signing_owned) = {
@@ -77,7 +95,10 @@ impl CognitoService {
         let signing = pool_signing_owned
             .as_ref()
             .map(|(p, k)| (p.as_str(), k.as_str()));
-        let claims = crate::service::token_claims_for(state, pool_id, username, client_id);
+        let mut claims = crate::service::token_claims_for(state, pool_id, username, client_id);
+        let auth_context =
+            step_up.map(|su| super::step_up_auth_context(state.user_pools.get(pool_id), su));
+        claims.auth_context = auth_context.clone();
         let tokens = crate::service::generate_tokens_with_overrides(
             pool_id,
             client_id,
@@ -98,6 +119,7 @@ impl CognitoService {
                 username: username.to_string(),
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
+                auth_context: auth_context.clone(),
             },
         );
         state.access_tokens.insert(
@@ -108,6 +130,7 @@ impl CognitoService {
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
                 expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                auth_context,
             },
         );
         state.auth_events.push(AuthEvent {
@@ -191,12 +214,18 @@ impl CognitoService {
     ///
     /// This is the fix for the sign-in MFA bypass: every password/SRP success
     /// path funnels through here before issuing tokens.
+    ///
+    /// A step-up sign-in (`step_up`) is challenged for the factor its target
+    /// level still needs; the pool/user MFA requirement stays a floor, so a
+    /// sign-in owing no step-up factor still gets the MFA challenge it would
+    /// without a target.
     pub(super) fn maybe_mfa_challenge(
         &self,
         pool_id: &str,
         client_id: &str,
         username: &str,
         req: &AwsRequest,
+        step_up: Option<&StepUpContext>,
     ) -> Option<AwsResponse> {
         let (
             challenge_name,
@@ -212,7 +241,9 @@ impl CognitoService {
             let state = accounts.get_or_create(&req.account_id);
             let pool = state.user_pools.get(pool_id)?;
             let user = state.users.get(pool_id).and_then(|u| u.get(username))?;
-            let challenge_name = super::required_mfa_challenge(pool, user)?;
+            let challenge_name = step_up
+                .and_then(super::step_up_next_challenge)
+                .or_else(|| super::required_mfa_challenge(pool, user))?;
 
             let phone = user
                 .attributes
@@ -237,6 +268,7 @@ impl CognitoService {
                     challenge_name: challenge_name.to_string(),
                     challenge_results: vec![],
                     challenge_metadata: sms_code.clone(),
+                    step_up: step_up.cloned(),
                 },
             );
             (
@@ -309,7 +341,7 @@ impl CognitoService {
             )
         })?;
 
-        let (pool_id, username, region, stored_sms_code, totp_secret, totp_verified) = {
+        let (pool_id, username, region, stored_sms_code, totp_secret, totp_verified, mut step_up) = {
             let accounts = self.state.read();
             let empty = CognitoState::new(&req.account_id, &req.region);
             let state = accounts.get(&req.account_id).unwrap_or(&empty);
@@ -343,6 +375,7 @@ impl CognitoService {
                 stored_sms_code,
                 totp_secret,
                 totp_verified,
+                sess.step_up.clone(),
             )
         };
 
@@ -391,6 +424,12 @@ impl CognitoService {
             }
             _ => unreachable!("dispatched only for MFA challenge names"),
         }
+        let factor = if challenge_name == "SMS_MFA" {
+            super::AMR_SMS
+        } else {
+            super::AMR_OTP
+        };
+        super::complete_factor(&mut step_up, factor);
 
         // Single-use session, then mint tokens.
         {
@@ -400,8 +439,15 @@ impl CognitoService {
                 .sessions
                 .remove(session);
         }
-        self.custom_auth_issue_tokens(&pool_id, client_id, &username, &region, req)
-            .await
+        self.issue_sign_in_tokens(
+            &pool_id,
+            client_id,
+            &username,
+            &region,
+            req,
+            step_up.as_ref(),
+        )
+        .await
     }
 
     /// Record a failed MFA attempt in the auth-event log for introspection.
@@ -433,6 +479,7 @@ impl CognitoService {
         client_id: &str,
         username: &str,
         req: &AwsRequest,
+        step_up: Option<&StepUpContext>,
     ) -> Option<AwsResponse> {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -455,6 +502,7 @@ impl CognitoService {
                 challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
                 challenge_results: vec![],
                 challenge_metadata: None,
+                step_up: step_up.cloned(),
             },
         );
         Some(AwsResponse::ok_json(json!({
@@ -503,7 +551,7 @@ impl CognitoService {
             .and_then(|v| v.as_str())
             .ok_or_else(bad_creds)?;
 
-        let (pool_id, username, region, stash_json) = {
+        let (pool_id, username, region, stash_json, mut step_up) = {
             let accounts = self.state.read();
             let empty = CognitoState::new(&req.account_id, &req.region);
             let state = accounts.get(&req.account_id).unwrap_or(&empty);
@@ -523,6 +571,7 @@ impl CognitoService {
                 sess.username.clone(),
                 state.region.clone(),
                 stash,
+                sess.step_up.clone(),
             )
         };
 
@@ -597,17 +646,23 @@ impl CognitoService {
                 .remove(session);
         }
 
+        super::complete_factor(&mut step_up, super::AMR_PWD);
+        let step_up = step_up.as_ref();
+
         // A valid SRP proof of a *temporary* password still owes a reset.
-        if let Some(resp) = self.maybe_force_new_password(&pool_id, client_id, &username, req) {
+        if let Some(resp) =
+            self.maybe_force_new_password(&pool_id, client_id, &username, req, step_up)
+        {
             return Ok(resp);
         }
 
-        // Enforce a second factor when the pool/user requires MFA.
-        if let Some(resp) = self.maybe_mfa_challenge(&pool_id, client_id, &username, req) {
+        // Enforce a second factor when the pool/user requires MFA, or the
+        // factor a step-up target still needs.
+        if let Some(resp) = self.maybe_mfa_challenge(&pool_id, client_id, &username, req, step_up) {
             return Ok(resp);
         }
 
-        self.custom_auth_issue_tokens(&pool_id, client_id, &username, &region, req)
+        self.issue_sign_in_tokens(&pool_id, client_id, &username, &region, req, step_up)
             .await
     }
 
@@ -647,7 +702,7 @@ impl CognitoService {
                 )
             })?;
 
-        let (pool_id, username, region) = {
+        let (pool_id, username, region, mut step_up) = {
             let accounts = self.state.read();
             let empty = CognitoState::new(&req.account_id, &req.region);
             let state = accounts.get(&req.account_id).unwrap_or(&empty);
@@ -665,6 +720,7 @@ impl CognitoService {
                 sess.user_pool_id.clone(),
                 sess.username.clone(),
                 state.region.clone(),
+                sess.step_up.clone(),
             )
         };
         // The SELECT_CHALLENGE session is single-use.
@@ -688,7 +744,7 @@ impl CognitoService {
                             "SRP_A is required for the PASSWORD_SRP challenge",
                         )
                     })?;
-                self.build_srp_challenge(&pool_id, client_id, &username, srp_a, req)
+                self.build_srp_challenge(&pool_id, client_id, &username, srp_a, req, step_up)
             }
             "PASSWORD" => {
                 let password = responses
@@ -713,17 +769,22 @@ impl CognitoService {
                 if !ok {
                     return Err(bad_creds());
                 }
+                super::complete_factor(&mut step_up, super::AMR_PWD);
+                let step_up = step_up.as_ref();
                 // A temporary password still owes a forced reset.
                 if let Some(resp) =
-                    self.maybe_force_new_password(&pool_id, client_id, &username, req)
+                    self.maybe_force_new_password(&pool_id, client_id, &username, req, step_up)
                 {
                     return Ok(resp);
                 }
-                // Enforce a second factor when the pool/user requires MFA.
-                if let Some(resp) = self.maybe_mfa_challenge(&pool_id, client_id, &username, req) {
+                // Enforce a second factor when the pool/user requires MFA, or
+                // the factor a step-up target still needs.
+                if let Some(resp) =
+                    self.maybe_mfa_challenge(&pool_id, client_id, &username, req, step_up)
+                {
                     return Ok(resp);
                 }
-                self.custom_auth_issue_tokens(&pool_id, client_id, &username, &region, req)
+                self.issue_sign_in_tokens(&pool_id, client_id, &username, &region, req, step_up)
                     .await
             }
             other => Err(AwsServiceError::aws_error(
@@ -763,7 +824,16 @@ impl CognitoService {
         // Validate + rotate the password and gather token inputs under the state
         // lock, then release the guard (it is not `Send` and must not be held
         // across the trigger `await` below).
-        let (sub, username, user_attributes, pool_id, account_id, region, pool_signing_owned) = {
+        let (
+            sub,
+            username,
+            user_attributes,
+            pool_id,
+            account_id,
+            region,
+            pool_signing_owned,
+            step_up,
+        ) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
 
@@ -839,8 +909,23 @@ impl CognitoService {
                 account_id,
                 region,
                 pool_signing_owned,
+                session_data.step_up.clone(),
             )
         };
+
+        // A step-up sign-in continues toward its target level once the new
+        // password is set: any factor it still owes is challenged next, and
+        // its tokens carry the level reached.
+        if let Some(step_up) = step_up.as_ref() {
+            if let Some(resp) =
+                self.maybe_mfa_challenge(&pool_id, client_id, &username, req, Some(step_up))
+            {
+                return Ok(resp);
+            }
+            return self
+                .issue_sign_in_tokens(&pool_id, client_id, &username, &region, req, Some(step_up))
+                .await;
+        }
 
         // NEW_PASSWORD_REQUIRED completion issues tokens, so real Cognito fires
         // the PreTokenGeneration trigger here too; apply any overrides it returns.
@@ -893,6 +978,7 @@ impl CognitoService {
                 username: username.clone(),
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
+                auth_context: None,
             },
         );
 
@@ -904,6 +990,7 @@ impl CognitoService {
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
                 expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                auth_context: None,
             },
         );
 
@@ -1177,6 +1264,7 @@ impl CognitoService {
                     challenge_name: next_challenge_name.clone(),
                     challenge_results,
                     challenge_metadata: new_challenge_metadata,
+                    step_up: None,
                 },
             );
         }
@@ -1289,6 +1377,7 @@ impl CognitoService {
                 username: username.to_string(),
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
+                auth_context: None,
             },
         );
         state.access_tokens.insert(
@@ -1299,6 +1388,7 @@ impl CognitoService {
                 client_id: client_id.to_string(),
                 issued_at: Utc::now(),
                 expires_at: Some(Utc::now() + chrono::Duration::seconds(tokens.expires_in)),
+                auth_context: None,
             },
         );
         state.auth_events.push(AuthEvent {

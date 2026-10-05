@@ -67,6 +67,18 @@ impl CognitoService {
             validate_string_length(msg, "smsVerificationMessage", 6, 140)?;
         }
 
+        // Custom ACR level names need the Essentials or Plus feature plan.
+        let acr_configuration = match body.get("AcrConfiguration").filter(|v| !v.is_null()) {
+            Some(v) => crate::acr::parse_acr_configuration(v)?,
+            None => Default::default(),
+        };
+        let tier = body["UserPoolTier"].as_str().unwrap_or("ESSENTIALS");
+        if !acr_configuration.is_empty() && !crate::acr::tier_supports_acr(tier) {
+            return Err(crate::acr::feature_unavailable(
+                "Custom ACR level names require the Essentials or Plus feature plan.",
+            ));
+        }
+
         // Generate the per-pool RSA-2048 keypair eagerly so every
         // token-issuing path (InitiateAuth, RespondToAuthChallenge,
         // AdminInitiateAuth, GetTokensFromRefreshToken, OAuth2 token
@@ -228,6 +240,7 @@ impl CognitoService {
             } else {
                 None
             },
+            acr_configuration,
         };
 
         let response = user_pool_to_json(&pool);
@@ -295,6 +308,32 @@ impl CognitoService {
                 format!("User pool {pool_id} does not exist."),
             )
         })?;
+
+        // Validate the ACR level names (and the feature plan they need)
+        // before changing anything, so a rejected request leaves the pool as
+        // it was. AcrConfiguration replaces the pool's custom names; levels it
+        // leaves out go back to their default names.
+        let acr_configuration = match body.get("AcrConfiguration").filter(|v| !v.is_null()) {
+            Some(v) => Some(crate::acr::parse_acr_configuration(v)?),
+            None => None,
+        };
+        if let Some(tier) = body["UserPoolTier"].as_str() {
+            validate_enum(tier, "userPoolTier", &["LITE", "ESSENTIALS", "PLUS"])?;
+        }
+        let new_tier = body["UserPoolTier"]
+            .as_str()
+            .unwrap_or(pool.user_pool_tier.as_str());
+        let custom_names = acr_configuration
+            .as_ref()
+            .unwrap_or(&pool.acr_configuration);
+        if !custom_names.is_empty() && !crate::acr::tier_supports_acr(new_tier) {
+            return Err(crate::acr::feature_unavailable(
+                "Custom ACR level names require the Essentials or Plus feature plan.",
+            ));
+        }
+        if let Some(names) = acr_configuration {
+            pool.acr_configuration = names;
+        }
 
         // Update fields that are present in the request
         if body["Policies"]["PasswordPolicy"].is_object() {

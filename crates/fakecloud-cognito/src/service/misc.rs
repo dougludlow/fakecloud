@@ -742,7 +742,10 @@ impl CognitoService {
                     .zip(pool.signing_kid.as_ref())
                     .map(|(p, k)| (p.clone(), k.clone()))
             });
-            let claims = super::token_claims_for(state, &pool_id, &username, client_id);
+            // A refresh keeps the acr / amr / auth_time of the original sign-in.
+            let auth_context = token_data.auth_context.clone();
+            let mut claims = super::token_claims_for(state, &pool_id, &username, client_id);
+            claims.auth_context = auth_context.clone();
 
             let rotation_enabled = state
                 .user_pool_clients
@@ -763,6 +766,7 @@ impl CognitoService {
                         username: username.clone(),
                         client_id: client_id.to_string(),
                         issued_at: Utc::now(),
+                        auth_context: claims.auth_context.clone(),
                     },
                 );
                 state.refresh_tokens.remove(refresh_token);
@@ -837,6 +841,7 @@ impl CognitoService {
                 client_id: client_id.to_string(),
                 issued_at: now,
                 expires_at: Some(now + chrono::Duration::seconds(tokens.expires_in)),
+                auth_context: claims.auth_context.clone(),
             },
         );
 
