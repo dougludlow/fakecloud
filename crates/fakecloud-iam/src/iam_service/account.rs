@@ -322,10 +322,50 @@ fn build_policy_details_xml(state: &IamState) -> Vec<String> {
 }
 
 impl IamService {
+    /// The `GetAccountSummary` `*Quota` entries backed by Service Quotas, as
+    /// `(summary key, applied value)`: the account's applied value when a
+    /// quota provider is attached, else the AWS default.
+    fn summary_quotas(&self, account_id: &str, region: &str) -> Vec<(&'static str, u64)> {
+        use fakecloud_core::quota::{IAM_SERVICE_CODE, IAM_SUMMARY_QUOTAS};
+        IAM_SUMMARY_QUOTAS
+            .iter()
+            .map(|q| {
+                let value = self
+                    .quota_provider
+                    .as_ref()
+                    .and_then(|p| {
+                        p.applied_value(account_id, region, IAM_SERVICE_CODE, q.quota_code)
+                    })
+                    .unwrap_or(q.default);
+                (q.summary_key, value.max(0.0) as u64)
+            })
+            .collect()
+    }
+
     pub(super) fn get_account_summary(
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        // Resolved before the IAM lock is taken: the lookup takes Service
+        // Quotas' (and Organizations') locks.
+        let quotas = self.summary_quotas(&req.account_id, &req.region);
+        let quota = |key: &str| -> u64 {
+            quotas
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        };
+        let users_quota = quota("UsersQuota");
+        let groups_quota = quota("GroupsQuota");
+        let server_certificates_quota = quota("ServerCertificatesQuota");
+        let policies_quota = quota("PoliciesQuota");
+        let roles_quota = quota("RolesQuota");
+        let instance_profiles_quota = quota("InstanceProfilesQuota");
+        let attached_per_group_quota = quota("AttachedPoliciesPerGroupQuota");
+        let attached_per_role_quota = quota("AttachedPoliciesPerRoleQuota");
+        let attached_per_user_quota = quota("AttachedPoliciesPerUserQuota");
+        let assume_role_policy_size_quota = quota("AssumeRolePolicySizeQuota");
         let accounts = self.state.read();
         let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
@@ -346,11 +386,11 @@ impl IamService {
   <GetAccountSummaryResult>
     <SummaryMap>
       <entry><key>Users</key><value>{}</value></entry>
-      <entry><key>UsersQuota</key><value>5000</value></entry>
+      <entry><key>UsersQuota</key><value>{users_quota}</value></entry>
       <entry><key>Groups</key><value>{}</value></entry>
-      <entry><key>GroupsQuota</key><value>300</value></entry>
+      <entry><key>GroupsQuota</key><value>{groups_quota}</value></entry>
       <entry><key>ServerCertificates</key><value>{}</value></entry>
-      <entry><key>ServerCertificatesQuota</key><value>20</value></entry>
+      <entry><key>ServerCertificatesQuota</key><value>{server_certificates_quota}</value></entry>
       <entry><key>UserPolicySizeQuota</key><value>2048</value></entry>
       <entry><key>GroupPolicySizeQuota</key><value>5120</value></entry>
       <entry><key>GroupsPerUserQuota</key><value>10</value></entry>
@@ -362,22 +402,22 @@ impl IamService {
       <entry><key>AccountAccessKeysPresent</key><value>0</value></entry>
       <entry><key>AccountSigningCertificatesPresent</key><value>0</value></entry>
       <entry><key>Policies</key><value>{}</value></entry>
-      <entry><key>PoliciesQuota</key><value>1500</value></entry>
+      <entry><key>PoliciesQuota</key><value>{policies_quota}</value></entry>
       <entry><key>PolicySizeQuota</key><value>6144</value></entry>
       <entry><key>PolicyVersionsInUse</key><value>{}</value></entry>
       <entry><key>PolicyVersionsInUseQuota</key><value>10000</value></entry>
       <entry><key>VersionsPerPolicyQuota</key><value>5</value></entry>
       <entry><key>Roles</key><value>{}</value></entry>
-      <entry><key>RolesQuota</key><value>1000</value></entry>
+      <entry><key>RolesQuota</key><value>{roles_quota}</value></entry>
       <entry><key>RolePolicySizeQuota</key><value>10240</value></entry>
       <entry><key>InstanceProfiles</key><value>{}</value></entry>
-      <entry><key>InstanceProfilesQuota</key><value>1000</value></entry>
+      <entry><key>InstanceProfilesQuota</key><value>{instance_profiles_quota}</value></entry>
       <entry><key>Providers</key><value>{}</value></entry>
-      <entry><key>AttachedPoliciesPerGroupQuota</key><value>10</value></entry>
-      <entry><key>AttachedPoliciesPerRoleQuota</key><value>10</value></entry>
-      <entry><key>AttachedPoliciesPerUserQuota</key><value>10</value></entry>
+      <entry><key>AttachedPoliciesPerGroupQuota</key><value>{attached_per_group_quota}</value></entry>
+      <entry><key>AttachedPoliciesPerRoleQuota</key><value>{attached_per_role_quota}</value></entry>
+      <entry><key>AttachedPoliciesPerUserQuota</key><value>{attached_per_user_quota}</value></entry>
       <entry><key>GlobalEndpointTokenVersion</key><value>{token_version}</value></entry>
-      <entry><key>AssumeRolePolicySizeQuota</key><value>2048</value></entry>
+      <entry><key>AssumeRolePolicySizeQuota</key><value>{assume_role_policy_size_quota}</value></entry>
     </SummaryMap>
   </GetAccountSummaryResult>
   <ResponseMetadata>

@@ -62,28 +62,41 @@ impl Ec2Service {
 /// How much each rule weighs against the rules-per-group quota.
 ///
 /// A CIDR or security-group rule weighs one. A rule that references a
-/// customer-managed prefix list weighs the list's `MaxEntries`, as on AWS, and
-/// counts only toward the list's address family. A prefix list fakecloud does
-/// not hold (an AWS-managed one) weighs one on both sides.
+/// customer-managed prefix list weighs the list's `MaxEntries`, and one that
+/// references an AWS-managed prefix list weighs the list's published weight
+/// (55 for the CloudFront origin-facing list), as on AWS; either counts only
+/// toward the list's address family. A prefix list id fakecloud knows nothing
+/// about weighs one on both sides.
 #[derive(Clone, Copy)]
 pub(crate) struct RuleWeights<'a> {
     prefix_lists: &'a BTreeMap<String, ManagedPrefixList>,
+    region: &'a str,
 }
 
 impl<'a> RuleWeights<'a> {
-    pub(crate) fn new(prefix_lists: &'a BTreeMap<String, ManagedPrefixList>) -> Self {
-        Self { prefix_lists }
+    pub(crate) fn new(
+        prefix_lists: &'a BTreeMap<String, ManagedPrefixList>,
+        region: &'a str,
+    ) -> Self {
+        Self {
+            prefix_lists,
+            region,
+        }
     }
 
     /// The rule's IPv4-side and IPv6-side weight.
     fn sides(&self, r: &SecurityGroupRule) -> [usize; 2] {
-        if let Some(list) = r
-            .prefix_list_id
-            .as_ref()
-            .and_then(|id| self.prefix_lists.get(id))
-        {
-            let weight = list.max_entries.max(1) as usize;
-            return if list.address_family.eq_ignore_ascii_case("IPv6") {
+        let family_weight = r.prefix_list_id.as_ref().and_then(|id| {
+            if let Some(list) = self.prefix_lists.get(id) {
+                return Some((
+                    list.address_family.as_str(),
+                    list.max_entries.max(1) as usize,
+                ));
+            }
+            super::aws_prefix_lists::by_id(self.region, id).map(|l| (l.address_family, l.weight))
+        });
+        if let Some((family, weight)) = family_weight {
+            return if family.eq_ignore_ascii_case("IPv6") {
                 [0, weight]
             } else {
                 [weight, 0]
@@ -333,7 +346,7 @@ mod tests {
         ];
         // Ingress: 3 IPv4-side (two CIDRs + the reference), 2 IPv6-side.
         assert_eq!(
-            RuleWeights::new(&BTreeMap::new()).group_rule_count(&rules),
+            RuleWeights::new(&BTreeMap::new(), "us-east-1").group_rule_count(&rules),
             3
         );
     }
@@ -353,7 +366,7 @@ mod tests {
         after[4].cidr_ipv4 = None;
         after[4].cidr_ipv6 = Some("::/0".into());
         let w = BTreeMap::new();
-        let w = RuleWeights::new(&w);
+        let w = RuleWeights::new(&w, "us-east-1");
         assert_eq!(w.side_grown_past(&before, &after, 2), None);
         // Egress growing to 3 IPv6 rules is caught even though ingress, the
         // busier direction, does not change.
@@ -387,9 +400,33 @@ mod tests {
         let mut unknown = rule(false, None, None, None);
         unknown.prefix_list_id = Some("pl-aws".into());
         let rules = [pl, unknown, rule(false, None, Some("::/0"), None)];
-        let w = RuleWeights::new(&lists);
+        let w = RuleWeights::new(&lists, "us-east-1");
         // IPv4: 10 (pl-1) + 1 (unknown list); IPv6: 1 (unknown list) + 1.
         assert_eq!(w.side_counts(rules.iter()), [11, 2]);
+    }
+
+    #[test]
+    fn an_aws_managed_prefix_list_rule_weighs_its_published_weight() {
+        let list = |name: &str| {
+            super::super::aws_prefix_lists::AWS_MANAGED_PREFIX_LISTS
+                .iter()
+                .find(|l| l.name_in("us-east-1") == name)
+                .unwrap()
+                .id_in("us-east-1")
+        };
+        let mut cf = rule(false, None, None, None);
+        cf.prefix_list_id = Some(list("com.amazonaws.global.cloudfront.origin-facing"));
+        let mut cf6 = rule(false, None, None, None);
+        cf6.prefix_list_id = Some(list("com.amazonaws.global.ipv6.cloudfront.origin-facing"));
+        let mut s3 = rule(false, None, None, None);
+        s3.prefix_list_id = Some(list("com.amazonaws.us-east-1.s3"));
+        let w = BTreeMap::new();
+        let w = RuleWeights::new(&w, "us-east-1");
+        assert_eq!(w.side_counts([cf.clone(), cf6, s3].iter()), [56, 55]);
+        // The same id means nothing in another region's list namespace.
+        let other = BTreeMap::new();
+        let other = RuleWeights::new(&other, "eu-west-1");
+        assert_eq!(other.side_counts([cf].iter()), [1, 1]);
     }
 
     struct Fixed(f64);
