@@ -182,7 +182,7 @@ pub const QUOTAS: &[QuotaDef] = &[
     ),
     q(VPC, "L-589F43AA", "Route tables per VPC", 200.0, true),
     max(
-        q(VPC, "L-93826ACB", "Routes per route table", 50.0, true),
+        q(VPC, "L-93826ACB", "Routes per route table", 500.0, true),
         1000.0,
     ),
     q(VPC, "L-B4A6D682", "Network ACLs per VPC", 200.0, true),
@@ -215,7 +215,10 @@ pub const QUOTAS: &[QuotaDef] = &[
         q(VPC, "L-83CA0A9D", "IPv4 CIDR blocks per VPC", 5.0, true),
         50.0,
     ),
-    q(VPC, "L-085A6257", "IPv6 CIDR blocks per VPC", 5.0, true),
+    max(
+        q(VPC, "L-085A6257", "IPv6 CIDR blocks per VPC", 5.0, true),
+        50.0,
+    ),
     max(
         q(
             VPC,
@@ -261,13 +264,19 @@ pub const QUOTAS: &[QuotaDef] = &[
         20480.0,
         false,
     ),
-    q(VPC, "L-BB24F6E5", "Network Address Usage", 64000.0, true),
-    q(
-        VPC,
-        "L-CD17FD4B",
-        "Peered Network Address Usage",
-        128000.0,
-        true,
+    max(
+        q(VPC, "L-BB24F6E5", "Network Address Usage", 64000.0, true),
+        256000.0,
+    ),
+    max(
+        q(
+            VPC,
+            "L-CD17FD4B",
+            "Peered Network Address Usage",
+            128000.0,
+            true,
+        ),
+        512000.0,
     ),
     q(
         VPC,
@@ -359,26 +368,29 @@ pub const QUOTAS: &[QuotaDef] = &[
     global(q("iam", "L-F55AF5E4", "Users per account", 5000.0, false)),
     global(max(
         q("iam", "L-FE177D64", "Roles per account", 1000.0, true),
-        5000.0,
+        10000.0,
     )),
     global(max(
         q("iam", "L-F4A5425F", "Groups per account", 300.0, true),
         500.0,
     )),
     global(max(
-        q("iam", "L-0DA4ABF3", "Managed policies per role", 10.0, true),
-        20.0,
+        q("iam", "L-0DA4ABF3", "Managed policies per role", 20.0, true),
+        25.0,
     )),
     global(max(
         q("iam", "L-4019AD8B", "Managed policies per user", 10.0, true),
         20.0,
     )),
-    global(q(
-        "iam",
-        "L-384571C4",
-        "Managed policies per group",
+    global(max(
+        q(
+            "iam",
+            "L-384571C4",
+            "Managed policies per group",
+            10.0,
+            false,
+        ),
         10.0,
-        true,
     )),
     global(max(
         q(
@@ -388,36 +400,65 @@ pub const QUOTAS: &[QuotaDef] = &[
             1500.0,
             true,
         ),
-        5000.0,
+        10000.0,
     )),
-    global(q(
-        "iam",
-        "L-BF35879D",
-        "Server certificates per account",
+    global(max(
+        q(
+            "iam",
+            "L-BF35879D",
+            "Server certificates per account",
+            20.0,
+            true,
+        ),
         20.0,
-        true,
     )),
-    global(q(
-        "iam",
-        "L-858F3967",
-        "OpenId connect providers per account",
-        100.0,
-        true,
+    global(max(
+        q(
+            "iam",
+            "L-858F3967",
+            "OpenId connect providers per account",
+            100.0,
+            true,
+        ),
+        700.0,
+    )),
+    global(max(
+        q(
+            "iam",
+            "L-6E65F664",
+            "Instance profiles per account",
+            1000.0,
+            true,
+        ),
+        10000.0,
+    )),
+    global(max(
+        q(
+            "iam",
+            "L-C07B4B0D",
+            "Role trust policy length",
+            2048.0,
+            true,
+        ),
+        8192.0,
     )),
     // ---- Lambda ----
-    q(
-        "lambda",
-        "L-B99A9384",
-        "Concurrent executions",
-        1000.0,
-        true,
+    unit(
+        q(
+            "lambda",
+            "L-B99A9384",
+            "Concurrent executions",
+            1000.0,
+            true,
+        ),
+        "Count",
     ),
     unit(
         q(
             "lambda",
             "L-2ACBD22F",
             "Function and layer storage",
-            75.0,
+            300.0,
             true,
         ),
         "Gigabytes",
@@ -491,6 +532,49 @@ mod tests {
             if let Some(m) = q.max_value {
                 assert!(m >= q.default, "{}", q.quota_code);
             }
+        }
+    }
+
+    /// Defaults, maximums and adjustability as the AWS docs publish them
+    /// (Amazon VPC quotas, IAM and STS quotas, Lambda endpoints and quotas).
+    #[test]
+    fn published_values() {
+        let cases: &[(&str, &str, f64, Option<f64>, bool)] = &[
+            (VPC, "L-93826ACB", 500.0, Some(1000.0), true),
+            (VPC, "L-085A6257", 5.0, Some(50.0), true),
+            (VPC, "L-BB24F6E5", 64000.0, Some(256000.0), true),
+            (VPC, "L-CD17FD4B", 128000.0, Some(512000.0), true),
+            ("iam", "L-0DA4ABF3", 20.0, Some(25.0), true),
+            ("iam", "L-4019AD8B", 10.0, Some(20.0), true),
+            ("iam", "L-384571C4", 10.0, Some(10.0), false),
+            ("iam", "L-FE177D64", 1000.0, Some(10000.0), true),
+            ("iam", "L-E95E4862", 1500.0, Some(10000.0), true),
+            ("iam", "L-F4A5425F", 300.0, Some(500.0), true),
+            ("iam", "L-6E65F664", 1000.0, Some(10000.0), true),
+            ("iam", "L-C07B4B0D", 2048.0, Some(8192.0), true),
+            ("iam", "L-BF35879D", 20.0, Some(20.0), true),
+            ("iam", "L-858F3967", 100.0, Some(700.0), true),
+            ("lambda", "L-2ACBD22F", 300.0, None, true),
+        ];
+        for &(service, code, default, max_value, adjustable) in cases {
+            let q = quota(service, code).unwrap_or_else(|| panic!("{code} missing"));
+            assert_eq!(q.default, default, "{code} default");
+            assert_eq!(q.max_value, max_value, "{code} max");
+            assert_eq!(q.adjustable, adjustable, "{code} adjustable");
+        }
+        assert_eq!(quota("lambda", "L-2ACBD22F").unwrap().unit, "Gigabytes");
+        assert_eq!(quota("lambda", "L-B99A9384").unwrap().unit, "Count");
+    }
+
+    /// Every IAM `GetAccountSummary` quota IAM resolves through Service
+    /// Quotas is a global `iam` quota here, with the same default.
+    #[test]
+    fn iam_summary_quotas_match_the_catalog() {
+        for s in fakecloud_core::quota::IAM_SUMMARY_QUOTAS {
+            let q = quota(fakecloud_core::quota::IAM_SERVICE_CODE, s.quota_code)
+                .unwrap_or_else(|| panic!("{} missing", s.quota_code));
+            assert!(q.global, "{}", s.quota_code);
+            assert_eq!(q.default, s.default, "{}", s.summary_key);
         }
     }
 

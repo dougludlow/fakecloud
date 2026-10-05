@@ -10753,6 +10753,82 @@ mod tests {
             .groups
             .contains_key(&asg_name));
 
+        // EKS add-on default versions resolve per Kubernetes minor: kube-proxy
+        // on a 1.33 cluster gets the 1.33 default, not the 1.31 one.
+        prov.create_resource(&make_resource(
+            "AWS::EKS::Cluster",
+            "C133",
+            serde_json::json!({
+                "Name": "cfn-c133",
+                "Version": "1.33",
+                "RoleArn": "arn:aws:iam::123456789012:role/eks",
+                "ResourcesVpcConfig": { "SubnetIds": [subnets[0].subnet_id] }
+            }),
+        ))
+        .expect("1.33 cluster provisions");
+        let kp = prov
+            .create_resource(&make_resource(
+                "AWS::EKS::Addon",
+                "KP",
+                serde_json::json!({ "ClusterName": "cfn-c133", "AddonName": "kube-proxy" }),
+            ))
+            .expect("kube-proxy provisions");
+        assert_eq!(
+            prov.eks_state.read().get(&prov.account_id).unwrap().addons["cfn-c133"]["kube-proxy"]
+                .addon_version,
+            "v1.33.3-eksbuild.4"
+        );
+        // An AddonVersion built only for a newer minor fails the update and
+        // leaves the add-on untouched.
+        let err = prov
+            .update_resource(
+                &kp,
+                &make_resource(
+                    "AWS::EKS::Addon",
+                    "KP",
+                    serde_json::json!({
+                        "ClusterName": "cfn-c133",
+                        "AddonName": "kube-proxy",
+                        "AddonVersion": "v1.34.1-eksbuild.2"
+                    }),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(err, "Addon version specified is not supported");
+        assert_eq!(
+            prov.eks_state.read().get(&prov.account_id).unwrap().addons["cfn-c133"]["kube-proxy"]
+                .addon_version,
+            "v1.33.3-eksbuild.4"
+        );
+        // adot has no 1.34 build: the add-on itself is refused.
+        prov.create_resource(&make_resource(
+            "AWS::EKS::Cluster",
+            "C134",
+            serde_json::json!({
+                "Name": "cfn-c134",
+                "Version": "1.34",
+                "RoleArn": "arn:aws:iam::123456789012:role/eks",
+                "ResourcesVpcConfig": { "SubnetIds": [subnets[0].subnet_id] }
+            }),
+        ))
+        .expect("1.34 cluster provisions");
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::EKS::Addon",
+                "Adot",
+                serde_json::json!({ "ClusterName": "cfn-c134", "AddonName": "adot" }),
+            ))
+            .unwrap_err();
+        assert_eq!(err, "Addon specified is not supported");
+        assert!(!prov
+            .eks_state
+            .read()
+            .get(&prov.account_id)
+            .unwrap()
+            .addons
+            .get("cfn-c134")
+            .is_some_and(|m| m.contains_key("adot")));
+
         // EKS add-on: its pod identity associations are real records.
         prov.create_resource(&make_resource(
             "AWS::EKS::Addon",
@@ -10775,6 +10851,9 @@ mod tests {
             .expect("association record");
         assert_eq!(assoc.owner_arn.as_deref(), Some(addon.arn.as_str()));
         assert_eq!(assoc.namespace, "kube-system");
+        // No AddonVersion: the catalog default for the cluster's Kubernetes
+        // version, as CreateAddon installs (not a synthesized string).
+        assert_eq!(addon.addon_version, "v1.20.4-eksbuild.2");
     }
 
     #[test]

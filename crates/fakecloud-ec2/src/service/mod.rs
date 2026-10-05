@@ -1,6 +1,7 @@
 //! EC2 service entrypoint: `ec2Query` dispatch over the per-account state.
 
 mod app_status;
+mod aws_prefix_lists;
 mod capacity;
 mod cvpn;
 mod dhcp;

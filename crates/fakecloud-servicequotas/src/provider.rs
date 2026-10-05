@@ -299,3 +299,37 @@ impl QuotaProvider for ServiceQuotasProvider {
             .then(|| applied_value(data, region, def))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(service: &str, code: &str) -> &'static QuotaDef {
+        catalog::quota(service, code).unwrap()
+    }
+
+    /// An increase above the documented maximum is not approved; one at it is.
+    #[test]
+    fn increases_are_capped_at_the_documented_maximum() {
+        let data = ServiceQuotasData::default();
+        let cases: &[(&str, &str, f64)] = &[
+            ("iam", "L-0DA4ABF3", 25.0),
+            ("iam", "L-FE177D64", 10000.0),
+            ("iam", "L-E95E4862", 10000.0),
+            ("iam", "L-858F3967", 700.0),
+            ("iam", "L-BF35879D", 20.0),
+            (catalog::VPC, "L-93826ACB", 1000.0),
+            (catalog::VPC, "L-085A6257", 50.0),
+            (catalog::VPC, "L-BB24F6E5", 256000.0),
+            (catalog::VPC, "L-CD17FD4B", 512000.0),
+        ];
+        for &(service, code, max) in cases {
+            let d = def(service, code);
+            assert!(approvable(&data, "us-east-1", d, max), "{code} at max");
+            assert!(
+                !approvable(&data, "us-east-1", d, max + 1.0),
+                "{code} above max"
+            );
+        }
+    }
+}

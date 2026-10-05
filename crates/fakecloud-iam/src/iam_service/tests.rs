@@ -712,6 +712,31 @@ fn get_account_summary() {
     assert!(resp.contains("<key>Users</key><value>2</value>"));
     assert!(resp.contains("<key>Groups</key><value>1</value>"));
     assert!(resp.contains("<key>UsersQuota</key><value>5000</value>"));
+    // AWS defaults without Service Quotas attached.
+    assert!(resp.contains("<key>AttachedPoliciesPerRoleQuota</key><value>20</value>"));
+    assert!(resp.contains("<key>AttachedPoliciesPerUserQuota</key><value>10</value>"));
+    assert!(resp.contains("<key>AttachedPoliciesPerGroupQuota</key><value>10</value>"));
+    assert!(resp.contains("<key>RolesQuota</key><value>1000</value>"));
+    assert!(resp.contains("<key>PoliciesQuota</key><value>1500</value>"));
+    assert!(resp.contains("<key>InstanceProfilesQuota</key><value>1000</value>"));
+    assert!(resp.contains("<key>AssumeRolePolicySizeQuota</key><value>2048</value>"));
+}
+
+/// Raised Service Quotas values show up in `GetAccountSummary`; quotas the
+/// provider does not know keep their AWS default.
+#[test]
+fn get_account_summary_reports_applied_service_quotas() {
+    let state: SharedIamState = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let applied = fakecloud_core::quota::FixedQuotas::default()
+        .with("iam", "L-0DA4ABF3", 25.0)
+        .with("iam", "L-FE177D64", 4000.0);
+    let svc = IamService::new(state).with_quota_provider(Some(Arc::new(applied)));
+    let resp = svc.handle_sync("GetAccountSummary", vec![]);
+    assert!(resp.contains("<key>AttachedPoliciesPerRoleQuota</key><value>25</value>"));
+    assert!(resp.contains("<key>RolesQuota</key><value>4000</value>"));
+    assert!(resp.contains("<key>GroupsQuota</key><value>300</value>"));
 }
 
 #[test]

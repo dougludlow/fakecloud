@@ -629,7 +629,7 @@ fn authorize(
         let state = accounts.get_or_create(&req.account_id);
         // A missing or empty GroupId (or a nonexistent one) is a hard error on
         // AWS, not a silent no-op.
-        let weights = RuleWeights::new(&state.managed_prefix_lists);
+        let weights = RuleWeights::new(&state.managed_prefix_lists, &req.region);
         let sg = state
             .security_groups
             .get_mut(&group_id)
@@ -758,7 +758,7 @@ pub(crate) fn modify_security_group_rules(
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let weights = RuleWeights::new(&state.managed_prefix_lists);
+        let weights = RuleWeights::new(&state.managed_prefix_lists, &req.region);
         let sg = state.security_groups.get_mut(&group_id).ok_or_else(|| {
             AwsServiceError::aws_error(
                 http::StatusCode::BAD_REQUEST,
@@ -1120,7 +1120,7 @@ pub(crate) fn validate_security_group_quotas_for_interface(
         let accounts = svc.state.read();
         let empty = Ec2State::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
-        let weights = RuleWeights::new(&state.managed_prefix_lists);
+        let weights = RuleWeights::new(&state.managed_prefix_lists, &req.region);
         for id in &group_ids {
             let sg = state
                 .security_groups

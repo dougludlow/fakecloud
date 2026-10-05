@@ -719,3 +719,250 @@ async fn account_quota_data_survives_a_restart_but_server_settings_follow_the_fl
         "auto"
     );
 }
+
+async fn default_quota(
+    sq: &aws_sdk_servicequotas::Client,
+    service: &str,
+    code: &str,
+) -> aws_sdk_servicequotas::types::ServiceQuota {
+    sq.get_aws_default_service_quota()
+        .service_code(service)
+        .quota_code(code)
+        .send()
+        .await
+        .unwrap()
+        .quota()
+        .unwrap()
+        .clone()
+}
+
+/// Request an increase of `service`/`code` to `value` and return how it was
+/// decided.
+async fn decide(
+    sq: &aws_sdk_servicequotas::Client,
+    service: &str,
+    code: &str,
+    value: f64,
+) -> RequestStatus {
+    let id = sq
+        .request_service_quota_increase()
+        .service_code(service)
+        .quota_code(code)
+        .desired_value(value)
+        .send()
+        .await
+        .unwrap()
+        .requested_quota()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+    status(sq, &id).await
+}
+
+/// Defaults, units and adjustability as AWS publishes them.
+#[tokio::test]
+async fn published_defaults() {
+    let server = TestServer::start().await;
+    let (sq, _) = clients(&server).await;
+
+    for (service, code, value) in [
+        (VPC, "L-93826ACB", 500.0),
+        ("iam", "L-0DA4ABF3", 20.0),
+        ("iam", "L-6E65F664", 1000.0),
+        ("iam", "L-C07B4B0D", 2048.0),
+        ("lambda", "L-2ACBD22F", 300.0),
+    ] {
+        assert_eq!(
+            default_quota(&sq, service, code).await.value(),
+            Some(value),
+            "{code}"
+        );
+    }
+    let storage = default_quota(&sq, "lambda", "L-2ACBD22F").await;
+    assert_eq!(storage.unit(), Some("Gigabytes"));
+    let concurrency = default_quota(&sq, "lambda", "L-B99A9384").await;
+    assert_eq!(concurrency.unit(), Some("Count"));
+    let per_group = default_quota(&sq, "iam", "L-384571C4").await;
+    assert!(!per_group.adjustable());
+
+    let err = sq
+        .request_service_quota_increase()
+        .service_code("iam")
+        .quota_code("L-384571C4")
+        .desired_value(11.0)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some("IllegalArgumentException"));
+}
+
+/// An increase past AWS's documented maximum is not approved; one at the
+/// maximum is.
+#[tokio::test]
+async fn increases_past_the_documented_maximum_are_not_approved() {
+    let server = TestServer::start().await;
+    let (sq, _) = clients(&server).await;
+
+    for (service, code, max) in [
+        ("iam", "L-0DA4ABF3", 25.0),
+        ("iam", "L-858F3967", 700.0),
+        ("iam", "L-FE177D64", 10000.0),
+        (VPC, "L-085A6257", 50.0),
+        (VPC, "L-BB24F6E5", 256000.0),
+        (VPC, "L-CD17FD4B", 512000.0),
+    ] {
+        assert_eq!(
+            decide(&sq, service, code, max + 1.0).await,
+            RequestStatus::NotApproved,
+            "{code} above max"
+        );
+        assert_eq!(
+            decide(&sq, service, code, max).await,
+            RequestStatus::Approved,
+            "{code} at max"
+        );
+    }
+    // Server certificates per account cannot go past the default of 20.
+    assert_eq!(
+        decide(&sq, "iam", "L-BF35879D", 21.0).await,
+        RequestStatus::NotApproved
+    );
+}
+
+/// A raised IAM quota shows up in IAM's own `GetAccountSummary`.
+#[tokio::test]
+async fn raised_iam_quota_shows_in_account_summary() {
+    use aws_sdk_iam::types::SummaryKeyType;
+
+    let server = TestServer::start().await;
+    let (sq, _) = clients(&server).await;
+    let iam = server.iam_client().await;
+
+    let summary = iam.get_account_summary().send().await.unwrap();
+    let map = summary.summary_map().unwrap();
+    assert_eq!(
+        map.get(&SummaryKeyType::AttachedPoliciesPerRoleQuota),
+        Some(&20)
+    );
+    assert_eq!(map.get(&SummaryKeyType::RolesQuota), Some(&1000));
+
+    assert_eq!(
+        decide(&sq, "iam", "L-0DA4ABF3", 25.0).await,
+        RequestStatus::Approved
+    );
+    assert_eq!(
+        decide(&sq, "iam", "L-FE177D64", 4000.0).await,
+        RequestStatus::Approved
+    );
+
+    let summary = iam.get_account_summary().send().await.unwrap();
+    let map = summary.summary_map().unwrap();
+    assert_eq!(
+        map.get(&SummaryKeyType::AttachedPoliciesPerRoleQuota),
+        Some(&25)
+    );
+    assert_eq!(map.get(&SummaryKeyType::RolesQuota), Some(&4000));
+    assert_eq!(map.get(&SummaryKeyType::GroupsQuota), Some(&300));
+}
+
+/// A rule that references the CloudFront origin-facing AWS-managed prefix
+/// list counts as its published weight of 55 rules, leaving 5 of the default
+/// 60.
+#[tokio::test]
+async fn aws_managed_prefix_list_rule_counts_its_weight() {
+    use aws_sdk_ec2::types::{Filter, PrefixListId};
+
+    let server = TestServer::start_full(&[], &["--enforce-quota", "vpc/L-0EA8095F"]).await;
+    let (_, ec2) = clients(&server).await;
+
+    let lists = ec2
+        .describe_managed_prefix_lists()
+        .filters(
+            Filter::builder()
+                .name("prefix-list-name")
+                .values("com.amazonaws.global.cloudfront.origin-facing")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lists.prefix_lists().len(), 1);
+    let cf = &lists.prefix_lists()[0];
+    assert_eq!(cf.owner_id(), Some("AWS"));
+    let pl_id = cf.prefix_list_id().unwrap().to_string();
+
+    // The list holds CloudFront's published origin-facing ranges, no more
+    // than its weight.
+    let entries = ec2
+        .get_managed_prefix_list_entries()
+        .prefix_list_id(&pl_id)
+        .send()
+        .await
+        .unwrap();
+    let n = entries.entries().len();
+    assert!(n > 0 && n <= 55, "{n} entries");
+    assert!(entries
+        .entries()
+        .iter()
+        .all(|e| e.cidr().is_some_and(|c| c.contains('.'))));
+
+    // An unknown filter name matches nothing, as in the other EC2 describes.
+    let none = ec2
+        .describe_managed_prefix_lists()
+        .filters(Filter::builder().name("no-such-filter").values("x").build())
+        .send()
+        .await
+        .unwrap();
+    assert!(none.prefix_lists().is_empty());
+
+    let vpc = ec2
+        .create_vpc()
+        .cidr_block("10.0.0.0/16")
+        .send()
+        .await
+        .unwrap();
+    let sg_id = ec2
+        .create_security_group()
+        .group_name("cloudfront")
+        .description("cloudfront")
+        .vpc_id(vpc.vpc().unwrap().vpc_id().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .group_id()
+        .unwrap()
+        .to_string();
+
+    ec2.authorize_security_group_ingress()
+        .group_id(&sg_id)
+        .ip_permissions(
+            IpPermission::builder()
+                .ip_protocol("tcp")
+                .from_port(443)
+                .to_port(443)
+                .prefix_list_ids(PrefixListId::builder().prefix_list_id(&pl_id).build())
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    // 55 + 5 = 60: at the quota.
+    ec2.authorize_security_group_ingress()
+        .group_id(&sg_id)
+        .set_ip_permissions(Some((0..5).map(cidr_rule).collect()))
+        .send()
+        .await
+        .unwrap();
+    let err = ec2
+        .authorize_security_group_ingress()
+        .group_id(&sg_id)
+        .ip_permissions(cidr_rule(5))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        aws_sdk_ec2::error::ProvideErrorMetadata::code(&err),
+        Some("RulesPerSecurityGroupLimitExceeded")
+    );
+}

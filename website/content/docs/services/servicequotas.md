@@ -23,10 +23,10 @@ account:
 
 | Service code | Quotas |
 |---|---|
-| `vpc` | 25 quotas, including `L-2AFB9258` Security groups per network interface (5), `L-0EA8095F` Inbound or outbound rules per security group (60), `L-F678F1CE` VPCs per Region (5), `L-407747CB` Subnets per VPC (200), `L-E79EC296` VPC security groups per Region (2500) |
+| `vpc` | 25 quotas, including `L-2AFB9258` Security groups per network interface (5), `L-0EA8095F` Inbound or outbound rules per security group (60), `L-F678F1CE` VPCs per Region (5), `L-407747CB` Subnets per VPC (200), `L-E79EC296` VPC security groups per Region (2500), `L-93826ACB` Routes per route table (500) |
 | `ec2` | On-Demand and Spot vCPU quotas (`L-1216C47A`, `L-34B43A08`, with their `AWS/Usage` usage metric), EC2-VPC Elastic IPs (`L-0263D0A3`), the accelerated-instance families, transit gateways, Site-to-Site VPN connections |
-| `iam` | Users, roles, groups, managed policies per role/user/group, customer managed policies, server certificates, OIDC providers (global quotas) |
-| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function storage, general purpose buckets, tables, customer managed keys |
+| `iam` | Users, roles, groups, instance profiles, managed policies per role (20)/user/group, customer managed policies, role trust policy length, server certificates, OIDC providers (global quotas) |
+| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function and layer storage (300 GB), general purpose buckets, tables, customer managed keys |
 
 `ListServices` returns these services. An unknown service code or quota code
 returns `NoSuchResourceException`.
@@ -53,8 +53,10 @@ returns `NoSuchResourceException`.
   default it is decided straight away (with `--quota-requests manual` it waits
   for the introspection API, see [Manual request approval](#manual-request-approval)).
   It is `APPROVED` and the applied value raised,
-  unless it asks for more than AWS allows. Some quotas have a documented
-  maximum (16 security groups per network interface, for example). For the two
+  unless it asks for more than AWS allows. Quotas with a documented maximum
+  carry it (16 security groups per network interface, 1,000 routes per route
+  table, 25 managed policies per role, 10,000 roles, 700 OIDC providers, for
+  example). For the two
   security-group quotas, AWS also requires that security groups per interface
   multiplied by rules per group stays at or below 1000. A request above
   either limit is `NOT_APPROVED`, and the applied value stays. A value at or
@@ -145,7 +147,11 @@ persist across restarts in persistent mode.
 As on AWS, the rules quota applies to each direction separately and counts
 IPv4 and IPv6 rules separately. A rule that references a security group counts
 toward both. A rule that references a customer-managed prefix list counts as
-the list's maximum number of entries, toward the list's address family.
+the list's maximum number of entries, and one that references an AWS-managed
+prefix list counts as the list's published weight (55 for the CloudFront
+origin-facing list, 1 for S3 and DynamoDB), toward the list's address family.
+`DescribeManagedPrefixLists` lists the AWS-managed prefix lists (owner `AWS`)
+alongside the account's own.
 `ModifyManagedPrefixList` honours this too: a larger `MaxEntries` that would
 push a referencing group over the quota leaves the list at its old size in
 `modify-failed`, with the group ids in `StateMessage`.
@@ -193,6 +199,15 @@ through the endpoints above. A value AWS would never approve (past the quota's
 maximum or the security-group product limit) is still `NOT_APPROVED` on
 submission, and approving a request that stopped being approvable while it
 waited returns 409; deny it instead.
+
+## IAM account summary
+
+IAM `GetAccountSummary` reads its `UsersQuota`, `GroupsQuota`, `RolesQuota`,
+`PoliciesQuota`, `InstanceProfilesQuota`, `ServerCertificatesQuota`,
+`AttachedPoliciesPer{Role,User,Group}Quota` and `AssumeRolePolicySizeQuota`
+entries from the account's applied `iam` quotas, so a quota raised here shows
+up there. The other entries (policy sizes, access keys per user, ...) are fixed
+AWS limits.
 
 ## Known limitations
 

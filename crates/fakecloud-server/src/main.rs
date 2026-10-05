@@ -2043,7 +2043,8 @@ async fn main() {
         } else {
             None
         };
-    let mut iam_service = IamService::new(iam_state.clone());
+    let mut iam_service =
+        IamService::new(iam_state.clone()).with_quota_provider(Some(quota_provider.clone()));
     if let Some(ref store) = iam_snapshot_store {
         iam_service = iam_service.with_snapshot_store(store.clone());
     }
