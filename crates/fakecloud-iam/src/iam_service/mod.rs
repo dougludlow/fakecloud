@@ -28,6 +28,9 @@ pub struct IamService {
     state: SharedIamState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: IamSnapshotLock,
+    /// Service Quotas, for the applied values `GetAccountSummary` reports.
+    /// Without one (a bare `IamService`) the AWS defaults apply.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 impl IamService {
@@ -36,7 +39,18 @@ impl IamService {
             state,
             snapshot_store: None,
             snapshot_lock: crate::persistence::new_snapshot_lock(),
+            quota_provider: None,
         }
+    }
+
+    /// Attach Service Quotas so `GetAccountSummary` reports each account's
+    /// applied quota values rather than the AWS defaults.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
+        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {

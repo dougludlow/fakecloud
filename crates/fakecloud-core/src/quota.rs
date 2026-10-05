@@ -21,6 +21,77 @@ pub const DEFAULT_SECURITY_GROUPS_PER_INTERFACE: usize = 5;
 /// AWS default for [`RULES_PER_SECURITY_GROUP`].
 pub const DEFAULT_RULES_PER_SECURITY_GROUP: usize = 60;
 
+/// Service code of the IAM quotas.
+pub const IAM_SERVICE_CODE: &str = "iam";
+
+/// An IAM `GetAccountSummary` `*Quota` entry backed by a Service Quotas quota.
+#[derive(Debug, Clone, Copy)]
+pub struct IamSummaryQuota {
+    /// The `SummaryMap` key, e.g. `RolesQuota`.
+    pub summary_key: &'static str,
+    /// The `iam` Service Quotas quota code.
+    pub quota_code: &'static str,
+    /// The AWS default for a new account.
+    pub default: f64,
+}
+
+/// The `GetAccountSummary` quota entries IAM reads from Service Quotas, so a
+/// quota raised with `RequestServiceQuotaIncrease` shows up in IAM. The other
+/// `*Quota` entries (policy sizes, access keys per user, ...) are fixed AWS
+/// limits with no Service Quotas counterpart.
+pub const IAM_SUMMARY_QUOTAS: &[IamSummaryQuota] = &[
+    IamSummaryQuota {
+        summary_key: "UsersQuota",
+        quota_code: "L-F55AF5E4",
+        default: 5000.0,
+    },
+    IamSummaryQuota {
+        summary_key: "GroupsQuota",
+        quota_code: "L-F4A5425F",
+        default: 300.0,
+    },
+    IamSummaryQuota {
+        summary_key: "ServerCertificatesQuota",
+        quota_code: "L-BF35879D",
+        default: 20.0,
+    },
+    IamSummaryQuota {
+        summary_key: "PoliciesQuota",
+        quota_code: "L-E95E4862",
+        default: 1500.0,
+    },
+    IamSummaryQuota {
+        summary_key: "RolesQuota",
+        quota_code: "L-FE177D64",
+        default: 1000.0,
+    },
+    IamSummaryQuota {
+        summary_key: "InstanceProfilesQuota",
+        quota_code: "L-6E65F664",
+        default: 1000.0,
+    },
+    IamSummaryQuota {
+        summary_key: "AttachedPoliciesPerGroupQuota",
+        quota_code: "L-384571C4",
+        default: 10.0,
+    },
+    IamSummaryQuota {
+        summary_key: "AttachedPoliciesPerRoleQuota",
+        quota_code: "L-0DA4ABF3",
+        default: 20.0,
+    },
+    IamSummaryQuota {
+        summary_key: "AttachedPoliciesPerUserQuota",
+        quota_code: "L-4019AD8B",
+        default: 10.0,
+    },
+    IamSummaryQuota {
+        summary_key: "AssumeRolePolicySizeQuota",
+        quota_code: "L-C07B4B0D",
+        default: 2048.0,
+    },
+];
+
 /// Resolves the applied value of a quota for an account.
 pub trait QuotaProvider: Send + Sync {
     /// The applied value of `service_code`/`quota_code` for `account_id` in

@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_lines)]
 
 use super::*;
+use crate::service::aws_prefix_lists::{self, GATEWAY_ENDPOINT_SERVICES};
 use crate::service::quota::RuleWeights;
 use crate::service_helpers::ec2_arn;
 
@@ -153,32 +154,81 @@ pub(crate) fn describe_managed_prefix_lists(
     let wanted = indexed_list(&req.query_params, "PrefixListId");
     let owner = req.account_id.clone();
     let region = region_of(req);
+    let filters = parse_filters(&req.query_params);
+    // `prefix-list-id`, `prefix-list-name`, `owner-id`, `tag:<key>` and
+    // `tag-key` select lists; a filter on another name matches nothing, as no
+    // list carries it.
+    let selected = |id: &str, name: &str, owner_id: &str, tags: &[Tag]| {
+        (wanted.is_empty() || wanted.iter().any(|w| w == id))
+            && filters.iter().all(|f| {
+                let candidates: Vec<&str> = match f.name.as_str() {
+                    "prefix-list-id" => vec![id],
+                    "prefix-list-name" => vec![name],
+                    "owner-id" => vec![owner_id],
+                    "tag-key" => tags.iter().map(|t| t.key.as_str()).collect(),
+                    other => match other.strip_prefix("tag:") {
+                        Some(key) => tags
+                            .iter()
+                            .filter(|t| t.key == key)
+                            .map(|t| t.value.as_str())
+                            .collect(),
+                        None => Vec::new(),
+                    },
+                };
+                f.values.iter().any(|v| {
+                    candidates
+                        .iter()
+                        .any(|c| crate::service_helpers::filter_value_matches(v, c))
+                })
+            })
+    };
     let accounts = svc.state.read();
     let empty = Ec2State::new(&req.account_id, &req.region);
     let state = accounts.get(&req.account_id).unwrap_or(&empty);
-    let items: Vec<String> = state
-        .managed_prefix_lists
-        .values()
-        .filter(|p| wanted.is_empty() || wanted.contains(&p.prefix_list_id))
-        .map(|p| managed_prefix_list_xml(p, state.tags_for(&p.prefix_list_id), &owner, &region))
+    // The AWS-managed lists every account can reference (owner `AWS`). They
+    // report no MaxEntries or version: a reference weighs the list's
+    // published weight instead.
+    let mut items: Vec<String> = aws_prefix_lists::AWS_MANAGED_PREFIX_LISTS
+        .iter()
+        .map(|l| (l.id_in(&region), l.name_in(&region), l))
+        .filter(|(id, name, _)| selected(id, name, "AWS", &[]))
+        .map(|(id, name, l)| {
+            format!(
+                "{}{}{}{}{}{}{}",
+                ec2_elem("prefixListId", &id),
+                ec2_elem("addressFamily", l.address_family),
+                ec2_elem("state", "create-complete"),
+                ec2_elem(
+                    "prefixListArn",
+                    &ec2_arn(&region, "aws", &format!("prefix-list/{id}"))
+                ),
+                ec2_elem("prefixListName", &name),
+                ec2_elem("ownerId", "AWS"),
+                super::super::tags::tag_set_xml(&[]),
+            )
+        })
         .collect();
+    items.extend(
+        state
+            .managed_prefix_lists
+            .values()
+            .filter(|p| {
+                selected(
+                    &p.prefix_list_id,
+                    &p.prefix_list_name,
+                    &owner,
+                    state.tags_for(&p.prefix_list_id),
+                )
+            })
+            .map(|p| {
+                managed_prefix_list_xml(p, state.tags_for(&p.prefix_list_id), &owner, &region)
+            }),
+    );
     Ok(Ec2Service::respond(
         "DescribeManagedPrefixLists",
         &req.request_id,
         &ec2_list("prefixListSet", &items),
     ))
-}
-
-/// A deterministic AWS-managed prefix-list id for `service` in `region` (the
-/// legacy DescribePrefixLists surfaces `com.amazonaws.<region>.s3` and
-/// `.dynamodb` alongside customer-managed lists).
-fn aws_managed_pl_id(region: &str, service: &str) -> String {
-    let mut hash: u64 = 1469598103934665603;
-    for b in format!("{region}.{service}").bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(1099511628257);
-    }
-    format!("pl-{:08x}", (hash & 0xffff_ffff) as u32)
 }
 
 fn legacy_pl_xml(id: &str, name: &str, cidrs: &[String]) -> String {
@@ -197,20 +247,16 @@ pub(crate) fn describe_prefix_lists(
 ) -> Result<AwsResponse, AwsServiceError> {
     let region = region_of(req);
     let wanted = indexed_list(&req.query_params, "PrefixListId");
-    // AWS-managed service prefix lists (representative CIDR sets).
+    // The gateway-endpoint AWS-managed lists (representative CIDR sets).
     let mut items: Vec<String> = Vec::new();
-    let managed = [
-        (
-            "s3",
-            vec!["54.231.0.0/17".to_string(), "52.216.0.0/15".to_string()],
-        ),
-        ("dynamodb", vec!["52.94.0.0/22".to_string()]),
-    ];
-    for (svc_name, cidrs) in managed {
-        let id = aws_managed_pl_id(&region, svc_name);
+    for list in GATEWAY_ENDPOINT_SERVICES
+        .iter()
+        .filter_map(|s| aws_prefix_lists::gateway_endpoint_list(s))
+    {
+        let id = list.id_in(&region);
         if wanted.is_empty() || wanted.contains(&id) {
-            let name = format!("com.amazonaws.{region}.{svc_name}");
-            items.push(legacy_pl_xml(&id, &name, &cidrs));
+            let cidrs: Vec<String> = list.cidrs.iter().map(|c| c.to_string()).collect();
+            items.push(legacy_pl_xml(&id, &list.name_in(&region), &cidrs));
         }
     }
     // Customer-managed prefix lists also appear here, with their entry CIDRs.
@@ -260,14 +306,25 @@ pub(crate) fn get_managed_prefix_list_entries(
     let accounts = svc.state.read();
     let empty = Ec2State::new(&req.account_id, &req.region);
     let state = accounts.get(&req.account_id).unwrap_or(&empty);
-    // Empty entry set for a synthetic id (EC2 models no error for this op).
-    let no_entries: Vec<PrefixListEntry> = Vec::new();
+    // An AWS-managed list reports the ranges fakecloud holds for it; any
+    // other unknown id an empty entry set (EC2 models no error for this op).
+    let aws_entries: Vec<PrefixListEntry> = aws_prefix_lists::by_id(&region_of(req), &id)
+        .map(|l| {
+            l.cidrs
+                .iter()
+                .map(|c| PrefixListEntry {
+                    cidr: c.to_string(),
+                    description: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let entries = match state.managed_prefix_lists.get(&id) {
         Some(pl) => match target_version {
             Some(v) => pl.version_history.get(&v).unwrap_or(&pl.entries),
             None => &pl.entries,
         },
-        None => &no_entries,
+        None => &aws_entries,
     };
     let items: Vec<String> = entries
         .iter()
@@ -322,7 +379,7 @@ pub(crate) fn modify_managed_prefix_list(
     // could not take the new size.
     let blocked = match (new_max, state.managed_prefix_lists.get(&id)) {
         (Some(m), Some(current)) if m > current.max_entries => {
-            groups_over_quota_at(state, &id, m, rule_limit)
+            groups_over_quota_at(state, &region, &id, m, rule_limit)
         }
         _ => Vec::new(),
     };
@@ -400,13 +457,19 @@ pub(crate) fn modify_managed_prefix_list(
 
 /// Security groups (at most ten, as AWS reports them) whose rules would exceed
 /// `limit` if prefix list `id` had `max_entries` entries.
-fn groups_over_quota_at(state: &Ec2State, id: &str, max_entries: i64, limit: usize) -> Vec<String> {
+fn groups_over_quota_at(
+    state: &Ec2State,
+    region: &str,
+    id: &str,
+    max_entries: i64,
+    limit: usize,
+) -> Vec<String> {
     let mut lists = state.managed_prefix_lists.clone();
     if let Some(pl) = lists.get_mut(id) {
         pl.max_entries = max_entries;
     }
-    let before = RuleWeights::new(&state.managed_prefix_lists);
-    let after = RuleWeights::new(&lists);
+    let before = RuleWeights::new(&state.managed_prefix_lists, region);
+    let after = RuleWeights::new(&lists, region);
     state
         .security_groups
         .values()
