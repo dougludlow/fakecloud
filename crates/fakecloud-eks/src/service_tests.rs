@@ -2437,6 +2437,75 @@ async fn capability_create_describe_list_update_delete() {
 }
 
 #[tokio::test]
+async fn argocd_endpoint_prefix_round_trips_and_survives_update() {
+    let svc = EksService::new(make_state());
+    create_cluster(&svc, "c1").await;
+    let viewer = json!({"id": "u-1", "type": "SSO_USER"});
+    let editor = json!({"id": "g-1", "type": "SSO_GROUP"});
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c1/capabilities",
+            &json!({
+                "capabilityName": "argo",
+                "type": "ARGOCD",
+                "roleArn": "arn:aws:iam::111122223333:role/eks-capability",
+                "deletePropagationPolicy": "RETAIN",
+                "configuration": {"argoCd": {
+                    "namespace": "argocd",
+                    "endpointPrefix": "my-argo",
+                    "rbacRoleMappings": [{"role": "VIEWER", "identities": [viewer]}]
+                }}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        v["capability"]["configuration"]["argoCd"]["endpointPrefix"],
+        "my-argo"
+    );
+
+    // UpdateArgoCdConfig carries only rbac deltas + networkAccess; the
+    // create-time endpointPrefix and namespace must survive it.
+    svc.handle(make_request(
+        Method::POST,
+        "/clusters/c1/capabilities/argo",
+        &json!({"configuration": {"argoCd": {
+            "networkAccess": {"vpceIds": ["vpce-0123456789abcdef0"]},
+            "rbacRoleMappings": {
+                "addOrUpdateRoleMappings": [{"role": "EDITOR", "identities": [editor]}],
+                "removeRoleMappings": [{"role": "VIEWER", "identities": [viewer]}]
+            }
+        }}})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/clusters/c1/capabilities/argo",
+            "",
+        ))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let argo = &v["capability"]["configuration"]["argoCd"];
+    assert_eq!(argo["endpointPrefix"], "my-argo");
+    assert_eq!(argo["namespace"], "argocd");
+    assert_eq!(
+        argo["networkAccess"]["vpceIds"][0],
+        "vpce-0123456789abcdef0"
+    );
+    assert_eq!(
+        argo["rbacRoleMappings"],
+        json!([{"role": "EDITOR", "identities": [editor]}])
+    );
+}
+
+#[tokio::test]
 async fn capability_on_missing_cluster_is_not_found() {
     let svc = EksService::new(make_state());
     let err = svc

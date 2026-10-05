@@ -1277,6 +1277,80 @@ pub(crate) fn normalize_capability_configuration(req: Option<&Value>) -> Option<
     Some(json!({ "argoCd": argo }))
 }
 
+/// Apply an `UpdateCapabilityConfiguration` onto a stored capability
+/// configuration. `UpdateArgoCdConfig` only carries `networkAccess` (which
+/// replaces the stored one) and `rbacRoleMappings` add/remove deltas; every
+/// other create-time member (`namespace`, `awsIdc`, `endpointPrefix`, which
+/// can't change after creation) is preserved.
+pub(crate) fn apply_capability_configuration_update(
+    existing: Option<&Value>,
+    update: Option<&Value>,
+) -> Option<Value> {
+    let delta = update.and_then(|u| u.get("argoCd"))?;
+    let mut argo = existing
+        .and_then(|e| e.get("argoCd"))
+        .and_then(|a| a.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(net) = delta.get("networkAccess") {
+        argo.insert("networkAccess".into(), net.clone());
+    }
+    if let Some(rbac) = delta.get("rbacRoleMappings") {
+        let mut mappings: Vec<Value> = argo
+            .get("rbacRoleMappings")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let identities_of = |m: &Value| -> Vec<Value> {
+            m.get("identities")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let same_identity =
+            |a: &Value, b: &Value| a.get("id") == b.get("id") && a.get("type") == b.get("type");
+        for add in rbac
+            .get("addOrUpdateRoleMappings")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let role = add.get("role");
+            match mappings.iter_mut().find(|m| m.get("role") == role) {
+                Some(existing) => {
+                    let mut ids = identities_of(existing);
+                    for id in identities_of(add) {
+                        if !ids.iter().any(|e| same_identity(e, &id)) {
+                            ids.push(id);
+                        }
+                    }
+                    existing["identities"] = Value::Array(ids);
+                }
+                None => mappings.push(add.clone()),
+            }
+        }
+        for remove in rbac
+            .get("removeRoleMappings")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let role = remove.get("role");
+            let gone = identities_of(remove);
+            for m in mappings.iter_mut().filter(|m| m.get("role") == role) {
+                let kept: Vec<Value> = identities_of(m)
+                    .into_iter()
+                    .filter(|id| !gone.iter().any(|g| same_identity(g, id)))
+                    .collect();
+                m["identities"] = Value::Array(kept);
+            }
+            mappings.retain(|m| !identities_of(m).is_empty());
+        }
+        argo.insert("rbacRoleMappings".into(), Value::Array(mappings));
+    }
+    Some(json!({ "argoCd": Value::Object(argo) }))
+}
+
 pub(crate) fn capability_json(c: &Capability) -> Value {
     let mut out = json!({
         "capabilityName": c.name,
