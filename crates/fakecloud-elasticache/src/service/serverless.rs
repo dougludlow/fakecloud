@@ -25,6 +25,24 @@ impl ElastiCacheService {
         let snapshot_retention_limit =
             optional_non_negative_i32_param(request, "SnapshotRetentionLimit")?;
         let daily_snapshot_time = optional_query_param(request, "DailySnapshotTime");
+        let network_type = optional_query_param(request, "NetworkType");
+        if let Some(ref nt) = network_type {
+            if nt != "ipv4" && nt != "ipv6" && nt != "dual_stack" {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterValue",
+                    format!(
+                        "Invalid value for NetworkType: '{nt}'. Valid values: ipv4, ipv6, dual_stack."
+                    ),
+                ));
+            }
+        }
+        let connection_type = optional_query_param(request, "ConnectionType");
+        validate_serverless_connection_type(
+            connection_type.as_deref(),
+            &engine,
+            &major_engine_version,
+        )?;
         let tags = parse_tags(request)?;
 
         let (arn, endpoint_address) = {
@@ -116,6 +134,8 @@ impl ElastiCacheService {
             user_group_id,
             snapshot_retention_limit,
             daily_snapshot_time,
+            network_type: Some(network_type.unwrap_or_else(|| "ipv4".to_string())),
+            connection_type: Some(connection_type.unwrap_or_else(|| "vpc".to_string())),
             container_id: String::new(),
             host_port: 0,
             data_volume: Some(fakecloud_core::data_volume::DataVolumeBinding::Scoped),

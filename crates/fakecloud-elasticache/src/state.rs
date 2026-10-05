@@ -489,6 +489,12 @@ pub struct ServerlessCache {
     pub user_group_id: Option<String>,
     pub snapshot_retention_limit: Option<i32>,
     pub daily_snapshot_time: Option<String>,
+    /// `NetworkType` — `ipv4` (default), `ipv6`, or `dual_stack`.
+    #[serde(default)]
+    pub network_type: Option<String>,
+    /// `ConnectionType` — `vpc` (default) or `public`. Fixed at creation.
+    #[serde(default)]
+    pub connection_type: Option<String>,
     pub container_id: String,
     pub host_port: u16,
     /// Which data volume the resource mounts (see
@@ -1591,6 +1597,8 @@ pub(crate) mod tests {
             user_group_id: None,
             snapshot_retention_limit: None,
             daily_snapshot_time: None,
+            network_type: None,
+            connection_type: None,
             container_id: "cid".to_string(),
             host_port: 6379,
             data_volume: None,
@@ -2058,6 +2066,8 @@ pub(crate) mod tests {
                 user_group_id: None,
                 snapshot_retention_limit: None,
                 daily_snapshot_time: None,
+                network_type: None,
+                connection_type: None,
                 container_id: "cid".to_string(),
                 host_port: 6379,
                 data_volume: None,

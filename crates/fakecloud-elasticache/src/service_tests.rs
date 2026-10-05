@@ -889,6 +889,92 @@ async fn create_serverless_cache_accepts_valkey_7() {
 }
 
 #[tokio::test]
+async fn serverless_cache_connection_and_network_type_round_trip() {
+    let shared = std::sync::Arc::new(parking_lot::RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let service = ElastiCacheService::new(shared);
+
+    // Defaults: vpc connection, ipv4, service-managed encryption.
+    let resp = service
+        .create_serverless_cache(&request(
+            "CreateServerlessCache",
+            &[("ServerlessCacheName", "sc-default"), ("Engine", "valkey")],
+        ))
+        .await
+        .unwrap();
+    let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        body.contains("<ConnectionType>vpc</ConnectionType>"),
+        "{body}"
+    );
+    assert!(body.contains("<NetworkType>ipv4</NetworkType>"), "{body}");
+    assert!(body.contains("<StorageEncryptionType>sse-elasticache</StorageEncryptionType>"));
+
+    // public on Valkey 9 with dual-stack networking and a CMK.
+    service
+        .create_serverless_cache(&request(
+            "CreateServerlessCache",
+            &[
+                ("ServerlessCacheName", "sc-public"),
+                ("Engine", "valkey"),
+                ("MajorEngineVersion", "9"),
+                ("ConnectionType", "public"),
+                ("NetworkType", "dual_stack"),
+                ("KmsKeyId", "arn:aws:kms:us-east-1:123456789012:key/k1"),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resp = service
+        .describe_serverless_caches(&request(
+            "DescribeServerlessCaches",
+            &[("ServerlessCacheName", "sc-public")],
+        ))
+        .unwrap();
+    let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        body.contains("<ConnectionType>public</ConnectionType>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<NetworkType>dual_stack</NetworkType>"),
+        "{body}"
+    );
+    assert!(body.contains("<StorageEncryptionType>sse-kms</StorageEncryptionType>"));
+
+    // public needs Valkey 9+.
+    let err = service
+        .create_serverless_cache(&request(
+            "CreateServerlessCache",
+            &[
+                ("ServerlessCacheName", "sc-public-8"),
+                ("Engine", "valkey"),
+                ("MajorEngineVersion", "8"),
+                ("ConnectionType", "public"),
+            ],
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterCombination");
+
+    let err = service
+        .create_serverless_cache(&request(
+            "CreateServerlessCache",
+            &[
+                ("ServerlessCacheName", "sc-bad"),
+                ("Engine", "valkey"),
+                ("ConnectionType", "internet"),
+            ],
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidParameterValue");
+}
+
+#[tokio::test]
 async fn create_cache_cluster_without_runtime_falls_back_to_metadata_only() {
     // No container runtime is configured. The Smithy model has no
     // "Docker missing" error shape, so refusing the call would emit an
@@ -1238,6 +1324,8 @@ fn service_with_serverless_cache(cache_name: &str) -> ElastiCacheService {
                 user_group_id: None,
                 snapshot_retention_limit: Some(1),
                 daily_snapshot_time: Some("03:00".to_string()),
+                network_type: None,
+                connection_type: None,
                 container_id: "cid".to_string(),
                 host_port: 6379,
                 data_volume: None,
@@ -2026,6 +2114,8 @@ fn describe_serverless_caches_returns_all() {
                 user_group_id: None,
                 snapshot_retention_limit: None,
                 daily_snapshot_time: None,
+                network_type: None,
+                connection_type: None,
                 container_id: "cid".to_string(),
                 host_port: 6380,
                 data_volume: None,
