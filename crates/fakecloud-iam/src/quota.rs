@@ -123,12 +123,17 @@ pub fn check_new(
     quota: IamQuota,
     limit: Option<usize>,
 ) -> Result<(), AwsServiceError> {
-    let usage = account_usage(state, quota)
-        .unwrap_or_else(|| panic!("check_new takes an account-level quota, not {quota:?}"));
-    if limit.is_none() {
-        return Ok(());
+    let usage = account_usage(state, quota);
+    // A per-principal quota has no account count: that is a caller bug,
+    // caught in tests, never a panic in a running server.
+    debug_assert!(
+        usage.is_some(),
+        "check_new takes an account-level quota, not {quota:?}"
+    );
+    match (usage, limit) {
+        (Some(usage), Some(_)) => check(quota, limit, usage + 1),
+        _ => Ok(()),
     }
-    check(quota, limit, usage + 1)
 }
 
 /// The managed policies a principal holds after attaching `adding` to
@@ -284,6 +289,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "account-level quota")]
     fn check_new_refuses_a_per_principal_quota() {
         let state = IamState::new_in_region("123456789012", "us-east-1");
