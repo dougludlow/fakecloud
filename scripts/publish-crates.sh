@@ -486,6 +486,7 @@ meta = json.loads(proc.stdout)
 
 # `publish = false` in Cargo.toml surfaces as an empty list here.
 packages = {p["name"]: p for p in meta["packages"] if p.get("publish") != []}
+unpublished = {p["name"] for p in meta["packages"] if p.get("publish") == []}
 position = {}
 errors = []
 
@@ -511,6 +512,13 @@ for name, pkg in packages.items():
         # only strips path-only dev-deps, and resolves the rest against the index
         # at publish time ("failed to select a version for the requirement").
         if dep.get("kind") == "dev" and dep.get("req") in (None, "*"):
+            continue
+        if dep.get("path") and dep["name"] in unpublished:
+            errors.append(
+                f"{name} depends on {dep['name']} with a version requirement, but "
+                f"{dep['name']} is publish = false — crates.io can never resolve it; "
+                "make it a path-only dev-dependency or publish it"
+            )
             continue
         if not dep.get("path") or dep["name"] not in position:
             continue

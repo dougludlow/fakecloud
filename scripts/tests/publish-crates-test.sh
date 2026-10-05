@@ -209,7 +209,7 @@ check J "deadline exit names the remaining crates and the resume command" \
 # orders the publish like a normal dep; a path-only dev-dep is stripped and does
 # not. Fixture: the real workspace metadata with one dev-dep injected from the
 # first listed crate onto the last.
-# dev_dep_check <req> -> exit code of --check against the fixture
+# dev_dep_check <req> [dep-name] -> exit code of --check against the fixture
 dev_dep_check() {
   "$CARGO_REAL" metadata --no-deps --format-version 1 --offline --manifest-path "$ROOT/Cargo.toml" |
     python3 -c '
@@ -217,9 +217,9 @@ import json, sys
 meta = json.load(sys.stdin)
 pkgs = {p["name"]: p for p in meta["packages"]}
 pkgs["fakecloud-aws"]["dependencies"].append(
-    {"name": "fakecloud", "kind": "dev", "req": sys.argv[1], "path": "/x"})
+    {"name": sys.argv[2], "kind": "dev", "req": sys.argv[1], "path": "/x"})
 json.dump(meta, sys.stdout)
-' "$1" > "$TMP/metadata.json"
+' "$1" "${2:-fakecloud}" > "$TMP/metadata.json"
   (cd "$ROOT" && env PATH="$STUB:$PATH" STUB_METADATA="$TMP/metadata.json" \
     bash "$SCRIPT" --check > "$OUT" 2>&1)
   echo $?
@@ -232,6 +232,15 @@ check K "versioned dev-dep published later is an ordering error" \
 code=$(dev_dep_check "*")
 check L "path-only dev-dep does not constrain publish order" \
   "$([ "$code" = 0 ] && saw 'dependency order valid' && echo 0 || echo 1)"
+
+# A versioned dep on a publish = false member can never resolve on crates.io.
+code=$(dev_dep_check "^$STUB_VERSION" fakecloud-testkit)
+check M "versioned dev-dep on an unpublished crate is rejected" \
+  "$([ "$code" = 1 ] && saw 'fakecloud-testkit is publish = false' && echo 0 || echo 1)"
+
+code=$(dev_dep_check "*" fakecloud-testkit)
+check N "path-only dev-dep on an unpublished crate is accepted" \
+  "$([ "$code" = 0 ] && echo 0 || echo 1)"
 
 echo
 if [ "$FAILURES" -ne 0 ]; then
