@@ -197,6 +197,21 @@ pub fn partition_for(region: &str) -> &'static str {
     }
 }
 
+/// The primary region of `region`'s partition: where the partition's
+/// account-wide (not per-region) settings are managed, such as the S3 bucket
+/// quota (US East (N. Virginia) in the commercial partition).
+pub fn partition_primary_region(region: &str) -> &'static str {
+    match partition_for(region) {
+        "aws-cn" => "cn-north-1",
+        "aws-us-gov" => "us-gov-west-1",
+        "aws-iso" => "us-iso-east-1",
+        "aws-iso-b" => "us-isob-east-1",
+        "aws-iso-f" => "us-isof-south-1",
+        "aws-iso-e" => "eu-isoe-west-1",
+        _ => "us-east-1",
+    }
+}
+
 impl fmt::Display for Arn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -351,6 +366,26 @@ mod tests {
         assert_eq!(partition_for("us-isob-east-1"), "aws-iso-b");
         assert_eq!(partition_for("us-isof-south-1"), "aws-iso-f");
         assert_eq!(partition_for("eu-isoe-west-1"), "aws-iso-e");
+    }
+
+    #[test]
+    fn partition_primary_region_stays_in_the_partition() {
+        for region in [
+            "us-east-1",
+            "eu-west-1",
+            "cn-northwest-1",
+            "us-gov-east-1",
+            "us-iso-west-1",
+            "us-isob-east-1",
+            "us-isof-east-1",
+            "eu-isoe-west-1",
+        ] {
+            let primary = partition_primary_region(region);
+            assert_eq!(partition_for(primary), partition_for(region), "{region}");
+        }
+        assert_eq!(partition_primary_region("ap-south-1"), "us-east-1");
+        assert_eq!(partition_primary_region("cn-northwest-1"), "cn-north-1");
+        assert_eq!(partition_primary_region("us-gov-east-1"), "us-gov-west-1");
     }
 
     #[test]

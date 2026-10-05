@@ -116,6 +116,9 @@ pub struct DynamoDbService {
     /// matches AWS's short idempotency window).
     transact_idempotency:
         Arc<parking_lot::Mutex<HashMap<(String, String), TransactIdempotencyEntry>>>,
+    /// Service Quotas, for the table quota once the user switched its
+    /// enforcement on. Without one nothing is enforced.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 impl DynamoDbService {
@@ -130,7 +133,24 @@ impl DynamoDbService {
             region: "us-east-1".to_string(),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             transact_idempotency: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            quota_provider: None,
         }
+    }
+
+    /// Attach Service Quotas so the table quota is enforced once the user
+    /// switches it on.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
+        self
+    }
+
+    /// The enforced table limit of `region` for `account_id`. Resolved before
+    /// the DynamoDB lock is taken.
+    pub(crate) fn table_limit(&self, account_id: &str, region: &str) -> Option<usize> {
+        crate::quota::enforced_table_limit(self.quota_provider.as_ref(), account_id, region)
     }
 
     /// Before an item write: start recording the keys written to every

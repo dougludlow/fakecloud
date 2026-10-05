@@ -145,6 +145,9 @@ pub struct S3Service {
     /// that bucket's policy to allow the replication role (logged under
     /// `soft`, refused under `strict`).
     pub(crate) iam_mode: fakecloud_core::auth::IamMode,
+    /// Service Quotas, for the bucket quota once the user switched its
+    /// enforcement on. Without one nothing is enforced.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 /// Serialize a persistence snapshot, turning a failure into a 500 rather than an
@@ -456,7 +459,18 @@ impl S3Service {
             store,
             credential_resolver: None,
             iam_mode: fakecloud_core::auth::IamMode::Off,
+            quota_provider: None,
         }
+    }
+
+    /// Attach Service Quotas so the general purpose bucket quota is enforced
+    /// once the user switches it on.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
+        self
     }
 
     pub fn with_iam_mode(mut self, mode: fakecloud_core::auth::IamMode) -> Self {

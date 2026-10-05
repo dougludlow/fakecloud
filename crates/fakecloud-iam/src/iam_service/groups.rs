@@ -25,6 +25,7 @@ impl IamService {
             .get("Path")
             .cloned()
             .unwrap_or_else(|| "/".to_string());
+        let limit = self.enforced(req, crate::quota::IamQuota::Groups);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -36,6 +37,7 @@ impl IamService {
                 format!("Group {group_name} already exists"),
             ));
         }
+        crate::quota::check_new(state, crate::quota::IamQuota::Groups, limit)?;
 
         let group = IamGroup {
             group_id: format!("AGPA{}", generate_id()),
@@ -647,6 +649,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let policy_arn = required_param(&req.query_params, "PolicyArn")?;
+        let limit = self.enforced(req, crate::quota::IamQuota::ManagedPoliciesPerGroup);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -681,6 +684,12 @@ impl IamService {
             .get_mut(&group_name)
             .expect("group presence checked above");
         if !group.attached_policies.contains(&policy_arn) {
+            crate::quota::check_attachments(
+                crate::quota::IamQuota::ManagedPoliciesPerGroup,
+                limit,
+                &group.attached_policies,
+                std::slice::from_ref(&policy_arn),
+            )?;
             group.attached_policies.push(policy_arn.clone());
             if let Some(p) = state.policies.get_mut(&policy_arn) {
                 p.attachment_count += 1;

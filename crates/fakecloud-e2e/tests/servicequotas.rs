@@ -5,8 +5,9 @@
 //! values it reports are the ones EC2 enforces once enforcement is switched
 //! on: raising "Inbound or outbound rules per security group" or "Security
 //! groups per network interface" with `RequestServiceQuotaIncrease` changes
-//! what `AuthorizeSecurityGroupIngress` and `CreateNetworkInterface` accept.
-//! Enforcement is opt-in (`--enforce-quotas`, `--enforce-quota`, or the
+//! what `AuthorizeSecurityGroupIngress` and `CreateNetworkInterface` accept,
+//! and that IAM, DynamoDB, KMS, S3 and Lambda refuse the create that would
+//! take an enforced count quota past its applied value. Enforcement is opt-in (`--enforce-quotas`, `--enforce-quota`, or the
 //! `/_fakecloud/service-quotas/*` introspection API, driven here through the
 //! Rust `fakecloud-sdk`).
 
@@ -965,6 +966,260 @@ async fn aws_managed_prefix_list_rule_counts_its_weight() {
         aws_sdk_ec2::error::ProvideErrorMetadata::code(&err),
         Some("RulesPerSecurityGroupLimitExceeded")
     );
+}
+
+// ---- IAM, DynamoDB, KMS, S3 and Lambda enforcement ----
+
+/// Lower `service`/`code` to one above its current usage and switch its
+/// enforcement on through the introspection API. Returns that usage, which
+/// must be reported (the service counts it).
+async fn cap_one_above_usage(fc: &FakeCloud, service: &str, code: &str) -> f64 {
+    let quotas = fc
+        .service_quotas()
+        .get_quotas(None, None, Some(service))
+        .await
+        .unwrap();
+    let usage = quotas
+        .quotas
+        .iter()
+        .find(|q| q.quota_code == code)
+        .unwrap_or_else(|| panic!("{service}/{code} missing"))
+        .usage
+        .unwrap_or_else(|| panic!("{service}/{code} reports no usage"));
+    let quota = fc
+        .service_quotas()
+        .put_quota(
+            service,
+            code,
+            &PutServiceQuotaRequest {
+                value: Some(usage + 1.0),
+                enforce: Some(QuotaEnforcement::Enforce),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(quota.enforceable && quota.enforced, "{service}/{code}");
+    usage
+}
+
+const TRUST: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+
+#[tokio::test]
+async fn enforced_iam_roles_quota_refuses_the_next_role() {
+    use aws_sdk_iam::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let fc = FakeCloud::new(server.endpoint());
+    let iam = server.iam_client().await;
+
+    let create = |name: &'static str| {
+        iam.create_role()
+            .role_name(name)
+            .assume_role_policy_document(TRUST)
+            .send()
+    };
+    // Unenforced by default: no limit applies.
+    create("before-1").await.unwrap();
+
+    let usage = cap_one_above_usage(&fc, "iam", "L-FE177D64").await;
+    create("fits").await.unwrap();
+    assert_eq!(usage_of(&fc, "iam", "L-FE177D64").await, usage + 1.0);
+    let err = create("over").await.unwrap_err();
+    assert_eq!(err.code(), Some("LimitExceeded"));
+    assert_eq!(
+        err.message(),
+        Some(format!("Cannot exceed quota for RolesPerAccount: {}", usage + 1.0).as_str())
+    );
+    assert_eq!(err.raw_response().unwrap().status().as_u16(), 409);
+}
+
+#[tokio::test]
+async fn enforced_managed_policies_per_role_quota_refuses_the_next_attachment() {
+    use aws_sdk_iam::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let fc = FakeCloud::new(server.endpoint());
+    let iam = server.iam_client().await;
+    iam.create_role()
+        .role_name("app")
+        .assume_role_policy_document(TRUST)
+        .send()
+        .await
+        .unwrap();
+
+    fc.service_quotas()
+        .put_quota(
+            "iam",
+            "L-0DA4ABF3",
+            &PutServiceQuotaRequest {
+                value: Some(1.0),
+                enforce: Some(QuotaEnforcement::Enforce),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let attach = |arn: &'static str| {
+        iam.attach_role_policy()
+            .role_name("app")
+            .policy_arn(arn)
+            .send()
+    };
+    attach("arn:aws:iam::aws:policy/ReadOnlyAccess")
+        .await
+        .unwrap();
+    let err = attach("arn:aws:iam::aws:policy/AdministratorAccess")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some("LimitExceeded"));
+    assert_eq!(
+        err.message(),
+        Some("Cannot exceed quota for PoliciesPerRole: 1")
+    );
+}
+
+#[tokio::test]
+async fn enforced_dynamodb_table_quota_refuses_the_next_table() {
+    use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+    let server = TestServer::start().await;
+    let fc = FakeCloud::new(server.endpoint());
+    let ddb = aws_sdk_dynamodb::Client::new(&server.aws_config().await);
+    let create = |name: &'static str| {
+        ddb.create_table()
+            .table_name(name)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("pk")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("pk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .billing_mode(BillingMode::PayPerRequest)
+            .send()
+    };
+    create("before").await.unwrap();
+
+    let usage = cap_one_above_usage(&fc, "dynamodb", "L-F98FE922").await;
+    assert_eq!(usage, 1.0);
+    create("fits").await.unwrap();
+    let err = create("over").await.unwrap_err();
+    assert_eq!(err.code(), Some("LimitExceededException"));
+    assert_eq!(
+        err.message(),
+        Some("Subscriber limit exceeded: There is a limit of 2 tables per subscriber")
+    );
+}
+
+#[tokio::test]
+async fn enforced_kms_key_quota_refuses_the_next_key() {
+    use aws_sdk_kms::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let fc = FakeCloud::new(server.endpoint());
+    let kms = aws_sdk_kms::Client::new(&server.aws_config().await);
+    kms.create_key().send().await.unwrap();
+
+    let usage = cap_one_above_usage(&fc, "kms", "L-C2F1777E").await;
+    assert_eq!(usage, 1.0);
+    let fits = kms.create_key().send().await.unwrap();
+    // A key pending deletion still counts.
+    kms.schedule_key_deletion()
+        .key_id(fits.key_metadata().unwrap().key_id())
+        .pending_window_in_days(7)
+        .send()
+        .await
+        .unwrap();
+    let err = kms.create_key().send().await.unwrap_err();
+    assert_eq!(err.code(), Some("LimitExceededException"));
+}
+
+#[tokio::test]
+async fn enforced_s3_bucket_quota_refuses_the_next_bucket() {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let fc = FakeCloud::new(server.endpoint());
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("quota-before")
+        .send()
+        .await
+        .unwrap();
+
+    let usage = cap_one_above_usage(&fc, "s3", "L-DC2B2D3D").await;
+    assert_eq!(usage, 1.0);
+    s3.create_bucket()
+        .bucket("quota-fits")
+        .send()
+        .await
+        .unwrap();
+    let err = s3
+        .create_bucket()
+        .bucket("quota-over")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some("TooManyBuckets"));
+    assert_eq!(
+        err.message(),
+        Some("You have attempted to create more buckets than allowed")
+    );
+}
+
+#[tokio::test]
+async fn enforced_lambda_code_storage_quota_refuses_the_next_deploy() {
+    use aws_sdk_lambda::error::ProvideErrorMetadata;
+    use aws_sdk_lambda::primitives::Blob;
+    use aws_sdk_lambda::types::{FunctionCode, Runtime};
+    let server = TestServer::start().await;
+    let fc = FakeCloud::new(server.endpoint());
+    let lambda = aws_sdk_lambda::Client::new(&server.aws_config().await);
+
+    // 100 bytes of storage, in the quota's gigabytes.
+    let limit_gb = 100.5 / (1024.0 * 1024.0 * 1024.0);
+    fc.service_quotas()
+        .put_quota(
+            "lambda",
+            "L-2ACBD22F",
+            &PutServiceQuotaRequest {
+                value: Some(limit_gb),
+                enforce: Some(QuotaEnforcement::Enforce),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let create = |name: &'static str| {
+        lambda
+            .create_function()
+            .function_name(name)
+            .runtime(Runtime::Python312)
+            .role("arn:aws:iam::123456789012:role/test-role")
+            .handler("index.handler")
+            .code(
+                FunctionCode::builder()
+                    .zip_file(Blob::new(vec![b'z'; 60]))
+                    .build(),
+            )
+            .send()
+    };
+    create("fits").await.unwrap();
+    let err = create("over").await.unwrap_err();
+    assert_eq!(err.code(), Some("CodeStorageExceededException"));
+    assert_eq!(err.message(), Some("Code storage limit exceeded."));
+
+    let settings = lambda.get_account_settings().send().await.unwrap();
+    assert_eq!(settings.account_limit().unwrap().total_code_size(), 100);
+    assert_eq!(settings.account_usage().unwrap().total_code_size(), 60);
+    let usage = usage_of(&fc, "lambda", "L-2ACBD22F").await;
+    assert_eq!((usage * 1024.0 * 1024.0 * 1024.0).round(), 60.0);
 }
 
 /// Usage of a quota as introspection reports it.

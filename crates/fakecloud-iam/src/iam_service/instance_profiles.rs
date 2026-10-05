@@ -26,6 +26,7 @@ impl IamService {
             .unwrap_or_else(|| "/".to_string());
         let tags = parse_tags(&req.query_params);
         validate_tags(&tags, 0)?;
+        let limit = self.enforced(req, crate::quota::IamQuota::InstanceProfiles);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -37,6 +38,7 @@ impl IamService {
                 format!("Instance Profile {name} already exists."),
             ));
         }
+        crate::quota::check_new(state, crate::quota::IamQuota::InstanceProfiles, limit)?;
 
         let partition = partition_for_region(&req.region);
         let arn = format!(

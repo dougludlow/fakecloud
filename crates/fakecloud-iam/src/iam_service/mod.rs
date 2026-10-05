@@ -28,8 +28,9 @@ pub struct IamService {
     state: SharedIamState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: IamSnapshotLock,
-    /// Service Quotas, for the applied values `GetAccountSummary` reports.
-    /// Without one (a bare `IamService`) the AWS defaults apply.
+    /// Service Quotas, for the applied values `GetAccountSummary` reports and
+    /// the quotas IAM enforces. Without one (a bare `IamService`) the AWS
+    /// defaults are reported and nothing is enforced.
     quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
@@ -44,13 +45,25 @@ impl IamService {
     }
 
     /// Attach Service Quotas so `GetAccountSummary` reports each account's
-    /// applied quota values rather than the AWS defaults.
+    /// applied quota values rather than the AWS defaults, and the IAM quotas
+    /// the user switched enforcement on for are checked.
     pub fn with_quota_provider(
         mut self,
         provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
     ) -> Self {
         self.quota_provider = provider;
         self
+    }
+
+    /// The limit of an IAM quota when Service Quotas enforces it for the
+    /// caller's account. Resolved before the IAM lock is taken.
+    fn enforced(&self, req: &AwsRequest, quota: crate::quota::IamQuota) -> Option<usize> {
+        crate::quota::enforced_limit(
+            self.quota_provider.as_ref(),
+            &req.account_id,
+            &req.region,
+            quota,
+        )
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {

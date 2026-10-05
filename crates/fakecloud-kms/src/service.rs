@@ -136,6 +136,9 @@ pub struct KmsService {
     state: SharedKmsState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// Service Quotas, for the customer managed key quota once the user
+    /// switched its enforcement on. Without one nothing is enforced.
+    quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
 }
 
 impl KmsService {
@@ -144,7 +147,24 @@ impl KmsService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            quota_provider: None,
         }
+    }
+
+    /// Attach Service Quotas so the customer managed key quota is enforced
+    /// once the user switches it on.
+    pub fn with_quota_provider(
+        mut self,
+        provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    ) -> Self {
+        self.quota_provider = provider;
+        self
+    }
+
+    /// The enforced customer managed key limit of `region`. Resolved before
+    /// the KMS lock is taken.
+    fn key_limit(&self, account_id: &str, region: &str) -> Option<usize> {
+        crate::quota::enforced_key_limit(self.quota_provider.as_ref(), account_id, region)
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -575,9 +595,11 @@ impl KmsService {
         // blocked the tokio worker on top of that. It depends only on
         // `key_spec`, so it does not need the lock at all.
         let (asym_priv, asym_pub) = Self::generate_asymmetric_material(&input.key_spec)?;
+        let key_limit = self.key_limit(&req.account_id, &req.region);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        crate::quota::check_new_key(state, &req.region, key_limit)?;
 
         let key_id = if input.multi_region {
             format!("mrk-{}", Uuid::new_v4().as_simple())
@@ -1376,6 +1398,7 @@ impl KmsService {
                     format!("Key '{key_id}' does not exist"),
                 )
             })?;
+        let replica_limit = self.key_limit(&req.account_id, &replica_region);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -1450,6 +1473,10 @@ impl KmsService {
             ..source_key
         };
 
+        // The replica is a customer managed key of its own Region.
+        if !state.keys.contains_key(&replica_storage_key) {
+            crate::quota::check_new_key(state, &replica_region, replica_limit)?;
+        }
         state.keys.insert(replica_storage_key, replica_key);
 
         Ok(AwsResponse::json(

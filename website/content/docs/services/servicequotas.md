@@ -9,12 +9,13 @@ from the AWS Smithy model ship, backed by account-partitioned state that
 persists across restarts in persistent mode. The wire protocol is awsJson1.1
 (x-amz-target `ServiceQuotasV20190624.<Op>`), signing as `servicequotas`.
 
-Quotas are not just reported. Once you switch enforcement on, EC2 reads the
-applied value of the EC2 and VPC quotas it checks (security groups and their
-rules, VPCs, subnets, gateways, route tables, network ACLs, network interfaces,
-endpoints, peering, Elastic IPs, VPN connections and the On-Demand and Spot vCPU
-quotas) from Service Quotas, so raising one with `RequestServiceQuotaIncrease`
-changes what EC2 accepts. Enforcement is
+Quotas are not just reported. Once you switch enforcement on, EC2, IAM,
+DynamoDB, KMS, S3 and Lambda read the applied value of the quotas they check
+(for EC2 and VPC: security groups and their rules, VPCs, subnets, gateways,
+route tables, network ACLs, network interfaces, endpoints, peering, Elastic IPs,
+VPN connections and the On-Demand and Spot vCPU quotas) from Service Quotas, so
+raising one with `RequestServiceQuotaIncrease` changes what the service accepts.
+Enforcement is
 **opt-in**: by default nothing is enforced, so a local test suite that creates
 more resources than a fresh AWS account allows keeps working. See
 [Enforcement](#enforcement).
@@ -29,7 +30,7 @@ account:
 | `vpc` | 25 quotas, including `L-2AFB9258` Security groups per network interface (5), `L-0EA8095F` Inbound or outbound rules per security group (60), `L-F678F1CE` VPCs per Region (5), `L-407747CB` Subnets per VPC (200), `L-E79EC296` VPC security groups per Region (2500), `L-93826ACB` Routes per route table (500) |
 | `ec2` | On-Demand and Spot vCPU quotas (`L-1216C47A`, `L-34B43A08`, with their `AWS/Usage` usage metric), EC2-VPC Elastic IPs (`L-0263D0A3`), the accelerated-instance families, transit gateways, Site-to-Site VPN connections |
 | `iam` | Users, roles, groups, instance profiles, managed policies per role (20)/user/group, customer managed policies, role trust policy length, server certificates, OIDC providers (global quotas) |
-| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function and layer storage (300 GB), general purpose buckets, tables, customer managed keys |
+| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function and layer storage (300 GB, not adjustable: an increase request is an `IllegalArgumentException`, but the introspection API can still set its applied value), general purpose buckets, tables, customer managed keys |
 
 `ListServices` returns these services. An unknown service code or quota code
 returns `NoSuchResourceException`.
@@ -112,9 +113,13 @@ reserved).
   **`UpdateAutoManagement`** and **`StopAutoManagement`** store the opt-in
   level and type, notification ARN and exclusion list per region.
 - **`StartQuotaUtilizationReport`** / **`GetQuotaUtilizationReport`** report
-  real usage for the quotas fakecloud can count from EC2 state (VPCs, internet
-  gateways, egress-only internet gateways, security groups, network interfaces
-  and Elastic IPs), as a percentage of the applied value.
+  real usage for the quotas fakecloud can count, as a percentage of the applied
+  value: from EC2 state (VPCs, internet gateways, egress-only internet
+  gateways, security groups, network interfaces and Elastic IPs), IAM (users,
+  roles, groups, customer managed policies, instance profiles, server
+  certificates, OIDC providers), DynamoDB tables per region, KMS customer
+  managed keys per region, S3 general purpose buckets, and Lambda function and
+  layer storage per region (in GB).
 
 ## Enforcement
 
@@ -164,6 +169,26 @@ persist across restarts in persistent mode.
 | Site-to-Site VPN connections per Region (`ec2`/`L-3E6EC3A3`) | `CreateVpnConnection` (`VpnConnectionLimitExceeded`) |
 | Running On-Demand Standard, F, G and VT, Inf, P, X and High Memory instances (`ec2`/`L-1216C47A`, `L-74FC7D96`, `L-DB2E81BA`, `L-1945791B`, `L-417A185B`, `L-7295265B`, `L-43DA4232`) | `RunInstances`, `StartInstances`, Auto Scaling and CloudFormation launches (`VcpuLimitExceeded`) |
 | All Standard Spot Instance Requests (`ec2`/`L-34B43A08`) | `RunInstances` with `InstanceMarketOptions.MarketType=spot`, `RequestSpotInstances` (`MaxSpotInstanceCountExceeded`) |
+| Users per account (`iam`/`L-F55AF5E4`) | `CreateUser` (`LimitExceeded`, `Cannot exceed quota for UsersPerAccount: N`) |
+| Roles per account (`iam`/`L-FE177D64`) | `CreateRole`, `CreateServiceLinkedRole` (`LimitExceeded`, `RolesPerAccount`); the service-linked roles an account starts with count |
+| Groups per account (`iam`/`L-F4A5425F`) | `CreateGroup` (`LimitExceeded`, `GroupsPerAccount`) |
+| Customer managed policies per account (`iam`/`L-E95E4862`) | `CreatePolicy` (`LimitExceeded`, `PoliciesPerAccount`) |
+| Managed policies per role / user / group (`iam`/`L-0DA4ABF3`, `L-4019AD8B`, `L-384571C4`) | `AttachRolePolicy`, `AttachUserPolicy`, `AttachGroupPolicy` (`LimitExceeded`, `PoliciesPerRole` / `PoliciesPerUser` / `PoliciesPerGroup`); AWS managed and customer managed policies both count, and re-attaching an attached policy is not a new attachment |
+| Server certificates per account (`iam`/`L-BF35879D`) | `UploadServerCertificate` (`LimitExceeded`, `ServerCertificatesPerAccount`) |
+| OpenId connect providers per account (`iam`/`L-858F3967`) | `CreateOpenIDConnectProvider` (`LimitExceeded`, `OpenIdConnectProvidersPerAccount`) |
+| Instance profiles per account (`iam`/`L-6E65F664`) | `CreateInstanceProfile` (`LimitExceeded`, `InstanceProfilesPerAccount`) |
+| Role trust policy length (`iam`/`L-C07B4B0D`) | `CreateRole`, `UpdateAssumeRolePolicy` (`LimitExceeded`, `ACLSizePerRole`); characters of the trust policy, not counting white space |
+| Maximum number of tables (`dynamodb`/`L-F98FE922`) | `CreateTable`, `RestoreTableFromBackup`, `RestoreTableToPointInTime`, `ImportTable`, and `UpdateTable` adding a replica (counted in the replica's region) (`LimitExceededException`) |
+| Customer Master Keys (`kms`/`L-C2F1777E`) | `CreateKey`, `ReplicateKey` (counted in the replica's region) (`LimitExceededException`); customer managed keys in any key state count, including pending deletion, AWS managed keys do not |
+| General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); per account across all regions, with the applied value read from the partition's primary region, where S3 manages it (`us-east-1`; `us-gov-west-1` in GovCloud, `cn-north-1` in China) |
+| Function and layer storage (`lambda`/`L-2ACBD22F`) | `CreateFunction`, `UpdateFunctionCode`, `PublishVersion`, `PublishLayerVersion` (`CodeStorageExceededException`); the code of every function's `$LATEST`, published version and layer version counts, container images do not |
+
+IAM refusals are HTTP 409 with IAM's `Cannot exceed quota for <Name>: <limit>`
+message. Every count quota refuses the request that would take the count past
+the applied value, so with a value of N the Nth resource is created and the
+next one is refused. CloudFormation stacks (and Cloud Control API) creating
+these resources hit the same limits, failing the resource with the service's
+error.
 
 As on AWS, the rules quota applies to each direction separately and counts
 IPv4 and IPv6 rules separately. A rule that references a security group counts
@@ -253,7 +278,7 @@ maximum or the security-group product limit) is still `NOT_APPROVED` on
 submission, and approving a request that stopped being approvable while it
 waited returns 409; deny it instead.
 
-## IAM account summary
+## IAM account summary and Lambda account settings
 
 IAM `GetAccountSummary` reads its `UsersQuota`, `GroupsQuota`, `RolesQuota`,
 `PoliciesQuota`, `InstanceProfilesQuota`, `ServerCertificatesQuota`,
@@ -262,10 +287,16 @@ entries from the account's applied `iam` quotas, so a quota raised here shows
 up there. The other entries (policy sizes, access keys per user, ...) are fixed
 AWS limits.
 
+Lambda `GetAccountSettings` reports the applied "Concurrent executions"
+(`L-B99A9384`) as `AccountLimit.ConcurrentExecutions` and the applied
+"Function and layer storage" (`L-2ACBD22F`) as `AccountLimit.TotalCodeSize`,
+and `PutFunctionConcurrency` keeps the unreserved pool at 100 or more against
+that concurrency limit, as Lambda always does.
+
 ## Known limitations
 
-- Only the EC2 and VPC quotas listed under
-  [Enforceable quotas](#enforceable-quotas) are enforceable. Other catalog
+- Only the quotas listed under [Enforceable quotas](#enforceable-quotas) are
+  enforceable. Other catalog
   quotas are reported and can be raised or lowered, but fakecloud does not
   refuse requests that go past them. Among the EC2 and VPC quotas, egress-only
   internet gateways per Region and transit gateways per account are counted
@@ -283,4 +314,9 @@ AWS limits.
   is refused with `InvalidParameterValue`; while it is not enforced, such a
   type is accepted and counts 0 vCPUs, also when it is started later. The Trn, DL, HPC
   and Mac families have quotas outside the catalog.
+- Lambda "Concurrent executions" (`L-B99A9384`) is not enforceable: invocations
+  from event source mappings, SNS, S3, EventBridge and other services run the
+  function without passing the `Invoke` concurrency gate, so fakecloud cannot
+  count in-flight executions account-wide. Reserved concurrency per function is
+  still enforced on `Invoke`.
 - The catalog covers the services above, not every AWS service.

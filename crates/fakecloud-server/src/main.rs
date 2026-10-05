@@ -2149,8 +2149,9 @@ async fn main() {
     // export path can persist result objects through the S3 store.
     let dynamodb_state_for_register = dynamodb_state.clone();
     let delivery_for_dynamodb_register = delivery_for_dynamodb;
-    let mut lambda_service =
-        LambdaService::new(lambda_state.clone()).with_ec2_state(ec2_state.clone());
+    let mut lambda_service = LambdaService::new(lambda_state.clone())
+        .with_ec2_state(ec2_state.clone())
+        .with_quota_provider(Some(quota_provider.clone()));
     lambda_service = lambda_service.with_role_trust_validator(
         fakecloud_iam::pass_role::IamRoleTrustValidator::shared(iam_state.clone()),
     );
@@ -2402,7 +2403,8 @@ async fn main() {
         } else {
             None
         };
-    let mut kms_service = KmsService::new(kms_state.clone());
+    let mut kms_service =
+        KmsService::new(kms_state.clone()).with_quota_provider(Some(quota_provider.clone()));
     if let Some(store) = kms_snapshot_store {
         // Hook-driven auto-provisioning (`aws/<service>` first use) saves
         // KMS state durably before the hook call returns.
@@ -2681,6 +2683,7 @@ async fn main() {
             .with_iam_mode(cli.iam_mode())
             .with_kms(kms_state.clone())
             .with_kms_hook(kms_hook_for_services.clone())
+            .with_quota_provider(Some(quota_provider.clone()))
             .with_credential_resolver(
                 fakecloud_iam::credential_resolver::IamCredentialResolver::shared(
                     iam_state.clone(),
@@ -2854,6 +2857,7 @@ async fn main() {
         .with_s3_store(s3_store.clone())
         .with_delivery(delivery_for_dynamodb_register)
         .with_kms_hook(kms_hook_for_services.clone())
+        .with_quota_provider(Some(quota_provider.clone()))
         .with_region(cli.region.clone());
     if let Some(store) = dynamodb_snapshot_store {
         dynamodb_service = dynamodb_service.with_snapshot_store(store);
@@ -4547,6 +4551,15 @@ async fn main() {
         servicequotas_settings.clone(),
     )
     .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()))
+    .with_usage_source(fakecloud_iam::quota::IamQuotaUsage::new(iam_state.clone()))
+    .with_usage_source(fakecloud_dynamodb::quota::DynamoDbQuotaUsage::new(
+        dynamodb_state.clone(),
+    ))
+    .with_usage_source(fakecloud_kms::quota::KmsQuotaUsage::new(kms_state.clone()))
+    .with_usage_source(fakecloud_s3::quota::S3QuotaUsage::new(s3_state.clone()))
+    .with_usage_source(fakecloud_lambda::quota::LambdaQuotaUsage::new(
+        lambda_state.clone(),
+    ))
     // Associating the template enables trusted access in Organizations.
     .with_organizations_snapshot_hook(cfn_snapshot_hooks.get("organizations").cloned());
     if let Some(store) = servicequotas_snapshot_store {

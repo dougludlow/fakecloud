@@ -24,11 +24,13 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let input = parse_kms_key_input(&resource.properties);
+        let key_limit = self.kms_key_limit(&self.region);
         let (key_id, arn) = kms_provisioner::provision_key(
             &self.kms_state,
             &self.account_id,
             &self.region,
             &input,
+            key_limit,
         )?;
         Ok(ProvisionResult::new(key_id.clone())
             .with("Arn", arn)
@@ -113,6 +115,7 @@ impl ResourceProvisioner {
             .unwrap_or(true);
         let policy = parse_key_policy(props);
         let tags = parse_tag_list(props);
+        let key_limit = self.kms_key_limit(&self.region);
 
         let (replica_key_id, replica_arn) = kms_provisioner::provision_replica_key(
             &self.kms_state,
@@ -123,6 +126,7 @@ impl ResourceProvisioner {
             enabled,
             policy,
             tags,
+            key_limit,
         )?;
         Ok(ProvisionResult::new(replica_key_id.clone())
             .with("KeyId", replica_key_id)

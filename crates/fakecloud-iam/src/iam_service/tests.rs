@@ -5728,3 +5728,274 @@ fn untouched_account_seeded_roles_match_created_account() {
     svc.create_user(&create).unwrap();
     assert!(list().contains(support), "after a write");
 }
+
+// ---- Service Quotas enforcement ----
+
+fn quota_service(quotas: fakecloud_core::quota::FixedQuotas) -> IamService {
+    let state: SharedIamState = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    IamService::new(state).with_quota_provider(Some(Arc::new(quotas)))
+}
+
+fn assert_limit_exceeded(result: Result<AwsResponse, AwsServiceError>, message: &str) {
+    let err = result.err().expect("request should be refused");
+    assert_eq!(err.status(), StatusCode::CONFLICT);
+    assert_eq!(err.code(), "LimitExceeded");
+    assert_eq!(err.message(), message);
+}
+
+const TRUST: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+const POLICY: &str =
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#;
+
+fn create_role_req(name: &str) -> AwsRequest {
+    make_request(
+        "CreateRole",
+        vec![("RoleName", name), ("AssumeRolePolicyDocument", TRUST)],
+    )
+}
+
+#[test]
+fn quotas_are_not_enforced_without_a_provider() {
+    let svc = make_service();
+    for i in 0..3 {
+        svc.create_role(&create_role_req(&format!("r{i}"))).unwrap();
+        svc.create_user(&make_request(
+            "CreateUser",
+            vec![("UserName", &format!("u{i}"))],
+        ))
+        .unwrap();
+    }
+}
+
+#[test]
+fn account_count_quotas_refuse_the_create_past_the_limit() {
+    let svc = quota_service(
+        fakecloud_core::quota::FixedQuotas::default()
+            .with("iam", "L-FE177D64", 4.0)
+            .with("iam", "L-F55AF5E4", 1.0)
+            .with("iam", "L-F4A5425F", 1.0)
+            .with("iam", "L-E95E4862", 1.0)
+            .with("iam", "L-6E65F664", 1.0)
+            .with("iam", "L-858F3967", 1.0)
+            .with("iam", "L-BF35879D", 1.0),
+    );
+
+    // A new account already has the two seeded service-linked roles
+    // (Support, Trusted Advisor), which count like on AWS.
+    svc.create_role(&create_role_req("r1")).unwrap();
+    svc.create_role(&create_role_req("r2")).unwrap();
+    assert_limit_exceeded(
+        svc.create_role(&create_role_req("r3")),
+        "Cannot exceed quota for RolesPerAccount: 4",
+    );
+    // A service-linked role is a role too.
+    assert_limit_exceeded(
+        svc.create_service_linked_role(&make_request(
+            "CreateServiceLinkedRole",
+            vec![("AWSServiceName", "elasticloadbalancing.amazonaws.com")],
+        )),
+        "Cannot exceed quota for RolesPerAccount: 4",
+    );
+    // Deleting a role frees the slot.
+    svc.delete_role(&make_request("DeleteRole", vec![("RoleName", "r2")]))
+        .unwrap();
+    svc.create_role(&create_role_req("r3")).unwrap();
+
+    svc.create_user(&make_request("CreateUser", vec![("UserName", "u1")]))
+        .unwrap();
+    assert_limit_exceeded(
+        svc.create_user(&make_request("CreateUser", vec![("UserName", "u2")])),
+        "Cannot exceed quota for UsersPerAccount: 1",
+    );
+    // An existing name still answers EntityAlreadyExists.
+    let dup = svc
+        .create_user(&make_request("CreateUser", vec![("UserName", "u1")]))
+        .err()
+        .unwrap();
+    assert_eq!(dup.code(), "EntityAlreadyExists");
+
+    svc.create_group(&make_request("CreateGroup", vec![("GroupName", "g1")]))
+        .unwrap();
+    assert_limit_exceeded(
+        svc.create_group(&make_request("CreateGroup", vec![("GroupName", "g2")])),
+        "Cannot exceed quota for GroupsPerAccount: 1",
+    );
+
+    svc.create_policy(&make_request(
+        "CreatePolicy",
+        vec![("PolicyName", "p1"), ("PolicyDocument", POLICY)],
+    ))
+    .unwrap();
+    assert_limit_exceeded(
+        svc.create_policy(&make_request(
+            "CreatePolicy",
+            vec![("PolicyName", "p2"), ("PolicyDocument", POLICY)],
+        )),
+        "Cannot exceed quota for PoliciesPerAccount: 1",
+    );
+
+    svc.create_instance_profile(&make_request(
+        "CreateInstanceProfile",
+        vec![("InstanceProfileName", "ip1")],
+    ))
+    .unwrap();
+    assert_limit_exceeded(
+        svc.create_instance_profile(&make_request(
+            "CreateInstanceProfile",
+            vec![("InstanceProfileName", "ip2")],
+        )),
+        "Cannot exceed quota for InstanceProfilesPerAccount: 1",
+    );
+
+    let oidc = |url: &str| {
+        make_request(
+            "CreateOpenIDConnectProvider",
+            vec![
+                ("Url", url),
+                (
+                    "ThumbprintList.member.1",
+                    "9e99a48a9960b14926bb7f3b02e22da2b0ab7280",
+                ),
+            ],
+        )
+    };
+    svc.create_oidc_provider(&oidc("https://one.example.com"))
+        .unwrap();
+    assert_limit_exceeded(
+        svc.create_oidc_provider(&oidc("https://two.example.com")),
+        "Cannot exceed quota for OpenIdConnectProvidersPerAccount: 1",
+    );
+
+    let cert = |name: &str| {
+        make_request(
+            "UploadServerCertificate",
+            vec![
+                ("ServerCertificateName", name),
+                (
+                    "CertificateBody",
+                    "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+                ),
+                (
+                    "PrivateKey",
+                    "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----",
+                ),
+            ],
+        )
+    };
+    svc.upload_server_certificate(&cert("c1")).unwrap();
+    assert_limit_exceeded(
+        svc.upload_server_certificate(&cert("c2")),
+        "Cannot exceed quota for ServerCertificatesPerAccount: 1",
+    );
+}
+
+#[test]
+fn managed_policies_per_principal_quotas_refuse_the_extra_attachment() {
+    let svc = quota_service(
+        fakecloud_core::quota::FixedQuotas::default()
+            .with("iam", "L-0DA4ABF3", 1.0)
+            .with("iam", "L-4019AD8B", 1.0)
+            .with("iam", "L-384571C4", 1.0),
+    );
+    svc.create_role(&create_role_req("r")).unwrap();
+    svc.create_user(&make_request("CreateUser", vec![("UserName", "u")]))
+        .unwrap();
+    svc.create_group(&make_request("CreateGroup", vec![("GroupName", "g")]))
+        .unwrap();
+    let a = "arn:aws:iam::aws:policy/ReadOnlyAccess";
+    let b = "arn:aws:iam::aws:policy/AdministratorAccess";
+
+    let attach = |action: &str, key: &str, name: &str, arn: &str| {
+        let req = make_request(action, vec![(key, name), ("PolicyArn", arn)]);
+        match action {
+            "AttachRolePolicy" => svc.attach_role_policy(&req),
+            "AttachUserPolicy" => svc.attach_user_policy(&req),
+            _ => svc.attach_group_policy(&req),
+        }
+    };
+    for (action, key, name, quota_name) in [
+        ("AttachRolePolicy", "RoleName", "r", "PoliciesPerRole"),
+        ("AttachUserPolicy", "UserName", "u", "PoliciesPerUser"),
+        ("AttachGroupPolicy", "GroupName", "g", "PoliciesPerGroup"),
+    ] {
+        attach(action, key, name, a).unwrap();
+        // Re-attaching the same policy is a no-op, not a new attachment.
+        attach(action, key, name, a).unwrap();
+        assert_limit_exceeded(
+            attach(action, key, name, b),
+            &format!("Cannot exceed quota for {quota_name}: 1"),
+        );
+    }
+}
+
+#[test]
+fn role_trust_policy_length_quota_ignores_white_space() {
+    let compact = crate::quota::trust_policy_size(TRUST);
+    let svc = quota_service(fakecloud_core::quota::FixedQuotas::default().with(
+        "iam",
+        "L-C07B4B0D",
+        compact as f64,
+    ));
+    // Padding with white space does not count.
+    let padded = TRUST.replace(',', " ,\n  ");
+    svc.create_role(&make_request(
+        "CreateRole",
+        vec![("RoleName", "fits"), ("AssumeRolePolicyDocument", &padded)],
+    ))
+    .unwrap();
+
+    let longer = TRUST.replace("ec2.amazonaws.com", "lambda.amazonaws.com");
+    let message = format!("Cannot exceed quota for ACLSizePerRole: {compact}");
+    assert_limit_exceeded(
+        svc.create_role(&make_request(
+            "CreateRole",
+            vec![
+                ("RoleName", "too-long"),
+                ("AssumeRolePolicyDocument", &longer),
+            ],
+        )),
+        &message,
+    );
+    assert_limit_exceeded(
+        svc.update_assume_role_policy(&make_request(
+            "UpdateAssumeRolePolicy",
+            vec![("RoleName", "fits"), ("PolicyDocument", &longer)],
+        )),
+        &message,
+    );
+}
+
+#[test]
+fn usage_source_counts_account_entities() {
+    use fakecloud_core::quota::QuotaUsageSource;
+    let svc = make_service();
+    svc.create_role(&create_role_req("r1")).unwrap();
+    svc.create_role(&create_role_req("r2")).unwrap();
+    svc.create_user(&make_request("CreateUser", vec![("UserName", "u")]))
+        .unwrap();
+    let usage = crate::quota::IamQuotaUsage::new(svc.state.clone());
+    // Two created plus the two seeded service-linked roles.
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "iam", "L-FE177D64"),
+        Some(4.0)
+    );
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "iam", "L-F55AF5E4"),
+        Some(1.0)
+    );
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "iam", "L-F4A5425F"),
+        Some(0.0)
+    );
+    assert_eq!(
+        usage.usage("999999999999", "us-east-1", "iam", "L-F55AF5E4"),
+        Some(0.0)
+    );
+    // Per-entity quotas have no account-level usage.
+    assert_eq!(
+        usage.usage("123456789012", "us-east-1", "iam", "L-0DA4ABF3"),
+        None
+    );
+}

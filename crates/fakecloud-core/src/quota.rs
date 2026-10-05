@@ -136,6 +136,42 @@ pub trait QuotaUsageSource: Send + Sync {
     ) -> Option<f64>;
 }
 
+/// The limit of a count quota when it is enforced for `account_id` in
+/// `region`: the applied value as a count (a negative value is 0, a value past
+/// `usize::MAX` saturates), or `None` when there is no provider or the quota
+/// is not enforced. Resolve it before taking the enforcing service's own
+/// state lock: the provider takes Service Quotas' locks.
+pub fn enforced_count(
+    provider: Option<&std::sync::Arc<dyn QuotaProvider>>,
+    account_id: &str,
+    region: &str,
+    service_code: &str,
+    quota_code: &str,
+) -> Option<usize> {
+    provider
+        .and_then(|p| p.enforced_limit(account_id, region, service_code, quota_code))
+        .map(|v| v.max(0.0) as usize)
+}
+
+/// Whether one more resource fits beside `existing` under an enforced `limit`.
+/// A `None` limit (not enforced) always has room.
+pub fn has_room(limit: Option<usize>, existing: usize) -> bool {
+    limit.is_none_or(|limit| existing < limit)
+}
+
+/// The failure reason of a resource a quota refused while provisioning it
+/// outside the service's API (CloudFormation, Cloud Control): the service's
+/// error message, status and code, as a resource handler reports a failed
+/// API call.
+pub fn refusal_reason(service: &str, err: &crate::service::AwsServiceError) -> String {
+    format!(
+        "{} (Service: {service}, Status Code: {}, Error Code: {})",
+        err.message(),
+        err.status().as_u16(),
+        err.code()
+    )
+}
+
 /// A [`QuotaProvider`] with fixed values that enforces every quota it holds,
 /// for wiring a service without Service Quotas (unit tests, embedders).
 #[derive(Debug, Clone, Default)]
@@ -185,5 +221,35 @@ impl QuotaProvider for FixedQuotas {
         quota_code: &str,
     ) -> Option<f64> {
         self.applied_value(account_id, region, service_code, quota_code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn enforced_count_saturates_and_floors_at_zero() {
+        let p: Arc<dyn QuotaProvider> = Arc::new(
+            FixedQuotas::default()
+                .with("s", "neg", -3.0)
+                .with("s", "big", f64::MAX)
+                .with("s", "frac", 2.9),
+        );
+        let get = |code| enforced_count(Some(&p), "a", "r", "s", code);
+        assert_eq!(get("neg"), Some(0));
+        assert_eq!(get("big"), Some(usize::MAX));
+        assert_eq!(get("frac"), Some(2));
+        assert_eq!(get("missing"), None);
+        assert_eq!(enforced_count(None, "a", "r", "s", "neg"), None);
+    }
+
+    #[test]
+    fn has_room_below_the_limit_only() {
+        assert!(has_room(None, usize::MAX));
+        assert!(has_room(Some(2), 1));
+        assert!(!has_room(Some(2), 2));
+        assert!(!has_room(Some(0), 0));
     }
 }

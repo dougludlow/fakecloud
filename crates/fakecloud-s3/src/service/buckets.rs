@@ -323,6 +323,12 @@ impl S3Service {
         let acl_header_present =
             grant_headers_present || acl_header.is_some_and(|a| a != "aws-exec-read");
         let acl = acl_header.unwrap_or("private");
+        // Resolved before the S3 lock: the lookup takes Service Quotas' locks.
+        let bucket_limit = crate::quota::enforced_bucket_limit(
+            self.quota_provider.as_ref(),
+            account_id,
+            &req.region,
+        );
 
         let mut accts = self.state.write();
         // A bucket the loader could not read is absent from memory, so its name
@@ -407,6 +413,7 @@ impl S3Service {
                 vec![("BucketName".to_string(), bucket.to_string())],
             ));
         }
+        crate::quota::check_new_bucket(state, bucket_limit)?;
         let object_lock_enabled = req
             .headers
             .get("x-amz-bucket-object-lock-enabled")

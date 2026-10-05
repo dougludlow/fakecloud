@@ -16,6 +16,7 @@ impl LambdaService {
         let supplied_revision = body["RevisionId"].as_str().map(String::from);
         let supplied_sha = body["CodeSha256"].as_str().map(String::from);
         let description_override = body["Description"].as_str().map(String::from);
+        let storage_limit = self.code_storage_limit(account_id, &req.region);
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(account_id, &req.region);
@@ -49,41 +50,52 @@ impl LambdaService {
             }
         }
 
+        self.publish_locked(
+            state,
+            function_name,
+            description_override.as_deref(),
+            storage_limit,
+        )
+    }
+
+    /// Publish `$LATEST` of `function_name` as a new version, under the
+    /// caller's Lambda lock. The request's preconditions are the caller's to
+    /// check. `storage_limit` is the enforced code storage limit the new
+    /// version's copy of the code is checked against; `UpdateFunctionCode`
+    /// with `Publish` passes `None`, having checked both copies before it
+    /// replaced `$LATEST`.
+    pub(crate) fn publish_locked(
+        &self,
+        state: &mut LambdaState,
+        function_name: &str,
+        description_override: Option<&str>,
+        storage_limit: Option<i64>,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let func = state
+            .functions
+            .get(function_name)
+            .ok_or_else(|| not_found_function(state, function_name))?;
         // Pick the next version number per function, monotonic per
         // function arn, never reused. AWS uses sequential decimal
         // strings starting at 1.
-        let existing = state
+        let latest_version = state
             .function_versions
             .get(function_name)
-            .cloned()
-            .unwrap_or_default();
-        let latest_version = existing.iter().filter_map(|v| v.parse::<u64>().ok()).max();
+            .and_then(|versions| versions.iter().filter_map(|v| v.parse::<u64>().ok()).max());
 
-        // PublishVersion is idempotent on AWS: if `$LATEST` hasn't
-        // changed since the most recent published version, return that
-        // existing snapshot instead of bumping the counter. We compare
-        // every field that PublishVersion would otherwise carry into
-        // the new snapshot — code identity, description, runtime,
-        // handler, role, env, memory/timeout, layers, image config,
-        // VPC, EFS, logging, tracing, kms, ephemeral storage — so a
-        // config-only change (e.g. UpdateFunctionConfiguration bumping
-        // memory) still produces a fresh version. This keeps deploy
-        // pipelines that re-publish on every CI run from leaking a
-        // fresh numbered version per build when the underlying
-        // artifact + config are identical.
-        if let Some(latest_num) = latest_version {
-            let latest_str = latest_num.to_string();
-            if let Some(prev_snap) = state
-                .function_version_snapshots
-                .get(function_name)
-                .and_then(|m| m.get(&latest_str))
-                .cloned()
-            {
-                let effective_desc = description_override
-                    .clone()
-                    .unwrap_or_else(|| func.description.clone());
-                if function_config_unchanged_for_publish(&prev_snap, func, &effective_desc) {
-                    let mut config = self.function_config_json(&prev_snap);
+        // PublishVersion is idempotent on AWS: if `$LATEST` hasn't changed
+        // since the most recent published version, return that existing
+        // snapshot instead of bumping the counter (see
+        // `publish_creates_version`), so deploy pipelines that re-publish on
+        // every CI run don't leak a numbered version per build.
+        if !publish_creates_version(state, function_name, func, description_override) {
+            if let Some(latest_str) = latest_version.map(|v| v.to_string()) {
+                if let Some(prev_snap) = state
+                    .function_version_snapshots
+                    .get(function_name)
+                    .and_then(|m| m.get(&latest_str))
+                {
+                    let mut config = self.function_config_json(prev_snap);
                     config["Version"] = json!(latest_str);
                     config["FunctionArn"] = json!(format!("{}:{latest_str}", func.function_arn));
                     config["MasterArn"] = json!(func.function_arn);
@@ -95,12 +107,15 @@ impl LambdaService {
         let next: u64 = latest_version.unwrap_or(0) + 1;
         let next_str = next.to_string();
 
+        // The new version stores its own copy of the code.
+        crate::quota::check_new_code(state, storage_limit, crate::quota::stored_code_size(func))?;
+
         // Snapshot the function config + code for the new immutable version.
         let mut snapshot = func.clone();
         snapshot.version = next_str.clone();
         snapshot.master_arn = Some(func.function_arn.clone());
         if let Some(desc) = description_override {
-            snapshot.description = desc;
+            snapshot.description = desc.to_string();
         }
         // Each numbered version gets its own RevisionId, decoupled from $LATEST.
         snapshot.revision_id = uuid::Uuid::new_v4().to_string();
@@ -115,6 +130,7 @@ impl LambdaService {
                 snap["OptimizationStatus"] = json!("On");
             }
         }
+        let function_arn = func.function_arn.clone();
 
         // Append to numbered list and store the snapshot.
         state
@@ -122,16 +138,16 @@ impl LambdaService {
             .entry(function_name.to_string())
             .or_default()
             .push(next_str.clone());
+        let mut config = self.function_config_json(&snapshot);
         state
             .function_version_snapshots
             .entry(function_name.to_string())
             .or_default()
-            .insert(next_str.clone(), snapshot.clone());
+            .insert(next_str.clone(), snapshot);
 
-        let mut config = self.function_config_json(&snapshot);
         config["Version"] = json!(next_str);
-        config["FunctionArn"] = json!(format!("{}:{next_str}", func.function_arn));
-        config["MasterArn"] = json!(func.function_arn);
+        config["FunctionArn"] = json!(format!("{function_arn}:{next_str}"));
+        config["MasterArn"] = json!(function_arn);
 
         Ok(AwsResponse::json(StatusCode::CREATED, config.to_string()))
     }
@@ -237,4 +253,16 @@ impl LambdaService {
         }
         config
     }
+}
+
+/// `ResourceNotFoundException` for a function missing from `state`.
+fn not_found_function(state: &LambdaState, function_name: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::NOT_FOUND,
+        "ResourceNotFoundException",
+        format!(
+            "Function not found: {}",
+            function_arn(&state.region, &state.account_id, function_name)
+        ),
+    )
 }

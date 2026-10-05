@@ -7,6 +7,7 @@ pub mod inventory;
 pub mod lifecycle;
 pub mod logging;
 pub mod persistence;
+pub mod quota;
 pub mod resource_policy;
 pub(crate) mod select;
 pub(crate) mod service;

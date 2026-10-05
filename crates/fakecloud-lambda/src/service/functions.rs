@@ -41,6 +41,7 @@ impl LambdaService {
             self.iam_mode,
         )?;
 
+        let storage_limit = self.code_storage_limit(&req.account_id, &req.region);
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably.
         // Layer ARNs may live in sibling accounts.
@@ -113,6 +114,7 @@ impl LambdaService {
             last_update_status_reason: None,
             last_update_status_reason_code: None,
         };
+        crate::quota::check_new_code(state, storage_limit, crate::quota::stored_code_size(&func))?;
 
         let response = self.function_config_json(&func);
 
