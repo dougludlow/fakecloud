@@ -229,6 +229,9 @@ func (fc *FakeCloud) WAFv2() *WAFv2Client { return &WAFv2Client{fc: fc} }
 // CloudFront returns the CloudFront admin sub-client.
 func (fc *FakeCloud) CloudFront() *CloudFrontClient { return &CloudFrontClient{fc: fc} }
 
+// ServiceQuotas returns the Service Quotas admin/introspection sub-client.
+func (fc *FakeCloud) ServiceQuotas() *ServiceQuotasClient { return &ServiceQuotasClient{fc: fc} }
+
 // ── Error type ─────────────────────────────────────────────────────
 
 // APIError is returned when the server responds with a non-2xx status.
@@ -320,6 +323,19 @@ func (fc *FakeCloud) doPost(ctx context.Context, path string, body interface{}, 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	return fc.do(req, out)
+}
+
+func (fc *FakeCloud) doPut(ctx context.Context, path string, body interface{}, out interface{}) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fc.BaseURL+path, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
 	return fc.do(req, out)
 }
 

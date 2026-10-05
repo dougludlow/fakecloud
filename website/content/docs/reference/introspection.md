@@ -400,6 +400,21 @@ and accepts, or is created through `CreateAccount`. Naming an
 | -------- | ------ | ----------- |
 | `/_fakecloud/secretsmanager/rotation-scheduler/tick` | POST | Rotate any secrets whose rotation window is due. |
 
+## Service Quotas
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/_fakecloud/service-quotas/quotas` | GET | Every quota with its default and applied value, usage and enforcement state. Query: `accountId`, `region`, `serviceCode` (all optional). |
+| `/_fakecloud/service-quotas/quotas/{service}/{quota}` | PUT | Set the applied value (even below the AWS default) and/or the enforcement override. Body `{accountId?, region?, value?, enforce?}`; `enforce: null` clears the override. |
+| `/_fakecloud/service-quotas/quotas/{service}/{quota}` | DELETE | Back to the AWS default and drop the override. Query: `accountId`, `region`. |
+| `/_fakecloud/service-quotas/enforcement` | GET / PUT | The global switch and per-quota overrides (server-wide and per account). |
+| `/_fakecloud/service-quotas/request-approval` | GET / PUT | `{mode: "auto" \| "manual"}`: how increase requests are decided. |
+| `/_fakecloud/service-quotas/requests` | GET | Increase requests across accounts, newest first. Query: `accountId`, `status`. |
+| `/_fakecloud/service-quotas/requests/{id}/approve` | POST | Approve a `PENDING` or `CASE_OPENED` request and raise the applied value. |
+| `/_fakecloud/service-quotas/requests/{id}/deny` | POST | Close a pending request without raising the quota. Body `{status?}` (`DENIED` default, `NOT_APPROVED`, `CASE_CLOSED`, `INVALID_REQUEST`). |
+
+See [Service Quotas](/docs/services/servicequotas/#introspection) for semantics.
+
 ## SES
 
 | Endpoint | Method | Description |

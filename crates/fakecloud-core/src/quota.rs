@@ -2,8 +2,11 @@
 //!
 //! Service Quotas owns the applied value of every quota (the AWS default,
 //! raised by an approved `RequestServiceQuotaIncrease` or an Organizations
-//! quota request template). Services that enforce a quota ask it for the
-//! current value through [`QuotaProvider`], so raising a quota through the
+//! quota request template, or set directly through the introspection API) and
+//! whether fakecloud enforces it. Enforcement is opt-in: a quota is enforced
+//! only when the user turned it on, for every quota (`--enforce-quotas`) or
+//! for that quota alone. Services that enforce a quota ask for its limit
+//! through [`QuotaProvider::enforced_limit`], so raising a quota through the
 //! Service Quotas API changes what the enforcing service accepts.
 //!
 //! The reverse direction is [`QuotaUsageSource`]: a service that can count its
@@ -32,6 +35,18 @@ pub trait QuotaProvider: Send + Sync {
         service_code: &str,
         quota_code: &str,
     ) -> Option<f64>;
+
+    /// The applied value of `service_code`/`quota_code` when fakecloud
+    /// enforces that quota for `account_id`, or `None` when it does not (the
+    /// quota is not switched on, or unknown). A service refuses a request
+    /// that would take it past the returned limit.
+    fn enforced_limit(
+        &self,
+        account_id: &str,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+    ) -> Option<f64>;
 }
 
 /// Reports how much of a quota an account currently uses.
@@ -48,4 +63,56 @@ pub trait QuotaUsageSource: Send + Sync {
         service_code: &str,
         quota_code: &str,
     ) -> Option<f64>;
+}
+
+/// A [`QuotaProvider`] with fixed values that enforces every quota it holds,
+/// for wiring a service without Service Quotas (unit tests, embedders).
+#[derive(Debug, Clone, Default)]
+pub struct FixedQuotas {
+    quotas: Vec<(String, String, f64)>,
+}
+
+impl FixedQuotas {
+    /// Enforce `service_code`/`quota_code` at `value`.
+    pub fn with(mut self, service_code: &str, quota_code: &str, value: f64) -> Self {
+        self.quotas
+            .retain(|(s, q, _)| !(s == service_code && q == quota_code));
+        self.quotas
+            .push((service_code.to_string(), quota_code.to_string(), value));
+        self
+    }
+
+    /// The two security-group quotas, enforced at their AWS defaults.
+    pub fn security_group_defaults() -> Self {
+        Self::default()
+            .with(
+                VPC_SERVICE_CODE,
+                SECURITY_GROUPS_PER_INTERFACE,
+                DEFAULT_SECURITY_GROUPS_PER_INTERFACE as f64,
+            )
+            .with(
+                VPC_SERVICE_CODE,
+                RULES_PER_SECURITY_GROUP,
+                DEFAULT_RULES_PER_SECURITY_GROUP as f64,
+            )
+    }
+}
+
+impl QuotaProvider for FixedQuotas {
+    fn applied_value(&self, _: &str, _: &str, service_code: &str, quota_code: &str) -> Option<f64> {
+        self.quotas
+            .iter()
+            .find(|(s, q, _)| s == service_code && q == quota_code)
+            .map(|(_, _, v)| *v)
+    }
+
+    fn enforced_limit(
+        &self,
+        account_id: &str,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+    ) -> Option<f64> {
+        self.applied_value(account_id, region, service_code, quota_code)
+    }
 }

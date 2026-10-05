@@ -1366,3 +1366,114 @@ public sealed record CloudFrontDistributionsResponse(IReadOnlyList<CloudFrontDis
 /// or <c>"InProgress"</c> synchronously.
 /// </summary>
 public sealed record CloudFrontDistributionStatusRequest(string? Status);
+
+// -- Service Quotas admin -----------------------------------------
+
+/// <summary>
+/// Tri-state enforcement setting for a Service Quotas override.
+/// <c>Enforce</c> is sent as <c>true</c>, <c>Ignore</c> as <c>false</c>, and
+/// <c>Default</c> as an explicit <c>null</c> that clears the override so the
+/// quota falls back to the next level (account override, server-wide
+/// override, then the global switch).
+/// </summary>
+public enum QuotaEnforcement
+{
+    Enforce,
+    Ignore,
+    Default,
+}
+
+/// <summary>
+/// One quota from <c>/_fakecloud/service-quotas/quotas</c>. <c>Usage</c> is
+/// null when no fakecloud service measures the quota.
+/// <c>EnforcementSource</c> says which setting decided <c>Enforced</c>: one of
+/// <c>not_enforceable</c>, <c>account_override</c>, <c>override</c>,
+/// <c>global</c>.
+/// </summary>
+public sealed record ServiceQuota(
+    string? ServiceCode,
+    string? QuotaCode,
+    string? QuotaName,
+    bool Global,
+    bool Adjustable,
+    string? Unit,
+    double DefaultValue,
+    double AppliedValue,
+    double? Usage,
+    bool Enforceable,
+    bool Enforced,
+    string? EnforcementSource);
+
+public sealed record ServiceQuotasResponse(
+    string? AccountId,
+    string? Region,
+    IReadOnlyList<ServiceQuota>? Quotas);
+
+/// <summary>
+/// Body for <c>PUT /_fakecloud/service-quotas/quotas/{service}/{quota}</c>.
+/// Null fields are omitted. A null <c>Enforcement</c> leaves enforcement
+/// unchanged; <see cref="QuotaEnforcement.Default"/> clears the override.
+/// With <c>AccountId</c> set, the override applies to that account only.
+/// </summary>
+public sealed record PutServiceQuotaRequest(
+    string? AccountId = null,
+    string? Region = null,
+    double? Value = null,
+    QuotaEnforcement? Enforcement = null);
+
+/// <summary>
+/// One override change for <c>PUT /_fakecloud/service-quotas/enforcement</c>.
+/// <c>AccountId</c> scopes it to one account; null applies it to every
+/// account.
+/// </summary>
+public sealed record ServiceQuotaOverrideChange(
+    string ServiceCode,
+    string QuotaCode,
+    QuotaEnforcement Enforcement,
+    string? AccountId = null);
+
+/// <summary>Body for <c>PUT /_fakecloud/service-quotas/enforcement</c>.</summary>
+public sealed record PutServiceQuotaEnforcementRequest(
+    bool? EnforceAll = null,
+    IReadOnlyList<ServiceQuotaOverrideChange>? Overrides = null);
+
+/// <summary>A server-wide enforcement override.</summary>
+public sealed record ServiceQuotaEnforcementOverride(
+    string? ServiceCode,
+    string? QuotaCode,
+    bool Enforce);
+
+/// <summary>An enforcement override scoped to one account.</summary>
+public sealed record ServiceQuotaAccountEnforcementOverride(
+    string? AccountId,
+    string? ServiceCode,
+    string? QuotaCode,
+    bool Enforce);
+
+public sealed record ServiceQuotaEnforcementResponse(
+    bool EnforceAll,
+    IReadOnlyList<ServiceQuotaEnforcementOverride>? Overrides,
+    IReadOnlyList<ServiceQuotaAccountEnforcementOverride>? AccountOverrides);
+
+/// <summary>How increase requests are decided: <c>auto</c> or <c>manual</c>.</summary>
+public sealed record ServiceQuotaRequestApprovalResponse(string? Mode);
+
+/// <summary>
+/// One quota increase request. <c>Region</c> is empty for a global quota;
+/// <c>CaseId</c> is null unless a support case was opened. <c>Created</c>
+/// and <c>LastUpdated</c> are RFC 3339 timestamps.
+/// </summary>
+public sealed record ServiceQuotaRequest(
+    string? AccountId,
+    string? RequestId,
+    string? ServiceCode,
+    string? QuotaCode,
+    string? QuotaName,
+    string? Region,
+    double DesiredValue,
+    string? Status,
+    string? CaseId,
+    string? Created,
+    string? LastUpdated);
+
+public sealed record ServiceQuotaRequestsResponse(IReadOnlyList<ServiceQuotaRequest>? Requests);

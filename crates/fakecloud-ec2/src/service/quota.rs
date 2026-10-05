@@ -2,8 +2,10 @@
 //!
 //! Applied values come from Service Quotas through
 //! [`fakecloud_core::quota::QuotaProvider`], so a quota raised with
-//! `RequestServiceQuotaIncrease` changes what EC2 accepts. Without a provider
-//! (a bare `Ec2Service`) the published AWS defaults apply.
+//! `RequestServiceQuotaIncrease` changes what EC2 accepts. Enforcement is
+//! opt-in: a quota is only checked once the user switched it on, and a bare
+//! `Ec2Service` (no provider) enforces nothing. The published AWS defaults
+//! still answer `ValidateSecurityGroupQuotasForInterface` without a provider.
 
 use std::sync::Arc;
 
@@ -23,7 +25,12 @@ use fakecloud_core::quota::{
     RULES_PER_SECURITY_GROUP, SECURITY_GROUPS_PER_INTERFACE, VPC_SERVICE_CODE as VPC,
 };
 
+fn as_count(v: f64) -> usize {
+    v.max(0.0) as usize
+}
+
 impl Ec2Service {
+    /// The applied value of a VPC quota, whether or not it is enforced.
     fn applied_quota(
         &self,
         account_id: &str,
@@ -34,8 +41,23 @@ impl Ec2Service {
         self.quota_provider
             .as_ref()
             .and_then(|p| p.applied_value(account_id, region, VPC, quota_code))
-            .map(|v| v.max(0.0) as usize)
+            .map(as_count)
             .unwrap_or(default)
+    }
+
+    /// The limit of a quota EC2 enforces for this account, `None` while the
+    /// quota is not enforced.
+    pub(crate) fn enforced_quota(
+        &self,
+        account_id: &str,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+    ) -> Option<usize> {
+        self.quota_provider
+            .as_ref()
+            .and_then(|p| p.enforced_limit(account_id, region, service_code, quota_code))
+            .map(as_count)
     }
 
     /// Applied value of "Security groups per network interface".
@@ -56,6 +78,24 @@ impl Ec2Service {
             RULES_PER_SECURITY_GROUP,
             DEFAULT_RULES_PER_SECURITY_GROUP,
         )
+    }
+
+    /// "Security groups per network interface" when it is enforced.
+    pub(crate) fn enforced_security_groups_per_interface(
+        &self,
+        account_id: &str,
+        region: &str,
+    ) -> Option<usize> {
+        self.enforced_quota(account_id, region, VPC, SECURITY_GROUPS_PER_INTERFACE)
+    }
+
+    /// "Inbound or outbound rules per security group" when it is enforced.
+    pub(crate) fn enforced_rules_per_security_group(
+        &self,
+        account_id: &str,
+        region: &str,
+    ) -> Option<usize> {
+        self.enforced_quota(account_id, region, VPC, RULES_PER_SECURITY_GROUP)
     }
 }
 
@@ -158,18 +198,16 @@ pub(crate) enum GroupHolder {
 }
 
 /// `SecurityGroupsPerInterfaceLimitExceeded` (or `...PerInstance...` for an
-/// instance) when more groups are requested than the applied quota allows.
+/// instance) when more groups are requested than `limit` allows. A `None`
+/// limit (the quota is not enforced) accepts any count.
 pub(crate) fn check_group_count(
-    svc: &Ec2Service,
-    account_id: &str,
-    region: &str,
+    limit: Option<usize>,
     holder: GroupHolder,
     requested: usize,
 ) -> Result<(), AwsServiceError> {
-    let limit = svc.security_groups_per_interface(account_id, region);
-    if requested <= limit {
+    let Some(limit) = limit.filter(|l| requested > *l) else {
         return Ok(());
-    }
+    };
     let (code, noun) = match holder {
         GroupHolder::Interface => ("SecurityGroupsPerInterfaceLimitExceeded", "interface"),
         GroupHolder::Instance => ("SecurityGroupsPerInstanceLimitExceeded", "instance"),
@@ -201,6 +239,10 @@ pub(crate) fn check_launch_groups(
     region: &str,
     params: &HashMap<String, String>,
 ) -> Result<(), AwsServiceError> {
+    let limit = svc.enforced_security_groups_per_interface(account_id, region);
+    if limit.is_none() {
+        return Ok(());
+    }
     let mut ids = indexed_list(params, "SecurityGroupId");
     let names = indexed_list(params, "SecurityGroup");
     if !names.is_empty() {
@@ -223,13 +265,7 @@ pub(crate) fn check_launch_groups(
             ids.extend(names.iter().map(|n| format!("name:{n}")));
         }
     }
-    check_group_count(
-        svc,
-        account_id,
-        region,
-        GroupHolder::Instance,
-        distinct_count(&ids),
-    )?;
+    check_group_count(limit, GroupHolder::Instance, distinct_count(&ids))?;
     let mut interfaces: Vec<&str> = params
         .keys()
         .filter_map(|k| k.strip_prefix("NetworkInterface."))
@@ -239,13 +275,7 @@ pub(crate) fn check_launch_groups(
     interfaces.dedup();
     for n in interfaces {
         let groups = indexed_list(params, &format!("NetworkInterface.{n}.SecurityGroupId"));
-        check_group_count(
-            svc,
-            account_id,
-            region,
-            GroupHolder::Interface,
-            distinct_count(&groups),
-        )?;
+        check_group_count(limit, GroupHolder::Interface, distinct_count(&groups))?;
     }
     Ok(())
 }
@@ -297,7 +327,6 @@ impl QuotaUsageSource for Ec2QuotaUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fakecloud_core::quota::QuotaProvider;
 
     fn rule(
         is_egress: bool,
@@ -392,26 +421,41 @@ mod tests {
         assert_eq!(w.side_counts(rules.iter()), [11, 2]);
     }
 
-    struct Fixed(f64);
-    impl QuotaProvider for Fixed {
-        fn applied_value(&self, _: &str, _: &str, _: &str, _: &str) -> Option<f64> {
-            Some(self.0)
-        }
-    }
-
     #[test]
-    fn provider_overrides_the_defaults() {
+    fn nothing_is_enforced_without_a_provider() {
         let req = crate::test_support::ec2_request("DescribeVpcs", &[]);
         let svc = Ec2Service::new();
         let (a, r) = (req.account_id.as_str(), req.region.as_str());
+        assert_eq!(svc.enforced_security_groups_per_interface(a, r), None);
+        assert_eq!(svc.enforced_rules_per_security_group(a, r), None);
+        // The applied values still answer validation.
         assert_eq!(svc.security_groups_per_interface(a, r), 5);
         assert_eq!(svc.rules_per_security_group(a, r), 60);
-        let svc = Ec2Service::new().with_quota_provider(Some(Arc::new(Fixed(8.0))));
+        let limit = svc.enforced_security_groups_per_interface(a, r);
+        assert!(check_group_count(limit, GroupHolder::Interface, 100).is_ok());
+    }
+
+    #[test]
+    fn provider_limits_are_enforced() {
+        let req = crate::test_support::ec2_request("DescribeVpcs", &[]);
+        let svc = Ec2Service::new().with_quota_provider(Some(Arc::new(
+            fakecloud_core::quota::FixedQuotas::default().with(
+                VPC,
+                SECURITY_GROUPS_PER_INTERFACE,
+                8.0,
+            ),
+        )));
+        let (a, r) = (req.account_id.as_str(), req.region.as_str());
         assert_eq!(svc.security_groups_per_interface(a, r), 8);
-        let check = |n| check_group_count(&svc, a, r, GroupHolder::Interface, n);
-        assert!(check(8).is_ok());
+        let limit = svc.enforced_security_groups_per_interface(a, r);
+        assert_eq!(limit, Some(8));
+        // A quota the provider does not enforce stays unchecked.
+        assert_eq!(svc.enforced_rules_per_security_group(a, r), None);
+        assert!(check_group_count(limit, GroupHolder::Interface, 8).is_ok());
         assert_eq!(
-            check(9).unwrap_err().code(),
+            check_group_count(limit, GroupHolder::Interface, 9)
+                .unwrap_err()
+                .code(),
             "SecurityGroupsPerInterfaceLimitExceeded"
         );
     }

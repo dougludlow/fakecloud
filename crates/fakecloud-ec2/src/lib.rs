@@ -25,6 +25,14 @@ pub use state::{Ec2Snapshot, Ec2State, SharedEc2State, EC2_SNAPSHOT_SCHEMA_VERSI
 /// Shared test helpers for the in-crate handler unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// An `Ec2Service` that enforces the two security-group quotas at their
+    /// AWS defaults, as a server started with them switched on does.
+    pub(crate) fn svc_enforcing_sg_quotas() -> crate::service::Ec2Service {
+        crate::service::Ec2Service::new().with_quota_provider(Some(std::sync::Arc::new(
+            fakecloud_core::quota::FixedQuotas::security_group_defaults(),
+        )))
+    }
+
     use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
     /// Extract the error from a handler result (AwsResponse is not `Debug`, so

@@ -302,6 +302,10 @@ impl FakeCloud {
         CloudFrontClient { fc: self }
     }
 
+    pub fn service_quotas(&self) -> ServiceQuotasClient<'_> {
+        ServiceQuotasClient { fc: self }
+    }
+
     // ── Internal helpers ────────────────────────────────────────────
 
     async fn parse<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T, Error> {
@@ -2587,12 +2591,16 @@ impl Elbv2Client<'_> {
     }
 }
 
-/// `?accountId=..&region=..` naming an (account, region) scope; an omitted
-/// part defaults to the server's account or region. Empty when both are
-/// omitted.
-fn scope_query(account_id: Option<&str>, region: Option<&str>) -> String {
-    let parts: Vec<String> = [("accountId", account_id), ("region", region)]
-        .into_iter()
+// ── Service Quotas ──────────────────────────────────────────────────
+
+pub struct ServiceQuotasClient<'a> {
+    fc: &'a FakeCloud,
+}
+
+/// `?key=value&..` from the parameters that are set; empty when none are.
+fn optional_query(params: &[(&str, Option<&str>)]) -> String {
+    let parts: Vec<String> = params
+        .iter()
         .filter_map(|(key, value)| {
             value.map(|v| format!("{key}={}", utf8_percent_encode(v, NON_ALPHANUMERIC)))
         })
@@ -2602,4 +2610,211 @@ fn scope_query(account_id: Option<&str>, region: Option<&str>) -> String {
     } else {
         format!("?{}", parts.join("&"))
     }
+}
+
+impl ServiceQuotasClient<'_> {
+    fn quota_url(&self, service_code: &str, quota_code: &str) -> String {
+        format!(
+            "{}/_fakecloud/service-quotas/quotas/{}/{}",
+            self.fc.base_url,
+            utf8_percent_encode(service_code, NON_ALPHANUMERIC),
+            utf8_percent_encode(quota_code, NON_ALPHANUMERIC),
+        )
+    }
+
+    /// Every quota (or one service's) with its applied value, usage and
+    /// enforcement state. An omitted account or region defaults to the
+    /// server's.
+    pub async fn get_quotas(
+        &self,
+        account_id: Option<&str>,
+        region: Option<&str>,
+        service_code: Option<&str>,
+    ) -> Result<ServiceQuotasResponse, Error> {
+        let query = optional_query(&[
+            ("accountId", account_id),
+            ("region", region),
+            ("serviceCode", service_code),
+        ]);
+        let resp = self
+            .fc
+            .client
+            .get(format!(
+                "{}/_fakecloud/service-quotas/quotas{query}",
+                self.fc.base_url
+            ))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Set a quota's applied value (even below the AWS default) and/or its
+    /// enforcement override.
+    pub async fn put_quota(
+        &self,
+        service_code: &str,
+        quota_code: &str,
+        request: &PutServiceQuotaRequest,
+    ) -> Result<ServiceQuota, Error> {
+        let resp = self
+            .fc
+            .client
+            .put(self.quota_url(service_code, quota_code))
+            .json(request)
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Put a quota back to its AWS default and drop its enforcement override
+    /// (the account's when `account_id` is given, else the server-wide one).
+    pub async fn delete_quota(
+        &self,
+        service_code: &str,
+        quota_code: &str,
+        account_id: Option<&str>,
+        region: Option<&str>,
+    ) -> Result<ServiceQuota, Error> {
+        let query = optional_query(&[("accountId", account_id), ("region", region)]);
+        let resp = self
+            .fc
+            .client
+            .delete(format!(
+                "{}{query}",
+                self.quota_url(service_code, quota_code)
+            ))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// The global enforcement switch and every override.
+    pub async fn get_enforcement(&self) -> Result<QuotaEnforcementResponse, Error> {
+        let resp = self
+            .fc
+            .client
+            .get(format!(
+                "{}/_fakecloud/service-quotas/enforcement",
+                self.fc.base_url
+            ))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Change the global switch and/or a batch of overrides.
+    pub async fn put_enforcement(
+        &self,
+        request: &PutQuotaEnforcementRequest,
+    ) -> Result<QuotaEnforcementResponse, Error> {
+        let resp = self
+            .fc
+            .client
+            .put(format!(
+                "{}/_fakecloud/service-quotas/enforcement",
+                self.fc.base_url
+            ))
+            .json(request)
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// How increase requests are decided: `auto` or `manual`.
+    pub async fn get_request_approval(&self) -> Result<QuotaRequestApproval, Error> {
+        let resp = self
+            .fc
+            .client
+            .get(format!(
+                "{}/_fakecloud/service-quotas/request-approval",
+                self.fc.base_url
+            ))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Switch request approval to `auto` or `manual` (requests stay `PENDING`
+    /// until [`Self::approve_request`] or [`Self::deny_request`]).
+    pub async fn set_request_approval(&self, mode: &str) -> Result<QuotaRequestApproval, Error> {
+        let resp = self
+            .fc
+            .client
+            .put(format!(
+                "{}/_fakecloud/service-quotas/request-approval",
+                self.fc.base_url
+            ))
+            .json(&serde_json::json!({ "mode": mode }))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Increase requests across accounts (or one), newest first.
+    pub async fn get_requests(
+        &self,
+        account_id: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<QuotaIncreaseRequestsResponse, Error> {
+        let query = optional_query(&[("accountId", account_id), ("status", status)]);
+        let resp = self
+            .fc
+            .client
+            .get(format!(
+                "{}/_fakecloud/service-quotas/requests{query}",
+                self.fc.base_url
+            ))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Approve a `PENDING` or `CASE_OPENED` request, raising the applied
+    /// value to the requested one.
+    pub async fn approve_request(&self, request_id: &str) -> Result<QuotaIncreaseRequest, Error> {
+        let resp = self
+            .fc
+            .client
+            .post(format!(
+                "{}/_fakecloud/service-quotas/requests/{}/approve",
+                self.fc.base_url,
+                utf8_percent_encode(request_id, NON_ALPHANUMERIC)
+            ))
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+
+    /// Close a pending request without raising the quota. `status` is one of
+    /// `DENIED` (the default), `NOT_APPROVED`, `CASE_CLOSED`,
+    /// `INVALID_REQUEST`.
+    pub async fn deny_request(
+        &self,
+        request_id: &str,
+        status: Option<&str>,
+    ) -> Result<QuotaIncreaseRequest, Error> {
+        let mut body = serde_json::Map::new();
+        if let Some(s) = status {
+            body.insert("status".into(), serde_json::Value::String(s.into()));
+        }
+        let resp = self
+            .fc
+            .client
+            .post(format!(
+                "{}/_fakecloud/service-quotas/requests/{}/deny",
+                self.fc.base_url,
+                utf8_percent_encode(request_id, NON_ALPHANUMERIC)
+            ))
+            .json(&body)
+            .send()
+            .await?;
+        FakeCloud::parse(resp).await
+    }
+}
+
+/// `?accountId=..&region=..` naming an (account, region) scope; an omitted
+/// part defaults to the server's account or region. Empty when both are
+/// omitted.
+fn scope_query(account_id: Option<&str>, region: Option<&str>) -> String {
+    optional_query(&[("accountId", account_id), ("region", region)])
 }

@@ -33,5 +33,6 @@ export {
   KmsClient,
   WafV2Client,
   CloudFrontClient,
+  ServiceQuotasClient,
 } from "./client.js";
 export type * from "./types.js";

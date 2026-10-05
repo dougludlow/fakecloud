@@ -313,16 +313,16 @@ pub(crate) fn modify_managed_prefix_list(
         .get("MaxEntries")
         .and_then(|v| v.parse::<i64>().ok());
     // Resolved before the EC2 lock is taken: Service Quotas answers it.
-    let rule_limit = svc.rules_per_security_group(&req.account_id, &req.region);
+    let rule_limit = svc.enforced_rules_per_security_group(&req.account_id, &req.region);
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     // A larger MaxEntries weighs more in every security group that references
     // the list. AWS fails the resize (the list goes to `modify-failed`, naming
     // up to ten resources in its state message) when a referencing group
     // could not take the new size.
-    let blocked = match (new_max, state.managed_prefix_lists.get(&id)) {
-        (Some(m), Some(current)) if m > current.max_entries => {
-            groups_over_quota_at(state, &id, m, rule_limit)
+    let blocked = match (new_max, state.managed_prefix_lists.get(&id), rule_limit) {
+        (Some(m), Some(current), Some(limit)) if m > current.max_entries => {
+            groups_over_quota_at(state, &id, m, limit)
         }
         _ => Vec::new(),
     };
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn resizing_a_referenced_list_past_the_rules_quota_fails() {
-        let svc = Ec2Service::new();
+        let svc = crate::test_support::svc_enforcing_sg_quotas();
         let created = body(
             create_managed_prefix_list(
                 &svc,

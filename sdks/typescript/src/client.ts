@@ -127,6 +127,19 @@ import type {
   CloudFrontDistributionStatusRequest,
   CloudFrontDistributionsResponse,
   Elbv2WafCountsResponse,
+  QuotasResponse,
+  GetQuotasOptions,
+  Quota,
+  PutQuotaRequest,
+  DeleteQuotaOptions,
+  QuotaEnforcementResponse,
+  PutQuotaEnforcementRequest,
+  QuotaRequestApprovalMode,
+  QuotaRequestApprovalResponse,
+  QuotaRequest,
+  QuotaRequestsResponse,
+  GetQuotaRequestsOptions,
+  QuotaDenyStatus,
 } from "./types.js";
 
 export class FakeCloudError extends Error {
@@ -1188,6 +1201,161 @@ export class CloudFrontClient {
   }
 }
 
+/**
+ * Service Quotas introspection client: read every quota's applied value,
+ * usage and enforcement state, set applied values (including below the AWS
+ * default), switch enforcement on or off, and decide increase requests held
+ * `PENDING` under manual approval.
+ */
+export class ServiceQuotasClient {
+  constructor(private baseUrl: string) {}
+
+  private async send<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+    const resp = await fetch(
+      `${this.baseUrl}/_fakecloud/service-quotas${path}`,
+      init,
+    );
+    return parse(resp);
+  }
+
+  private static quotaPath(serviceCode: string, quotaCode: string): string {
+    return `/quotas/${encodeURIComponent(serviceCode)}/${encodeURIComponent(quotaCode)}`;
+  }
+
+  private static query(params: Record<string, string | undefined>): string {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined) qs.set(k, v);
+    }
+    const s = qs.toString();
+    return s ? `?${s}` : "";
+  }
+
+  /**
+   * List every quota (or one service's) with its applied value, usage and
+   * enforcement state. Account and region default to the server's.
+   */
+  async getQuotas(opts?: GetQuotasOptions): Promise<QuotasResponse> {
+    const qs = ServiceQuotasClient.query({
+      accountId: opts?.accountId,
+      region: opts?.region,
+      serviceCode: opts?.serviceCode,
+    });
+    return this.send("GET", `/quotas${qs}`);
+  }
+
+  /**
+   * Set one quota's applied value and/or enforcement override. `enforce`:
+   * `true` enforces, `false` ignores, `null` clears the override, and
+   * `undefined` leaves enforcement unchanged (the key is not sent).
+   */
+  async putQuota(
+    serviceCode: string,
+    quotaCode: string,
+    req: PutQuotaRequest,
+  ): Promise<Quota> {
+    // JSON.stringify drops `undefined` keys and keeps `null`, so an unset
+    // `enforce` is omitted while an explicit `null` clears the override.
+    return this.send(
+      "PUT",
+      ServiceQuotasClient.quotaPath(serviceCode, quotaCode),
+      req,
+    );
+  }
+
+  /**
+   * Reset one quota's applied value to the AWS default and drop its
+   * enforcement override (the account's when `accountId` is given, else the
+   * server-wide one).
+   */
+  async deleteQuota(
+    serviceCode: string,
+    quotaCode: string,
+    opts?: DeleteQuotaOptions,
+  ): Promise<Quota> {
+    const qs = ServiceQuotasClient.query({
+      accountId: opts?.accountId,
+      region: opts?.region,
+    });
+    return this.send(
+      "DELETE",
+      `${ServiceQuotasClient.quotaPath(serviceCode, quotaCode)}${qs}`,
+    );
+  }
+
+  /** Read the global enforcement switch and every override. */
+  async getEnforcement(): Promise<QuotaEnforcementResponse> {
+    return this.send("GET", "/enforcement");
+  }
+
+  /**
+   * Change the global enforcement switch and/or a batch of overrides. An
+   * override's `enforce` of `null` (or omitted) clears it. Every change is
+   * validated before any is applied.
+   */
+  async putEnforcement(
+    req: PutQuotaEnforcementRequest,
+  ): Promise<QuotaEnforcementResponse> {
+    return this.send("PUT", "/enforcement", req);
+  }
+
+  /** Read how increase requests are decided (`auto` or `manual`). */
+  async getRequestApproval(): Promise<QuotaRequestApprovalResponse> {
+    return this.send("GET", "/request-approval");
+  }
+
+  /**
+   * Set how increase requests are decided: `auto` approves them on
+   * submission, `manual` holds them `PENDING` until `approveRequest` or
+   * `denyRequest`.
+   */
+  async setRequestApproval(
+    mode: QuotaRequestApprovalMode,
+  ): Promise<QuotaRequestApprovalResponse> {
+    return this.send("PUT", "/request-approval", { mode });
+  }
+
+  /** List increase requests, newest first, optionally filtered. */
+  async getRequests(
+    opts?: GetQuotaRequestsOptions,
+  ): Promise<QuotaRequestsResponse> {
+    const qs = ServiceQuotasClient.query({
+      accountId: opts?.accountId,
+      status: opts?.status,
+    });
+    return this.send("GET", `/requests${qs}`);
+  }
+
+  /** Approve a pending request, raising the account's applied value. */
+  async approveRequest(requestId: string): Promise<QuotaRequest> {
+    return this.send(
+      "POST",
+      `/requests/${encodeURIComponent(requestId)}/approve`,
+    );
+  }
+
+  /** Close a pending request without raising the quota (default `DENIED`). */
+  async denyRequest(
+    requestId: string,
+    status?: QuotaDenyStatus,
+  ): Promise<QuotaRequest> {
+    return this.send(
+      "POST",
+      `/requests/${encodeURIComponent(requestId)}/deny`,
+      status === undefined ? {} : { status },
+    );
+  }
+}
+
 // ── Main client ────────────────────────────────────────────────────
 
 export class FakeCloud {
@@ -1227,6 +1395,7 @@ export class FakeCloud {
   private readonly _kms: KmsClient;
   private readonly _wafv2: WafV2Client;
   private readonly _cloudfront: CloudFrontClient;
+  private readonly _serviceQuotas: ServiceQuotasClient;
 
   constructor(baseUrl: string = "http://localhost:4566") {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -1267,6 +1436,7 @@ export class FakeCloud {
     this._kms = new KmsClient(this.baseUrl);
     this._wafv2 = new WafV2Client(this.baseUrl);
     this._cloudfront = new CloudFrontClient(this.baseUrl);
+    this._serviceQuotas = new ServiceQuotasClient(this.baseUrl);
   }
 
   // ── Health & Reset ─────────────────────────────────────────────
@@ -1493,6 +1663,10 @@ export class FakeCloud {
 
   get cloudfront(): CloudFrontClient {
     return this._cloudfront;
+  }
+
+  get serviceQuotas(): ServiceQuotasClient {
+    return this._serviceQuotas;
   }
 }
 

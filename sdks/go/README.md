@@ -348,6 +348,31 @@ func main() {
 | `GetDistributions(ctx)` | List distributions, each with its `.cloudfront.net` domain and whether the in-process data plane serves it |
 | `SetDistributionStatus(ctx, id, req)` | Force a distribution into `Deployed`/`InProgress` |
 
+### Service Quotas - `fc.ServiceQuotas()`
+
+| Method | Description |
+|--------|-------------|
+| `GetQuotas(ctx, opts)` | List quotas (optionally one account/region/service) with default, applied value, usage and enforcement state |
+| `PutQuota(ctx, serviceCode, quotaCode, req)` | Set a quota's applied value (may be below the AWS default) and/or its enforcement override |
+| `DeleteQuota(ctx, serviceCode, quotaCode, opts)` | Reset a quota to its AWS default and drop its override |
+| `GetEnforcement(ctx)` | Read the global enforcement switch and every server-wide and per-account override |
+| `PutEnforcement(ctx, req)` | Change the global switch and/or a batch of overrides |
+| `GetRequestApproval(ctx)` / `SetRequestApproval(ctx, mode)` | Read or switch how increase requests are decided (`auto` or `manual`) |
+| `GetRequests(ctx, opts)` | List increase requests, optionally by account and status |
+| `ApproveRequest(ctx, requestID)` | Approve a pending request, raising the applied value |
+| `DenyRequest(ctx, requestID, status)` | Close a pending request as `DENIED` (default), `NOT_APPROVED`, `CASE_CLOSED` or `INVALID_REQUEST` |
+
+Enforcement is tri-state: `QuotaEnforcementEnforce` (sent as `true`), `QuotaEnforcementIgnore` (`false`) and `QuotaEnforcementDefault` (`null`, clears the override). In `PutQuota`, a nil `Enforcement` leaves enforcement unchanged.
+
+```go
+one := 1.0
+_, err := fc.ServiceQuotas().PutQuota(ctx, "vpc", "L-0EA8095F", &fakecloud.ServiceQuotasPutQuotaRequest{
+    Value:       &one,
+    Enforcement: fakecloud.QuotaEnforcementEnforce.Ptr(),
+})
+// Authorizing more than one rule per direction on a security group now fails with RulesPerSecurityGroupLimitExceeded.
+```
+
 #### Testing Bedrock-calling code end-to-end
 
 ```go

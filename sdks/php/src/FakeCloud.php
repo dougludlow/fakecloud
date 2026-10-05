@@ -52,6 +52,7 @@ final class FakeCloud
     private KmsClient $kms;
     private WafV2Client $wafv2;
     private CloudFrontClient $cloudfront;
+    private ServiceQuotasClient $serviceQuotas;
 
     public function __construct(string $baseUrl = self::DEFAULT_BASE_URL)
     {
@@ -90,6 +91,7 @@ final class FakeCloud
         $this->kms = new KmsClient($this->http);
         $this->wafv2 = new WafV2Client($this->http);
         $this->cloudfront = new CloudFrontClient($this->http);
+        $this->serviceQuotas = new ServiceQuotasClient($this->http);
     }
 
     public function baseUrl(): string
@@ -226,6 +228,7 @@ final class FakeCloud
     public function kms(): KmsClient { return $this->kms; }
     public function wafv2(): WafV2Client { return $this->wafv2; }
     public function cloudfront(): CloudFrontClient { return $this->cloudfront; }
+    public function serviceQuotas(): ServiceQuotasClient { return $this->serviceQuotas; }
 }
 
 // ── Sub-clients ────────────────────────────────────────────────
@@ -1681,5 +1684,166 @@ final class CloudFrontClient
             '/_fakecloud/cloudfront/distributions/' . HttpTransport::encodePath($distributionId) . '/status',
             ['status' => $status]
         );
+    }
+}
+
+/**
+ * Service Quotas admin sub-client. Reads every quota's applied value,
+ * usage and enforcement state, sets applied values directly (including
+ * below the AWS default, so a test can hit a limit without creating the
+ * default number of resources), switches enforcement globally, per quota
+ * or per account, and decides increase requests held `PENDING` under
+ * manual approval.
+ */
+final class ServiceQuotasClient
+{
+    public function __construct(private readonly HttpTransport $http) {}
+
+    /**
+     * List every quota (or one service's, via $serviceCode) with its
+     * applied value, usage and enforcement state for $accountId /
+     * $region (null: the server's default). Throws
+     * {@see FakeCloudError} with HTTP 404 for an unknown service code.
+     */
+    public function getQuotas(
+        ?string $accountId = null,
+        ?string $region = null,
+        ?string $serviceCode = null,
+    ): ServiceQuotasResponse {
+        $path = '/_fakecloud/service-quotas/quotas' . self::query([
+            'accountId' => $accountId,
+            'region' => $region,
+            'serviceCode' => $serviceCode,
+        ]);
+        return ServiceQuotasResponse::fromArray($this->http->get($path));
+    }
+
+    /**
+     * Set one quota's applied value and/or enforcement override. Leave
+     * `$req->enforcement` null to keep enforcement as it is; pass
+     * {@see QuotaEnforcement::Default} to clear the override. Throws
+     * {@see FakeCloudError} with HTTP 404 for an unknown quota and 400
+     * when nothing would change or the quota cannot be enforced.
+     */
+    public function putQuota(string $serviceCode, string $quotaCode, PutServiceQuotaRequest $req): ServiceQuota
+    {
+        return ServiceQuota::fromArray(
+            $this->http->putJson(self::quotaPath($serviceCode, $quotaCode), $req->toArray())
+        );
+    }
+
+    /**
+     * Put a quota back to its AWS default and drop its enforcement
+     * override: the account's when $accountId is given, else the
+     * server-wide one.
+     */
+    public function deleteQuota(
+        string $serviceCode,
+        string $quotaCode,
+        ?string $accountId = null,
+        ?string $region = null,
+    ): ServiceQuota {
+        $path = self::quotaPath($serviceCode, $quotaCode) . self::query([
+            'accountId' => $accountId,
+            'region' => $region,
+        ]);
+        return ServiceQuota::fromArray($this->http->delete($path));
+    }
+
+    /** The global enforcement switch plus every per-quota and per-account override. */
+    public function getEnforcement(): ServiceQuotaEnforcementResponse
+    {
+        return ServiceQuotaEnforcementResponse::fromArray(
+            $this->http->get('/_fakecloud/service-quotas/enforcement')
+        );
+    }
+
+    /**
+     * Change the global enforcement switch and/or a batch of overrides.
+     * Every change is validated before any is applied.
+     */
+    public function putEnforcement(PutServiceQuotaEnforcementRequest $req): ServiceQuotaEnforcementResponse
+    {
+        return ServiceQuotaEnforcementResponse::fromArray(
+            $this->http->putJson('/_fakecloud/service-quotas/enforcement', $req->toArray())
+        );
+    }
+
+    /** How quota increase requests are decided: `"auto"` or `"manual"`. */
+    public function getRequestApproval(): ServiceQuotaRequestApprovalResponse
+    {
+        return ServiceQuotaRequestApprovalResponse::fromArray(
+            $this->http->get('/_fakecloud/service-quotas/request-approval')
+        );
+    }
+
+    /**
+     * Switch how increase requests are decided. `"manual"` holds new
+     * requests `PENDING` until {@see approveRequest()} or
+     * {@see denyRequest()} decides them.
+     */
+    public function setRequestApproval(string $mode): ServiceQuotaRequestApprovalResponse
+    {
+        return ServiceQuotaRequestApprovalResponse::fromArray(
+            $this->http->putJson('/_fakecloud/service-quotas/request-approval', ['mode' => $mode])
+        );
+    }
+
+    /**
+     * List quota increase requests across accounts (or one), newest
+     * first, optionally filtered by status.
+     */
+    public function getRequests(?string $accountId = null, ?string $status = null): ServiceQuotaIncreaseRequestsResponse
+    {
+        $path = '/_fakecloud/service-quotas/requests' . self::query([
+            'accountId' => $accountId,
+            'status' => $status,
+        ]);
+        return ServiceQuotaIncreaseRequestsResponse::fromArray($this->http->get($path));
+    }
+
+    /**
+     * Approve a `PENDING` or `CASE_OPENED` request, raising the account's
+     * applied value to the requested one. Throws {@see FakeCloudError}
+     * with HTTP 404 for an unknown request and 409 when already decided.
+     */
+    public function approveRequest(string $requestId): ServiceQuotaIncreaseRequest
+    {
+        return ServiceQuotaIncreaseRequest::fromArray(
+            $this->http->postEmpty(
+                '/_fakecloud/service-quotas/requests/' . HttpTransport::encodePath($requestId) . '/approve'
+            )
+        );
+    }
+
+    /**
+     * Close a `PENDING` or `CASE_OPENED` request without raising the
+     * quota. $status is one of `DENIED` (the server default when null),
+     * `NOT_APPROVED`, `CASE_CLOSED` or `INVALID_REQUEST`.
+     */
+    public function denyRequest(string $requestId, ?string $status = null): ServiceQuotaIncreaseRequest
+    {
+        $path = '/_fakecloud/service-quotas/requests/' . HttpTransport::encodePath($requestId) . '/deny';
+        $resp = $status === null
+            ? $this->http->postEmpty($path)
+            : $this->http->postJson($path, ['status' => $status]);
+        return ServiceQuotaIncreaseRequest::fromArray($resp);
+    }
+
+    private static function quotaPath(string $serviceCode, string $quotaCode): string
+    {
+        return '/_fakecloud/service-quotas/quotas/'
+            . HttpTransport::encodePath($serviceCode) . '/'
+            . HttpTransport::encodePath($quotaCode);
+    }
+
+    /** @param array<string, ?string> $params */
+    private static function query(array $params): string
+    {
+        $params = array_filter($params, fn ($v) => $v !== null);
+        if ($params === []) {
+            return '';
+        }
+        return '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
     }
 }

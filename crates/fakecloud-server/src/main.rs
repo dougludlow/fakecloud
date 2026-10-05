@@ -29,6 +29,7 @@ mod pipes_runner;
 mod reaper;
 mod reset;
 mod runtime;
+mod servicequotas_admin;
 mod ses_smtp;
 mod sqs_lambda_poller;
 mod stepfunctions_delivery;
@@ -222,6 +223,12 @@ async fn main() {
     let persistence_config = match cli.persistence_config() {
         Ok(cfg) => cfg,
         Err(err) => fatal_exit(format_args!("invalid persistence configuration: {err}")),
+    };
+    // Which Service Quotas quotas are enforced, and how increase requests are
+    // decided, at startup (and after a reset).
+    let quota_baseline = match cli.quota_settings() {
+        Ok(settings) => settings,
+        Err(err) => fatal_exit(format_args!("invalid quota configuration: {err}")),
     };
     if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
         // Persistent mode means "state survives restart", so the data INSIDE
@@ -831,11 +838,15 @@ async fn main() {
             &endpoint_url,
         )),
     );
-    // Applied quota values, for the services that enforce a quota (EC2's
-    // security groups per interface and rules per group).
+    let servicequotas_settings: fakecloud_servicequotas::SharedQuotaSettings =
+        Arc::new(parking_lot::RwLock::new(quota_baseline.clone()));
+    // Enforced quota limits, for the services that enforce a quota (EC2's
+    // security groups per interface and rules per group) once the user
+    // switched enforcement on.
     let servicequotas_provider = Arc::new(fakecloud_servicequotas::ServiceQuotasProvider::new(
         servicequotas_state.clone(),
         organizations_state.clone(),
+        servicequotas_settings.clone(),
     ));
     let quota_provider: Arc<dyn fakecloud_core::quota::QuotaProvider> =
         servicequotas_provider.clone();
@@ -1567,6 +1578,9 @@ async fn main() {
         bedrock_agent: bedrock_agent_state.clone(),
         bedrock_agent_runtime: bedrock_agent_runtime_state.clone(),
         organizations: organizations_state.clone(),
+        servicequotas: servicequotas_state.clone(),
+        servicequotas_settings: servicequotas_settings.clone(),
+        servicequotas_baseline: quota_baseline.clone(),
         container_runtime: container_runtime.clone(),
         rds_runtime: rds_runtime.clone(),
         elasticache_runtime: elasticache_runtime.clone(),
@@ -4512,9 +4526,18 @@ async fn main() {
                 .clone();
             let path = data_path.join("servicequotas").join("snapshot.json");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
-            match fakecloud_servicequotas::persistence::load_into(&store, &servicequotas_state) {
+            match fakecloud_servicequotas::persistence::load_into(
+                &store,
+                &servicequotas_state,
+                &servicequotas_settings,
+            ) {
                 Ok(fakecloud_servicequotas::persistence::LoadOutcome::Loaded(accounts)) => {
                     tracing::info!(accounts, "loaded servicequotas persistence snapshot");
+                    // Settings changed at runtime were restored; the startup
+                    // flags still win for the settings they name.
+                    if let Err(err) = cli.apply_quota_flags(&mut servicequotas_settings.write()) {
+                        fatal_exit(format_args!("invalid quota configuration: {err}"));
+                    }
                 }
                 Ok(fakecloud_servicequotas::persistence::LoadOutcome::Empty) => {
                     tracing::info!("no servicequotas persistence snapshot found; starting empty");
@@ -4529,6 +4552,7 @@ async fn main() {
         servicequotas_state.clone(),
         organizations_state.clone(),
     )
+    .with_settings(servicequotas_settings.clone(), quota_baseline.clone())
     .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()))
     // Associating the template enables trusted access in Organizations.
     .with_organizations_snapshot_hook(cfn_snapshot_hooks.get("organizations").cloned());
@@ -12424,6 +12448,9 @@ async fn main() {
                 None => axum::Router::new(),
             }
         })
+        // Service Quotas introspection: applied values, enforcement switches
+        // and manual decisions on increase requests.
+        .merge(servicequotas_admin::router(servicequotas_service.clone()))
         .merge({
             // AWS Support hands out presigned attachment upload / download
             // links; they point back here and are served by these routes, so a

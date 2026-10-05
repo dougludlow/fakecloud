@@ -106,6 +106,16 @@ final class HttpTransport
         return $this->send('POST', $path, $body, 'text/plain');
     }
 
+    /**
+     * PUT a JSON body and decode the JSON response. An empty $body is
+     * sent as `{}` (not `[]`) so the server sees an object.
+     */
+    public function putJson(string $path, array $body): array
+    {
+        $payload = $body === [] ? '{}' : json_encode($body, JSON_THROW_ON_ERROR);
+        return $this->send('PUT', $path, $payload, 'application/json');
+    }
+
     public function delete(string $path): array
     {
         return $this->send('DELETE', $path);
@@ -139,12 +149,10 @@ final class HttpTransport
         $responseBody = curl_exec($ch);
         if ($responseBody === false) {
             $error = curl_error($ch);
-            curl_close($ch);
             throw new FakeCloudError(-1, "network error: {$error}");
         }
 
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         return ['body' => $responseBody, 'status' => $status];
     }

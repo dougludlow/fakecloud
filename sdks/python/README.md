@@ -230,6 +230,40 @@ Called as a method on the main client: `fc.organizations()`.
 |---|---|
 | `get_accounts()` | List member accounts with lifecycle state, parent OU, tags, attached SCPs |
 
+### `fc.service_quotas`
+
+| Method | Description |
+|---|---|
+| `get_quotas(account_id=None, region=None, service_code=None)` | Every quota (or one service's) with applied value, usage and enforcement state |
+| `put_quota(service_code, quota_code, *, account_id=None, region=None, value=None, enforcement=None)` | Set a quota's applied value (may be below the AWS default) and/or its enforcement override |
+| `delete_quota(service_code, quota_code, account_id=None, region=None)` | Reset a quota to its AWS default and drop its override |
+| `get_enforcement()` | Global `enforce_all` switch plus server-wide and per-account overrides |
+| `put_enforcement(enforce_all=None, overrides=None)` | Change the global switch and/or a batch of `ServiceQuotaEnforcementChange` overrides |
+| `get_request_approval()` / `set_request_approval(mode)` | Read or set how increase requests are decided (`"auto"` or `"manual"`) |
+| `get_requests(account_id=None, status=None)` | Increase requests, newest first |
+| `approve_request(request_id)` | Approve a pending request, raising the applied value |
+| `deny_request(request_id, status=None)` | Deny a pending request (`DENIED` by default, or `NOT_APPROVED` / `CASE_CLOSED` / `INVALID_REQUEST`) |
+
+Enforcement is tri-state via `QuotaEnforcement` (from `fakecloud.types`):
+`ENFORCE` sends `true`, `IGNORE` sends `false`, `DEFAULT` sends `null` and
+clears the override. In `put_quota`, `enforcement=None` omits the field and
+leaves enforcement unchanged. With `account_id`, the override applies to that
+account only; otherwise it is server-wide.
+
+```python
+from fakecloud.types import QuotaEnforcement
+
+# Allow 1 rule per security group and make sure the limit is enforced.
+fc.service_quotas.put_quota(
+    "vpc", "L-0EA8095F", value=1, enforcement=QuotaEnforcement.ENFORCE
+)
+
+# Hold increase requests for manual review, then approve one.
+fc.service_quotas.set_request_approval("manual")
+pending = fc.service_quotas.get_requests(status="PENDING").requests
+fc.service_quotas.approve_request(pending[0].request_id)
+```
+
 ### `fc.ses`
 
 | Method | Description |

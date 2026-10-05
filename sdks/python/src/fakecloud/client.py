@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 from urllib.parse import quote as _urlquote
 
 import httpx
@@ -93,6 +93,7 @@ from fakecloud.types import (
     OrganizationsResponsibilityTransfersResponse,
     PendingConfirmationsResponse,
     PreTokenGenInvocationsResponse,
+    QuotaEnforcement,
     RdsInstancesResponse,
     RdsLambdaInvokeRequest,
     RdsLambdaInvokeResponse,
@@ -110,6 +111,13 @@ from fakecloud.types import (
     S3NotificationsResponse,
     S3ObjectLambdaResponsesResponse,
     SchedulerSchedulesResponse,
+    ServiceQuota,
+    ServiceQuotaEnforcementChange,
+    ServiceQuotaRequest,
+    ServiceQuotaRequestsResponse,
+    ServiceQuotasEnforcementResponse,
+    ServiceQuotasRequestApprovalResponse,
+    ServiceQuotasResponse,
     SesBouncesResponse,
     SesDkimPublicKey,
     SesEmailsResponse,
@@ -1156,6 +1164,156 @@ class OrganizationsClient:
         return OrganizationsResponsibilityTransfersResponse.from_dict(resp.json())
 
 
+class ServiceQuotasClient:
+    """Async Service Quotas admin/introspection client.
+
+    Reads every quota's applied value, usage and enforcement state, sets
+    applied values directly (including below the AWS default, so a test
+    can hit a limit without creating the default number of resources),
+    switches enforcement globally, per quota or per account, and decides
+    increase requests held ``PENDING`` under manual approval.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, base_url: str) -> None:
+        self._client = client
+        self._base = base_url
+
+    async def get_quotas(
+        self,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+        service_code: Optional[str] = None,
+    ) -> ServiceQuotasResponse:
+        """List every quota (or one service's) for an account and region
+        (default: the server's)."""
+        resp = await self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/quotas",
+            params=_sq_quota_params(account_id, region, service_code),
+        )
+        _check(resp)
+        return ServiceQuotasResponse.from_dict(resp.json())
+
+    async def put_quota(
+        self,
+        service_code: str,
+        quota_code: str,
+        *,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+        value: Optional[float] = None,
+        enforcement: Optional[QuotaEnforcement] = None,
+    ) -> ServiceQuota:
+        """Set a quota's applied value and/or enforcement override.
+
+        ``enforcement=None`` leaves enforcement unchanged (the ``enforce``
+        key is omitted); ``QuotaEnforcement.DEFAULT`` clears the override
+        (sends ``"enforce": null``). With ``account_id`` the override is
+        scoped to that account, otherwise it is server-wide. ``value`` may
+        be below the AWS default.
+        """
+        resp = await self._client.put(
+            _sq_quota_url(self._base, service_code, quota_code),
+            json=_sq_put_quota_body(account_id, region, value, enforcement),
+        )
+        _check(resp)
+        return ServiceQuota.from_dict(resp.json())
+
+    async def delete_quota(
+        self,
+        service_code: str,
+        quota_code: str,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> ServiceQuota:
+        """Reset a quota to its AWS default and drop its enforcement
+        override (the account's when ``account_id`` is given, else the
+        server-wide one)."""
+        resp = await self._client.delete(
+            _sq_quota_url(self._base, service_code, quota_code),
+            params=_sq_quota_params(account_id, region, None),
+        )
+        _check(resp)
+        return ServiceQuota.from_dict(resp.json())
+
+    async def get_enforcement(self) -> ServiceQuotasEnforcementResponse:
+        """The global enforcement switch and every override."""
+        resp = await self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/enforcement"
+        )
+        _check(resp)
+        return ServiceQuotasEnforcementResponse.from_dict(resp.json())
+
+    async def put_enforcement(
+        self,
+        enforce_all: Optional[bool] = None,
+        overrides: Optional[List[ServiceQuotaEnforcementChange]] = None,
+    ) -> ServiceQuotasEnforcementResponse:
+        """Change the global switch (``None`` leaves it) and/or a batch of
+        overrides. Every change is validated before any is applied."""
+        resp = await self._client.put(
+            f"{self._base}/_fakecloud/service-quotas/enforcement",
+            json=_sq_enforcement_body(enforce_all, overrides),
+        )
+        _check(resp)
+        return ServiceQuotasEnforcementResponse.from_dict(resp.json())
+
+    async def get_request_approval(self) -> ServiceQuotasRequestApprovalResponse:
+        """How increase requests are decided (``"auto"`` or ``"manual"``)."""
+        resp = await self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/request-approval"
+        )
+        _check(resp)
+        return ServiceQuotasRequestApprovalResponse.from_dict(resp.json())
+
+    async def set_request_approval(
+        self, mode: str
+    ) -> ServiceQuotasRequestApprovalResponse:
+        """Set how increase requests are decided: ``"auto"`` approves them
+        immediately, ``"manual"`` holds them ``PENDING`` until
+        ``approve_request`` / ``deny_request``."""
+        resp = await self._client.put(
+            f"{self._base}/_fakecloud/service-quotas/request-approval",
+            json={"mode": mode},
+        )
+        _check(resp)
+        return ServiceQuotasRequestApprovalResponse.from_dict(resp.json())
+
+    async def get_requests(
+        self,
+        account_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> ServiceQuotaRequestsResponse:
+        """Increase requests across accounts (or one), newest first,
+        optionally filtered by status."""
+        resp = await self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/requests",
+            params=_sq_request_params(account_id, status),
+        )
+        _check(resp)
+        return ServiceQuotaRequestsResponse.from_dict(resp.json())
+
+    async def approve_request(self, request_id: str) -> ServiceQuotaRequest:
+        """Approve a pending request, raising the account's applied value
+        to the requested one."""
+        resp = await self._client.post(
+            _sq_request_url(self._base, request_id, "approve")
+        )
+        _check(resp)
+        return ServiceQuotaRequest.from_dict(resp.json())
+
+    async def deny_request(
+        self, request_id: str, status: Optional[str] = None
+    ) -> ServiceQuotaRequest:
+        """Deny a pending request with ``status`` (``"DENIED"`` by default;
+        also ``"NOT_APPROVED"``, ``"CASE_CLOSED"``, ``"INVALID_REQUEST"``)."""
+        resp = await self._client.post(
+            _sq_request_url(self._base, request_id, "deny"),
+            json=_sq_deny_body(status),
+        )
+        _check(resp)
+        return ServiceQuotaRequest.from_dict(resp.json())
+
+
 class SesClient:
     """Async SES introspection client."""
 
@@ -2004,6 +2162,117 @@ class _SyncOrganizationsClient:
         return OrganizationsResponsibilityTransfersResponse.from_dict(resp.json())
 
 
+class _SyncServiceQuotasClient:
+    """Sync Service Quotas admin/introspection client."""
+
+    def __init__(self, client: httpx.Client, base_url: str) -> None:
+        self._client = client
+        self._base = base_url
+
+    def get_quotas(
+        self,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+        service_code: Optional[str] = None,
+    ) -> ServiceQuotasResponse:
+        resp = self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/quotas",
+            params=_sq_quota_params(account_id, region, service_code),
+        )
+        _check(resp)
+        return ServiceQuotasResponse.from_dict(resp.json())
+
+    def put_quota(
+        self,
+        service_code: str,
+        quota_code: str,
+        *,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+        value: Optional[float] = None,
+        enforcement: Optional[QuotaEnforcement] = None,
+    ) -> ServiceQuota:
+        resp = self._client.put(
+            _sq_quota_url(self._base, service_code, quota_code),
+            json=_sq_put_quota_body(account_id, region, value, enforcement),
+        )
+        _check(resp)
+        return ServiceQuota.from_dict(resp.json())
+
+    def delete_quota(
+        self,
+        service_code: str,
+        quota_code: str,
+        account_id: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> ServiceQuota:
+        resp = self._client.delete(
+            _sq_quota_url(self._base, service_code, quota_code),
+            params=_sq_quota_params(account_id, region, None),
+        )
+        _check(resp)
+        return ServiceQuota.from_dict(resp.json())
+
+    def get_enforcement(self) -> ServiceQuotasEnforcementResponse:
+        resp = self._client.get(f"{self._base}/_fakecloud/service-quotas/enforcement")
+        _check(resp)
+        return ServiceQuotasEnforcementResponse.from_dict(resp.json())
+
+    def put_enforcement(
+        self,
+        enforce_all: Optional[bool] = None,
+        overrides: Optional[List[ServiceQuotaEnforcementChange]] = None,
+    ) -> ServiceQuotasEnforcementResponse:
+        resp = self._client.put(
+            f"{self._base}/_fakecloud/service-quotas/enforcement",
+            json=_sq_enforcement_body(enforce_all, overrides),
+        )
+        _check(resp)
+        return ServiceQuotasEnforcementResponse.from_dict(resp.json())
+
+    def get_request_approval(self) -> ServiceQuotasRequestApprovalResponse:
+        resp = self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/request-approval"
+        )
+        _check(resp)
+        return ServiceQuotasRequestApprovalResponse.from_dict(resp.json())
+
+    def set_request_approval(self, mode: str) -> ServiceQuotasRequestApprovalResponse:
+        resp = self._client.put(
+            f"{self._base}/_fakecloud/service-quotas/request-approval",
+            json={"mode": mode},
+        )
+        _check(resp)
+        return ServiceQuotasRequestApprovalResponse.from_dict(resp.json())
+
+    def get_requests(
+        self,
+        account_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> ServiceQuotaRequestsResponse:
+        resp = self._client.get(
+            f"{self._base}/_fakecloud/service-quotas/requests",
+            params=_sq_request_params(account_id, status),
+        )
+        _check(resp)
+        return ServiceQuotaRequestsResponse.from_dict(resp.json())
+
+    def approve_request(self, request_id: str) -> ServiceQuotaRequest:
+        resp = self._client.post(_sq_request_url(self._base, request_id, "approve"))
+        _check(resp)
+        return ServiceQuotaRequest.from_dict(resp.json())
+
+    def deny_request(
+        self, request_id: str, status: Optional[str] = None
+    ) -> ServiceQuotaRequest:
+        resp = self._client.post(
+            _sq_request_url(self._base, request_id, "deny"),
+            json=_sq_deny_body(status),
+        )
+        _check(resp)
+        return ServiceQuotaRequest.from_dict(resp.json())
+
+
 class _SyncSesClient:
     def __init__(self, client: httpx.Client, base_url: str) -> None:
         self._client = client
@@ -2803,6 +3072,10 @@ class FakeCloud:
     def organizations(self) -> OrganizationsClient:
         return OrganizationsClient(self._client, self._base)
 
+    @property
+    def service_quotas(self) -> ServiceQuotasClient:
+        return ServiceQuotasClient(self._client, self._base)
+
     # ── Lifecycle ───────────────────────────────────────────────────
 
     async def aclose(self) -> None:
@@ -3030,6 +3303,10 @@ class FakeCloudSync:
     def organizations(self) -> _SyncOrganizationsClient:
         return _SyncOrganizationsClient(self._client, self._base)
 
+    @property
+    def service_quotas(self) -> _SyncServiceQuotasClient:
+        return _SyncServiceQuotasClient(self._client, self._base)
+
     # ── Lifecycle ───────────────────────────────────────────────────
 
     def close(self) -> None:
@@ -3060,3 +3337,77 @@ def _scope_params(account_id: Optional[str], region: Optional[str]) -> Dict[str,
     if region:
         params["region"] = region
     return params
+
+
+def _sq_quota_url(base: str, service_code: str, quota_code: str) -> str:
+    return (
+        f"{base}/_fakecloud/service-quotas/quotas/"
+        f"{_urlquote(service_code, safe='')}/{_urlquote(quota_code, safe='')}"
+    )
+
+
+def _sq_request_url(base: str, request_id: str, action: str) -> str:
+    return (
+        f"{base}/_fakecloud/service-quotas/requests/"
+        f"{_urlquote(request_id, safe='')}/{action}"
+    )
+
+
+def _sq_quota_params(
+    account_id: Optional[str], region: Optional[str], service_code: Optional[str]
+) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    if account_id is not None:
+        params["accountId"] = account_id
+    if region is not None:
+        params["region"] = region
+    if service_code is not None:
+        params["serviceCode"] = service_code
+    return params
+
+
+def _sq_request_params(
+    account_id: Optional[str], status: Optional[str]
+) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    if account_id is not None:
+        params["accountId"] = account_id
+    if status is not None:
+        params["status"] = status
+    return params
+
+
+def _sq_put_quota_body(
+    account_id: Optional[str],
+    region: Optional[str],
+    value: Optional[float],
+    enforcement: Optional[QuotaEnforcement],
+) -> Dict[str, Any]:
+    """Body of ``PUT /quotas/{service}/{quota}``. ``enforcement=None`` omits
+    the ``enforce`` key (leave unchanged); ``DEFAULT`` sends ``null``."""
+    body: Dict[str, Any] = {}
+    if account_id is not None:
+        body["accountId"] = account_id
+    if region is not None:
+        body["region"] = region
+    if value is not None:
+        body["value"] = value
+    if enforcement is not None:
+        body["enforce"] = enforcement.to_json()
+    return body
+
+
+def _sq_enforcement_body(
+    enforce_all: Optional[bool],
+    overrides: Optional[List[ServiceQuotaEnforcementChange]],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    if enforce_all is not None:
+        body["enforceAll"] = enforce_all
+    if overrides is not None:
+        body["overrides"] = [o.to_dict() for o in overrides]
+    return body
+
+
+def _sq_deny_body(status: Optional[str]) -> Dict[str, Any]:
+    return {} if status is None else {"status": status}

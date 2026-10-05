@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
@@ -3781,3 +3782,209 @@ class Elbv2WafCountsResponse:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Elbv2WafCountsResponse:
         return cls(counts=dict(data.get("counts") or {}))
+
+
+# -- Service Quotas --------------------------------------------------
+
+
+class QuotaEnforcement(Enum):
+    """Tri-state enforcement override for a Service Quotas quota.
+
+    ``ENFORCE`` makes fakecloud reject requests past the applied value,
+    ``IGNORE`` lets them through, and ``DEFAULT`` clears the override so
+    the quota follows the global ``enforce_all`` switch again. On the
+    wire these are ``true``, ``false`` and ``null``.
+    """
+
+    ENFORCE = "enforce"
+    IGNORE = "ignore"
+    DEFAULT = "default"
+
+    def to_json(self) -> Optional[bool]:
+        if self is QuotaEnforcement.ENFORCE:
+            return True
+        if self is QuotaEnforcement.IGNORE:
+            return False
+        return None
+
+
+@dataclass
+class ServiceQuota:
+    """One quota from `/_fakecloud/service-quotas/quotas`.
+
+    ``usage`` is ``None`` when no fakecloud service measures the quota.
+    ``enforcement_source`` is one of ``"not_enforceable"``,
+    ``"account_override"``, ``"override"`` or ``"global"``.
+    """
+
+    service_code: str
+    quota_code: str
+    quota_name: str
+    global_: bool
+    adjustable: bool
+    unit: str
+    default_value: float
+    applied_value: float
+    usage: Optional[float]
+    enforceable: bool
+    enforced: bool
+    enforcement_source: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ServiceQuota:
+        d = _convert_keys(data)
+        usage = d.get("usage")
+        return cls(
+            service_code=d["service_code"],
+            quota_code=d["quota_code"],
+            quota_name=d["quota_name"],
+            global_=d["global"],
+            adjustable=d["adjustable"],
+            unit=d["unit"],
+            default_value=float(d["default_value"]),
+            applied_value=float(d["applied_value"]),
+            usage=None if usage is None else float(usage),
+            enforceable=d["enforceable"],
+            enforced=d["enforced"],
+            enforcement_source=d["enforcement_source"],
+        )
+
+
+@dataclass
+class ServiceQuotasResponse:
+    account_id: str
+    region: str
+    quotas: List[ServiceQuota]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ServiceQuotasResponse:
+        return cls(
+            account_id=data["accountId"],
+            region=data["region"],
+            quotas=[ServiceQuota.from_dict(q) for q in data.get("quotas", [])],
+        )
+
+
+@dataclass
+class ServiceQuotaEnforcementOverride:
+    """A server-wide enforcement override (applies to every account)."""
+
+    service_code: str
+    quota_code: str
+    enforce: bool
+
+
+@dataclass
+class ServiceQuotaAccountEnforcementOverride:
+    """An enforcement override scoped to one account."""
+
+    account_id: str
+    service_code: str
+    quota_code: str
+    enforce: bool
+
+
+@dataclass
+class ServiceQuotasEnforcementResponse:
+    enforce_all: bool
+    overrides: List[ServiceQuotaEnforcementOverride] = field(default_factory=list)
+    account_overrides: List[ServiceQuotaAccountEnforcementOverride] = field(
+        default_factory=list
+    )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ServiceQuotasEnforcementResponse:
+        d = _convert_keys(data)
+        return cls(
+            enforce_all=d["enforce_all"],
+            overrides=[
+                ServiceQuotaEnforcementOverride(**o) for o in d.get("overrides", [])
+            ],
+            account_overrides=[
+                ServiceQuotaAccountEnforcementOverride(**o)
+                for o in d.get("account_overrides", [])
+            ],
+        )
+
+
+@dataclass
+class ServiceQuotaEnforcementChange:
+    """One override change for `put_enforcement`.
+
+    ``account_id`` scopes the override to one account; ``None`` makes it
+    server-wide. ``QuotaEnforcement.DEFAULT`` clears the override.
+    """
+
+    service_code: str
+    quota_code: str
+    enforcement: QuotaEnforcement
+    account_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "serviceCode": self.service_code,
+            "quotaCode": self.quota_code,
+            "enforce": self.enforcement.to_json(),
+        }
+        if self.account_id is not None:
+            d["accountId"] = self.account_id
+        return d
+
+
+@dataclass
+class ServiceQuotasRequestApprovalResponse:
+    """How increase requests are decided: ``"auto"`` or ``"manual"``."""
+
+    mode: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ServiceQuotasRequestApprovalResponse:
+        return cls(mode=data["mode"])
+
+
+@dataclass
+class ServiceQuotaRequest:
+    """A quota increase request. ``region`` is empty for global quotas;
+    ``created`` and ``last_updated`` are RFC3339 timestamps."""
+
+    account_id: str
+    request_id: str
+    service_code: str
+    quota_code: str
+    quota_name: str
+    region: str
+    desired_value: float
+    status: str
+    case_id: Optional[str]
+    created: str
+    last_updated: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ServiceQuotaRequest:
+        d = _convert_keys(data)
+        return cls(
+            account_id=d["account_id"],
+            request_id=d["request_id"],
+            service_code=d["service_code"],
+            quota_code=d["quota_code"],
+            quota_name=d["quota_name"],
+            region=d["region"],
+            desired_value=float(d["desired_value"]),
+            status=d["status"],
+            case_id=d.get("case_id"),
+            created=d["created"],
+            last_updated=d["last_updated"],
+        )
+
+
+@dataclass
+class ServiceQuotaRequestsResponse:
+    requests: List[ServiceQuotaRequest]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ServiceQuotaRequestsResponse:
+        return cls(
+            requests=[
+                ServiceQuotaRequest.from_dict(r) for r in data.get("requests", [])
+            ]
+        )

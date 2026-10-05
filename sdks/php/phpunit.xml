@@ -8,6 +8,7 @@
     <testsuites>
         <testsuite name="unit">
             <file>tests/ClientTest.php</file>
+            <file>tests/ServiceQuotasClientTest.php</file>
         </testsuite>
         <testsuite name="e2e">
             <file>tests/E2ETest.php</file>

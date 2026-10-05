@@ -38,6 +38,22 @@ impl From<StorageModeArg> for StorageMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub(crate) enum QuotaRequestsArg {
+    Auto,
+    Manual,
+}
+
+impl From<QuotaRequestsArg> for fakecloud_servicequotas::RequestApproval {
+    fn from(value: QuotaRequestsArg) -> Self {
+        match value {
+            QuotaRequestsArg::Auto => Self::Auto,
+            QuotaRequestsArg::Manual => Self::Manual,
+        }
+    }
+}
+
 const DEFAULT_S3_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Parser)]
@@ -184,6 +200,42 @@ pub(crate) struct Cli {
     #[arg(long, env = "FAKECLOUD_DNS_UPSTREAM")]
     pub dns_upstream: Option<String>,
 
+    /// Enforce every Service Quotas quota fakecloud can check, at its applied
+    /// value (the AWS default unless raised). Off by default: nothing is
+    /// enforced until switched on, here, per quota with `--enforce-quota`, or
+    /// at runtime through `/_fakecloud/service-quotas/*`. See
+    /// `/docs/services/service-quotas`.
+    #[arg(long, default_value_t = false, env = "FAKECLOUD_ENFORCE_QUOTAS")]
+    pub enforce_quotas: bool,
+
+    /// Enforce one quota, as `SERVICE_CODE/QUOTA_CODE` (e.g.
+    /// `vpc/L-0EA8095F`). Repeatable; the env var takes a comma-separated
+    /// list.
+    #[arg(
+        long = "enforce-quota",
+        value_name = "SERVICE/QUOTA",
+        env = "FAKECLOUD_ENFORCE_QUOTA",
+        value_delimiter = ','
+    )]
+    pub enforce_quota: Vec<String>,
+
+    /// Never enforce one quota, even with `--enforce-quotas`, as
+    /// `SERVICE_CODE/QUOTA_CODE`. Repeatable; the env var takes a
+    /// comma-separated list.
+    #[arg(
+        long = "ignore-quota",
+        value_name = "SERVICE/QUOTA",
+        env = "FAKECLOUD_IGNORE_QUOTA",
+        value_delimiter = ','
+    )]
+    pub ignore_quota: Vec<String>,
+
+    /// How Service Quotas increase requests are decided: `auto` (on
+    /// submission, the default) or `manual` (left `PENDING` until approved or
+    /// denied through `/_fakecloud/service-quotas/requests/{id}/...`).
+    #[arg(long, value_enum, env = "FAKECLOUD_QUOTA_REQUESTS")]
+    pub quota_requests: Option<QuotaRequestsArg>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -255,6 +307,60 @@ impl Cli {
                 )
             )
         })
+    }
+
+    /// Apply the quota flags to `settings`: the flags win over whatever a
+    /// persisted snapshot holds for the settings they name.
+    pub fn apply_quota_flags(
+        &self,
+        settings: &mut fakecloud_servicequotas::QuotaSettings,
+    ) -> Result<(), String> {
+        let resolve = |reference: &str| {
+            fakecloud_servicequotas::catalog::parse_ref(reference.trim()).ok_or_else(|| {
+                format!("unknown quota {reference:?}: expected SERVICE_CODE/QUOTA_CODE from the Service Quotas catalog")
+            })
+        };
+        for reference in &self.enforce_quota {
+            let def = resolve(reference)?;
+            if !def.enforceable {
+                return Err(format!(
+                    "quota {reference} ({}) is not enforceable: no fakecloud service checks requests against it",
+                    def.name
+                ));
+            }
+            if self
+                .ignore_quota
+                .iter()
+                .any(|i| resolve(i).is_ok_and(|d| std::ptr::eq(d, def)))
+            {
+                return Err(format!(
+                    "quota {reference} is given to both --enforce-quota and --ignore-quota"
+                ));
+            }
+            settings
+                .overrides
+                .insert(fakecloud_servicequotas::settings::quota_ref(def), true);
+        }
+        for reference in &self.ignore_quota {
+            let def = resolve(reference)?;
+            settings
+                .overrides
+                .insert(fakecloud_servicequotas::settings::quota_ref(def), false);
+        }
+        if self.enforce_quotas {
+            settings.enforce_all = true;
+        }
+        if let Some(mode) = self.quota_requests {
+            settings.request_approval = mode.into();
+        }
+        Ok(())
+    }
+
+    /// The quota settings the server starts with (and a reset restores).
+    pub fn quota_settings(&self) -> Result<fakecloud_servicequotas::QuotaSettings, String> {
+        let mut settings = fakecloud_servicequotas::QuotaSettings::default();
+        self.apply_quota_flags(&mut settings)?;
+        Ok(settings)
     }
 
     pub fn persistence_config(&self) -> Result<PersistenceConfig, String> {
@@ -423,5 +529,75 @@ mod tests {
         assert_eq!(cli.s3_cache_size, DEFAULT_S3_CACHE_BYTES);
         let cli = Cli::try_parse_from(["fakecloud", "--s3-cache-size", "1024"]).unwrap();
         assert_eq!(cli.s3_cache_size, 1024);
+    }
+
+    #[test]
+    fn quotas_are_not_enforced_by_default() {
+        let cli = Cli::try_parse_from(["fakecloud"]).unwrap();
+        assert_eq!(
+            cli.quota_settings().unwrap(),
+            fakecloud_servicequotas::QuotaSettings::default()
+        );
+    }
+
+    #[test]
+    fn quota_flags_build_the_settings() {
+        let cli = Cli::try_parse_from([
+            "fakecloud",
+            "--enforce-quotas",
+            "--enforce-quota",
+            "vpc/L-2AFB9258",
+            "--ignore-quota",
+            "vpc/L-0EA8095F",
+            "--quota-requests",
+            "manual",
+        ])
+        .unwrap();
+        let s = cli.quota_settings().unwrap();
+        assert!(s.enforce_all);
+        assert_eq!(s.overrides.get("vpc/L-2AFB9258"), Some(&true));
+        assert_eq!(s.overrides.get("vpc/L-0EA8095F"), Some(&false));
+        assert_eq!(
+            s.request_approval,
+            fakecloud_servicequotas::RequestApproval::Manual
+        );
+    }
+
+    #[test]
+    fn quota_flags_override_persisted_settings_they_name() {
+        let cli = Cli::try_parse_from(["fakecloud", "--ignore-quota", "vpc/L-2AFB9258"]).unwrap();
+        let mut persisted = fakecloud_servicequotas::QuotaSettings {
+            enforce_all: true,
+            ..Default::default()
+        };
+        persisted
+            .overrides
+            .insert("vpc/L-2AFB9258".to_string(), true);
+        cli.apply_quota_flags(&mut persisted).unwrap();
+        assert!(persisted.enforce_all, "unnamed settings are kept");
+        assert_eq!(persisted.overrides.get("vpc/L-2AFB9258"), Some(&false));
+    }
+
+    #[test]
+    fn quota_flags_reject_bad_references() {
+        let bad = |args: &[&str]| {
+            let mut argv = vec!["fakecloud"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+                .unwrap()
+                .quota_settings()
+                .unwrap_err()
+        };
+        assert!(bad(&["--enforce-quota", "vpc/L-NOPE"]).contains("unknown quota"));
+        assert!(bad(&["--enforce-quota", "nonsense"]).contains("unknown quota"));
+        assert!(bad(&["--enforce-quota", "lambda/L-B99A9384"]).contains("not enforceable"));
+        assert!(bad(&[
+            "--enforce-quota",
+            "vpc/L-2AFB9258",
+            "--ignore-quota",
+            "vpc/L-2AFB9258"
+        ])
+        .contains("both"));
+        assert!(Cli::try_parse_from(["fakecloud", "--quota-requests", "later"]).is_err());
     }
 }

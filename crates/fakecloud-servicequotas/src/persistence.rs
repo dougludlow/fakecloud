@@ -6,6 +6,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use fakecloud_persistence::SnapshotStore;
 
+use crate::settings::SharedQuotaSettings;
 use crate::state::{
     ServiceQuotasSnapshot, SharedServiceQuotasState, SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION,
 };
@@ -28,9 +29,12 @@ pub enum LoadError {
     SchemaTooNew { on_disk: u32, supported: u32 },
 }
 
+/// Load the snapshot into `state`, and its server-wide settings (when it has
+/// any) into `settings`.
 pub fn load_into(
     store: &dyn SnapshotStore,
     state: &SharedServiceQuotasState,
+    settings: &SharedQuotaSettings,
 ) -> Result<LoadOutcome, LoadError> {
     let Some(bytes) = store.load().map_err(|e| LoadError::Io(e.to_string()))? else {
         return Ok(LoadOutcome::Empty);
@@ -45,11 +49,15 @@ pub fn load_into(
     }
     let accounts = snapshot.accounts.account_count();
     *state.write() = snapshot.accounts;
+    if let Some(saved) = snapshot.settings {
+        *settings.write() = saved;
+    }
     Ok(LoadOutcome::Loaded(accounts))
 }
 
 pub async fn save_snapshot(
     state: &SharedServiceQuotasState,
+    settings: &SharedQuotaSettings,
     store: Option<Arc<dyn SnapshotStore>>,
     lock: &AsyncMutex<()>,
 ) {
@@ -60,6 +68,7 @@ pub async fn save_snapshot(
     let snapshot = ServiceQuotasSnapshot {
         schema_version: SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION,
         accounts: state.read().clone(),
+        settings: Some(settings.read().clone()),
     };
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
@@ -93,6 +102,10 @@ mod tests {
         }
     }
 
+    fn settings() -> SharedQuotaSettings {
+        Arc::new(RwLock::new(Default::default()))
+    }
+
     fn state() -> SharedServiceQuotasState {
         Arc::new(RwLock::new(MultiAccountState::new(
             "000000000000",
@@ -104,7 +117,7 @@ mod tests {
     #[test]
     fn empty_store_is_empty() {
         assert_eq!(
-            load_into(&MemStore(Mutex::new(None)), &state()).unwrap(),
+            load_into(&MemStore(Mutex::new(None)), &state(), &settings()).unwrap(),
             LoadOutcome::Empty
         );
     }
@@ -114,17 +127,41 @@ mod tests {
         let mut accounts: MultiAccountState<ServiceQuotasData> =
             MultiAccountState::new("000000000000", "us-east-1", "");
         accounts.get_or_create("111122223333");
+        let saved = crate::settings::QuotaSettings {
+            enforce_all: true,
+            request_approval: crate::settings::RequestApproval::Manual,
+            ..Default::default()
+        };
         let snap = ServiceQuotasSnapshot {
             schema_version: SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION,
             accounts,
+            settings: Some(saved.clone()),
         };
         let store = MemStore(Mutex::new(Some(serde_json::to_vec(&snap).unwrap())));
         let restored = state();
+        let restored_settings = settings();
         assert_eq!(
-            load_into(&store, &restored).unwrap(),
+            load_into(&store, &restored, &restored_settings).unwrap(),
             LoadOutcome::Loaded(2)
         );
         assert!(restored.read().get("111122223333").is_some());
+        assert_eq!(*restored_settings.read(), saved);
+    }
+
+    #[test]
+    fn a_snapshot_without_settings_keeps_the_current_ones() {
+        let accounts: MultiAccountState<ServiceQuotasData> =
+            MultiAccountState::new("000000000000", "us-east-1", "");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION,
+            "accounts": accounts,
+        }))
+        .unwrap();
+        let store = MemStore(Mutex::new(Some(bytes)));
+        let current = settings();
+        current.write().enforce_all = true;
+        load_into(&store, &state(), &current).unwrap();
+        assert!(current.read().enforce_all);
     }
 
     #[test]
@@ -138,7 +175,7 @@ mod tests {
         .unwrap();
         let store = MemStore(Mutex::new(Some(bytes)));
         assert!(matches!(
-            load_into(&store, &state()),
+            load_into(&store, &state(), &settings()),
             Err(LoadError::SchemaTooNew { .. })
         ));
     }

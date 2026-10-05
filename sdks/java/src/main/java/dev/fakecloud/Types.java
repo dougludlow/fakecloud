@@ -1696,4 +1696,184 @@ public final class Types {
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record CloudFrontDistributionStatusRequest(String status) {}
+
+    // -- Service Quotas -----------------------------------------------
+
+    /**
+     * Tri-state enforcement for a Service Quotas override.
+     *
+     * <ul>
+     *   <li>{@link #ENFORCE} sends {@code true}: requests over the quota are rejected.</li>
+     *   <li>{@link #IGNORE} sends {@code false}: the quota is never enforced.</li>
+     *   <li>{@link #DEFAULT} sends {@code null}: the override is cleared, so the
+     *       quota falls back to the global {@code enforceAll} switch.</li>
+     * </ul>
+     *
+     * <p>Leaving the enforcement {@code null} on a
+     * {@link ServiceQuotasPutQuotaRequest} omits the {@code enforce} key
+     * entirely, which leaves the current enforcement unchanged.
+     */
+    public enum QuotaEnforcement {
+        ENFORCE(Boolean.TRUE),
+        IGNORE(Boolean.FALSE),
+        DEFAULT(null);
+
+        private final Boolean wire;
+
+        QuotaEnforcement(Boolean wire) {
+            this.wire = wire;
+        }
+
+        /** The JSON value sent for this state: {@code true}, {@code false} or {@code null}. */
+        public Boolean toWire() {
+            return wire;
+        }
+    }
+
+    /**
+     * One quota from {@code GET /_fakecloud/service-quotas/quotas} (or the
+     * single quota returned by a put/delete). {@code usage} is {@code null}
+     * when no fakecloud service measures it. {@code enforcementSource} is one
+     * of {@code not_enforceable}, {@code account_override}, {@code override}
+     * or {@code global}.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuota(
+            String serviceCode,
+            String quotaCode,
+            String quotaName,
+            boolean global,
+            boolean adjustable,
+            String unit,
+            double defaultValue,
+            double appliedValue,
+            Double usage,
+            boolean enforceable,
+            boolean enforced,
+            String enforcementSource) {}
+
+    /** Every quota for one account and region. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotasResponse(
+            String accountId, String region, List<ServiceQuota> quotas) {}
+
+    /**
+     * Body for {@code PUT /_fakecloud/service-quotas/quotas/{service}/{quota}}.
+     * Every field is optional, but at least one of {@code value} and
+     * {@code enforcement} must be set. {@code value} may be below the AWS
+     * default. A {@code null} {@code enforcement} leaves enforcement
+     * unchanged; {@link QuotaEnforcement#DEFAULT} clears the override. When
+     * {@code accountId} is set the override applies to that account only,
+     * otherwise server-wide.
+     */
+    public record ServiceQuotasPutQuotaRequest(
+            String accountId,
+            String region,
+            Double value,
+            QuotaEnforcement enforcement) {
+        /** The JSON body, omitting {@code enforce} when enforcement is unset. */
+        Map<String, Object> toBody() {
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            if (accountId != null) {
+                body.put("accountId", accountId);
+            }
+            if (region != null) {
+                body.put("region", region);
+            }
+            if (value != null) {
+                body.put("value", value);
+            }
+            if (enforcement != null) {
+                body.put("enforce", enforcement.toWire());
+            }
+            return body;
+        }
+    }
+
+    /**
+     * One override change in {@code PUT /_fakecloud/service-quotas/enforcement}.
+     * {@code accountId} scopes the override to one account ({@code null}
+     * applies to every account). A {@code null} {@code enforcement} is
+     * treated as {@link QuotaEnforcement#DEFAULT} and clears the override.
+     */
+    public record ServiceQuotasOverrideChange(
+            String serviceCode,
+            String quotaCode,
+            String accountId,
+            QuotaEnforcement enforcement) {
+        Map<String, Object> toBody() {
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("serviceCode", serviceCode);
+            body.put("quotaCode", quotaCode);
+            if (accountId != null) {
+                body.put("accountId", accountId);
+            }
+            body.put("enforce", enforcement == null ? null : enforcement.toWire());
+            return body;
+        }
+    }
+
+    /**
+     * Body for {@code PUT /_fakecloud/service-quotas/enforcement}. A
+     * {@code null} {@code enforceAll} leaves the global switch unchanged.
+     */
+    public record ServiceQuotasPutEnforcementRequest(
+            Boolean enforceAll, List<ServiceQuotasOverrideChange> overrides) {
+        Map<String, Object> toBody() {
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            if (enforceAll != null) {
+                body.put("enforceAll", enforceAll);
+            }
+            if (overrides != null) {
+                body.put(
+                        "overrides",
+                        overrides.stream().map(ServiceQuotasOverrideChange::toBody).toList());
+            }
+            return body;
+        }
+    }
+
+    /** A server-wide enforcement override. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotasEnforcementOverride(
+            String serviceCode, String quotaCode, boolean enforce) {}
+
+    /** An enforcement override scoped to one account. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotasAccountEnforcementOverride(
+            String accountId, String serviceCode, String quotaCode, boolean enforce) {}
+
+    /** The global enforcement switch and every override. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotasEnforcementResponse(
+            boolean enforceAll,
+            List<ServiceQuotasEnforcementOverride> overrides,
+            List<ServiceQuotasAccountEnforcementOverride> accountOverrides) {}
+
+    /** How increase requests are decided: {@code auto} or {@code manual}. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotasRequestApprovalResponse(String mode) {}
+
+    /**
+     * One quota increase request. {@code region} is empty for global
+     * quotas; {@code caseId} is {@code null} unless a support case was
+     * opened. {@code created} and {@code lastUpdated} are RFC 3339.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotaRequest(
+            String accountId,
+            String requestId,
+            String serviceCode,
+            String quotaCode,
+            String quotaName,
+            String region,
+            double desiredValue,
+            String status,
+            String caseId,
+            String created,
+            String lastUpdated) {}
+
+    /** Increase requests, newest first. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ServiceQuotaRequestsResponse(List<ServiceQuotaRequest> requests) {}
 }
