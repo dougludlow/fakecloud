@@ -3,6 +3,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return, ec2_scalar_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     filter_value_matches, gen_id, indexed_list, paginate, parse_filters, require, validate_enum,
@@ -97,7 +98,7 @@ pub(crate) fn create_network_interface(
     // Resolve the subnet's VPC, and default the security group to that VPC's
     // `default` group when the caller specified none (AWS does this, and the
     // `aws_network_interface` resource asserts `security_groups.# == 1`).
-    let (resolved_vpc_id, default_groups) = {
+    let (resolved_vpc_id, default_groups, subnet_az) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
         let vpc_id = state
@@ -105,6 +106,7 @@ pub(crate) fn create_network_interface(
             .get(&subnet_id)
             .map(|s| s.vpc_id.clone())
             .unwrap_or_default();
+        let subnet_az = rq::subnet_az(state, &subnet_id).map(str::to_string);
         let mut groups = indexed_list(&req.query_params, "SecurityGroupId");
         if groups.is_empty() {
             if let Some(default_sg) = state
@@ -115,20 +117,25 @@ pub(crate) fn create_network_interface(
                 groups.push(default_sg.group_id.clone());
             }
         }
-        (vpc_id, groups)
+        (vpc_id, groups, subnet_az)
     };
-    let eni = NetworkInterface {
-        network_interface_id: id.clone(),
-        subnet_id,
-        vpc_id: resolved_vpc_id,
-        availability_zone: format!(
+    // The interface lives in its subnet's zone (the region's first zone for a
+    // subnet fakecloud does not know).
+    let availability_zone = subnet_az.unwrap_or_else(|| {
+        format!(
             "{}a",
             if req.region.is_empty() {
                 "us-east-1"
             } else {
                 &req.region
             }
-        ),
+        )
+    });
+    let eni = NetworkInterface {
+        network_interface_id: id.clone(),
+        subnet_id,
+        vpc_id: resolved_vpc_id,
+        availability_zone,
         description: req
             .query_params
             .get("Description")
@@ -155,9 +162,19 @@ pub(crate) fn create_network_interface(
         requester_managed: false,
     };
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(
+        &req.account_id,
+        &req.region,
+        rq::NETWORK_INTERFACES_PER_REGION,
+    );
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        let in_az = rq::network_interfaces_by_az(state)
+            .get(eni.availability_zone.as_str())
+            .copied()
+            .unwrap_or(0);
+        check_interface_count(in_az, 1, limit)?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -178,6 +195,23 @@ pub(crate) fn create_network_interface(
         &req.request_id,
         &body,
     ))
+}
+
+/// `NetworkInterfaceLimitExceeded` when `adding` interfaces in a zone that
+/// holds `in_az` would go past "Network interfaces per Region", which AWS
+/// enforces per Availability Zone.
+pub(crate) fn check_interface_count(
+    in_az: usize,
+    adding: usize,
+    limit: Option<usize>,
+) -> Result<(), AwsServiceError> {
+    rq::check(
+        limit,
+        in_az,
+        adding,
+        "NetworkInterfaceLimitExceeded",
+        |_| "The maximum number of network interfaces has been reached.".to_string(),
+    )
 }
 
 pub(crate) fn delete_network_interface(

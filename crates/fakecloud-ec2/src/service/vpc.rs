@@ -4,6 +4,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     filter_value_matches, gen_id, indexed_list, not_found, paginate, parse_filters, require,
@@ -150,9 +151,14 @@ pub(crate) fn create_vpc(
     }
 
     let owner = req.account_id.clone();
+    // Only "VPCs per Region" holds CreateVpc back; the default security
+    // group, network ACL and main route table it provisions count toward
+    // their quotas' usage without refusing the VPC.
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::VPCS_PER_REGION);
     let body = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        check_vpc_count(state, limit)?;
         crate::service::tags::apply_tag_specifications(state, &req.query_params, &vpc_id, "vpc");
         let tags = state.tags_for(&vpc_id).to_vec();
         state.vpcs.insert(vpc_id.clone(), vpc.clone());
@@ -175,20 +181,21 @@ pub(crate) fn create_default_vpc(
     // 1.3). We surface the existing default rather than the error so callers
     // that defensively call CreateDefaultVpc keep working.
     let owner = req.account_id.clone();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::VPCS_PER_REGION);
     let body = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let vpc = state
-            .vpcs
-            .values()
-            .find(|v| v.is_default)
-            .cloned()
-            // No default VPC somehow (e.g. it was deleted): re-create one.
-            .unwrap_or_else(|| {
+        let vpc = match state.vpcs.values().find(|v| v.is_default).cloned() {
+            Some(v) => v,
+            // No default VPC somehow (e.g. it was deleted): re-create one,
+            // which counts toward the VPC quota like any other.
+            None => {
+                check_vpc_count(state, limit)?;
                 let v = build_vpc("172.31.0.0/16".to_string(), "default".to_string(), true);
                 state.vpcs.insert(v.vpc_id.clone(), v.clone());
                 v
-            });
+            }
+        };
         let tags = state.tags_for(&vpc.vpc_id).to_vec();
         format!("<vpc>{}</vpc>", vpc_xml(&vpc, &tags, &owner))
     };
@@ -197,6 +204,14 @@ pub(crate) fn create_default_vpc(
         &req.request_id,
         &body,
     ))
+}
+
+/// `VpcLimitExceeded` once the account holds as many VPCs as "VPCs per
+/// Region" allows.
+fn check_vpc_count(state: &Ec2State, limit: Option<usize>) -> Result<(), AwsServiceError> {
+    rq::check(limit, rq::vpcs(state), 1, "VpcLimitExceeded", |_| {
+        "The maximum number of VPCs has been reached.".to_string()
+    })
 }
 
 fn build_vpc(cidr: String, tenancy: String, is_default: bool) -> Vpc {
@@ -428,10 +443,21 @@ pub(crate) fn associate_vpc_cidr_block(
     };
     // Lenient: record on the VPC when it exists, but always return a valid
     // association response (random-id positive variants must not 4xx).
+    let limit =
+        svc.enforced_count_quota(&req.account_id, &req.region, rq::IPV4_CIDR_BLOCKS_PER_VPC);
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
         if let Some(vpc) = state.vpcs.get_mut(&vpc_id) {
+            rq::check(
+                limit,
+                rq::ipv4_cidr_blocks(vpc),
+                1,
+                "CidrLimitExceeded",
+                |limit| {
+                    format!("This network '{vpc_id}' has met its maximum number of allowed CIDRs: {limit}")
+                },
+            )?;
             vpc.cidr_associations.push(assoc.clone());
         }
     }

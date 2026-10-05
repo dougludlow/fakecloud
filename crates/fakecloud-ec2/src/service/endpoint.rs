@@ -4,6 +4,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return, ec2_scalar_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{gen_id, indexed_list, require, validate_enum, validate_max_results};
 use crate::state::{ConnectionNotification, Ec2State, EndpointService, FlowLog, Tag, VpcEndpoint};
@@ -89,9 +90,31 @@ pub(crate) fn create_vpc_endpoint(
         payer_responsibility: "vpc-endpoint-account".to_string(),
     };
     let owner = req.account_id.clone();
+    // A gateway endpoint counts toward the Region's gateway endpoints, an
+    // interface or Gateway Load Balancer endpoint toward its VPC's combined
+    // interface endpoint quota. Other endpoint types have quotas fakecloud
+    // does not model.
+    let gateway = e.endpoint_type.eq_ignore_ascii_case("Gateway");
+    let interface = rq::is_interface_endpoint(&e.endpoint_type);
+    let quota = if gateway {
+        Some(rq::GATEWAY_ENDPOINTS_PER_REGION)
+    } else if interface {
+        Some(rq::INTERFACE_ENDPOINTS_PER_VPC)
+    } else {
+        None
+    };
+    let limit = quota.and_then(|q| svc.enforced_count_quota(&req.account_id, &req.region, q));
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        let current = if gateway {
+            rq::gateway_endpoints(state)
+        } else {
+            rq::interface_endpoints_in_vpc(state, &e.vpc_id)
+        };
+        rq::check(limit, current, 1, "VpcEndpointLimitExceeded", |_| {
+            "The maximum number of VPC endpoints has been reached.".to_string()
+        })?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,

@@ -9,6 +9,7 @@
 
 pub mod cfn_provision;
 pub mod defaults;
+mod instance_types;
 mod pagination;
 mod pagination_table;
 pub mod runtime;

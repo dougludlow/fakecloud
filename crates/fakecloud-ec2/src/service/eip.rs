@@ -3,6 +3,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     ec2_arn, filter_value_matches, gen_id, indexed_list, not_found, parse_filters, require,
@@ -95,6 +96,7 @@ pub(crate) fn allocate_address(
         network_border_group: network_border_group.clone(),
         domain_name: None,
     };
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::ELASTIC_IPS);
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -107,6 +109,17 @@ pub(crate) fn allocate_address(
                 "InvalidPublicIpv4PoolID.NotFound",
                 &public_ipv4_pool,
             ));
+        }
+        // Only addresses from Amazon's pool count toward the quota; BYOIP
+        // addresses do not.
+        if public_ipv4_pool == "amazon" {
+            rq::check(
+                limit,
+                rq::elastic_ips(state),
+                1,
+                "AddressLimitExceeded",
+                |_| "The maximum number of addresses has been reached.".to_string(),
+            )?;
         }
         crate::service::tags::apply_tag_specifications(
             state,

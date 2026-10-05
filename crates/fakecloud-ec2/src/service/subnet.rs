@@ -4,6 +4,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     ec2_arn, filter_value_matches, gen_id, indexed_list, invalid_parameter_value, not_found,
@@ -102,6 +103,22 @@ fn build_subnet(vpc_id: String, cidr: String, az: &str, default_for_az: bool) ->
     }
 }
 
+/// `SubnetLimitExceeded` once `vpc_id` holds as many subnets as "Subnets per
+/// VPC" allows.
+fn check_subnet_count(
+    state: &crate::state::Ec2State,
+    vpc_id: &str,
+    limit: Option<usize>,
+) -> Result<(), AwsServiceError> {
+    rq::check(
+        limit,
+        rq::subnets_in_vpc(state, vpc_id),
+        1,
+        "SubnetLimitExceeded",
+        |_| "The maximum number of subnets has been reached.".to_string(),
+    )
+}
+
 /// Deterministic association id for a subnet's IPv6 CIDR.
 fn subnet_ipv6_assoc_id(subnet_id: &str) -> String {
     // Probe variants send arbitrary (often short) synthetic ids; strip the
@@ -177,9 +194,11 @@ pub(crate) fn create_subnet(
     let id = subnet.subnet_id.clone();
     let owner = req.account_id.clone();
     let region = req.region.clone();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::SUBNETS_PER_VPC);
     let body = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        check_subnet_count(state, &subnet.vpc_id, limit)?;
         crate::service::tags::apply_tag_specifications(state, &req.query_params, &id, "subnet");
         let tags = state.tags_for(&id).to_vec();
         // AWS auto-associates every new subnet with its VPC's default network
@@ -215,6 +234,7 @@ pub(crate) fn create_default_subnet(
     let az = default_az(req)?;
     let owner = req.account_id.clone();
     let region = req.region.clone();
+    let limit = svc.enforced_count_quota(&req.account_id, &req.region, rq::SUBNETS_PER_VPC);
     let body = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -237,6 +257,7 @@ pub(crate) fn create_default_subnet(
         {
             existing
         } else {
+            check_subnet_count(state, &default_vpc, limit)?;
             let s = build_subnet(default_vpc, "172.31.0.0/20".to_string(), &az, true);
             state.subnets.insert(s.subnet_id.clone(), s.clone());
             s

@@ -1003,19 +1003,6 @@ async fn cap_one_above_usage(fc: &FakeCloud, service: &str, code: &str) -> f64 {
     usage
 }
 
-async fn usage_of(fc: &FakeCloud, service: &str, code: &str) -> f64 {
-    fc.service_quotas()
-        .get_quotas(None, None, Some(service))
-        .await
-        .unwrap()
-        .quotas
-        .into_iter()
-        .find(|q| q.quota_code == code)
-        .unwrap()
-        .usage
-        .unwrap()
-}
-
 const TRUST: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
 
 #[tokio::test]
@@ -1233,4 +1220,162 @@ async fn enforced_lambda_code_storage_quota_refuses_the_next_deploy() {
     assert_eq!(settings.account_usage().unwrap().total_code_size(), 60);
     let usage = usage_of(&fc, "lambda", "L-2ACBD22F").await;
     assert_eq!((usage * 1024.0 * 1024.0 * 1024.0).round(), 60.0);
+}
+
+/// Usage of a quota as introspection reports it.
+async fn usage_of(fc: &FakeCloud, service_code: &str, quota_code: &str) -> f64 {
+    fc.service_quotas()
+        .get_quotas(None, None, Some(service_code))
+        .await
+        .unwrap()
+        .quotas
+        .into_iter()
+        .find(|q| q.quota_code == quota_code)
+        .unwrap()
+        .usage
+        .unwrap_or_else(|| panic!("{service_code}/{quota_code} is measured"))
+}
+
+/// Set a quota's applied value and switch its enforcement on.
+async fn enforce_at(fc: &FakeCloud, service_code: &str, quota_code: &str, value: f64) {
+    let q = fc
+        .service_quotas()
+        .put_quota(
+            service_code,
+            quota_code,
+            &PutServiceQuotaRequest {
+                value: Some(value),
+                enforce: Some(QuotaEnforcement::Enforce),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(q.enforced);
+    assert_eq!(q.applied_value, value);
+}
+
+fn ec2_code<E: aws_sdk_ec2::error::ProvideErrorMetadata>(e: &E) -> Option<&str> {
+    aws_sdk_ec2::error::ProvideErrorMetadata::code(e)
+}
+
+/// VPCs per Region, lowered to one more than the account holds (its default
+/// VPC included): one more VPC fits, the next is refused.
+#[tokio::test]
+async fn vpcs_per_region_is_enforced() {
+    let server = TestServer::start().await;
+    let (_, ec2) = clients(&server).await;
+    let fc = FakeCloud::new(server.endpoint());
+    let held = usage_of(&fc, VPC, "L-F678F1CE").await;
+    assert!(held >= 1.0, "the default VPC counts");
+    enforce_at(&fc, VPC, "L-F678F1CE", held + 1.0).await;
+
+    ec2.create_vpc()
+        .cidr_block("10.20.0.0/16")
+        .send()
+        .await
+        .unwrap();
+    let err = ec2
+        .create_vpc()
+        .cidr_block("10.21.0.0/16")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(ec2_code(&err), Some("VpcLimitExceeded"));
+    assert_eq!(usage_of(&fc, VPC, "L-F678F1CE").await, held + 1.0);
+}
+
+#[tokio::test]
+async fn elastic_ips_are_enforced() {
+    let server = TestServer::start().await;
+    let (_, ec2) = clients(&server).await;
+    let fc = FakeCloud::new(server.endpoint());
+    let held = usage_of(&fc, "ec2", "L-0263D0A3").await;
+    enforce_at(&fc, "ec2", "L-0263D0A3", held + 2.0).await;
+
+    for _ in 0..2 {
+        ec2.allocate_address().send().await.unwrap();
+    }
+    let err = ec2.allocate_address().send().await.unwrap_err();
+    assert_eq!(ec2_code(&err), Some("AddressLimitExceeded"));
+    assert_eq!(usage_of(&fc, "ec2", "L-0263D0A3").await, held + 2.0);
+}
+
+/// Subnets per VPC is counted per VPC: a full VPC refuses another subnet
+/// while a second VPC still takes one.
+#[tokio::test]
+async fn subnets_per_vpc_is_enforced_per_vpc() {
+    let server = TestServer::start().await;
+    let (_, ec2) = clients(&server).await;
+    let fc = FakeCloud::new(server.endpoint());
+    enforce_at(&fc, VPC, "L-407747CB", 1.0).await;
+
+    let mut vpcs = Vec::new();
+    for cidr in ["10.30.0.0/16", "10.31.0.0/16"] {
+        let vpc = ec2.create_vpc().cidr_block(cidr).send().await.unwrap();
+        vpcs.push(vpc.vpc().unwrap().vpc_id().unwrap().to_string());
+    }
+    let subnet =
+        |vpc_id: &str, cidr: &str| ec2.create_subnet().vpc_id(vpc_id).cidr_block(cidr).send();
+    subnet(&vpcs[0], "10.30.1.0/24").await.unwrap();
+    let err = subnet(&vpcs[0], "10.30.2.0/24").await.unwrap_err();
+    assert_eq!(ec2_code(&err), Some("SubnetLimitExceeded"));
+    subnet(&vpcs[1], "10.31.1.0/24").await.unwrap();
+}
+
+/// With every quota enforced at the AWS defaults, a new account runs at most
+/// 5 vCPUs of Standard On-Demand instances; an approved increase raises what
+/// RunInstances accepts.
+#[tokio::test]
+async fn on_demand_vcpus_are_enforced_at_the_aws_default() {
+    let server = TestServer::start_full(
+        &[("FAKECLOUD_CONTAINER_CLI", "false")],
+        &["--enforce-quotas"],
+    )
+    .await;
+    let (sq, ec2) = clients(&server).await;
+    let fc = FakeCloud::new(server.endpoint());
+    let run = || {
+        ec2.run_instances()
+            .image_id("ami-12345678")
+            .instance_type(aws_sdk_ec2::types::InstanceType::T3Micro)
+            .min_count(1)
+            .max_count(1)
+            .send()
+    };
+    // t3.micro has 2 vCPUs: two fit in 5, a third does not.
+    run().await.unwrap();
+    run().await.unwrap();
+    let err = run().await.unwrap_err();
+    assert_eq!(ec2_code(&err), Some("VcpuLimitExceeded"));
+    assert_eq!(usage_of(&fc, "ec2", "L-1216C47A").await, 4.0);
+
+    let id = sq
+        .request_service_quota_increase()
+        .service_code("ec2")
+        .quota_code("L-1216C47A")
+        .desired_value(8.0)
+        .send()
+        .await
+        .unwrap()
+        .requested_quota()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+    assert_eq!(status(&sq, &id).await, RequestStatus::Approved);
+    run().await.unwrap();
+    assert_eq!(usage_of(&fc, "ec2", "L-1216C47A").await, 6.0);
+
+    // Other families have their own quota: G instances start at 0 vCPUs.
+    let err = ec2
+        .run_instances()
+        .image_id("ami-12345678")
+        .instance_type(aws_sdk_ec2::types::InstanceType::G5Xlarge)
+        .min_count(1)
+        .max_count(1)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(ec2_code(&err), Some("VcpuLimitExceeded"));
 }

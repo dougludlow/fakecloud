@@ -855,7 +855,16 @@ fn introspect_quotas_lists_the_catalog_with_usage() {
         .unwrap()
         .clone();
     assert_eq!(vpcs["usage"], 3.0);
-    assert_eq!(vpcs["enforcementSource"], "not_enforceable");
+    assert_eq!(vpcs["enforced"], false);
+    assert_eq!(vpcs["enforcementSource"], "global");
+    let eigws = vpc["quotas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["quotaCode"] == "L-45FE3B85")
+        .unwrap()
+        .clone();
+    assert_eq!(eigws["enforcementSource"], "not_enforceable");
     assert_eq!(
         s.introspect_quotas(None, None, Some("nope"))
             .unwrap_err()

@@ -4,6 +4,7 @@
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{gen_id, indexed_list, require, validate_enum, validate_max_results};
 use crate::state::{CustomerGateway, Ec2State, Tag, VpnConcentrator, VpnConnection, VpnGateway};
@@ -307,9 +308,18 @@ pub(crate) fn create_vpn_connection(
             .is_some_and(|v| v == "true"),
         routes: Vec::new(),
     };
+    let limit =
+        svc.enforced_count_quota(&req.account_id, &req.region, rq::VPN_CONNECTIONS_PER_REGION);
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        rq::check(
+            limit,
+            rq::vpn_connections(state),
+            1,
+            "VpnConnectionLimitExceeded",
+            |_| "The maximum number of VPN connections has been reached.".to_string(),
+        )?;
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,

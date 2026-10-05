@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::resource_quotas as rq;
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     gen_id, indexed_list, require, require_struct, validate_enum, validate_int_range,
@@ -967,10 +968,27 @@ pub(crate) fn request_spot_instances(
         .get("Type")
         .cloned()
         .unwrap_or_else(|| "one-time".to_string());
+    let instance_type = req
+        .query_params
+        .get("LaunchSpecification.InstanceType")
+        .filter(|v| !v.is_empty())
+        .cloned();
+    // Each request's instance counts toward the Spot vCPU quota of its family.
+    let spot_quota = instance_type
+        .as_deref()
+        .and_then(|t| rq::vcpu_quota(t, true));
+    let spot_limit =
+        spot_quota.and_then(|q| svc.enforced_count_quota(&req.account_id, &req.region, q));
     let mut rendered = Vec::new();
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        if let (Some(quota), Some(t)) = (spot_quota, instance_type.as_deref()) {
+            let adding = count
+                .max(1)
+                .saturating_mul(rq::launch_vcpus(t, spot_limit)?);
+            rq::check_vcpus(quota, spot_limit, rq::instance_vcpus(state, quota), adding)?;
+        }
         for _ in 0..count.max(1) {
             let id = gen_id("sir");
             let r = SpotRequest {
@@ -978,6 +996,7 @@ pub(crate) fn request_spot_instances(
                 state: "active".to_string(),
                 request_type: rtype.clone(),
                 spot_price: price.clone(),
+                instance_type: instance_type.clone(),
             };
             rendered.push(spot_request_xml(&r, &[]));
             state.spot_requests.insert(id, r);

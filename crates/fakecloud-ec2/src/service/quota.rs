@@ -14,9 +14,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use fakecloud_core::service::AwsServiceError;
 
+use crate::service::resource_quotas;
 use crate::service::Ec2Service;
 use crate::service_helpers::indexed_list;
-use crate::state::{ManagedPrefixList, SecurityGroupRule, SharedEc2State};
+use crate::state::{Ec2State, ManagedPrefixList, SecurityGroupRule, SharedEc2State};
+use parking_lot::Mutex;
 
 pub(crate) use fakecloud_core::quota::{
     DEFAULT_RULES_PER_SECURITY_GROUP, DEFAULT_SECURITY_GROUPS_PER_INTERFACE,
@@ -321,15 +323,35 @@ pub(crate) fn rules_limit_exceeded(message: String) -> AwsServiceError {
     bad_request("RulesPerSecurityGroupLimitExceeded", message)
 }
 
-/// Counts the EC2 resources behind region-level quotas, so Service Quotas
-/// utilization reports show real usage.
+/// The account the cached default network is built for. Its resource ids are
+/// never returned; only how many resources there are.
+const DEFAULTS_ACCOUNT: &str = "000000000000";
+
+/// Counts the EC2 resources behind the EC2 and VPC quotas, so Service Quotas
+/// utilization reports and introspection show real usage.
 pub struct Ec2QuotaUsage {
     state: SharedEc2State,
+    /// The default network an account EC2 has not stored yet ships with, per
+    /// region, built once. It is built for no real account: only its counts
+    /// are read, and every account's defaults count the same.
+    defaults: Mutex<HashMap<String, Arc<Ec2State>>>,
 }
 
 impl Ec2QuotaUsage {
     pub fn new(state: SharedEc2State) -> Arc<Self> {
-        Arc::new(Self { state })
+        Arc::new(Self {
+            state,
+            defaults: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The default network's state in `region`, for counting only.
+    fn default_counts(&self, region: &str) -> Arc<Ec2State> {
+        self.defaults
+            .lock()
+            .entry(region.to_string())
+            .or_insert_with(|| Arc::new(Ec2State::new(DEFAULTS_ACCOUNT, region)))
+            .clone()
     }
 }
 
@@ -341,22 +363,18 @@ impl QuotaUsageSource for Ec2QuotaUsage {
     fn usage(
         &self,
         account_id: &str,
-        _region: &str,
+        region: &str,
         service_code: &str,
         quota_code: &str,
     ) -> Option<f64> {
+        let quota = resource_quotas::by_code(service_code, quota_code)?;
+        // An account EC2 has not stored yet still has the default network
+        // every account ships with (default VPC, subnets, security group...),
+        // as the EC2 read paths report it. Resolved before the EC2 lock.
+        let fallback = self.default_counts(region);
         let accounts = self.state.read();
-        let state = accounts.get(account_id);
-        let count = |n: Option<usize>| Some(n.unwrap_or(0) as f64);
-        match (service_code, quota_code) {
-            (VPC, "L-F678F1CE") => count(state.map(|s| s.vpcs.len())),
-            (VPC, "L-A4707A72") => count(state.map(|s| s.internet_gateways.len())),
-            (VPC, "L-E79EC296") => count(state.map(|s| s.security_groups.len())),
-            (VPC, "L-DF5E4CA3") => count(state.map(|s| s.network_interfaces.len())),
-            (VPC, "L-45FE3B85") => count(state.map(|s| s.egress_only_igws.len())),
-            ("ec2", "L-0263D0A3") => count(state.map(|s| s.elastic_ips.len())),
-            _ => None,
-        }
+        let state = accounts.get(account_id).unwrap_or(&fallback);
+        resource_quotas::usage(state, quota).map(|n| n as f64)
     }
 }
 

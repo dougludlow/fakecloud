@@ -6497,6 +6497,66 @@ mod tests {
     }
 
     #[test]
+    fn ec2_count_quotas_apply_to_stack_resources() {
+        // Stack resources create through the EC2 handlers, so an enforced
+        // count quota refuses them as it refuses a direct call.
+        let mut prov = make_provisioner();
+        let vpcs = prov
+            .ec2_state
+            .read()
+            .get("123456789012")
+            .map_or(0, |s| s.vpcs.len());
+        prov.quota_provider = Some(Arc::new(
+            fakecloud_core::quota::FixedQuotas::default()
+                .with("vpc", "L-F678F1CE", (vpcs + 1) as f64)
+                .with("vpc", "L-407747CB", 1.0)
+                .with("ec2", "L-0263D0A3", 0.0)
+                .with("ec2", "L-1216C47A", 0.0),
+        ));
+        let vpc = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc",
+                serde_json::json!({ "CidrBlock": "10.6.0.0/16" }),
+            ))
+            .expect("VPC provisions");
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc2",
+                serde_json::json!({ "CidrBlock": "10.7.0.0/16" }),
+            ))
+            .expect_err("over the VPC quota");
+        assert!(err.contains("maximum number of VPCs"), "{err}");
+        let subnet = |name: &str| {
+            prov.create_resource(&make_resource(
+                "AWS::EC2::Subnet",
+                name,
+                serde_json::json!({ "VpcId": vpc.physical_id, "CidrBlock": "10.6.1.0/24" }),
+            ))
+        };
+        subnet("A").expect("first subnet fits");
+        let err = subnet("B").expect_err("over the subnet quota");
+        assert!(err.contains("maximum number of subnets"), "{err}");
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::EIP",
+                "Eip",
+                serde_json::json!({ "Domain": "vpc" }),
+            ))
+            .expect_err("over the Elastic IP quota");
+        assert!(err.contains("maximum number of addresses"), "{err}");
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::Instance",
+                "Box",
+                serde_json::json!({ "ImageId": "ami-12345678", "InstanceType": "t3.micro" }),
+            ))
+            .expect_err("over the vCPU quota");
+        assert!(err.contains("vCPU limit of 0"), "{err}");
+    }
+
+    #[test]
     fn ec2_security_group_over_the_rule_quota_leaves_no_partial_state() {
         // 61 inline ingress rules exceed the default 60 rules-per-group quota.
         let over: Vec<serde_json::Value> = (0..61)
