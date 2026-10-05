@@ -65,10 +65,10 @@ CRATES=(
   fakecloud-sqs
   fakecloud-iam
   fakecloud-organizations
-  fakecloud-ec2            # depends on aws + core only
+  fakecloud-kms
+  fakecloud-ec2            # depends on aws + core; dev-depends on kms (versioned, so it ships)
   fakecloud-lambda
   fakecloud-logs
-  fakecloud-kms
   fakecloud-ses
   fakecloud-rds
   fakecloud-rds-data        # depends on rds
@@ -506,8 +506,11 @@ for name, pkg in packages.items():
     if name not in position:
         continue
     for dep in pkg["dependencies"]:
-        # dev-dependencies do not affect publish order; normal and build deps do.
-        if dep.get("kind") not in (None, "build"):
+        # Normal and build deps always ship. A dev-dependency ships too when it
+        # carries a version requirement (every `workspace = true` pin does): cargo
+        # only strips path-only dev-deps, and resolves the rest against the index
+        # at publish time ("failed to select a version for the requirement").
+        if dep.get("kind") == "dev" and dep.get("req") in (None, "*"):
             continue
         if not dep.get("path") or dep["name"] not in position:
             continue

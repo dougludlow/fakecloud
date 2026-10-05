@@ -54,7 +54,10 @@ STUBEOF
 # succeeds and records the publish in the stub index.
 cat > "$STUB/cargo" <<'STUBEOF'
 #!/usr/bin/env bash
-[ "${1:-}" = metadata ] && exec "$CARGO_REAL" "$@"
+if [ "${1:-}" = metadata ]; then
+  [ -n "${STUB_METADATA:-}" ] && exec cat "$STUB_METADATA"
+  exec "$CARGO_REAL" "$@"
+fi
 name="$3"
 n=$(cat "$STUB_COUNT" 2>/dev/null || echo 0)
 n=$((n + 1))
@@ -200,6 +203,35 @@ check I "genuine publish failure aborts the release" \
 code=$(run 'fakecloud@EXISTS' START_AT=fakecloud DEADLINE_MINUTES=0 STUB_FAIL_TIMES=1 STUB_FAIL_MODE=429)
 check J "deadline exit names the remaining crates and the resume command" \
   "$([ "$code" = 1 ] && saw 'not yet published: fakecloud' && saw 'gh workflow run release.yml' && echo 0 || echo 1)"
+
+# --check: a dev-dependency with a version requirement (any `workspace = true`
+# pin) ships in the published manifest and is resolved against crates.io, so it
+# orders the publish like a normal dep; a path-only dev-dep is stripped and does
+# not. Fixture: the real workspace metadata with one dev-dep injected from the
+# first listed crate onto the last.
+# dev_dep_check <req> -> exit code of --check against the fixture
+dev_dep_check() {
+  "$CARGO_REAL" metadata --no-deps --format-version 1 --offline --manifest-path "$ROOT/Cargo.toml" |
+    python3 -c '
+import json, sys
+meta = json.load(sys.stdin)
+pkgs = {p["name"]: p for p in meta["packages"]}
+pkgs["fakecloud-aws"]["dependencies"].append(
+    {"name": "fakecloud", "kind": "dev", "req": sys.argv[1], "path": "/x"})
+json.dump(meta, sys.stdout)
+' "$1" > "$TMP/metadata.json"
+  (cd "$ROOT" && env PATH="$STUB:$PATH" STUB_METADATA="$TMP/metadata.json" \
+    bash "$SCRIPT" --check > "$OUT" 2>&1)
+  echo $?
+}
+
+code=$(dev_dep_check "^$STUB_VERSION")
+check K "versioned dev-dep published later is an ordering error" \
+  "$([ "$code" = 1 ] && saw 'fakecloud-aws is published before its dependency fakecloud' && echo 0 || echo 1)"
+
+code=$(dev_dep_check "*")
+check L "path-only dev-dep does not constrain publish order" \
+  "$([ "$code" = 0 ] && saw 'dependency order valid' && echo 0 || echo 1)"
 
 echo
 if [ "$FAILURES" -ne 0 ]; then
