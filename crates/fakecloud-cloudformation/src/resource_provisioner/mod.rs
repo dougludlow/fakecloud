@@ -10769,6 +10769,9 @@ mod tests {
             .expect("association record");
         assert_eq!(assoc.owner_arn.as_deref(), Some(addon.arn.as_str()));
         assert_eq!(assoc.namespace, "kube-system");
+        // No AddonVersion: the catalog default for the cluster's Kubernetes
+        // version, as CreateAddon installs (not a synthesized string).
+        assert_eq!(addon.addon_version, "v1.20.4-eksbuild.2");
     }
 
     #[test]

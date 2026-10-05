@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsServiceError};
 
+pub(crate) use crate::addon_catalog::{
+    addon_catalog, default_addon_version, pod_identity_configuration,
+};
 use crate::service::LOG_TYPES;
 use crate::state::*;
 
@@ -772,23 +775,6 @@ pub(crate) fn fargate_profile_json(p: &FargateProfile) -> Value {
     })
 }
 
-/// The AWS default add-on version for an add-on at a given cluster version:
-/// the catalog version flagged `defaultVersion` for that Kubernetes minor.
-/// Clusters on a version outside the catalog resolve against the default
-/// cluster version, and add-ons outside the catalog fall back to a generic
-/// `v1.0.0-eksbuild.1`, so CreateAddon always echoes a plausible version.
-pub(crate) fn default_addon_version(addon_name: &str, cluster_version: &str) -> String {
-    let Some(spec) = ADDON_CATALOG.iter().find(|a| a.name == addon_name) else {
-        return "v1.0.0-eksbuild.1".to_string();
-    };
-    [cluster_version, DEFAULT_K8S_VERSION]
-        .iter()
-        .flat_map(|cv| addon_versions_for(spec, cv))
-        .find(|(_, is_default)| *is_default)
-        .map(|(v, _)| v)
-        .unwrap_or_else(|| "v1.0.0-eksbuild.1".to_string())
-}
-
 pub(crate) fn addon_json(a: &Addon) -> Value {
     let mut out = json!({
         "addonName": a.name,
@@ -816,365 +802,6 @@ pub(crate) fn addon_json(a: &Addon) -> Value {
     out
 }
 
-/// One add-on in the `DescribeAddonVersions` catalog, as AWS publishes it.
-struct AddonSpec {
-    name: &'static str,
-    addon_type: &'static str,
-    /// `aws` for AWS-maintained add-ons, `community` for the community add-ons
-    /// EKS packages and publishes.
-    owner: &'static str,
-    namespace: &'static str,
-    compute_types: &'static [&'static str],
-    requires_iam: bool,
-    /// Versions newest-first, compatible with every catalog cluster version.
-    /// Empty for add-ons whose versions track the Kubernetes minor (`coredns`,
-    /// `kube-proxy`), which `addon_versions_for` derives per cluster version.
-    versions: &'static [&'static str],
-    /// The version AWS flags `defaultVersion` for these static-version add-ons.
-    default: &'static str,
-}
-
-const EC2_FARGATE: &[&str] = &["ec2", "fargate"];
-const EC2_ONLY: &[&str] = &["ec2"];
-
-/// The add-ons EKS offers through `DescribeAddonVersions`: the AWS-owned
-/// networking, storage, security and observability add-ons plus the community
-/// add-ons EKS publishes.
-const ADDON_CATALOG: &[AddonSpec] = &[
-    AddonSpec {
-        name: "vpc-cni",
-        addon_type: "networking",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: true,
-        versions: &[
-            "v1.20.4-eksbuild.1",
-            "v1.19.5-eksbuild.1",
-            "v1.19.2-eksbuild.1",
-            "v1.18.3-eksbuild.2",
-        ],
-        default: "v1.18.3-eksbuild.2",
-    },
-    AddonSpec {
-        name: "coredns",
-        addon_type: "networking",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_FARGATE,
-        requires_iam: false,
-        versions: &[],
-        default: "",
-    },
-    AddonSpec {
-        name: "kube-proxy",
-        addon_type: "networking",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: false,
-        versions: &[],
-        default: "",
-    },
-    AddonSpec {
-        name: "aws-ebs-csi-driver",
-        addon_type: "storage",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: true,
-        versions: &[
-            "v1.48.0-eksbuild.2",
-            "v1.44.0-eksbuild.1",
-            "v1.35.0-eksbuild.1",
-        ],
-        default: "v1.35.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "aws-efs-csi-driver",
-        addon_type: "storage",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: true,
-        versions: &[
-            "v2.1.11-eksbuild.1",
-            "v2.1.4-eksbuild.1",
-            "v2.1.0-eksbuild.1",
-        ],
-        default: "v2.1.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "aws-mountpoint-s3-csi-driver",
-        addon_type: "storage",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: true,
-        versions: &["v2.1.0-eksbuild.1", "v1.15.0-eksbuild.1"],
-        default: "v1.15.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "aws-fsx-csi-driver",
-        addon_type: "storage",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: true,
-        versions: &["v1.6.0-eksbuild.1", "v1.5.0-eksbuild.1"],
-        default: "v1.5.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "snapshot-controller",
-        addon_type: "storage",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_FARGATE,
-        requires_iam: false,
-        versions: &["v8.3.0-eksbuild.1", "v8.2.0-eksbuild.1"],
-        default: "v8.2.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "eks-pod-identity-agent",
-        addon_type: "security",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: false,
-        versions: &[
-            "v1.3.8-eksbuild.2",
-            "v1.3.7-eksbuild.2",
-            "v1.3.4-eksbuild.1",
-        ],
-        default: "v1.3.4-eksbuild.1",
-    },
-    AddonSpec {
-        name: "aws-guardduty-agent",
-        addon_type: "security",
-        owner: "aws",
-        namespace: "amazon-guardduty",
-        compute_types: EC2_ONLY,
-        requires_iam: false,
-        versions: &["v1.10.0-eksbuild.2", "v1.8.1-eksbuild.2"],
-        default: "v1.8.1-eksbuild.2",
-    },
-    AddonSpec {
-        name: "aws-secrets-store-csi-driver-provider",
-        addon_type: "security",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: false,
-        versions: &["v2.1.0-eksbuild.1", "v2.0.0-eksbuild.1"],
-        default: "v2.0.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "amazon-cloudwatch-observability",
-        addon_type: "observability",
-        owner: "aws",
-        namespace: "amazon-cloudwatch",
-        compute_types: EC2_FARGATE,
-        requires_iam: true,
-        versions: &[
-            "v4.4.0-eksbuild.1",
-            "v3.6.0-eksbuild.2",
-            "v2.1.3-eksbuild.1",
-        ],
-        default: "v2.1.3-eksbuild.1",
-    },
-    AddonSpec {
-        name: "adot",
-        addon_type: "observability",
-        owner: "aws",
-        namespace: "opentelemetry-operator-system",
-        compute_types: EC2_FARGATE,
-        requires_iam: false,
-        versions: &["v0.117.0-eksbuild.1", "v0.109.0-eksbuild.1"],
-        default: "v0.109.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "eks-node-monitoring-agent",
-        addon_type: "observability",
-        owner: "aws",
-        namespace: "kube-system",
-        compute_types: EC2_ONLY,
-        requires_iam: false,
-        versions: &["v1.4.0-eksbuild.2", "v1.0.1-eksbuild.2"],
-        default: "v1.0.1-eksbuild.2",
-    },
-    AddonSpec {
-        name: "aws-network-flow-monitoring-agent",
-        addon_type: "observability",
-        owner: "aws",
-        namespace: "amazon-network-flow-monitor",
-        compute_types: EC2_ONLY,
-        requires_iam: true,
-        versions: &["v1.0.2-eksbuild.5", "v1.0.1-eksbuild.2"],
-        default: "v1.0.1-eksbuild.2",
-    },
-    AddonSpec {
-        name: "metrics-server",
-        addon_type: "observability",
-        owner: "community",
-        namespace: "kube-system",
-        compute_types: EC2_FARGATE,
-        requires_iam: false,
-        versions: &["v0.8.0-eksbuild.1", "v0.7.2-eksbuild.1"],
-        default: "v0.7.2-eksbuild.1",
-    },
-    AddonSpec {
-        name: "kube-state-metrics",
-        addon_type: "observability",
-        owner: "community",
-        namespace: "kube-state-metrics",
-        compute_types: EC2_FARGATE,
-        requires_iam: false,
-        versions: &["v2.15.0-eksbuild.1", "v2.14.0-eksbuild.1"],
-        default: "v2.14.0-eksbuild.1",
-    },
-    AddonSpec {
-        name: "prometheus-node-exporter",
-        addon_type: "observability",
-        owner: "community",
-        namespace: "prometheus-node-exporter",
-        compute_types: EC2_ONLY,
-        requires_iam: false,
-        versions: &["v1.9.1-eksbuild.2", "v1.8.2-eksbuild.1"],
-        default: "v1.8.2-eksbuild.1",
-    },
-    AddonSpec {
-        name: "cert-manager",
-        addon_type: "security",
-        owner: "community",
-        namespace: "cert-manager",
-        compute_types: EC2_FARGATE,
-        requires_iam: false,
-        versions: &["v1.17.2-eksbuild.1", "v1.16.3-eksbuild.1"],
-        default: "v1.16.3-eksbuild.1",
-    },
-    AddonSpec {
-        name: "external-dns",
-        addon_type: "networking",
-        owner: "community",
-        namespace: "external-dns",
-        compute_types: EC2_FARGATE,
-        requires_iam: true,
-        versions: &["v0.17.0-eksbuild.1", "v0.15.1-eksbuild.1"],
-        default: "v0.15.1-eksbuild.1",
-    },
-];
-
-/// The `(version, defaultVersion)` pairs an add-on offers on one cluster
-/// version, newest first. Empty when the cluster version is outside the
-/// catalog.
-fn addon_versions_for(spec: &AddonSpec, cluster_version: &str) -> Vec<(String, bool)> {
-    let Some(row) = CLUSTER_VERSIONS.iter().find(|r| r.0 == cluster_version) else {
-        return Vec::new();
-    };
-    let owned = |list: &[&str], default: &str| -> Vec<(String, bool)> {
-        list.iter()
-            .map(|v| (v.to_string(), *v == default))
-            .collect()
-    };
-    match spec.name {
-        // CoreDNS releases track ranges of Kubernetes minors.
-        "coredns" => {
-            let minor: u32 = cluster_version
-                .split('.')
-                .nth(1)
-                .and_then(|m| m.parse().ok())
-                .unwrap_or(0);
-            if minor <= 28 {
-                owned(
-                    &["v1.10.1-eksbuild.18", "v1.10.1-eksbuild.13"],
-                    "v1.10.1-eksbuild.13",
-                )
-            } else if minor <= 32 {
-                owned(
-                    &[
-                        "v1.11.4-eksbuild.2",
-                        "v1.11.3-eksbuild.1",
-                        "v1.11.1-eksbuild.9",
-                    ],
-                    "v1.11.1-eksbuild.9",
-                )
-            } else {
-                owned(
-                    &["v1.12.2-eksbuild.4", "v1.12.1-eksbuild.2"],
-                    "v1.12.1-eksbuild.2",
-                )
-            }
-        }
-        // kube-proxy ships one build line per Kubernetes minor, matching the
-        // control plane's patch release; the `.0` build is the default.
-        "kube-proxy" => {
-            let base = format!("v{cluster_version}.0-eksbuild.2");
-            let latest = format!("v{}-eksbuild.3", row.1);
-            if row.1 == format!("{cluster_version}.0") {
-                vec![(base, true)]
-            } else {
-                vec![(latest, false), (base, true)]
-            }
-        }
-        _ => owned(spec.versions, spec.default),
-    }
-}
-
-/// The add-on catalog returned by `DescribeAddonVersions`, one `AddonInfo` per
-/// add-on. With a `kubernetesVersion` the versions and their compatibilities
-/// are scoped to that cluster version (an unknown version yields no add-ons,
-/// as on AWS); without one every catalog cluster version is listed.
-pub(crate) fn addon_catalog(cluster_version: Option<&str>) -> Vec<Value> {
-    let scope: Vec<&str> = match cluster_version {
-        Some(v) => vec![v],
-        None => CLUSTER_VERSIONS.iter().rev().map(|r| r.0).collect(),
-    };
-    ADDON_CATALOG
-        .iter()
-        .filter_map(|spec| {
-            // version -> compatibilities, preserving newest-first order.
-            let mut versions: Vec<(String, Vec<Value>)> = Vec::new();
-            for cv in &scope {
-                for (version, is_default) in addon_versions_for(spec, cv) {
-                    let compat = json!({
-                        "clusterVersion": cv,
-                        "platformVersions": ["*"],
-                        "defaultVersion": is_default,
-                    });
-                    match versions.iter_mut().find(|(v, _)| *v == version) {
-                        Some((_, compats)) => compats.push(compat),
-                        None => versions.push((version, vec![compat])),
-                    }
-                }
-            }
-            if versions.is_empty() {
-                return None;
-            }
-            let addon_versions: Vec<Value> = versions
-                .into_iter()
-                .map(|(version, compatibilities)| {
-                    json!({
-                        "addonVersion": version,
-                        "architecture": ["amd64", "arm64"],
-                        "computeTypes": spec.compute_types,
-                        "compatibilities": compatibilities,
-                        "requiresConfiguration": false,
-                        "requiresIamPermissions": spec.requires_iam,
-                    })
-                })
-                .collect();
-            Some(json!({
-                "addonName": spec.name,
-                "type": spec.addon_type,
-                "addonVersions": addon_versions,
-                "publisher": "eks",
-                "owner": spec.owner,
-                "defaultNamespace": spec.namespace,
-            }))
-        })
-        .collect()
-}
-
 /// A JSON-schema string describing the configuration accepted by an add-on,
 /// returned by `DescribeAddonConfiguration`.
 pub(crate) fn addon_configuration_schema(addon_name: &str) -> String {
@@ -1197,43 +824,6 @@ pub(crate) fn addon_configuration_schema(addon_name: &str) -> String {
         },
     })
     .to_string()
-}
-
-/// The recommended pod-identity configuration for an add-on, returned by
-/// `DescribeAddonConfiguration` as `podIdentityConfiguration`.
-pub(crate) fn pod_identity_configuration(region: &str, addon_name: &str) -> Value {
-    let policy =
-        |name: &str| Arn::global_in(region, "iam", "aws", &format!("policy/{name}")).to_string();
-    match addon_name {
-        "vpc-cni" => json!([{
-            "serviceAccount": "aws-node",
-            "recommendedManagedPolicies": [policy("AmazonEKS_CNI_Policy")],
-        }]),
-        "aws-ebs-csi-driver" => json!([{
-            "serviceAccount": "ebs-csi-controller-sa",
-            "recommendedManagedPolicies": [policy("service-role/AmazonEBSCSIDriverPolicy")],
-        }]),
-        "aws-efs-csi-driver" => json!([{
-            "serviceAccount": "efs-csi-controller-sa",
-            "recommendedManagedPolicies": [policy("service-role/AmazonEFSCSIDriverPolicy")],
-        }]),
-        "aws-fsx-csi-driver" => json!([{
-            "serviceAccount": "fsx-csi-controller-sa",
-            "recommendedManagedPolicies": [policy("AmazonFSxFullAccess")],
-        }]),
-        "amazon-cloudwatch-observability" => json!([{
-            "serviceAccount": "cloudwatch-agent",
-            "recommendedManagedPolicies": [
-                policy("CloudWatchAgentServerPolicy"),
-                policy("AWSXrayWriteOnlyAccess"),
-            ],
-        }]),
-        "aws-network-flow-monitoring-agent" => json!([{
-            "serviceAccount": "aws-network-flow-monitor-agent-service-account",
-            "recommendedManagedPolicies": [policy("CloudWatchNetworkFlowMonitorAgentPublishPolicy")],
-        }]),
-        _ => json!([]),
-    }
 }
 
 /// Split a principal ARN into its access-entry `(type, name)` ARN segments.
@@ -1539,118 +1129,133 @@ pub(crate) fn insights_refresh_json(r: &InsightsRefresh) -> Value {
     out
 }
 
-// (version, patch, platformVersion, releaseYmd, eoStandardYmd, eoExtendedYmd,
-//  status, default)
-type ClusterVersionRow = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    bool,
-);
+/// The date fakecloud's EKS version data is pinned to. AWS's version table
+/// moves every few months (new minors, support tiers ending), so the cluster
+/// versions below, their support status, and the add-on catalog
+/// (`addon_catalog.json`, captured the same day) all describe EKS as of this
+/// date. It sits in the window where Kubernetes 1.28 (extended support until
+/// 2025-11-26) and 1.34 (released 2025-10-02) were both offered.
+const CLUSTER_VERSIONS_AS_OF: &str = "2025-11-25";
+
+/// One row of the `DescribeClusterVersions` catalog.
+struct ClusterVersionRow {
+    version: &'static str,
+    /// The control plane's Kubernetes patch at the as-of date.
+    patch: &'static str,
+    /// The newest platform version released for the minor by the as-of date.
+    platform: &'static str,
+    release: &'static str,
+    end_of_standard: &'static str,
+    end_of_extended: &'static str,
+    default: bool,
+}
+
+/// Kubernetes minors offered by EKS on `CLUSTER_VERSIONS_AS_OF`, with the
+/// release and end-of-support dates from the EKS user guide's version
+/// lifecycle page and the patch / platform version from its platform-versions
+/// page (the 2025-11-18 platform release for every minor; 1.28's newest
+/// documented platform version is eks.49).
 const CLUSTER_VERSIONS: &[ClusterVersionRow] = &[
-    (
-        "1.28",
-        "1.28.15",
-        "eks.30",
-        "2023-09-26",
-        "2024-11-26",
-        "2025-11-26",
-        "extended_support",
-        false,
-    ),
-    (
-        "1.29",
-        "1.29.10",
-        "eks.24",
-        "2024-01-23",
-        "2025-03-23",
-        "2026-03-23",
-        "extended_support",
-        false,
-    ),
-    (
-        "1.30",
-        "1.30.6",
-        "eks.20",
-        "2024-05-23",
-        "2025-07-23",
-        "2026-07-23",
-        "standard_support",
-        false,
-    ),
-    (
-        "1.31",
-        "1.31.2",
-        "eks.9",
-        "2024-09-26",
-        "2025-11-26",
-        "2026-11-26",
-        "standard_support",
-        true,
-    ),
-    (
-        "1.32",
-        "1.32.0",
-        "eks.2",
-        "2025-01-23",
-        "2026-03-23",
-        "2027-03-23",
-        "standard_support",
-        false,
-    ),
-    (
-        "1.33",
-        "1.33.0",
-        "eks.3",
-        "2025-05-28",
-        "2026-07-28",
-        "2027-07-28",
-        "standard_support",
-        false,
-    ),
-    (
-        "1.34",
-        "1.34.0",
-        "eks.1",
-        "2025-11-11",
-        "2027-01-11",
-        "2028-01-11",
-        "standard_support",
-        false,
-    ),
+    ClusterVersionRow {
+        version: "1.28",
+        patch: "1.28.15",
+        platform: "eks.49",
+        release: "2023-09-26",
+        end_of_standard: "2024-11-26",
+        end_of_extended: "2025-11-26",
+        default: false,
+    },
+    ClusterVersionRow {
+        version: "1.29",
+        patch: "1.29.15",
+        platform: "eks.57",
+        release: "2024-01-23",
+        end_of_standard: "2025-03-23",
+        end_of_extended: "2026-03-23",
+        default: false,
+    },
+    ClusterVersionRow {
+        version: "1.30",
+        patch: "1.30.14",
+        platform: "eks.54",
+        release: "2024-05-23",
+        end_of_standard: "2025-07-23",
+        end_of_extended: "2026-07-23",
+        default: false,
+    },
+    ClusterVersionRow {
+        version: "1.31",
+        patch: "1.31.13",
+        platform: "eks.46",
+        release: "2024-09-26",
+        end_of_standard: "2025-11-26",
+        end_of_extended: "2026-11-26",
+        default: true,
+    },
+    ClusterVersionRow {
+        version: "1.32",
+        patch: "1.32.9",
+        platform: "eks.30",
+        release: "2025-01-23",
+        end_of_standard: "2026-03-23",
+        end_of_extended: "2027-03-23",
+        default: false,
+    },
+    ClusterVersionRow {
+        version: "1.33",
+        patch: "1.33.5",
+        platform: "eks.23",
+        release: "2025-05-29",
+        end_of_standard: "2026-07-29",
+        end_of_extended: "2027-07-29",
+        default: false,
+    },
+    ClusterVersionRow {
+        version: "1.34",
+        patch: "1.34.1",
+        platform: "eks.9",
+        release: "2025-10-02",
+        end_of_standard: "2026-12-02",
+        end_of_extended: "2027-12-02",
+        default: false,
+    },
 ];
 
-/// A real catalogue of recent Kubernetes minor versions with plausible
-/// platform versions, release dates, and support windows, returned by
-/// `DescribeClusterVersions`. 1.31 is the default.
+/// The support tier of a version on `as_of`, as the `(status, versionStatus)`
+/// pair: the deprecated `status` uses the `ClusterVersionStatus` enum
+/// (`standard-support`), `versionStatus` the `VersionStatus` enum
+/// (`STANDARD_SUPPORT`). ISO dates compare correctly as strings.
+fn support_status(row: &ClusterVersionRow, as_of: &str) -> (&'static str, &'static str) {
+    if as_of < row.end_of_standard {
+        ("standard-support", "STANDARD_SUPPORT")
+    } else if as_of < row.end_of_extended {
+        ("extended-support", "EXTENDED_SUPPORT")
+    } else {
+        ("unsupported", "UNSUPPORTED")
+    }
+}
+
+/// The `DescribeClusterVersions` catalog: every Kubernetes minor EKS offered
+/// on `CLUSTER_VERSIONS_AS_OF`, ascending, with its support status on that
+/// date. 1.31 is the default.
 pub(crate) fn cluster_version_catalog(cluster_type: &str) -> Vec<Value> {
     CLUSTER_VERSIONS
         .iter()
-        .map(
-            |(ver, patch, plat, release, eos, eoe, status, is_default)| {
-                let version_status = match *status {
-                    "standard_support" => "STANDARD_SUPPORT",
-                    "extended_support" => "EXTENDED_SUPPORT",
-                    _ => "UNSUPPORTED",
-                };
-                json!({
-                    "clusterVersion": ver,
-                    "clusterType": cluster_type,
-                    "defaultPlatformVersion": plat,
-                    "defaultVersion": is_default,
-                    "releaseDate": date_to_number(release),
-                    "endOfStandardSupportDate": date_to_number(eos),
-                    "endOfExtendedSupportDate": date_to_number(eoe),
-                    "status": status,
-                    "versionStatus": version_status,
-                    "kubernetesPatchVersion": patch,
-                })
-            },
-        )
+        .map(|row| {
+            let (status, version_status) = support_status(row, CLUSTER_VERSIONS_AS_OF);
+            json!({
+                "clusterVersion": row.version,
+                "clusterType": cluster_type,
+                "defaultPlatformVersion": row.platform,
+                "defaultVersion": row.default,
+                "releaseDate": date_to_number(row.release),
+                "endOfStandardSupportDate": date_to_number(row.end_of_standard),
+                "endOfExtendedSupportDate": date_to_number(row.end_of_extended),
+                "status": status,
+                "versionStatus": version_status,
+                "kubernetesPatchVersion": row.patch,
+            })
+        })
         .collect()
 }
 

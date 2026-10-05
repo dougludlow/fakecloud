@@ -586,7 +586,7 @@ impl ResourceProvisioner {
                 .get("AddonVersion")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("v{cluster_version}-eksbuild.1")),
+                .unwrap_or_else(|| fakecloud_eks::default_addon_version(&name, &cluster_version)),
             status: "ACTIVE".to_string(),
             created_at: now,
             modified_at: now,

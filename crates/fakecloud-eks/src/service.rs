@@ -3018,9 +3018,10 @@ impl EksService {
             }
             None => 100,
         };
-        // Enum query params reject values outside the model's declared members.
+        // Enum query params reject values outside the model's declared enum
+        // values (`ClusterVersionStatus` is `standard-support`, hyphenated).
         if let Some(status) = req.query_params.get("status") {
-            if !["unsupported", "standard_support", "extended_support"].contains(&status.as_str()) {
+            if !["unsupported", "standard-support", "extended-support"].contains(&status.as_str()) {
                 return Err(invalid_parameter(format!("Invalid status: {status}")));
             }
         }

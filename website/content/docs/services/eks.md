@@ -44,18 +44,24 @@ in persistent mode.
   `selectors`, their own `CREATING` -> `ACTIVE` transition.
 - **Add-ons** — `CreateAddon`, `DescribeAddon`, `ListAddons`, `DeleteAddon`,
   `UpdateAddon` (tracked version updates), plus the read-only catalogue ops
-  `DescribeAddonVersions` and `DescribeAddonConfiguration`. The catalogue
-  carries the AWS-owned add-ons (vpc-cni, coredns, kube-proxy, the EBS/EFS/FSx/
-  Mountpoint for S3 CSI drivers, snapshot-controller, eks-pod-identity-agent,
-  aws-guardduty-agent, aws-secrets-store-csi-driver-provider,
+  `DescribeAddonVersions` and `DescribeAddonConfiguration`. The catalogue is a
+  snapshot of the real `describe-addon-versions` output from 2025-11-25 (the
+  same date as the cluster-version table): every AWS-owned add-on (vpc-cni,
+  coredns, kube-proxy, the EBS/EFS/FSx/Mountpoint for S3 CSI drivers,
+  snapshot-controller, eks-pod-identity-agent, aws-guardduty-agent,
+  aws-secrets-store-csi-driver-provider, aws-privateca-connector-for-kubernetes,
   amazon-cloudwatch-observability, adot, eks-node-monitoring-agent,
-  aws-network-flow-monitoring-agent) and the EKS-published community add-ons
-  (metrics-server, kube-state-metrics, prometheus-node-exporter, cert-manager,
-  external-dns), each with versions and per-Kubernetes-version compatibilities
-  flagging the default version (coredns and kube-proxy track the cluster's
-  Kubernetes minor). `kubernetesVersion`, `addonName`, `types`, `owners`, and
-  `publishers` filter it, and `CreateAddon` without an `addonVersion` installs
-  the default for the cluster's version. An add-on's
+  aws-network-flow-monitoring-agent, sriov-network-metrics-exporter and the
+  SageMaker HyperPod and Spaces add-ons) and every EKS-published community
+  add-on (metrics-server, kube-state-metrics, prometheus-node-exporter,
+  cert-manager, external-dns, fluent-bit), with AWS's version strings,
+  architectures, compute types, and per-Kubernetes-version compatibilities
+  flagging the default version. `kubernetesVersion`, `addonName`, `types`,
+  `owners`, and `publishers` filter it, and `CreateAddon` (or an
+  `AWS::EKS::Addon` without `AddonVersion`) installs the default for the
+  cluster's version. `DescribeAddonConfiguration` recommends the documented
+  pod identity service account and managed policies (for example
+  `external-dns` -> `AmazonRoute53FullAccess`). An add-on's
   `podIdentityAssociations` become real pod identity associations in the
   add-on's namespace, owned by the add-on (`ownerArn`): they resolve through
   `DescribePodIdentityAssociation`, an `UpdateAddon` keeps the association (and
@@ -90,8 +96,9 @@ in persistent mode.
   `connectorConfig`) and `DeregisterCluster`.
 - **Cluster maintenance** — `AssociateEncryptionConfig` and `CancelUpdate` (both
   operate on tracked `Update` records), plus the read-only `DescribeClusterVersions`
-  catalogue (Kubernetes 1.28-1.32 with platform versions and standard/extended
-  support windows).
+  catalogue (Kubernetes 1.28-1.34 as of 2025-11-25, with patch and platform
+  versions, AWS's release and standard/extended support dates, and each
+  version's support status on that date).
 - **EKS Anywhere subscriptions** — `CreateEksAnywhereSubscription`,
   `DescribeEksAnywhereSubscription`, `ListEksAnywhereSubscriptions`,
   `UpdateEksAnywhereSubscription`, `DeleteEksAnywhereSubscription`
