@@ -551,6 +551,27 @@ impl GlueService {
 
     // column statistics task runs / settings / schedule
 
+    /// The Data Catalog a column-statistics task request targets: `CatalogID`
+    /// when supplied, otherwise the caller's account (the AWS default).
+    fn cst_catalog(body: &Value, account_id: &str) -> String {
+        body.get("CatalogID")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(account_id)
+            .to_string()
+    }
+
+    /// Whether a stored task run belongs to `catalog`/`db`/`table`. Runs
+    /// recorded before `CatalogID` was tracked belong to the account catalog.
+    fn cst_run_matches(r: &Value, catalog: &str, account_id: &str, db: &str, table: &str) -> bool {
+        r.get("CatalogID")
+            .and_then(Value::as_str)
+            .unwrap_or(account_id)
+            == catalog
+            && r.get("DatabaseName").and_then(Value::as_str) == Some(db)
+            && r.get("TableName").and_then(Value::as_str) == Some(table)
+    }
+
     pub(crate) fn start_column_statistics_task_run(
         &self,
         req: &AwsRequest,
@@ -559,18 +580,23 @@ impl GlueService {
         let db = req_str(&body, "DatabaseName")?.to_string();
         let table = req_str(&body, "TableName")?.to_string();
         req_str(&body, "Role")?;
+        let catalog = Self::cst_catalog(&body, &req.account_id);
         let id = new_id();
         let now = now_ts();
+        let mut run = json!({
+            "ColumnStatisticsTaskRunId": id, "CustomerId": req.account_id,
+            "CatalogID": catalog, "DatabaseName": db, "TableName": table,
+            "Status": "RUNNING", "CreationTime": now, "LastUpdated": now, "StartTime": now,
+            "Role": body.get("Role").cloned().unwrap_or(Value::Null),
+        });
+        for f in ["ColumnNameList", "SampleSize", "SecurityConfiguration"] {
+            if let Some(v) = body.get(f).filter(|v| !v.is_null()) {
+                run[f] = v.clone();
+            }
+        }
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
-        st.column_stats_task_runs.insert(
-            id.clone(),
-            json!({
-                "ColumnStatisticsTaskRunId": id, "DatabaseName": db, "TableName": table,
-                "Status": "RUNNING", "CreationTime": now, "LastUpdated": now,
-                "Role": body.get("Role").cloned().unwrap_or(Value::Null),
-            }),
-        );
+        st.column_stats_task_runs.insert(id.clone(), run);
         Ok(AwsResponse::ok_json(json!({
             "ColumnStatisticsTaskRunId": id,
         })))
@@ -602,15 +628,13 @@ impl GlueService {
         let body = req.json_body();
         let db = req_str(&body, "DatabaseName")?.to_string();
         let table = req_str(&body, "TableName")?.to_string();
+        let catalog = Self::cst_catalog(&body, &req.account_id);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         let runs: Vec<Value> = st
             .column_stats_task_runs
             .values()
-            .filter(|r| {
-                r.get("DatabaseName").and_then(|v| v.as_str()) == Some(db.as_str())
-                    && r.get("TableName").and_then(|v| v.as_str()) == Some(table.as_str())
-            })
+            .filter(|r| Self::cst_run_matches(r, &catalog, &req.account_id, &db, &table))
             .cloned()
             .collect();
         Ok(AwsResponse::ok_json(json!({
@@ -639,11 +663,11 @@ impl GlueService {
         let body = req.json_body();
         let db = req_str(&body, "DatabaseName")?.to_string();
         let table = req_str(&body, "TableName")?.to_string();
+        let catalog = Self::cst_catalog(&body, &req.account_id);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         let found = st.column_stats_task_runs.values_mut().any(|r| {
-            if r.get("DatabaseName").and_then(|v| v.as_str()) == Some(db.as_str())
-                && r.get("TableName").and_then(|v| v.as_str()) == Some(table.as_str())
+            if Self::cst_run_matches(r, &catalog, &req.account_id, &db, &table)
                 && r.get("Status").and_then(|v| v.as_str()) == Some("RUNNING")
             {
                 if let Some(obj) = r.as_object_mut() {
@@ -664,8 +688,79 @@ impl GlueService {
         Ok(AwsResponse::ok_json(json!({})))
     }
 
-    fn cst_settings_key(db: &str, table: &str) -> String {
-        format!("{db}\u{1f}{table}")
+    /// Storage key for a table's task settings. The account's own catalog
+    /// keeps the original `db\x1ftable` key (so persisted settings stay
+    /// addressable); any other catalog is prefixed onto it.
+    fn cst_settings_key(catalog: &str, account_id: &str, db: &str, table: &str) -> String {
+        if catalog == account_id {
+            format!("{db}\u{1f}{table}")
+        } else {
+            format!("{catalog}\u{1f}{db}\u{1f}{table}")
+        }
+    }
+
+    fn cst_settings_not_found(db: &str, table: &str) -> AwsServiceError {
+        entity_not_found(format!(
+            "Column statistics task settings not found for table {db}.{table}"
+        ))
+    }
+
+    /// Fold a Create/UpdateColumnStatisticsTaskSettings request onto the
+    /// stored `ColumnStatisticsTaskSettings`. Only members present on the
+    /// request change; the request's cron `Schedule` becomes the read shape's
+    /// `Schedule` structure, keeping a schedule's started/stopped state.
+    fn cst_apply_settings(settings: &mut Value, body: &Value) {
+        for f in [
+            "Role",
+            "ColumnNameList",
+            "SampleSize",
+            "SecurityConfiguration",
+        ] {
+            if let Some(v) = body.get(f).filter(|v| !v.is_null()) {
+                settings[f] = v.clone();
+            }
+        }
+        if let Some(expr) = body.get("Schedule").and_then(Value::as_str) {
+            let state = settings["Schedule"]
+                .get("State")
+                .and_then(Value::as_str)
+                .unwrap_or("SCHEDULED")
+                .to_string();
+            settings["Schedule"] = json!({ "ScheduleExpression": expr, "State": state });
+            settings["ScheduleType"] = json!("CRON");
+        }
+    }
+
+    /// Normalize stored settings to the `ColumnStatisticsTaskSettings` read
+    /// shape. Settings persisted before the read shape was stored hold the raw
+    /// request (cron `Schedule` string, no `CatalogID`); upgrade them in place.
+    fn cst_settings_json(stored: &Value, catalog: &str) -> Value {
+        let mut out = json!({
+            "DatabaseName": stored.get("DatabaseName").cloned().unwrap_or(Value::Null),
+            "TableName": stored.get("TableName").cloned().unwrap_or(Value::Null),
+            "CatalogID": catalog,
+            "SettingSource": "TABLE",
+        });
+        let mut legacy = stored.clone();
+        if let Some(expr) = stored.get("Schedule").and_then(Value::as_str) {
+            legacy["Schedule"] = Value::Null;
+            Self::cst_apply_settings(&mut out, &json!({ "Schedule": expr }));
+        }
+        for f in [
+            "Role",
+            "ColumnNameList",
+            "SampleSize",
+            "SecurityConfiguration",
+            "Schedule",
+            "ScheduleType",
+            "SettingSource",
+            "LastExecutionAttempt",
+        ] {
+            if let Some(v) = legacy.get(f).filter(|v| !v.is_null()) {
+                out[f] = v.clone();
+            }
+        }
+        out
     }
 
     pub(crate) fn create_column_statistics_task_settings(
@@ -676,10 +771,23 @@ impl GlueService {
         let db = req_str(&body, "DatabaseName")?.to_string();
         let table = req_str(&body, "TableName")?.to_string();
         req_str(&body, "Role")?;
+        let catalog = Self::cst_catalog(&body, &req.account_id);
+        let key = Self::cst_settings_key(&catalog, &req.account_id, &db, &table);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
-        st.column_stats_task_settings
-            .insert(Self::cst_settings_key(&db, &table), body.clone());
+        if st.column_stats_task_settings.contains_key(&key) {
+            return Err(crate::common::already_exists(format!(
+                "Column statistics task settings already exist for table {db}.{table}"
+            )));
+        }
+        let mut settings = json!({
+            "DatabaseName": db,
+            "TableName": table,
+            "CatalogID": catalog,
+            "SettingSource": "TABLE",
+        });
+        Self::cst_apply_settings(&mut settings, &body);
+        st.column_stats_task_settings.insert(key, settings);
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -690,13 +798,17 @@ impl GlueService {
         let body = req.json_body();
         let db = req_str(&body, "DatabaseName")?.to_string();
         let table = req_str(&body, "TableName")?.to_string();
+        let catalog = Self::cst_catalog(&body, &req.account_id);
+        let key = Self::cst_settings_key(&catalog, &req.account_id, &db, &table);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
-        let key = Self::cst_settings_key(&db, &table);
-        if !st.column_stats_task_settings.contains_key(&key) {
-            return Err(entity_not_found("Task settings not found"));
-        }
-        st.column_stats_task_settings.insert(key, body.clone());
+        let stored = st
+            .column_stats_task_settings
+            .get_mut(&key)
+            .ok_or_else(|| Self::cst_settings_not_found(&db, &table))?;
+        let mut settings = Self::cst_settings_json(stored, &catalog);
+        Self::cst_apply_settings(&mut settings, &body);
+        *stored = settings;
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -707,20 +819,20 @@ impl GlueService {
         let body = req.json_body();
         let db = req_str(&body, "DatabaseName")?;
         let table = req_str(&body, "TableName")?;
+        let catalog = Self::cst_catalog(&body, &req.account_id);
         let accounts = self.state.read();
-        let s = accounts.get(&req.account_id).and_then(|s| {
-            s.column_stats_task_settings
-                .get(&Self::cst_settings_key(db, table))
-        });
-        let settings = match s {
-            Some(v) => json!({
-                "DatabaseName": v.get("DatabaseName").cloned().unwrap_or(Value::Null),
-                "TableName": v.get("TableName").cloned().unwrap_or(Value::Null),
-                "Role": v.get("Role").cloned().unwrap_or(Value::Null),
-                "Schedule": v.get("Schedule").cloned().unwrap_or(Value::Null),
-            }),
-            None => return Err(entity_not_found("Task settings not found")),
-        };
+        let settings = accounts
+            .get(&req.account_id)
+            .and_then(|s| {
+                s.column_stats_task_settings.get(&Self::cst_settings_key(
+                    &catalog,
+                    &req.account_id,
+                    db,
+                    table,
+                ))
+            })
+            .map(|v| Self::cst_settings_json(v, &catalog))
+            .ok_or_else(|| Self::cst_settings_not_found(db, table))?;
         Ok(AwsResponse::ok_json(json!({
             "ColumnStatisticsTaskSettings": settings,
         })))
@@ -733,10 +845,17 @@ impl GlueService {
         let body = req.json_body();
         let db = req_str(&body, "DatabaseName")?.to_string();
         let table = req_str(&body, "TableName")?.to_string();
+        let catalog = Self::cst_catalog(&body, &req.account_id);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         st.column_stats_task_settings
-            .remove(&Self::cst_settings_key(&db, &table));
+            .remove(&Self::cst_settings_key(
+                &catalog,
+                &req.account_id,
+                &db,
+                &table,
+            ))
+            .ok_or_else(|| Self::cst_settings_not_found(&db, &table))?;
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -744,19 +863,43 @@ impl GlueService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let body = req.json_body();
-        req_str(&body, "DatabaseName")?;
-        req_str(&body, "TableName")?;
-        Ok(AwsResponse::ok_json(json!({})))
+        self.set_column_statistics_schedule_state(req, "SCHEDULED")
     }
 
     pub(crate) fn stop_column_statistics_task_run_schedule(
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        self.set_column_statistics_schedule_state(req, "NOT_SCHEDULED")
+    }
+
+    /// Start/StopColumnStatisticsTaskRunSchedule: flip the `State` of the
+    /// table's task-settings schedule, keeping its cron expression.
+    fn set_column_statistics_schedule_state(
+        &self,
+        req: &AwsRequest,
+        state: &str,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        req_str(&body, "DatabaseName")?;
-        req_str(&body, "TableName")?;
+        let db = req_str(&body, "DatabaseName")?.to_string();
+        let table = req_str(&body, "TableName")?.to_string();
+        let catalog = Self::cst_catalog(&body, &req.account_id);
+        let key = Self::cst_settings_key(&catalog, &req.account_id, &db, &table);
+        let mut accounts = self.state.write();
+        let st = accounts.get_or_create(&req.account_id, &req.region);
+        let stored = st
+            .column_stats_task_settings
+            .get_mut(&key)
+            .ok_or_else(|| Self::cst_settings_not_found(&db, &table))?;
+        let mut settings = Self::cst_settings_json(stored, &catalog);
+        let mut schedule = settings
+            .get("Schedule")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        schedule["State"] = json!(state);
+        settings["Schedule"] = schedule;
+        *stored = settings;
         Ok(AwsResponse::ok_json(json!({})))
     }
 

@@ -27,6 +27,7 @@ const CRAWLER_FIELDS: &[&str] = &[
     "Configuration",
     "CrawlerSecurityConfiguration",
     "LakeFormationConfiguration",
+    "CatalogId",
 ];
 
 fn crawler_running(name: &str) -> AwsServiceError {
