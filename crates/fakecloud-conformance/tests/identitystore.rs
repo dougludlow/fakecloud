@@ -11,6 +11,7 @@ use helpers::TestServer;
 #[test_action("identitystore", "DeleteUser", checksum = "a1616606")]
 #[test_action("identitystore", "DescribeGroup", checksum = "5ba6a817")]
 #[test_action("identitystore", "DescribeGroupMembership", checksum = "8d6d7ee8")]
+#[test_action("identitystore", "DescribeIdentityStore", checksum = "aca6f179")]
 #[test_action("identitystore", "DescribeUser", checksum = "7ace4b3d")]
 #[test_action("identitystore", "GetGroupId", checksum = "9c842932")]
 #[test_action("identitystore", "GetGroupMembershipId", checksum = "6b7a120d")]
@@ -23,8 +24,10 @@ use helpers::TestServer;
     checksum = "066f8bb1"
 )]
 #[test_action("identitystore", "ListGroups", checksum = "e8c855e3")]
+#[test_action("identitystore", "ListIdentityStores", checksum = "5c8fed45")]
 #[test_action("identitystore", "ListUsers", checksum = "0a857df7")]
 #[test_action("identitystore", "UpdateGroup", checksum = "65e9ff88")]
+#[test_action("identitystore", "UpdateIdentityStore", checksum = "aacde00f")]
 #[test_action("identitystore", "UpdateUser", checksum = "22ce2a10")]
 #[tokio::test]
 async fn identitystore_probe() {

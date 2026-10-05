@@ -3,7 +3,9 @@
 //!
 //! An Identity Store is a per-account directory of users, groups, and the
 //! memberships linking them. Real AWS provisions the store (a `d-xxxxxxxxxx`
-//! id) when an IAM Identity Center instance is enabled; we create the store
+//! id) when an IAM Identity Center instance is enabled; the SSO Admin
+//! instance remains the source of truth for which stores exist (surfaced to
+//! this crate through a lookup hook), and we additionally create a directory
 //! lazily on first write so the directory API is usable without first standing
 //! up an instance. User and group attribute bags (the nested SCIM `Name`,
 //! `Emails`, `Addresses`, ... shapes) are stored as the raw request `Value` so
@@ -32,8 +34,19 @@ pub struct StoredUser {
     /// (`UserName`, `Name`, `DisplayName`, `Emails`, `Addresses`,
     /// `PhoneNumbers`, ...). Echoed back verbatim on describe.
     pub attributes: Value,
+    /// Optimistic-concurrency revision: starts at 1 and is bumped by every
+    /// `UpdateUser`. Reported as the opaque `Revision` string and checked
+    /// against the optional `Revision` of `UpdateUser`/`DeleteUser`.
+    #[serde(default = "initial_revision")]
+    pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The revision a freshly created user or group starts at (also the value a
+/// snapshot written before revisions existed restores to).
+pub fn initial_revision() -> u64 {
+    1
 }
 
 /// A group in an Identity Store.
@@ -44,6 +57,9 @@ pub struct StoredGroup {
     #[serde(default)]
     pub display_name: Option<String>,
     pub attributes: Value,
+    /// Optimistic-concurrency revision, bumped by every `UpdateGroup`.
+    #[serde(default = "initial_revision")]
+    pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -70,9 +86,15 @@ pub struct IdentityStoreDir {
     /// Memberships keyed by `MembershipId`.
     #[serde(default)]
     pub memberships: BTreeMap<String, StoredMembership>,
+    /// The store's `NetworkConfiguration` as last set by
+    /// `UpdateIdentityStore` (full replacement), normalized to the model's
+    /// members. `None` until one is configured.
+    #[serde(default)]
+    pub network_configuration: Option<Value>,
 }
 
-/// Per-account state: every Identity Store the account owns, keyed by
+/// Per-account state: every Identity Store directory the account has written
+/// to (or configured), keyed by
 /// `IdentityStoreId` (`d-xxxxxxxxxx`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IdentityStoreData {

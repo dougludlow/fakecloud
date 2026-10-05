@@ -1,8 +1,10 @@
 //! Identity Store (`identitystore`) awsJson1.1 dispatch + operation handlers.
 //!
-//! The full 19-operation directory control plane: users, groups, and the
-//! memberships linking them, plus the attribute-lookup helpers
-//! (`GetUserId`/`GetGroupId`/`GetGroupMembershipId`) and `IsMemberInGroups`.
+//! The full 22-operation control plane: users, groups, and the memberships
+//! linking them, plus the attribute-lookup helpers
+//! (`GetUserId`/`GetGroupId`/`GetGroupMembershipId`), `IsMemberInGroups`, and
+//! the identity-store resource itself (`DescribeIdentityStore`,
+//! `ListIdentityStores`, `UpdateIdentityStore`).
 //! State is account-partitioned and persisted. Nested SCIM attribute bags are
 //! stored as the raw request `Value` so they round-trip verbatim.
 
@@ -15,11 +17,14 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_snapshot;
-use crate::state::{SharedIdentityStoreState, StoredGroup, StoredMembership, StoredUser};
+use crate::state::{
+    initial_revision, SharedIdentityStoreState, StoredGroup, StoredMembership, StoredUser,
+};
 
 /// Every operation name in the Identity Store Smithy model.
 pub const IDENTITYSTORE_ACTIONS: &[&str] = &[
@@ -31,6 +36,7 @@ pub const IDENTITYSTORE_ACTIONS: &[&str] = &[
     "DeleteUser",
     "DescribeGroup",
     "DescribeGroupMembership",
+    "DescribeIdentityStore",
     "DescribeUser",
     "GetGroupId",
     "GetGroupMembershipId",
@@ -39,8 +45,10 @@ pub const IDENTITYSTORE_ACTIONS: &[&str] = &[
     "ListGroupMemberships",
     "ListGroupMembershipsForMember",
     "ListGroups",
+    "ListIdentityStores",
     "ListUsers",
     "UpdateGroup",
+    "UpdateIdentityStore",
     "UpdateUser",
 ];
 
@@ -59,10 +67,17 @@ const SENSITIVE_USER_FIELDS: &[&str] = &[
     "Birthdate",
 ];
 
+/// Resolves the identity-store ids an account owns through its IAM Identity
+/// Center instances (the SSO Admin control plane is the source of truth for
+/// which stores were provisioned). Wired by the server so this crate does not
+/// depend on the SSO Admin crate.
+pub type InstanceStoreLookup = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
 pub struct IdentityStoreService {
     state: SharedIdentityStoreState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    instance_stores: Option<InstanceStoreLookup>,
 }
 
 impl IdentityStoreService {
@@ -71,7 +86,33 @@ impl IdentityStoreService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            instance_stores: None,
         }
+    }
+
+    /// Attach the lookup for identity stores provisioned by IAM Identity
+    /// Center instances, so `ListIdentityStores`/`DescribeIdentityStore`/
+    /// `UpdateIdentityStore` see them before any directory write.
+    pub fn with_instance_store_lookup(mut self, lookup: InstanceStoreLookup) -> Self {
+        self.instance_stores = Some(lookup);
+        self
+    }
+
+    /// Every identity-store id `account` owns: the stores of its Identity
+    /// Center instances plus any directory created by a write, sorted and
+    /// de-duplicated.
+    fn known_stores(&self, account: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .instance_stores
+            .as_ref()
+            .map(|f| f(account))
+            .unwrap_or_default();
+        if let Some(acct) = self.state.read().get(account) {
+            ids.extend(acct.stores.keys().cloned());
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -134,6 +175,9 @@ fn dispatch(s: &IdentityStoreService, req: &AwsRequest) -> Result<AwsResponse, A
         "ListGroupMemberships" => s.list_group_memberships(req),
         "ListGroupMembershipsForMember" => s.list_group_memberships_for_member(req),
         "IsMemberInGroups" => s.is_member_in_groups(req),
+        "DescribeIdentityStore" => s.describe_identity_store(req),
+        "ListIdentityStores" => s.list_identity_stores(req),
+        "UpdateIdentityStore" => s.update_identity_store(req),
         _ => Err(AwsServiceError::action_not_implemented(
             s.service_name(),
             &req.action,
@@ -164,11 +208,90 @@ fn not_found(msg: &str) -> AwsServiceError {
 }
 
 fn conflict(msg: &str) -> AwsServiceError {
+    conflict_with_reason(msg, "UNIQUENESS_CONSTRAINT_VIOLATION")
+}
+
+/// `ConflictException` carrying its modeled `Reason`
+/// (`UNIQUENESS_CONSTRAINT_VIOLATION` | `CONCURRENT_MODIFICATION`).
+fn conflict_with_reason(msg: &str, reason: &str) -> AwsServiceError {
     // `ConflictException` is modeled with `@httpError(409)`; the SDKs and
     // Terraform's retry/error handling key on the 409 status, so returning 400
     // here would misclassify a duplicate-resource conflict as a plain
     // client-validation error.
-    AwsServiceError::aws_error(StatusCode::CONFLICT, "ConflictException", msg)
+    AwsServiceError::aws_error_with_fields(
+        StatusCode::CONFLICT,
+        "ConflictException",
+        msg,
+        vec![("Reason".to_string(), reason.to_string())],
+    )
+}
+
+/// Read and validate the optional `Revision` (`ResourceRevision`: @length
+/// 1..=64, @pattern `^[0-9]+$`) of an update/delete request. Validated
+/// up front, whether or not the target resource exists.
+fn req_revision(b: &Value) -> Result<Option<&str>, AwsServiceError> {
+    let Some(v) = b.get("Revision") else {
+        return Ok(None);
+    };
+    v.as_str()
+        .filter(|r| (1..=64).contains(&r.len()) && r.bytes().all(|c| c.is_ascii_digit()))
+        .map(Some)
+        .ok_or_else(|| validation("Revision must be a string of 1 to 64 digits matching ^[0-9]+$."))
+}
+
+/// When an expected revision was supplied, require it to equal the resource's
+/// `current` revision; a mismatch is `ConflictException`
+/// (`CONCURRENT_MODIFICATION`).
+fn check_revision(expected: Option<&str>, current: u64, kind: &str) -> Result<(), AwsServiceError> {
+    let Some(rev) = expected else {
+        return Ok(());
+    };
+    // Revisions are opaque tokens: compare them verbatim.
+    if rev != current.to_string() {
+        return Err(conflict_with_reason(
+            &format!(
+                "The {kind} was modified concurrently: expected revision {rev} but the current revision is {current}."
+            ),
+            "CONCURRENT_MODIFICATION",
+        ));
+    }
+    Ok(())
+}
+
+/// The ARN of a user/group/membership. These are global, account-less ARNs:
+/// `arn:<partition>:identitystore:::<kind>/<id>`.
+fn resource_arn(region: &str, kind: &str, id: &str) -> String {
+    Arn::global_in(region, "identitystore", "", &format!("{kind}/{id}")).to_string()
+}
+
+/// The ARN of an identity store:
+/// `arn:<partition>:identitystore::<account>:identitystore/<id>`.
+fn identity_store_arn(region: &str, account: &str, store: &str) -> String {
+    Arn::global_in(
+        region,
+        "identitystore",
+        account,
+        &format!("identitystore/{store}"),
+    )
+    .to_string()
+}
+
+/// Mint a user/group/membership id. Stores with a canonical `d-<10 hex>` id
+/// get AWS's `<10 hex>-<UUID>` form (the store id's hex prefixed onto a random
+/// UUID); any other store id gets a bare UUID, the legacy-store format.
+fn new_resource_id(store: &str) -> String {
+    let uuid = Uuid::new_v4();
+    match store.strip_prefix("d-") {
+        Some(hex)
+            if hex.len() == 10
+                && hex
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) =>
+        {
+            format!("{hex}-{uuid}")
+        }
+        _ => uuid.to_string(),
+    }
 }
 
 fn req_str<'a>(b: &'a Value, f: &str) -> Result<&'a str, AwsServiceError> {
@@ -192,13 +315,25 @@ fn check_len(b: &Value, field: &str, min: usize, max: usize) -> Result<(), AwsSe
     Ok(())
 }
 
+/// Read the required `IdentityStoreId`. The model accepts either the bare id
+/// (`d-1234567890`) or the store's ARN
+/// (`arn:aws:identitystore::111122223333:identitystore/d-1234567890`); both
+/// resolve to the bare id that keys the directory.
 fn store_id(b: &Value) -> Result<String, AwsServiceError> {
     let s = req_str(b, "IdentityStoreId")?;
-    // IdentityStoreId @length 1..=36.
-    if s.chars().count() > 36 {
+    // IdentityStoreId @length 1..=93.
+    if s.chars().count() > 93 {
         return Err(validation(
-            "IdentityStoreId must have length between 1 and 36, inclusive.",
+            "IdentityStoreId must have length between 1 and 93, inclusive.",
         ));
+    }
+    if s.starts_with("arn:") {
+        return arn_resource(s, "identitystore")
+            .and_then(|r| r.rsplit_once(":identitystore/"))
+            .map(|(_, id)| id)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| validation("IdentityStoreId is not a valid identity store ARN."));
     }
     Ok(s.to_string())
 }
@@ -366,29 +501,40 @@ fn apply_operations(attributes: &mut Value, ops: &Value) {
     }
 }
 
-fn build_user(u: &StoredUser, store: &str) -> Value {
+fn build_user(u: &StoredUser, store: &str, region: &str) -> Value {
     let mut m = u.attributes.as_object().cloned().unwrap_or_default();
     m.insert("IdentityStoreId".into(), json!(store));
     m.insert("UserId".into(), json!(u.user_id));
+    m.insert(
+        "UserArn".into(),
+        json!(resource_arn(region, "user", &u.user_id)),
+    );
+    m.insert("Revision".into(), json!(u.revision.to_string()));
     m.entry("UserStatus").or_insert(json!("ENABLED"));
     m.insert("CreatedAt".into(), epoch(&u.created_at));
     m.insert("UpdatedAt".into(), epoch(&u.updated_at));
     Value::Object(m)
 }
 
-fn build_group(g: &StoredGroup, store: &str) -> Value {
+fn build_group(g: &StoredGroup, store: &str, region: &str) -> Value {
     let mut m = g.attributes.as_object().cloned().unwrap_or_default();
     m.insert("IdentityStoreId".into(), json!(store));
     m.insert("GroupId".into(), json!(g.group_id));
+    m.insert(
+        "GroupArn".into(),
+        json!(resource_arn(region, "group", &g.group_id)),
+    );
+    m.insert("Revision".into(), json!(g.revision.to_string()));
     m.insert("CreatedAt".into(), epoch(&g.created_at));
     m.insert("UpdatedAt".into(), epoch(&g.updated_at));
     Value::Object(m)
 }
 
-fn build_membership(m: &StoredMembership, store: &str) -> Value {
+fn build_membership(m: &StoredMembership, store: &str, region: &str) -> Value {
     json!({
         "IdentityStoreId": store,
         "MembershipId": m.membership_id,
+        "MembershipArn": resource_arn(region, "membership", &m.membership_id),
         "GroupId": m.group_id,
         "MemberId": { "UserId": m.member_user_id },
         "CreatedAt": epoch(&m.created_at),
@@ -444,24 +590,31 @@ impl IdentityStoreService {
                 )));
             }
         }
-        let user_id = Uuid::new_v4().to_string();
+        let user_id = new_resource_id(&sid);
         let now = Utc::now();
         // Strip control/routing members from the persisted attribute bag.
         let mut attributes = b.clone();
         if let Value::Object(m) = &mut attributes {
             m.remove("IdentityStoreId");
         }
+        let revision = initial_revision();
         dir.users.insert(
             user_id.clone(),
             StoredUser {
                 user_id: user_id.clone(),
                 user_name,
                 attributes,
+                revision,
                 created_at: now,
                 updated_at: now,
             },
         );
-        ok(json!({ "IdentityStoreId": sid, "UserId": user_id }))
+        ok(json!({
+            "IdentityStoreId": sid,
+            "UserId": user_id,
+            "UserArn": resource_arn(&req.region, "user", &user_id),
+            "Revision": revision.to_string(),
+        }))
     }
 
     fn describe_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -477,13 +630,14 @@ impl IdentityStoreService {
             .users
             .get(user_id)
             .ok_or_else(|| not_found("USER not found."))?;
-        ok(build_user(u, &sid))
+        ok(build_user(u, &sid, &req.region))
     }
 
     fn update_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let sid = store_id(&b)?;
         let user_id = resource_id(&b, "UserId")?.to_string();
+        let revision = req_revision(&b)?;
         let ops = b
             .get("Operations")
             .cloned()
@@ -497,25 +651,36 @@ impl IdentityStoreService {
             .users
             .get_mut(&user_id)
             .ok_or_else(|| not_found("USER not found."))?;
+        check_revision(revision, u.revision, "user")?;
         apply_operations(&mut u.attributes, &ops);
         u.user_name = u
             .attributes
             .get("UserName")
             .and_then(Value::as_str)
             .map(str::to_string);
+        u.revision += 1;
         u.updated_at = Utc::now();
-        ok(json!({}))
+        ok(json!({
+            "IdentityStoreId": sid,
+            "UserId": user_id,
+            "UserArn": resource_arn(&req.region, "user", &user_id),
+            "Revision": u.revision.to_string(),
+        }))
     }
 
     fn delete_user(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let sid = store_id(&b)?;
         let user_id = resource_id(&b, "UserId")?.to_string();
+        let revision = req_revision(&b)?;
         let mut guard = self.state.write();
         if let Some(dir) = guard
             .get_mut(&req.account_id)
             .and_then(|a| a.stores.get_mut(&sid))
         {
+            if let Some(u) = dir.users.get(&user_id) {
+                check_revision(revision, u.revision, "user")?;
+            }
             dir.users.remove(&user_id);
             dir.memberships.retain(|_, m| m.member_user_id != user_id);
         }
@@ -539,7 +704,11 @@ impl IdentityStoreService {
             }
         });
         match found {
-            Some(u) => ok(json!({ "IdentityStoreId": sid, "UserId": u.user_id })),
+            Some(u) => ok(json!({
+                "IdentityStoreId": sid,
+                "UserId": u.user_id,
+                "UserArn": resource_arn(&req.region, "user", &u.user_id),
+            })),
             None => Err(not_found("USER not found.")),
         }
     }
@@ -555,7 +724,7 @@ impl IdentityStoreService {
                 dir.users
                     .values()
                     .filter(|u| matches_filters(&u.attributes, b.get("Filters")))
-                    .map(|u| build_user(u, &sid))
+                    .map(|u| build_user(u, &sid, &req.region))
                     .collect()
             })
             .unwrap_or_default();
@@ -595,23 +764,30 @@ impl IdentityStoreService {
                 )));
             }
         }
-        let group_id = Uuid::new_v4().to_string();
+        let group_id = new_resource_id(&sid);
         let now = Utc::now();
         let mut attributes = b.clone();
         if let Value::Object(m) = &mut attributes {
             m.remove("IdentityStoreId");
         }
+        let revision = initial_revision();
         dir.groups.insert(
             group_id.clone(),
             StoredGroup {
                 group_id: group_id.clone(),
                 display_name,
                 attributes,
+                revision,
                 created_at: now,
                 updated_at: now,
             },
         );
-        ok(json!({ "GroupId": group_id, "IdentityStoreId": sid }))
+        ok(json!({
+            "GroupId": group_id,
+            "IdentityStoreId": sid,
+            "GroupArn": resource_arn(&req.region, "group", &group_id),
+            "Revision": revision.to_string(),
+        }))
     }
 
     fn describe_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -624,13 +800,14 @@ impl IdentityStoreService {
             .and_then(|a| a.stores.get(&sid))
             .and_then(|d| d.groups.get(group_id))
             .ok_or_else(|| not_found("GROUP not found."))?;
-        ok(build_group(g, &sid))
+        ok(build_group(g, &sid, &req.region))
     }
 
     fn update_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let sid = store_id(&b)?;
         let group_id = resource_id(&b, "GroupId")?.to_string();
+        let revision = req_revision(&b)?;
         let ops = b
             .get("Operations")
             .cloned()
@@ -641,25 +818,36 @@ impl IdentityStoreService {
             .and_then(|a| a.stores.get_mut(&sid))
             .and_then(|d| d.groups.get_mut(&group_id))
             .ok_or_else(|| not_found("GROUP not found."))?;
+        check_revision(revision, g.revision, "group")?;
         apply_operations(&mut g.attributes, &ops);
         g.display_name = g
             .attributes
             .get("DisplayName")
             .and_then(Value::as_str)
             .map(str::to_string);
+        g.revision += 1;
         g.updated_at = Utc::now();
-        ok(json!({}))
+        ok(json!({
+            "GroupId": group_id,
+            "IdentityStoreId": sid,
+            "GroupArn": resource_arn(&req.region, "group", &group_id),
+            "Revision": g.revision.to_string(),
+        }))
     }
 
     fn delete_group(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let b = parse(req)?;
         let sid = store_id(&b)?;
         let group_id = resource_id(&b, "GroupId")?.to_string();
+        let revision = req_revision(&b)?;
         let mut guard = self.state.write();
         if let Some(dir) = guard
             .get_mut(&req.account_id)
             .and_then(|a| a.stores.get_mut(&sid))
         {
+            if let Some(g) = dir.groups.get(&group_id) {
+                check_revision(revision, g.revision, "group")?;
+            }
             dir.groups.remove(&group_id);
             dir.memberships.retain(|_, m| m.group_id != group_id);
         }
@@ -683,7 +871,11 @@ impl IdentityStoreService {
             }
         });
         match found {
-            Some(g) => ok(json!({ "GroupId": g.group_id, "IdentityStoreId": sid })),
+            Some(g) => ok(json!({
+                "GroupId": g.group_id,
+                "IdentityStoreId": sid,
+                "GroupArn": resource_arn(&req.region, "group", &g.group_id),
+            })),
             None => Err(not_found("GROUP not found.")),
         }
     }
@@ -699,7 +891,7 @@ impl IdentityStoreService {
                 dir.groups
                     .values()
                     .filter(|g| matches_filters(&g.attributes, b.get("Filters")))
-                    .map(|g| build_group(g, &sid))
+                    .map(|g| build_group(g, &sid, &req.region))
                     .collect()
             })
             .unwrap_or_default();
@@ -737,7 +929,7 @@ impl IdentityStoreService {
                 existing.membership_id
             )));
         }
-        let membership_id = Uuid::new_v4().to_string();
+        let membership_id = new_resource_id(&sid);
         let now = Utc::now();
         dir.memberships.insert(
             membership_id.clone(),
@@ -749,7 +941,11 @@ impl IdentityStoreService {
                 updated_at: now,
             },
         );
-        ok(json!({ "MembershipId": membership_id, "IdentityStoreId": sid }))
+        ok(json!({
+            "MembershipId": membership_id,
+            "IdentityStoreId": sid,
+            "MembershipArn": resource_arn(&req.region, "membership", &membership_id),
+        }))
     }
 
     fn describe_group_membership(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -762,7 +958,7 @@ impl IdentityStoreService {
             .and_then(|a| a.stores.get(&sid))
             .and_then(|d| d.memberships.get(membership_id))
             .ok_or_else(|| not_found("MEMBERSHIP not found."))?;
-        ok(build_membership(m, &sid))
+        ok(build_membership(m, &sid, &req.region))
     }
 
     fn delete_group_membership(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -794,7 +990,11 @@ impl IdentityStoreService {
                     .find(|m| m.group_id == group_id && m.member_user_id == member)
             })
             .ok_or_else(|| not_found("MEMBERSHIP not found."))?;
-        ok(json!({ "MembershipId": m.membership_id, "IdentityStoreId": sid }))
+        ok(json!({
+            "MembershipId": m.membership_id,
+            "IdentityStoreId": sid,
+            "MembershipArn": resource_arn(&req.region, "membership", &m.membership_id),
+        }))
     }
 
     fn list_group_memberships(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -809,7 +1009,7 @@ impl IdentityStoreService {
                 dir.memberships
                     .values()
                     .filter(|m| m.group_id == group_id)
-                    .map(|m| build_membership(m, &sid))
+                    .map(|m| build_membership(m, &sid, &req.region))
                     .collect()
             })
             .unwrap_or_default();
@@ -836,7 +1036,7 @@ impl IdentityStoreService {
                 dir.memberships
                     .values()
                     .filter(|m| m.member_user_id == member)
-                    .map(|m| build_membership(m, &sid))
+                    .map(|m| build_membership(m, &sid, &req.region))
                     .collect()
             })
             .unwrap_or_default();
@@ -886,6 +1086,180 @@ impl IdentityStoreService {
             })
             .collect();
         ok(json!({ "Results": results }))
+    }
+}
+
+impl IdentityStoreService {
+    // ---- identity stores ----
+
+    /// Resolve the request's `IdentityStoreId` (id or ARN) to a store the
+    /// account owns, or `ResourceNotFoundException` (`IDENTITY_STORE`).
+    fn existing_store(&self, b: &Value, account: &str) -> Result<String, AwsServiceError> {
+        let sid = store_id(b)?;
+        if self.known_stores(account).contains(&sid) {
+            Ok(sid)
+        } else {
+            Err(AwsServiceError::aws_error_with_fields(
+                StatusCode::NOT_FOUND,
+                "ResourceNotFoundException",
+                format!("Identity store {sid} not found."),
+                vec![
+                    ("ResourceType".to_string(), "IDENTITY_STORE".to_string()),
+                    ("ResourceId".to_string(), sid.clone()),
+                ],
+            ))
+        }
+    }
+
+    fn describe_identity_store(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let b = parse(req)?;
+        let sid = self.existing_store(&b, &req.account_id)?;
+        let mut out = json!({
+            "IdentityStoreId": sid,
+            "IdentityStoreArn": identity_store_arn(&req.region, &req.account_id, &sid),
+        });
+        if let Some(nc) = self
+            .state
+            .read()
+            .get(&req.account_id)
+            .and_then(|a| a.stores.get(&sid))
+            .and_then(|d| d.network_configuration.clone())
+        {
+            out["NetworkConfiguration"] = nc;
+        }
+        ok(out)
+    }
+
+    fn list_identity_stores(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let b = parse(req)?;
+        let rows: Vec<Value> = self
+            .known_stores(&req.account_id)
+            .into_iter()
+            .map(|sid| {
+                json!({
+                    "IdentityStoreArn": identity_store_arn(&req.region, &req.account_id, &sid),
+                    "IdentityStoreId": sid,
+                })
+            })
+            .collect();
+        let (page, next) = paginate(rows, &b)?;
+        let mut out = json!({ "IdentityStores": page });
+        if let Some(t) = next {
+            out["NextToken"] = json!(t);
+        }
+        ok(out)
+    }
+
+    fn update_identity_store(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let b = parse(req)?;
+        let sid = self.existing_store(&b, &req.account_id)?;
+        let network = b
+            .get("NetworkConfiguration")
+            .map(normalize_network_configuration)
+            .transpose()?;
+        if let Some(nc) = network {
+            // Full replacement of the store's network configuration.
+            let mut guard = self.state.write();
+            let dir = guard
+                .get_or_create(&req.account_id)
+                .stores
+                .entry(sid.clone())
+                .or_default();
+            dir.network_configuration = Some(nc);
+        }
+        ok(json!({
+            "IdentityStoreId": sid,
+            "IdentityStoreArn": identity_store_arn(&req.region, &req.account_id, &sid),
+        }))
+    }
+}
+
+/// Validate a `NetworkConfiguration` against the model and return it with only
+/// its modeled members (`VpceAccessRequired` required; the three optional
+/// lists each 1..=50 unique items).
+fn normalize_network_configuration(nc: &Value) -> Result<Value, AwsServiceError> {
+    let obj = nc
+        .as_object()
+        .ok_or_else(|| validation("NetworkConfiguration must be an object."))?;
+    let vpce = obj
+        .get("VpceAccessRequired")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            validation("NetworkConfiguration.VpceAccessRequired must be set to true or false.")
+        })?;
+    let mut out = Map::new();
+    out.insert("VpceAccessRequired".into(), json!(vpce));
+    for (field, item_ok) in [
+        ("ApiRestrictSourceVpcs", is_vpc_id as fn(&str) -> bool),
+        ("ApiAllowSourceIps", is_ip_cidr),
+        ("ScimAllowSourceIps", is_ip_cidr),
+    ] {
+        let Some(v) = obj.get(field) else {
+            continue;
+        };
+        let items: Vec<&str> = v
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .filter(|items: &Vec<&str>| Some(items.len()) == v.as_array().map(Vec::len))
+            .ok_or_else(|| validation(&format!("{field} must be a list of strings.")))?;
+        if !(1..=50).contains(&items.len()) {
+            return Err(validation(&format!(
+                "{field} must contain between 1 and 50 items, inclusive."
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &items {
+            if !item_ok(item) {
+                return Err(validation(&format!(
+                    "{field} contains an invalid value: {item}"
+                )));
+            }
+            if !seen.insert(*item) {
+                return Err(validation(&format!(
+                    "{field} must not contain duplicate values: {item}"
+                )));
+            }
+        }
+        out.insert(field.into(), json!(items));
+    }
+    Ok(Value::Object(out))
+}
+
+/// `VpcIdType`: `^vpc-([0-9a-f]){8}(([0-9a-f]){9})?$`.
+fn is_vpc_id(s: &str) -> bool {
+    s.strip_prefix("vpc-").is_some_and(|hex| {
+        (hex.len() == 8 || hex.len() == 17)
+            && hex
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
+}
+
+/// `IpCidrType`: an IPv4 or IPv6 address with an optional in-range prefix
+/// length (@length 2..=43).
+fn is_ip_cidr(s: &str) -> bool {
+    if !(2..=43).contains(&s.len()) {
+        return false;
+    }
+    let (addr, prefix) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let max = match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) if !addr.contains(':') => 32,
+        // The model's IPv6 alternative has no embedded-IPv4 (`::ffff:1.2.3.4`)
+        // form.
+        Ok(std::net::IpAddr::V6(_)) if !addr.contains('.') => 128,
+        _ => return false,
+    };
+    match prefix {
+        None => true,
+        Some(p) => {
+            !p.is_empty()
+                && !(p.len() > 1 && p.starts_with('0'))
+                && p.bytes().all(|c| c.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| n <= max)
+        }
     }
 }
 
@@ -1310,5 +1684,379 @@ mod tests {
             }),
         );
         assert_eq!(got["GroupId"], json!(gid));
+    }
+
+    fn call_err(s: &IdentityStoreService, action: &str, body: Value) -> AwsServiceError {
+        dispatch(s, &req(action, body))
+            .err()
+            .expect("op should fail")
+    }
+
+    fn field<'a>(err: &'a AwsServiceError, name: &str) -> Option<&'a str> {
+        err.extra_fields()
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn user_revision_arn_and_optimistic_concurrency() {
+        let s = svc();
+        let sid = "d-1234567890";
+        let created = call(
+            &s,
+            "CreateUser",
+            json!({ "IdentityStoreId": sid, "UserName": "rev" }),
+        );
+        let uid = created["UserId"].as_str().unwrap().to_string();
+        // Non-legacy stores mint `<10 hex of the store id>-<UUID>` ids.
+        assert!(uid.starts_with("1234567890-"), "{uid}");
+        assert_eq!(uid.len(), 47);
+        let arn = format!("arn:aws:identitystore:::user/{uid}");
+        assert_eq!(created["UserArn"], json!(arn));
+        assert_eq!(created["Revision"], json!("1"));
+
+        let desc = call(
+            &s,
+            "DescribeUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid }),
+        );
+        assert_eq!(desc["UserArn"], json!(arn));
+        assert_eq!(desc["Revision"], json!("1"));
+        let got = call(
+            &s,
+            "GetUserId",
+            json!({
+                "IdentityStoreId": sid,
+                "AlternateIdentifier": { "UniqueAttribute": { "AttributePath": "UserName", "AttributeValue": "rev" } }
+            }),
+        );
+        assert_eq!(got["UserArn"], json!(arn));
+
+        let ops = json!([{ "AttributePath": "DisplayName", "AttributeValue": "R" }]);
+        let updated = call(
+            &s,
+            "UpdateUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid, "Operations": ops, "Revision": "1" }),
+        );
+        assert_eq!(
+            updated,
+            json!({ "IdentityStoreId": sid, "UserId": uid, "UserArn": arn, "Revision": "2" })
+        );
+        let listed = call(&s, "ListUsers", json!({ "IdentityStoreId": sid }));
+        assert_eq!(listed["Users"][0]["Revision"], json!("2"));
+        assert_eq!(listed["Users"][0]["UserArn"], json!(arn));
+
+        // A stale revision is rejected and leaves the user untouched.
+        let err = call_err(
+            &s,
+            "UpdateUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid, "Operations": ops, "Revision": "1" }),
+        );
+        assert_eq!(err.code(), "ConflictException");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        assert_eq!(field(&err, "Reason"), Some("CONCURRENT_MODIFICATION"));
+        let err = call_err(
+            &s,
+            "DeleteUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid, "Revision": "1" }),
+        );
+        assert_eq!(field(&err, "Reason"), Some("CONCURRENT_MODIFICATION"));
+        // A malformed revision is a validation error, not a conflict.
+        let err = call_err(
+            &s,
+            "DeleteUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid, "Revision": "abc" }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+        // The matching revision deletes.
+        call(
+            &s,
+            "DeleteUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid, "Revision": "2" }),
+        );
+        let err = call_err(
+            &s,
+            "DescribeUser",
+            json!({ "IdentityStoreId": sid, "UserId": uid }),
+        );
+        assert_eq!(err.code(), "ResourceNotFoundException");
+        // Revision is validated even when the target no longer exists.
+        for bad in ["", "1".repeat(65).as_str()] {
+            let err = call_err(
+                &s,
+                "DeleteUser",
+                json!({ "IdentityStoreId": sid, "UserId": uid, "Revision": bad }),
+            );
+            assert_eq!(err.code(), "ValidationException");
+        }
+    }
+
+    #[test]
+    fn group_and_membership_arns_and_group_revision() {
+        let s = svc();
+        let sid = "d-abcdef0123";
+        let g = call(
+            &s,
+            "CreateGroup",
+            json!({ "IdentityStoreId": sid, "DisplayName": "eng" }),
+        );
+        let gid = g["GroupId"].as_str().unwrap().to_string();
+        let garn = format!("arn:aws:identitystore:::group/{gid}");
+        assert_eq!(g["GroupArn"], json!(garn));
+        assert_eq!(g["Revision"], json!("1"));
+        let updated = call(
+            &s,
+            "UpdateGroup",
+            json!({
+                "IdentityStoreId": sid, "GroupId": gid,
+                "Operations": [{ "AttributePath": "Description", "AttributeValue": "d" }]
+            }),
+        );
+        assert_eq!(
+            updated,
+            json!({ "GroupId": gid, "IdentityStoreId": sid, "GroupArn": garn, "Revision": "2" })
+        );
+        let err = call_err(
+            &s,
+            "UpdateGroup",
+            json!({
+                "IdentityStoreId": sid, "GroupId": gid, "Revision": "1",
+                "Operations": [{ "AttributePath": "Description", "AttributeValue": "x" }]
+            }),
+        );
+        assert_eq!(field(&err, "Reason"), Some("CONCURRENT_MODIFICATION"));
+        let desc = call(
+            &s,
+            "DescribeGroup",
+            json!({ "IdentityStoreId": sid, "GroupId": gid }),
+        );
+        assert_eq!(desc["Description"], json!("d"));
+        assert_eq!(desc["Revision"], json!("2"));
+        let got = call(
+            &s,
+            "GetGroupId",
+            json!({
+                "IdentityStoreId": sid,
+                "AlternateIdentifier": { "UniqueAttribute": { "AttributePath": "DisplayName", "AttributeValue": "eng" } }
+            }),
+        );
+        assert_eq!(got["GroupArn"], json!(garn));
+        let listed = call(&s, "ListGroups", json!({ "IdentityStoreId": sid }));
+        assert_eq!(listed["Groups"][0]["GroupArn"], json!(garn));
+
+        let uid = call(
+            &s,
+            "CreateUser",
+            json!({ "IdentityStoreId": sid, "UserName": "m" }),
+        )["UserId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let m = call(
+            &s,
+            "CreateGroupMembership",
+            json!({ "IdentityStoreId": sid, "GroupId": gid, "MemberId": { "UserId": uid } }),
+        );
+        let mid = m["MembershipId"].as_str().unwrap().to_string();
+        assert!(mid.starts_with("abcdef0123-"), "{mid}");
+        let marn = format!("arn:aws:identitystore:::membership/{mid}");
+        assert_eq!(m["MembershipArn"], json!(marn));
+        let d = call(
+            &s,
+            "DescribeGroupMembership",
+            json!({ "IdentityStoreId": sid, "MembershipId": mid }),
+        );
+        assert_eq!(d["MembershipArn"], json!(marn));
+        let got = call(
+            &s,
+            "GetGroupMembershipId",
+            json!({ "IdentityStoreId": sid, "GroupId": gid, "MemberId": { "UserId": uid } }),
+        );
+        assert_eq!(got["MembershipArn"], json!(marn));
+        let l = call(
+            &s,
+            "ListGroupMemberships",
+            json!({ "IdentityStoreId": sid, "GroupId": gid }),
+        );
+        assert_eq!(l["GroupMemberships"][0]["MembershipArn"], json!(marn));
+        let l = call(
+            &s,
+            "ListGroupMembershipsForMember",
+            json!({ "IdentityStoreId": sid, "MemberId": { "UserId": uid } }),
+        );
+        assert_eq!(l["GroupMemberships"][0]["MembershipArn"], json!(marn));
+        // Duplicate display names carry the uniqueness reason.
+        let err = call_err(
+            &s,
+            "CreateGroup",
+            json!({ "IdentityStoreId": sid, "DisplayName": "eng" }),
+        );
+        assert_eq!(
+            field(&err, "Reason"),
+            Some("UNIQUENESS_CONSTRAINT_VIOLATION")
+        );
+    }
+
+    #[test]
+    fn identity_store_id_accepts_arn() {
+        let s = svc();
+        let arn = "arn:aws:identitystore::000000000000:identitystore/d-1234567890";
+        let created = call(
+            &s,
+            "CreateUser",
+            json!({ "IdentityStoreId": arn, "UserName": "a" }),
+        );
+        // Responses carry the bare id; the ARN resolves to the same directory.
+        assert_eq!(created["IdentityStoreId"], json!("d-1234567890"));
+        let listed = call(
+            &s,
+            "ListUsers",
+            json!({ "IdentityStoreId": "d-1234567890" }),
+        );
+        assert_eq!(listed["Users"].as_array().unwrap().len(), 1);
+        let err = call_err(
+            &s,
+            "ListUsers",
+            json!({ "IdentityStoreId": "arn:aws:s3:::bucket" }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+    }
+
+    #[test]
+    fn identity_store_describe_list_update() {
+        let s = svc().with_instance_store_lookup(Arc::new(|account: &str| {
+            if account == "000000000000" {
+                vec!["d-aaaaaaaaaa".to_string()]
+            } else {
+                vec![]
+            }
+        }));
+        // A directory created by a write is also a known store.
+        call(
+            &s,
+            "CreateGroup",
+            json!({ "IdentityStoreId": "d-bbbbbbbbbb", "DisplayName": "g" }),
+        );
+        let listed = call(&s, "ListIdentityStores", json!({}));
+        assert_eq!(
+            listed,
+            json!({ "IdentityStores": [
+                { "IdentityStoreId": "d-aaaaaaaaaa", "IdentityStoreArn": "arn:aws:identitystore::000000000000:identitystore/d-aaaaaaaaaa" },
+                { "IdentityStoreId": "d-bbbbbbbbbb", "IdentityStoreArn": "arn:aws:identitystore::000000000000:identitystore/d-bbbbbbbbbb" },
+            ]})
+        );
+        let page = call(&s, "ListIdentityStores", json!({ "MaxResults": 1 }));
+        assert_eq!(page["IdentityStores"].as_array().unwrap().len(), 1);
+        assert_eq!(page["NextToken"], json!("1"));
+
+        let arn = "arn:aws:identitystore::000000000000:identitystore/d-aaaaaaaaaa";
+        let desc = call(
+            &s,
+            "DescribeIdentityStore",
+            json!({ "IdentityStoreId": arn }),
+        );
+        assert_eq!(
+            desc,
+            json!({ "IdentityStoreId": "d-aaaaaaaaaa", "IdentityStoreArn": arn })
+        );
+
+        let updated = call(
+            &s,
+            "UpdateIdentityStore",
+            json!({
+                "IdentityStoreId": "d-aaaaaaaaaa",
+                "NetworkConfiguration": {
+                    "VpceAccessRequired": true,
+                    "ApiRestrictSourceVpcs": ["vpc-0123abcd"],
+                    "ScimAllowSourceIps": ["0.0.0.0/0", "2001:db8::/32"]
+                }
+            }),
+        );
+        assert_eq!(
+            updated,
+            json!({ "IdentityStoreId": "d-aaaaaaaaaa", "IdentityStoreArn": arn })
+        );
+        let desc = call(
+            &s,
+            "DescribeIdentityStore",
+            json!({ "IdentityStoreId": "d-aaaaaaaaaa" }),
+        );
+        assert_eq!(
+            desc["NetworkConfiguration"],
+            json!({
+                "VpceAccessRequired": true,
+                "ApiRestrictSourceVpcs": ["vpc-0123abcd"],
+                "ScimAllowSourceIps": ["0.0.0.0/0", "2001:db8::/32"]
+            })
+        );
+        // Full replacement: a later update drops the omitted lists.
+        call(
+            &s,
+            "UpdateIdentityStore",
+            json!({
+                "IdentityStoreId": "d-aaaaaaaaaa",
+                "NetworkConfiguration": { "VpceAccessRequired": false }
+            }),
+        );
+        let desc = call(
+            &s,
+            "DescribeIdentityStore",
+            json!({ "IdentityStoreId": "d-aaaaaaaaaa" }),
+        );
+        assert_eq!(
+            desc["NetworkConfiguration"],
+            json!({ "VpceAccessRequired": false })
+        );
+
+        for bad in [
+            json!({}),
+            json!({ "VpceAccessRequired": true, "ApiRestrictSourceVpcs": ["vpc-xyz"] }),
+            json!({ "VpceAccessRequired": true, "ApiAllowSourceIps": ["10.0.0.0/33"] }),
+            json!({ "VpceAccessRequired": true, "ApiAllowSourceIps": [] }),
+            json!({ "VpceAccessRequired": true, "ApiAllowSourceIps": ["1.2.3.4", "1.2.3.4"] }),
+        ] {
+            let err = call_err(
+                &s,
+                "UpdateIdentityStore",
+                json!({ "IdentityStoreId": "d-aaaaaaaaaa", "NetworkConfiguration": bad }),
+            );
+            assert_eq!(err.code(), "ValidationException", "{bad}");
+        }
+
+        for op in ["DescribeIdentityStore", "UpdateIdentityStore"] {
+            let err = call_err(&s, op, json!({ "IdentityStoreId": "d-cccccccccc" }));
+            assert_eq!(err.code(), "ResourceNotFoundException");
+            assert_eq!(err.status(), StatusCode::NOT_FOUND);
+            assert_eq!(field(&err, "ResourceType"), Some("IDENTITY_STORE"));
+        }
+    }
+
+    #[test]
+    fn cidr_and_vpc_patterns() {
+        for ok in [
+            "10.0.0.0/8",
+            "1.2.3.4",
+            "0.0.0.0/0",
+            "::/0",
+            "2001:db8::1",
+            "fe80::/10",
+        ] {
+            assert!(is_ip_cidr(ok), "{ok}");
+        }
+        for bad in [
+            "10.0.0.0/",
+            "10.0.0.256",
+            "01.2.3.4",
+            "1.2.3.4/033",
+            "::ffff:1.2.3.4",
+            "x",
+        ] {
+            assert!(!is_ip_cidr(bad), "{bad}");
+        }
+        assert!(is_vpc_id("vpc-0123abcd"));
+        assert!(is_vpc_id("vpc-0123456789abcdef0"));
+        assert!(!is_vpc_id("vpc-0123ABCD"));
+        assert!(!is_vpc_id("vpc-0123abc"));
     }
 }
