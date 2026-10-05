@@ -120,7 +120,8 @@ async fn put_request_approval(State(svc): State<Svc>, body: axum::body::Bytes) -
         })?;
         svc.introspect_set_request_approval(&mode)
     });
-    respond_saved(&svc, result).await
+    // Server-wide settings are not persisted, so there is nothing to save.
+    respond(result)
 }
 
 async fn list_requests(

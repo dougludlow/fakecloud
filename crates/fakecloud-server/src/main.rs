@@ -4543,8 +4543,8 @@ async fn main() {
     let mut servicequotas_service = fakecloud_servicequotas::ServiceQuotasService::new(
         servicequotas_state.clone(),
         organizations_state.clone(),
+        servicequotas_settings.clone(),
     )
-    .with_settings(servicequotas_settings.clone())
     .with_usage_source(fakecloud_ec2::Ec2QuotaUsage::new(ec2_state.clone()))
     // Associating the template enables trusted access in Organizations.
     .with_organizations_snapshot_hook(cfn_snapshot_hooks.get("organizations").cloned());

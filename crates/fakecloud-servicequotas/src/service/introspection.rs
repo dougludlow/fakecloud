@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::ServiceQuotasService;
 use crate::catalog::{self, QuotaDef};
-use crate::provider::applied_value;
+use crate::provider::{applied_value, approvable};
 use crate::settings::{enforcement, quota_ref, QuotaSettings, RequestApproval};
 use crate::state::{applied_key, QuotaRequest, ServiceQuotasData};
 
@@ -154,9 +154,10 @@ fn find_def(service_code: &str, quota_code: &str) -> Result<&'static QuotaDef> {
     })
 }
 
-/// A quota can only be switched on when a fakecloud service checks it.
+/// Only quotas a fakecloud service checks take an override: switching another
+/// on would silently do nothing, and ignoring it is already the case.
 fn check_enforce(def: &QuotaDef, enforce: Option<bool>) -> Result<()> {
-    if enforce == Some(true) && !def.enforceable {
+    if enforce.is_some() && !def.enforceable {
         return Err(bad_request(format!(
             "quota {} ({}) is not enforceable: no fakecloud service checks requests against it",
             quota_ref(def),
@@ -495,8 +496,22 @@ impl ServiceQuotasService {
         let status = match decision {
             Decision::Approve => {
                 // An approved increase raises the quota to the requested value;
-                // it never lowers one set higher in the meantime.
+                // it never lowers one set higher in the meantime. AWS's own
+                // limits (a documented maximum, the security-group product)
+                // still hold: values may have changed since submission.
                 if let Some(def) = catalog::quota(&request.service_code, &request.quota_code) {
+                    if !approvable(data, &request.region, def, request.desired_value) {
+                        return Err(IntrospectionError {
+                            status: StatusCode::CONFLICT,
+                            message: format!(
+                                "quota request {request_id} asks for {} which AWS would not \
+                                 approve for {} (past its maximum or the security-group \
+                                 product limit); deny it instead",
+                                request.desired_value,
+                                quota_ref(def)
+                            ),
+                        });
+                    }
                     let current = applied_value(Some(data), &request.region, def);
                     data.applied.insert(
                         applied_key(

@@ -152,14 +152,12 @@ pub fn apply_template_if_new(
         }
         // Template entries are submitted as ordinary increase requests, so
         // they are decided on the same terms.
-        let status = match approval {
-            RequestApproval::Manual => "PENDING",
-            RequestApproval::Auto
-                if approvable(data, &entry.aws_region, def, entry.desired_value) =>
-            {
-                "APPROVED"
-            }
-            RequestApproval::Auto => "NOT_APPROVED",
+        let status = if !approvable(data, &entry.aws_region, def, entry.desired_value) {
+            "NOT_APPROVED"
+        } else if approval == RequestApproval::Manual {
+            "PENDING"
+        } else {
+            "APPROVED"
         };
         if status == "APPROVED" {
             data.applied.insert(

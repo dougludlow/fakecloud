@@ -322,7 +322,14 @@ impl Cli {
             request_approval: self.quota_requests.map(Into::into).unwrap_or_default(),
             ..Default::default()
         };
-        for reference in &self.enforce_quota {
+        // Empty items (an empty env var, a trailing comma) name nothing.
+        let named = |list: &'_ [String]| -> Vec<String> {
+            list.iter()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect()
+        };
+        let resolve_enforceable = |reference: &str| {
             let def = resolve(reference)?;
             if !def.enforceable {
                 return Err(format!(
@@ -330,12 +337,17 @@ impl Cli {
                     def.name
                 ));
             }
+            Ok(def)
+        };
+        for reference in named(&self.enforce_quota) {
+            let def = resolve_enforceable(&reference)?;
             settings
                 .overrides
                 .insert(fakecloud_servicequotas::settings::quota_ref(def), true);
         }
-        for reference in &self.ignore_quota {
-            let key = fakecloud_servicequotas::settings::quota_ref(resolve(reference)?);
+        for reference in named(&self.ignore_quota) {
+            let key =
+                fakecloud_servicequotas::settings::quota_ref(resolve_enforceable(&reference)?);
             if settings.overrides.insert(key, false) == Some(true) {
                 return Err(format!(
                     "quota {reference} is given to both --enforce-quota and --ignore-quota"
@@ -565,6 +577,22 @@ mod tests {
             "vpc/L-2AFB9258"
         ])
         .contains("both"));
+        assert!(bad(&["--ignore-quota", "lambda/L-B99A9384"]).contains("not enforceable"));
         assert!(Cli::try_parse_from(["fakecloud", "--quota-requests", "later"]).is_err());
+    }
+
+    #[test]
+    fn empty_quota_list_items_are_skipped() {
+        let cli = Cli::try_parse_from([
+            "fakecloud",
+            "--ignore-quota",
+            "vpc/L-0EA8095F,",
+            "--enforce-quota",
+            "",
+        ])
+        .unwrap();
+        let s = cli.quota_settings().unwrap();
+        assert_eq!(s.overrides.len(), 1);
+        assert_eq!(s.overrides.get("vpc/L-0EA8095F"), Some(&false));
     }
 }

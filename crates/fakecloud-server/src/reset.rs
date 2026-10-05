@@ -399,7 +399,14 @@ impl ResetState {
         match service {
             "servicequotas" => {
                 if let Some(data) = self.servicequotas.write().get_mut(account_id) {
-                    *data = Default::default();
+                    // The account still exists in its organization, and AWS
+                    // applies the quota request template once, at creation:
+                    // keep the marker so a reset does not apply it again.
+                    let template_checked = data.template_checked.take();
+                    *data = fakecloud_servicequotas::ServiceQuotasData {
+                        template_checked,
+                        ..Default::default()
+                    };
                 }
             }
             "iam" | "sts" => {

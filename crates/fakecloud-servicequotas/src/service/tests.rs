@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::QuotaSettings;
 use bytes::Bytes;
 use fakecloud_core::multi_account::MultiAccountState;
 use fakecloud_organizations::{MemberAccount, OrganizationState, OrganizationsRegistry};
@@ -21,6 +22,7 @@ fn svc_with(orgs: SharedOrganizationsState) -> ServiceQuotasService {
             "",
         ))),
         orgs,
+        Arc::new(RwLock::new(QuotaSettings::default())),
     )
 }
 
@@ -973,4 +975,61 @@ fn approving_never_lowers_a_quota_set_higher_meanwhile() {
     s.introspect_decide_request(&id, Decision::Approve).unwrap();
     let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap();
     assert_eq!(q["Quota"]["Value"], 150.0);
+}
+
+#[test]
+fn manual_approval_still_refuses_values_aws_would_not_approve() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    // 100 groups per interface is past the documented maximum of 16.
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = run(
+        &s,
+        ACCT,
+        "GetRequestedServiceQuotaChange",
+        json!({ "RequestId": id }),
+    )
+    .unwrap();
+    assert_eq!(r["RequestedQuota"]["Status"], "NOT_APPROVED");
+
+    // An approvable request that stops being approvable while it waits
+    // (rules per group raised so groups x rules would pass 1000) cannot be
+    // approved.
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(10.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rules: PutQuotaRequest = serde_json::from_value(json!({ "value": 200.0 })).unwrap();
+    s.introspect_put_quota("vpc", "L-0EA8095F", &rules).unwrap();
+    let e = s
+        .introspect_decide_request(&id, Decision::Approve)
+        .unwrap_err();
+    assert_eq!(e.status, StatusCode::CONFLICT);
+    assert!(s
+        .introspect_decide_request(&id, Decision::deny(None).unwrap())
+        .is_ok());
+}
+
+#[test]
+fn an_override_on_a_quota_no_service_checks_is_refused() {
+    let s = svc();
+    for enforce in [json!(true), json!(false)] {
+        let body: PutQuotaRequest = serde_json::from_value(json!({ "enforce": enforce })).unwrap();
+        let e = s
+            .introspect_put_quota("lambda", "L-B99A9384", &body)
+            .unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    }
+    // Clearing is always allowed.
+    let body: PutQuotaRequest = serde_json::from_value(json!({ "enforce": null })).unwrap();
+    assert!(s
+        .introspect_put_quota("lambda", "L-B99A9384", &body)
+        .is_ok());
 }

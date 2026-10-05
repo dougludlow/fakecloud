@@ -153,8 +153,8 @@ push a referencing group over the quota leaves the list at its old size in
 `ValidateSecurityGroupQuotasForInterface` exists to ask whether groups fit the
 quotas, so it always answers against the applied values, enforced or not.
 
-Every other catalog quota is reported with `enforceable: false`; switching one
-on is refused rather than silently doing nothing.
+Every other catalog quota is reported with `enforceable: false`; an override
+on one (on or off) is refused rather than silently doing nothing.
 
 ## Introspection
 
@@ -189,7 +189,10 @@ With `--quota-requests manual` (or `PUT .../request-approval {"mode":"manual"}`)
 `RequestServiceQuotaIncrease` and template entries stay `PENDING`, so code that
 polls `GetRequestedServiceQuotaChange` can be tested through every status:
 open a support case with `CreateSupportCase`, then approve or deny the request
-through the endpoints above.
+through the endpoints above. A value AWS would never approve (past the quota's
+maximum or the security-group product limit) is still `NOT_APPROVED` on
+submission, and approving a request that stopped being approvable while it
+waited returns 409; deny it instead.
 
 ## Known limitations
 

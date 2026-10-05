@@ -34,7 +34,7 @@ use crate::provider::{
     applied_value, apply_template_if_new, approvable, new_request_id, quota_arn, quota_region,
     requester,
 };
-use crate::settings::{QuotaSettings, RequestApproval, SharedQuotaSettings};
+use crate::settings::{RequestApproval, SharedQuotaSettings};
 use crate::state::{
     applied_key, template_key, AutoManagement, QuotaRequest, SharedServiceQuotasState,
     TemplateEntry, UtilizationEntry, UtilizationReport,
@@ -112,22 +112,22 @@ pub struct ServiceQuotasService {
 }
 
 impl ServiceQuotasService {
-    pub fn new(state: SharedServiceQuotasState, orgs: SharedOrganizationsState) -> Self {
+    /// `settings` must be the ones the [`crate::ServiceQuotasProvider`] reads,
+    /// so introspection changes reach the enforcing services.
+    pub fn new(
+        state: SharedServiceQuotasState,
+        orgs: SharedOrganizationsState,
+        settings: SharedQuotaSettings,
+    ) -> Self {
         Self {
             state,
             orgs,
-            settings: Arc::new(parking_lot::RwLock::new(QuotaSettings::default())),
+            settings,
             usage_sources: Vec::new(),
             orgs_snapshot_hook: None,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
-    }
-
-    /// Share `settings` with the [`crate::ServiceQuotasProvider`].
-    pub fn with_settings(mut self, settings: SharedQuotaSettings) -> Self {
-        self.settings = settings;
-        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -641,15 +641,17 @@ impl ServiceQuotasService {
         // read sees the outcome; under manual approval it waits for the
         // introspection API.
         let response = request_json(&request);
-        if approval == RequestApproval::Auto {
-            let approved = approvable(data, &req.region, def, desired);
-            request.status = if approved { "APPROVED" } else { "NOT_APPROVED" }.to_string();
-            if approved {
-                data.applied.insert(
-                    applied_key(&req.region, def.global, def.service_code, def.quota_code),
-                    desired,
-                );
-            }
+        // A value AWS would never approve is NOT_APPROVED straight away in
+        // either mode; only an approvable request waits under manual approval.
+        let approved = approvable(data, &req.region, def, desired);
+        if !approved {
+            request.status = "NOT_APPROVED".to_string();
+        } else if approval == RequestApproval::Auto {
+            request.status = "APPROVED".to_string();
+            data.applied.insert(
+                applied_key(&req.region, def.global, def.service_code, def.quota_code),
+                desired,
+            );
         }
         data.requests.insert(id, request);
         ok(json!({ "RequestedQuota": response }))
