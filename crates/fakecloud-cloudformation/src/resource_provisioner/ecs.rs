@@ -426,6 +426,14 @@ impl ResourceProvisioner {
                 .get("ServiceConnectConfiguration")
                 .filter(|v| !v.is_null())
                 .cloned(),
+            vpc_lattice_configurations: props
+                .get("VpcLatticeConfigurations")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(lowercase_first_keys)
+                .collect(),
         };
         state.record_service_revision(&service);
         state.services.insert(key.clone(), service);
@@ -690,6 +698,13 @@ impl ResourceProvisioner {
         }
         if let Some(nc) = props.get("NetworkConfiguration") {
             svc.network_configuration = Some(lowercase_first_keys(nc.clone()));
+        }
+        if let Some(arr) = props
+            .get("VpcLatticeConfigurations")
+            .and_then(|v| v.as_array())
+        {
+            svc.vpc_lattice_configurations =
+                arr.iter().cloned().map(lowercase_first_keys).collect();
         }
         if props.get("Tags").is_some() {
             svc.tags = parse_ecs_tags(props.get("Tags"));

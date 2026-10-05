@@ -1311,13 +1311,22 @@ pub(crate) fn service_to_json(svc: &Service) -> Value {
     // AWS carries serviceConnectConfiguration on each deployment. Echo the
     // service's stored config onto the PRIMARY deployment so a Create/Update
     // that supplied one round-trips on DescribeServices instead of vanishing.
-    if let Some(ref sc) = svc.service_connect_configuration {
-        for (dv, dep) in deployment_values.iter_mut().zip(svc.deployments.iter()) {
-            if dep.status == "PRIMARY" {
-                if let Some(obj) = dv.as_object_mut() {
-                    obj.insert("serviceConnectConfiguration".into(), sc.clone());
-                }
-            }
+    // VPC Lattice configurations ride on the deployment the same way.
+    for (dv, dep) in deployment_values.iter_mut().zip(svc.deployments.iter()) {
+        if dep.status != "PRIMARY" {
+            continue;
+        }
+        let Some(obj) = dv.as_object_mut() else {
+            continue;
+        };
+        if let Some(ref sc) = svc.service_connect_configuration {
+            obj.insert("serviceConnectConfiguration".into(), sc.clone());
+        }
+        if !svc.vpc_lattice_configurations.is_empty() {
+            obj.insert(
+                "vpcLatticeConfigurations".into(),
+                Value::Array(svc.vpc_lattice_configurations.clone()),
+            );
         }
     }
     map.insert("deployments".into(), Value::Array(deployment_values));
@@ -1402,6 +1411,99 @@ pub(crate) fn service_to_json(svc: &Service) -> Value {
                 .collect::<Vec<_>>()),
         );
     }
+    Value::Object(map)
+}
+
+/// Render a stored `ServiceRevision` to the wire shape, including the
+/// `resolvedConfiguration` ECS derives from the revision's load balancer and
+/// VPC Lattice configurations: each target group that serves traffic and the
+/// production listener rule (from `advancedConfiguration`) that routes to it.
+pub(crate) fn service_revision_to_json(rev: &crate::state::ServiceRevision) -> Value {
+    fn resolved(entries: &[Value]) -> Vec<Value> {
+        entries
+            .iter()
+            .filter_map(|e| {
+                let tg = e.get("targetGroupArn").and_then(|v| v.as_str())?;
+                let mut out = serde_json::Map::new();
+                out.insert("targetGroupArn".into(), json!(tg));
+                if let Some(rule) = e
+                    .get("advancedConfiguration")
+                    .and_then(|a| a.get("productionListenerRule"))
+                    .and_then(|v| v.as_str())
+                {
+                    out.insert("productionListenerRule".into(), json!(rule));
+                }
+                Some(Value::Object(out))
+            })
+            .collect()
+    }
+    let mut map = serde_json::Map::new();
+    map.insert("serviceRevisionArn".into(), json!(rev.service_revision_arn));
+    map.insert("serviceArn".into(), json!(rev.service_arn));
+    map.insert("clusterArn".into(), json!(rev.cluster_arn));
+    map.insert("taskDefinition".into(), json!(rev.task_definition_arn));
+    map.insert("launchType".into(), json!(rev.launch_type));
+    if !rev.capacity_provider_strategy.is_empty() {
+        map.insert(
+            "capacityProviderStrategy".into(),
+            Value::Array(rev.capacity_provider_strategy.clone()),
+        );
+    }
+    if rev.launch_type == "FARGATE" {
+        map.insert(
+            "platformVersion".into(),
+            json!(rev.platform_version.as_deref().unwrap_or("LATEST")),
+        );
+        map.insert("platformFamily".into(), json!("Linux"));
+    } else if let Some(ref pv) = rev.platform_version {
+        map.insert("platformVersion".into(), json!(pv));
+    }
+    if !rev.load_balancers.is_empty() {
+        map.insert(
+            "loadBalancers".into(),
+            Value::Array(rev.load_balancers.clone()),
+        );
+    }
+    if !rev.service_registries.is_empty() {
+        map.insert(
+            "serviceRegistries".into(),
+            Value::Array(rev.service_registries.clone()),
+        );
+    }
+    if let Some(ref nc) = rev.network_configuration {
+        map.insert("networkConfiguration".into(), nc.clone());
+    }
+    if let Some(ref sc) = rev.service_connect_configuration {
+        map.insert("serviceConnectConfiguration".into(), sc.clone());
+    }
+    if !rev.volume_configurations.is_empty() {
+        map.insert(
+            "volumeConfigurations".into(),
+            Value::Array(rev.volume_configurations.clone()),
+        );
+    }
+    if !rev.vpc_lattice_configurations.is_empty() {
+        map.insert(
+            "vpcLatticeConfigurations".into(),
+            Value::Array(rev.vpc_lattice_configurations.clone()),
+        );
+    }
+    let resolved_lbs = resolved(&rev.load_balancers);
+    let resolved_lattice = resolved(&rev.vpc_lattice_configurations);
+    if !resolved_lbs.is_empty() || !resolved_lattice.is_empty() {
+        let mut rc = serde_json::Map::new();
+        if !resolved_lbs.is_empty() {
+            rc.insert("loadBalancers".into(), Value::Array(resolved_lbs));
+        }
+        if !resolved_lattice.is_empty() {
+            rc.insert(
+                "vpcLatticeConfigurations".into(),
+                Value::Array(resolved_lattice),
+            );
+        }
+        map.insert("resolvedConfiguration".into(), Value::Object(rc));
+    }
+    map.insert("createdAt".into(), json!(rev.created_at.timestamp()));
     Value::Object(map)
 }
 

@@ -106,6 +106,11 @@ impl EcsService {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        let vpc_lattice_configurations: Vec<Value> = body
+            .get("vpcLatticeConfigurations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         let runtime = self.runtime.clone();
         let account = request.account_id.clone();
@@ -204,6 +209,7 @@ impl EcsService {
                     .get("serviceConnectConfiguration")
                     .filter(|v| !v.is_null())
                     .cloned(),
+                vpc_lattice_configurations: vpc_lattice_configurations.clone(),
             };
             state.services.insert(key.clone(), service.clone());
             state.record_service_revision(&service);
@@ -466,6 +472,12 @@ impl EcsService {
                 }
                 if let Some(a) = body.get("volumeConfigurations").and_then(|v| v.as_array()) {
                     svc.volume_configurations = a.clone();
+                }
+                if let Some(a) = body
+                    .get("vpcLatticeConfigurations")
+                    .and_then(|v| v.as_array())
+                {
+                    svc.vpc_lattice_configurations = a.clone();
                 }
 
                 if let Some(n) = new_desired {

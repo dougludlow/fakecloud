@@ -911,6 +911,78 @@ pub(super) mod multi_container_tests {
     }
 
     #[test]
+    fn vpc_lattice_configurations_round_trip_with_advanced_configuration() {
+        let svc = fresh_service();
+        svc.register_task_definition(&make_request(
+            "RegisterTaskDefinition",
+            json!({"family": "web", "containerDefinitions": [{"name": "app", "image": "alpine"}]}),
+        ))
+        .unwrap();
+        let lattice = json!([{
+            "roleArn": "arn:aws:iam::123456789012:role/ecs-infra",
+            "targetGroupArn": "arn:aws:vpc-lattice:us-east-1:123456789012:targetgroup/tg-blue",
+            "portName": "http",
+            "advancedConfiguration": {
+                "alternateTargetGroupArn": "arn:aws:vpc-lattice:us-east-1:123456789012:targetgroup/tg-green",
+                "productionListenerRule": "arn:aws:vpc-lattice:us-east-1:123456789012:service/svc-1/listener/listener-1/rule/rule-prod",
+                "testListenerRule": "arn:aws:vpc-lattice:us-east-1:123456789012:service/svc-1/listener/listener-1/rule/rule-test"
+            }
+        }]);
+        let created = svc
+            .create_service(&make_request(
+                "CreateService",
+                json!({
+                    "serviceName": "s",
+                    "taskDefinition": "web",
+                    "desiredCount": 0,
+                    "vpcLatticeConfigurations": lattice,
+                }),
+            ))
+            .unwrap();
+        let cbody: Value = serde_json::from_slice(created.body.expect_bytes()).unwrap();
+        let primary = &cbody["service"]["deployments"][0];
+        assert_eq!(primary["status"], "PRIMARY");
+        assert_eq!(primary["vpcLatticeConfigurations"], lattice);
+        let service_arn = cbody["service"]["serviceArn"].as_str().unwrap().to_string();
+
+        let d = svc
+            .describe_service_revisions(&make_request(
+                "DescribeServiceRevisions",
+                json!({"serviceRevisionArns": [format!("{service_arn}:1")]}),
+            ))
+            .unwrap();
+        let dbody: Value = serde_json::from_slice(d.body.expect_bytes()).unwrap();
+        let rev = &dbody["serviceRevisions"][0];
+        assert_eq!(rev["vpcLatticeConfigurations"], lattice);
+        assert_eq!(
+            rev["resolvedConfiguration"]["vpcLatticeConfigurations"],
+            json!([{
+                "targetGroupArn": "arn:aws:vpc-lattice:us-east-1:123456789012:targetgroup/tg-blue",
+                "productionListenerRule": "arn:aws:vpc-lattice:us-east-1:123456789012:service/svc-1/listener/listener-1/rule/rule-prod"
+            }])
+        );
+        assert!(rev["resolvedConfiguration"].get("loadBalancers").is_none());
+
+        // UpdateService replaces the stored configuration.
+        let updated_lattice = json!([{
+            "roleArn": "arn:aws:iam::123456789012:role/ecs-infra",
+            "targetGroupArn": "arn:aws:vpc-lattice:us-east-1:123456789012:targetgroup/tg-green",
+            "portName": "http"
+        }]);
+        let updated = svc
+            .update_service(&make_request(
+                "UpdateService",
+                json!({"service": "s", "vpcLatticeConfigurations": updated_lattice}),
+            ))
+            .unwrap();
+        let ubody: Value = serde_json::from_slice(updated.body.expect_bytes()).unwrap();
+        assert_eq!(
+            ubody["service"]["deployments"][0]["vpcLatticeConfigurations"],
+            updated_lattice
+        );
+    }
+
+    #[test]
     fn describe_service_revisions_returns_stored_revision_or_missing() {
         let svc = fresh_service();
         svc.register_task_definition(&make_request(

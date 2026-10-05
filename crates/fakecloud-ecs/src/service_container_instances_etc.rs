@@ -1224,14 +1224,7 @@ impl EcsService {
         let mut failures = Vec::new();
         for r in &refs {
             match state.and_then(|s| s.service_revisions.get(r)) {
-                Some(rev) => found.push(json!({
-                    "serviceRevisionArn": rev.service_revision_arn,
-                    "serviceArn": rev.service_arn,
-                    "clusterArn": rev.cluster_arn,
-                    "taskDefinition": rev.task_definition_arn,
-                    "launchType": rev.launch_type,
-                    "createdAt": rev.created_at.timestamp(),
-                })),
+                Some(rev) => found.push(service_revision_to_json(rev)),
                 None => failures.push(json!({"arn": r, "reason": "MISSING"})),
             }
         }
