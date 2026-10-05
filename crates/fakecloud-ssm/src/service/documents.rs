@@ -259,6 +259,7 @@ impl SsmService {
             status: "Active".to_string(),
             permissions: BTreeMap::new(),
             reviews: Vec::new(),
+            custom_shares: Some(Vec::new()),
         };
 
         state.documents.insert(name.clone(), doc);
@@ -1219,11 +1220,6 @@ fn policy_principal_accounts(policy: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Reserved `permissions` key holding the accounts a document is shared with
-/// through custom sharing (`ModifyDocumentPermission`), kept apart from the
-/// effective `Share` list so removing a resource policy cannot drop them.
-const CUSTOM_SHARE_KEY: &str = "__custom_share";
-
 /// Every account the resource policies on document `name` share it with.
 fn policy_grants(policies: &[SsmResourcePolicy], name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1241,10 +1237,10 @@ fn policy_grants(policies: &[SsmResourcePolicy], name: &str) -> Vec<String> {
 }
 
 /// The document's custom sharing. State written before custom sharing was
-/// tracked separately has no `CUSTOM_SHARE_KEY`; there, it is the `Share`
+/// tracked separately has no `custom_shares`; there, it is the `Share`
 /// accounts no current policy grants.
 fn custom_shares(doc: &SsmDocument, grants: &[String]) -> Vec<String> {
-    match doc.permissions.get(CUSTOM_SHARE_KEY) {
+    match &doc.custom_shares {
         Some(custom) => custom.clone(),
         None => doc
             .permissions
@@ -1269,7 +1265,7 @@ fn set_document_sharing(doc: &mut SsmDocument, custom: Vec<String>, grants: &[St
             share.push(id.clone());
         }
     }
-    doc.permissions.insert(CUSTOM_SHARE_KEY.to_string(), custom);
+    doc.custom_shares = Some(custom);
     doc.permissions.insert("Share".to_string(), share);
 }
 

@@ -63,6 +63,12 @@ pub struct SsmDocument {
     pub permissions: BTreeMap<String, Vec<String>>, // permission_type -> account_ids
     #[serde(default)]
     pub reviews: Vec<DocumentReview>,
+    /// Accounts shared through custom sharing (`ModifyDocumentPermission`),
+    /// kept apart from the effective `Share` permission so removing a
+    /// resource policy cannot drop them. `None` for state written before
+    /// custom sharing was tracked separately.
+    #[serde(default)]
+    pub custom_shares: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

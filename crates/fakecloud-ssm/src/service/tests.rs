@@ -6543,7 +6543,7 @@ fn legacy_document_sharing_is_split_from_policy_grants() {
         let mut accounts = svc.state.write();
         let st = accounts.regional_mut("123456789012", "us-east-1");
         let doc = st.documents.get_mut("LegacyShareDoc").unwrap();
-        doc.permissions.remove("__custom_share");
+        doc.custom_shares = None;
         doc.permissions.insert(
             "Share".to_string(),
             vec!["111111111111".to_string(), "222222222222".to_string()],
