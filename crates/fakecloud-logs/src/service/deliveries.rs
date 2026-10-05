@@ -32,6 +32,28 @@ fn delivery_to_json(d: &Delivery) -> Value {
     delivery_json
 }
 
+/// Render a stored `DeliveryDestination` to the wire shape shared by
+/// `PutDeliveryDestination`, `GetDeliveryDestination` and
+/// `DescribeDeliveryDestinations`.
+fn delivery_destination_to_json(dd: &DeliveryDestination) -> Value {
+    let mut obj = json!({
+        "name": dd.name,
+        "arn": dd.arn,
+        "deliveryDestinationType": dd.delivery_destination_type,
+        "deliveryDestinationConfiguration": dd_config_json(&dd.delivery_destination_configuration),
+    });
+    if let Some(ref fmt) = dd.output_format {
+        obj["outputFormat"] = json!(fmt);
+    }
+    if !dd.tags.is_empty() {
+        obj["tags"] = json!(dd.tags);
+    }
+    if let Some(ref role_arn) = dd.role_arn {
+        obj["roleArn"] = json!(role_arn);
+    }
+    obj
+}
+
 impl LogsService {
     // ---- Delivery Destinations ----
 
@@ -82,6 +104,8 @@ impl LogsService {
                     .collect()
             })
             .unwrap_or_default();
+
+        let role_arn = body["roleArn"].as_str().map(str::to_string);
 
         let tags: std::collections::BTreeMap<String, String> = body["tags"]
             .as_object()
@@ -135,40 +159,16 @@ impl LogsService {
 
         let dd = DeliveryDestination {
             name: name.clone(),
-            arn: arn.clone(),
-            output_format: output_format.clone(),
-            delivery_destination_configuration: config.clone(),
-            delivery_destination_type: delivery_destination_type.clone(),
-            tags: tags.clone(),
+            arn,
+            output_format,
+            delivery_destination_configuration: config,
+            delivery_destination_type,
+            tags,
             delivery_destination_policy: existing_policy,
+            role_arn,
         };
-
-        state.delivery_destinations.insert(name.clone(), dd);
-
-        // Build the configuration object for the response, preserving existing fields
-        // and always including destinationResourceArn (Smithy shape requires string, not null)
-        let config_resp = {
-            let mut c: serde_json::Map<String, Value> =
-                config.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
-            c.entry("destinationResourceArn".to_string())
-                .or_insert_with(|| json!(""));
-            Value::Object(c)
-        };
-
-        let mut resp = json!({
-            "deliveryDestination": {
-                "name": name,
-                "arn": arn,
-                "deliveryDestinationType": delivery_destination_type,
-                "deliveryDestinationConfiguration": config_resp,
-            }
-        });
-        if let Some(ref fmt) = output_format {
-            resp["deliveryDestination"]["outputFormat"] = json!(fmt);
-        }
-        if !tags.is_empty() {
-            resp["deliveryDestination"]["tags"] = json!(tags);
-        }
+        let resp = json!({ "deliveryDestination": delivery_destination_to_json(&dd) });
+        state.delivery_destinations.insert(name, dd);
 
         Ok(AwsResponse::json(
             StatusCode::OK,
@@ -204,15 +204,7 @@ impl LogsService {
             )
         })?;
 
-        let mut obj = json!({
-            "name": dd.name,
-            "arn": dd.arn,
-            "deliveryDestinationType": dd.delivery_destination_type,
-            "deliveryDestinationConfiguration": dd_config_json(&dd.delivery_destination_configuration),
-        });
-        if let Some(ref fmt) = dd.output_format {
-            obj["outputFormat"] = json!(fmt);
-        }
+        let obj = delivery_destination_to_json(dd);
 
         Ok(AwsResponse::json(
             StatusCode::OK,
@@ -236,18 +228,7 @@ impl LogsService {
         let dds: Vec<Value> = state
             .delivery_destinations
             .values()
-            .map(|dd| {
-                let mut obj = json!({
-                    "name": dd.name,
-                    "arn": dd.arn,
-                    "deliveryDestinationType": dd.delivery_destination_type,
-                    "deliveryDestinationConfiguration": dd_config_json(&dd.delivery_destination_configuration),
-                });
-                if let Some(ref fmt) = dd.output_format {
-                    obj["outputFormat"] = json!(fmt);
-                }
-                obj
-            })
+            .map(delivery_destination_to_json)
             .collect();
 
         Ok(AwsResponse::json(
@@ -1031,6 +1012,57 @@ mod tests {
             config["destinationResourceArn"].as_str().unwrap(),
             "arn:aws:s3:::my-bucket"
         );
+    }
+
+    #[test]
+    fn delivery_destination_role_arn_and_tags_round_trip() {
+        let svc = make_service();
+        let role = "arn:aws:iam::123456789012:role/xray-delivery";
+        let resp = svc
+            .put_delivery_destination(&make_request(
+                "PutDeliveryDestination",
+                json!({
+                    "name": "xray-dest",
+                    "deliveryDestinationType": "XRAY",
+                    "roleArn": role,
+                    "tags": {"team": "obs"},
+                }),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["deliveryDestination"]["roleArn"], role);
+        assert_eq!(body["deliveryDestination"]["tags"]["team"], "obs");
+
+        let resp = svc
+            .get_delivery_destination(&make_request(
+                "GetDeliveryDestination",
+                json!({"name": "xray-dest"}),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["deliveryDestination"]["roleArn"], role);
+        assert_eq!(body["deliveryDestination"]["tags"]["team"], "obs");
+
+        let resp = svc
+            .describe_delivery_destinations(&make_request(
+                "DescribeDeliveryDestinations",
+                json!({}),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["deliveryDestinations"][0]["roleArn"], role);
+
+        // A destination created without a role does not report one.
+        let resp = svc
+            .put_delivery_destination(&make_request(
+                "PutDeliveryDestination",
+                json!({"name": "plain", "deliveryDestinationConfiguration": {
+                    "destinationResourceArn": "arn:aws:s3:::b"
+                }}),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(body["deliveryDestination"].get("roleArn").is_none());
     }
 
     #[test]

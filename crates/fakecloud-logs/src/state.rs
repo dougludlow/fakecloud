@@ -351,6 +351,10 @@ pub struct DeliveryDestination {
     pub delivery_destination_type: String,
     pub tags: BTreeMap<String, String>,
     pub delivery_destination_policy: Option<String>,
+    /// IAM role CloudWatch Logs assumes to deliver to this destination
+    /// (X-Ray trace delivery destinations).
+    #[serde(default)]
+    pub role_arn: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
