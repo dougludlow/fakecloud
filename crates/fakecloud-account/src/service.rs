@@ -269,7 +269,11 @@ impl AccountService {
         let body = parse_json(&req.body)?;
         let account = target_account(&body, req)?;
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&account);
+        // Read-only lookup: an account with no state has no contact phone, and
+        // a call that fails on that must not create an entry for it.
+        let st = accounts
+            .get_mut(&account)
+            .ok_or_else(no_contact_information)?;
         let phone = contact_phone(st)?;
         if phone_verification_status(st) == "VERIFIED" {
             return Err(conflict(
@@ -298,7 +302,9 @@ impl AccountService {
             return Err(validation("Otp must be exactly 6 alphanumeric characters."));
         }
         let mut accounts = self.state.write();
-        let st = accounts.get_or_create(&account);
+        let st = accounts
+            .get_mut(&account)
+            .ok_or_else(no_contact_information)?;
         contact_phone(st)?;
         match phone_verification_status(st) {
             "VERIFIED" => {
@@ -757,7 +763,11 @@ fn contact_phone(st: &AccountData) -> Result<String, AwsServiceError> {
         .and_then(|i| i.get("PhoneNumber"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| not_found("No contact information found for this account."))
+        .ok_or_else(no_contact_information)
+}
+
+fn no_contact_information() -> AwsServiceError {
+    not_found("No contact information found for this account.")
 }
 
 /// The contact phone number's `PhoneNumberVerificationStatus`: the recorded
@@ -1142,6 +1152,19 @@ mod tests {
         assert_eq!(v["VerificationStatus"], "UNVERIFIED");
         let e = err(&s, "/verifyPhoneNumber", json!({"Otp": "000000"})).await;
         assert_eq!(e.code(), "ConflictException");
+    }
+
+    #[tokio::test]
+    async fn failed_phone_verification_creates_no_account_state() {
+        let s = svc();
+        let target = json!({"AccountId": "777788889999"});
+        let e = err(&s, "/sendPhoneNumberVerification", target.clone()).await;
+        assert_eq!(e.code(), "ResourceNotFoundException");
+        let mut verify = target.clone();
+        verify["Otp"] = json!("000000");
+        let e = err(&s, "/verifyPhoneNumber", verify).await;
+        assert_eq!(e.code(), "ResourceNotFoundException");
+        assert!(s.state.read().get("777788889999").is_none());
     }
 
     #[tokio::test]
