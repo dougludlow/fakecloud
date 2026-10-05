@@ -2946,6 +2946,13 @@ impl OpenSearchService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let dom = label(l.domain.as_deref())?;
         let dry_run_id = req.query_params.get("dryRunId").filter(|id| !id.is_empty());
+        if let Some(id) = dry_run_id {
+            if !is_guid(id) {
+                return Err(validation(format!(
+                    "1 validation error detected: Value '{id}' at 'dryRunId' failed to satisfy constraint: Member must satisfy regular expression pattern: \\p{{XDigit}}{{8}}-\\p{{XDigit}}{{4}}-\\p{{XDigit}}{{4}}-\\p{{XDigit}}{{4}}-\\p{{XDigit}}{{12}}"
+                )));
+            }
+        }
         let accounts = self.state.read();
         let d = accounts
             .get(&req.account_id)
@@ -3822,6 +3829,16 @@ fn validate_domain_name(name: &str) -> Result<(), AwsServiceError> {
         return Err(validation("DomainName must match [a-z][a-z0-9\\-]+."));
     }
     Ok(())
+}
+
+/// Whether `s` matches the model's `GUID` shape (8-4-4-4-12 hex digits).
+fn is_guid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn validation(msg: impl Into<String>) -> AwsServiceError {

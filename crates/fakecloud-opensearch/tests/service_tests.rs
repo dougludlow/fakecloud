@@ -2251,6 +2251,11 @@ async fn dry_run_progress_reports_the_requested_dry_run() {
         call_err(&svc, progress(Some("00000000-0000-4000-8000-000000000000"))).await,
         (409, "ResourceNotFoundException".to_string())
     );
+    // A DryRunId that is not a GUID fails validation before the lookup.
+    assert_eq!(
+        call_err(&svc, progress(Some("not-a-guid"))).await,
+        (400, "ValidationException".to_string())
+    );
 
     // An unknown domain is not found.
     assert_eq!(

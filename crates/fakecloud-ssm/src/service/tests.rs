@@ -6559,3 +6559,31 @@ fn legacy_document_sharing_is_split_from_policy_grants() {
         vec!["111111111111"]
     );
 }
+
+#[test]
+fn deleted_document_policies_do_not_share_a_recreated_document() {
+    let svc = make_service();
+    create_doc(&svc, "RecreatedDoc");
+    let arn = "arn:aws:ssm:us-east-1:123456789012:document/RecreatedDoc";
+    put_document_share_policy(&svc, arn, "222222222222");
+    svc.delete_document(&make_request(
+        "DeleteDocument",
+        json!({"Name": "RecreatedDoc"}),
+    ))
+    .unwrap();
+
+    create_doc(&svc, "RecreatedDoc");
+    svc.modify_document_permission(&make_request(
+        "ModifyDocumentPermission",
+        json!({
+            "Name": "RecreatedDoc",
+            "PermissionType": "Share",
+            "AccountIdsToAdd": ["111111111111"],
+        }),
+    ))
+    .unwrap();
+    assert_eq!(
+        document_share_accounts(&svc, "RecreatedDoc"),
+        vec!["111111111111"]
+    );
+}

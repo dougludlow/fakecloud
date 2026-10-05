@@ -373,7 +373,7 @@ fn parse_resource_id(s: &str, field: &str, kind: &str) -> Result<String, AwsServ
     let (arn_kind, id) = arn_resource(s, "identitystore")
         .and_then(|r| r.strip_prefix("::"))
         .and_then(|r| r.split_once('/'))
-        .filter(|(_, id)| !id.is_empty())
+        .filter(|(_, id)| !id.is_empty() && !id.contains('/'))
         .ok_or_else(|| validation(&format!("{field} is not a valid identity store ARN.")))?;
     if arn_kind != kind {
         return Err(validation(&format!(
@@ -2036,6 +2036,13 @@ mod tests {
             &s,
             "IsMemberInGroups",
             json!({ "IdentityStoreId": sid, "MemberId": { "UserId": uid }, "GroupIds": [uarn] }),
+        );
+        assert_eq!(err.code(), "ValidationException");
+        // A slash inside the id is not a valid resource ARN.
+        let err = call_err(
+            &s,
+            "DescribeUser",
+            json!({ "IdentityStoreId": sid, "UserId": format!("{uarn}/x") }),
         );
         assert_eq!(err.code(), "ValidationException");
         // Over the model's 100-char cap.

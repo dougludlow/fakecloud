@@ -410,6 +410,11 @@ impl SsmService {
             if state.documents.remove(name).is_none() {
                 return Err(doc_not_found(name));
             }
+            // A document's resource policies go with it, so a document later
+            // created under the same name does not inherit their sharing.
+            state
+                .resource_policies
+                .retain(|p| document_name_from_arn(&p.resource_arn) != Some(name));
         }
 
         Ok(AwsResponse::ok_json(json!({})))
