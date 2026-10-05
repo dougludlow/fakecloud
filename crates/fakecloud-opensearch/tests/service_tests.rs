@@ -392,6 +392,111 @@ async fn dry_run_config_update_does_not_persist() {
 }
 
 #[tokio::test]
+async fn accepted_warnings_are_reported_on_change_and_dry_run_progress() {
+    let svc = service();
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("{OS}/opensearch/domain"),
+            json!({"DomainName": "warn", "EngineVersion": "OpenSearch_2.9"}),
+        ),
+    )
+    .await;
+
+    // A dry run records its accepted warnings without applying the change.
+    let dry = json_of(
+        &call(
+            &svc,
+            req(
+                Method::POST,
+                &format!("{OS}/opensearch/domain/warn/config"),
+                json!({
+                    "EBSOptions": {"EBSEnabled": true, "VolumeSize": 20},
+                    "DryRun": true,
+                    "AcceptedWarnings": ["DryRunWarning"],
+                }),
+            ),
+        )
+        .await,
+    );
+    let dry_status = &dry["DryRunProgressStatus"];
+    assert_eq!(dry_status["AcceptedWarnings"], json!(["DryRunWarning"]));
+    assert_eq!(dry_status["ValidationFailures"], json!([]));
+    let dry_id = dry_status["DryRunId"].as_str().unwrap().to_string();
+    let progress = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/warn/dryRun"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(progress["DryRunProgressStatus"]["DryRunId"], dry_id);
+    assert_eq!(
+        progress["DryRunProgressStatus"]["AcceptedWarnings"],
+        json!(["DryRunWarning"])
+    );
+
+    // An applied change reports its accepted warnings and touched members,
+    // and AcceptedWarnings is not persisted as a domain config member.
+    let updated = json_of(
+        &call(
+            &svc,
+            req(
+                Method::POST,
+                &format!("{OS}/opensearch/domain/warn/config"),
+                json!({
+                    "EBSOptions": {"EBSEnabled": true, "VolumeSize": 20},
+                    "AcceptedWarnings": ["ShardCountWarning", "MemoryWarning"],
+                }),
+            ),
+        )
+        .await,
+    );
+    assert!(updated["DomainConfig"].get("AcceptedWarnings").is_none());
+    let change = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/warn/progress"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    let status = &change["ChangeProgressStatus"];
+    assert_eq!(
+        status["AcceptedWarnings"],
+        json!(["ShardCountWarning", "MemoryWarning"])
+    );
+    assert_eq!(status["CompletedProperties"], json!(["EBSOptions"]));
+    assert_eq!(status["ValidationFailures"], json!([]));
+    assert_eq!(status["ConfigChangeStatus"], "Completed");
+    assert_eq!(status["InitiatedBy"], "CUSTOMER");
+    // The change id is stable across reads.
+    let again = json_of(
+        &call(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/warn/progress"),
+                json!({}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        again["ChangeProgressStatus"]["ChangeId"],
+        status["ChangeId"]
+    );
+}
+
+#[tokio::test]
 async fn delete_domain_removes_it() {
     let svc = service();
     call(
