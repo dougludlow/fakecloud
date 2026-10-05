@@ -281,14 +281,14 @@ impl ResourceProvisioner {
         let state = accounts.regional_mut(&self.account_id, &self.region);
         // The update is built on a copy and checked against the quotas
         // before it replaces `$LATEST`, so a refused update changes nothing.
-        let original = state
+        let mut func = state
             .functions
             .get(&function_name)
             .cloned()
             .ok_or_else(|| {
                 format!("Cannot update {function_name}: function does not exist in lambda state")
             })?;
-        let mut func = original.clone();
+        let old_size = fakecloud_lambda::quota::stored_code_size(&func);
 
         func.runtime = cfg.runtime;
         func.role = cfg.role;
@@ -325,7 +325,7 @@ impl ResourceProvisioner {
 
         // The same check `UpdateFunctionCode` runs on its updated record, so
         // S3-sourced code and container images count alike.
-        fakecloud_lambda::quota::check_replaced_code(state, storage_limit, &original, &func, false)
+        fakecloud_lambda::quota::check_replaced_code(state, storage_limit, old_size, &func, false)
             .map_err(|e| super::quota::refusal("Lambda", e))?;
         if let Some(reserved) = cfg.reserved_concurrent_executions {
             let limit = fakecloud_lambda::quota::concurrency_limit(state, concurrency_quota);

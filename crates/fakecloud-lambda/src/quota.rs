@@ -103,15 +103,15 @@ pub fn check_new_code(
     Ok(())
 }
 
-/// Refuse replacing the `$LATEST` record `old` with `new` (and, when
-/// `publish_copy`, also storing `new`'s code as a published version) when
-/// that grows storage past the enforced `limit`. Both `UpdateFunctionCode`
+/// Refuse replacing a `$LATEST` record that stores `old_size` bytes with
+/// `new` (and, when `publish_copy`, also storing `new`'s code as a published
+/// version) when that grows storage past the enforced `limit`. Both `UpdateFunctionCode`
 /// and a CloudFormation function update build the updated record first and
 /// check it here, so S3-sourced code and container images count the same.
 pub fn check_replaced_code(
     state: &LambdaState,
     limit: Option<i64>,
-    old: &LambdaFunction,
+    old_size: i64,
     new: &LambdaFunction,
     publish_copy: bool,
 ) -> Result<(), AwsServiceError> {
@@ -120,7 +120,7 @@ pub fn check_replaced_code(
     };
     let before = code_storage_used(state);
     let new_size = stored_code_size(new);
-    let after = before - stored_code_size(old) + new_size + if publish_copy { new_size } else { 0 };
+    let after = before - old_size + new_size + if publish_copy { new_size } else { 0 };
     if after > limit && after > before {
         return Err(storage_exceeded());
     }
@@ -135,13 +135,26 @@ pub const DEFAULT_CONCURRENT_EXECUTIONS: i64 = 1000;
 /// The AWS default "Function and layer storage", in bytes (300 GB).
 pub const DEFAULT_CODE_STORAGE_BYTES: i64 = 300 * 1024 * 1024 * 1024;
 
-/// A stored account setting, unless it is unset (0, as a state migrated from
-/// an older snapshot carries).
+/// `value`, unless it is 0 or less: an unset account setting (a state migrated
+/// from an older snapshot carries all-zero settings), not a limit of 0.
+pub fn setting_or(value: i64, default: i64) -> i64 {
+    if value > 0 {
+        value
+    } else {
+        default
+    }
+}
+
+/// A stored account setting, unless it is unset (see [`setting_or`]).
 fn stored(
     state: &LambdaState,
     pick: impl Fn(&crate::state::AccountSettings) -> i64,
 ) -> Option<i64> {
-    state.account_settings.as_ref().map(pick).filter(|v| *v > 0)
+    state
+        .account_settings
+        .as_ref()
+        .map(pick)
+        .filter(|v| setting_or(*v, 0) > 0)
 }
 
 /// The concurrency limit of `state`'s Region: the applied Service Quotas

@@ -597,8 +597,8 @@ impl LambdaService {
         // The update is built on a copy and checked against the code storage
         // quota before it replaces `$LATEST`, so a refused update changes
         // nothing.
-        let original = func.clone();
-        let mut func = original.clone();
+        let old_size = crate::quota::stored_code_size(func);
+        let mut func = func.clone();
 
         let mut changed = false;
         if let Some(bytes) = new_zip {
@@ -685,22 +685,25 @@ impl LambdaService {
         // With Publish=true the new code is also stored as a published
         // version (unless publishing would return the latest version
         // unchanged), so both copies must fit before `$LATEST` changes.
-        let publish_copy = publish
+        // Measured once: the publish step below does not check again.
+        let publish_copy = storage_limit.is_some()
+            && publish
             && crate::service::publish_creates_version(
                 state,
                 function_name,
                 &func,
                 body["Description"].as_str(),
             );
-        crate::quota::check_replaced_code(state, storage_limit, &original, &func, publish_copy)?;
+        crate::quota::check_replaced_code(state, storage_limit, old_size, &func, publish_copy)?;
         let response = self.function_config_json(&func);
         state.functions.insert(function_name.to_string(), func);
 
         // Publish=true mints a new immutable version snapshot off the
-        // freshly updated $LATEST and returns that version's config.
+        // freshly updated $LATEST and returns that version's config, under
+        // the same lock. The request's RevisionId was checked against the
+        // `$LATEST` it replaced, so it is not re-checked against the new one.
         if publish {
-            drop(accounts);
-            return self.publish_version(function_name, &req.account_id, req);
+            return self.publish_locked(state, function_name, body["Description"].as_str(), None);
         }
 
         ok(response)

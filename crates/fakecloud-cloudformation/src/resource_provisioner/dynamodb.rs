@@ -554,11 +554,13 @@ impl ResourceProvisioner {
         };
         // Every replica is a new table in its region: check them all before
         // the local table is created, so a refused replica leaves no table.
+        // A declared TableName that a replica region already holds is not a
+        // new table there; a generated name is not decided yet.
         let replica_limits = self.replica_table_limits(replicas);
         fakecloud_dynamodb::quota::check_new_replicas(
             &self.dynamodb_state.read(),
             &self.account_id,
-            None,
+            props.get("TableName").and_then(|v| v.as_str()),
             &replica_limits,
         )
         .map_err(|e| super::quota::refusal("DynamoDb", e))?;
@@ -568,13 +570,20 @@ impl ResourceProvisioner {
         // The other replicas are real tables in their own regions, kept in
         // step with this one (DynamoDB global tables version 2019.11.21).
         let mut accounts = self.dynamodb_state.write();
-        fakecloud_dynamodb::set_table_replicas(
+        if let Err(e) = fakecloud_dynamodb::set_table_replicas(
             &mut accounts,
             &self.account_id,
             &self.region,
             &table_name,
             &replica_specs(replicas),
-        )?;
+        ) {
+            // Roll back the local table just created, so a failed global
+            // table leaves nothing behind.
+            if let Some(state) = accounts.regional_get_mut(&self.account_id, &self.region) {
+                state.tables.remove(&table_name);
+            }
+            return Err(e);
+        }
         let table_id = accounts
             .regional(&self.account_id, &self.region)
             .and_then(|s| s.tables.get(&table_name))

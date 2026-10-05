@@ -203,6 +203,16 @@ fn increase_must_exceed_current_value_and_quota_must_be_adjustable() {
         call_err(&s, "RequestServiceQuotaIncrease", fixed).code(),
         "IllegalArgumentException"
     );
+    // Lambda function and layer storage is not increasable on AWS.
+    let storage = json!({
+        "ServiceCode": "lambda",
+        "QuotaCode": "L-2ACBD22F",
+        "DesiredValue": 400.0,
+    });
+    assert_eq!(
+        call_err(&s, "RequestServiceQuotaIncrease", storage).code(),
+        "IllegalArgumentException"
+    );
 }
 
 #[test]

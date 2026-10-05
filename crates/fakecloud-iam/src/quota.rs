@@ -112,15 +112,23 @@ pub fn check(
 /// providers) when `state` already holds as many as the enforced `limit`.
 /// The IAM API and CloudFormation both create through here. A `None` limit
 /// accepts anything.
+///
+/// # Panics
+///
+/// On a per-principal quota (managed policies per role, user or group, role
+/// trust policy length), which has no account count: those are checked with
+/// [`check_attachments`] and [`check_trust_policy`].
 pub fn check_new(
     state: &IamState,
     quota: IamQuota,
     limit: Option<usize>,
 ) -> Result<(), AwsServiceError> {
+    let usage = account_usage(state, quota)
+        .unwrap_or_else(|| panic!("check_new takes an account-level quota, not {quota:?}"));
     if limit.is_none() {
         return Ok(());
     }
-    check(quota, limit, account_usage(state, quota).unwrap_or(0) + 1)
+    check(quota, limit, usage + 1)
 }
 
 /// The managed policies a principal holds after attaching `adding` to
@@ -273,6 +281,13 @@ mod tests {
             &["c".into()]
         )
         .is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "account-level quota")]
+    fn check_new_refuses_a_per_principal_quota() {
+        let state = IamState::new_in_region("123456789012", "us-east-1");
+        let _ = check_new(&state, IamQuota::ManagedPoliciesPerRole, None);
     }
 
     #[test]

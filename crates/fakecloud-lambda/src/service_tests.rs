@@ -5371,3 +5371,32 @@ async fn a_migrated_zero_account_setting_does_not_block_reservations() {
     );
     assert_eq!(settings["AccountLimit"]["CodeSizeZipped"], 52_428_800);
 }
+
+#[tokio::test]
+async fn update_function_code_with_publish_and_revision_id_publishes_the_new_code() {
+    let svc = LambdaService::new(make_state());
+    create_in_region(&svc, "rev", "us-east-1", "").await;
+    let func = json_body(
+        &lambda_call(&svc, Method::GET, "/2015-03-31/functions/rev", Value::Null)
+            .await
+            .unwrap(),
+    );
+    let revision = func["Configuration"]["RevisionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The RevisionId names the `$LATEST` being replaced; publishing the new
+    // `$LATEST` must not re-check it against the updated revision.
+    let published = json_body(
+        &lambda_call(
+            &svc,
+            Method::PUT,
+            "/2015-03-31/functions/rev/code",
+            json!({"ZipFile": b64(b"newer"), "Publish": true, "RevisionId": revision}),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(published["Version"], "1");
+    assert_eq!(published["CodeSize"], 5);
+}

@@ -236,6 +236,11 @@ mod tests {
 
     /// A table limit of 1 in every region, with eu-west-1 already full.
     fn full_west() -> ResourceProvisioner {
+        full_west_holding("occupant")
+    }
+
+    /// Like [`full_west`], with eu-west-1's one table named `name`.
+    fn full_west_holding(name: &str) -> ResourceProvisioner {
         let prov = enforcing(fakecloud_core::quota::FixedQuotas::default().with(
             "dynamodb",
             "L-F98FE922",
@@ -244,10 +249,10 @@ mod tests {
         let mut accounts = prov.dynamodb_state.write();
         let west = accounts.regional_mut(&prov.account_id, "eu-west-1");
         west.tables.insert(
-            "occupant".to_string(),
+            name.to_string(),
             fakecloud_dynamodb::DynamoTable::new(
-                "occupant".to_string(),
-                "arn:aws:dynamodb:eu-west-1:123456789012:table/occupant".to_string(),
+                name.to_string(),
+                format!("arn:aws:dynamodb:eu-west-1:123456789012:table/{name}"),
                 "id".to_string(),
                 Vec::new(),
                 Vec::new(),
@@ -353,5 +358,24 @@ mod tests {
             .unwrap()
             .functions["sized"];
         assert_eq!(func.code_size, 8, "$LATEST keeps its package");
+    }
+
+    #[test]
+    fn a_replica_region_holding_the_declared_name_is_not_a_new_table_and_failure_rolls_back() {
+        // eu-west-1 is at its limit of 1 with a table already named `glob`:
+        // that is not a new table, so the quota does not refuse it, and the
+        // replica step then fails (the region already holds the name). The
+        // local table created before that step is rolled back.
+        let prov = full_west_holding("glob");
+        let region = prov.region.clone();
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::DynamoDB::GlobalTable",
+                "G",
+                global_table(&[&region, "eu-west-1"]),
+            ))
+            .expect_err("the replica region already holds the table");
+        assert!(!err.contains("LimitExceededException"), "{err}");
+        assert!(local_tables(&prov).is_empty(), "local table rolled back");
     }
 }

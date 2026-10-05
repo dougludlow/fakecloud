@@ -30,7 +30,7 @@ account:
 | `vpc` | 25 quotas, including `L-2AFB9258` Security groups per network interface (5), `L-0EA8095F` Inbound or outbound rules per security group (60), `L-F678F1CE` VPCs per Region (5), `L-407747CB` Subnets per VPC (200), `L-E79EC296` VPC security groups per Region (2500), `L-93826ACB` Routes per route table (500) |
 | `ec2` | On-Demand and Spot vCPU quotas (`L-1216C47A`, `L-34B43A08`, with their `AWS/Usage` usage metric), EC2-VPC Elastic IPs (`L-0263D0A3`), the accelerated-instance families, transit gateways, Site-to-Site VPN connections |
 | `iam` | Users, roles, groups, instance profiles, managed policies per role (20)/user/group, customer managed policies, role trust policy length, server certificates, OIDC providers (global quotas) |
-| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function and layer storage (300 GB), general purpose buckets, tables, customer managed keys |
+| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function and layer storage (300 GB, not adjustable: an increase request is an `IllegalArgumentException`, but the introspection API can still set its applied value), general purpose buckets, tables, customer managed keys |
 
 `ListServices` returns these services. An unknown service code or quota code
 returns `NoSuchResourceException`.

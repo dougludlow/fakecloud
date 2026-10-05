@@ -1038,21 +1038,6 @@ impl Drop for ConcurrencyGuard {
     }
 }
 
-/// Map an Invoke `Qualifier` (alias name, numeric version, or
-/// `$LATEST`) to a concrete numeric version string. Aliases with a
-/// `RoutingConfig.AdditionalVersionWeights` table do a weighted pick
-/// across the alias's primary `function_version` plus the additional
-/// True when `prev` is byte-equivalent to `live` for every field
-/// that `PublishVersion` would otherwise capture into a new snapshot.
-/// Used to short-circuit a no-op publish (AWS-style idempotency:
-/// re-publishing without any change returns the previous version
-/// unchanged). The comparison spans code identity (sha + size),
-/// configuration (runtime/handler/role/timeout/memory/env/layers/...)
-/// and every advanced field round-tripped through
-/// `function_config_json`. The caller is responsible for resolving
-/// the `effective_description` (caller-supplied override wins over
-/// the live `$LATEST` description, matching real PublishVersion
-/// semantics).
 /// Whether publishing `func` (the `$LATEST` record of `function_name`) would
 /// store a new version: false when the latest published version already has
 /// the same code and configuration, in which case `PublishVersion` returns
@@ -1082,6 +1067,21 @@ pub(crate) fn publish_creates_version(
     !function_config_unchanged_for_publish(prev_snap, func, effective_desc)
 }
 
+/// Map an Invoke `Qualifier` (alias name, numeric version, or
+/// `$LATEST`) to a concrete numeric version string. Aliases with a
+/// `RoutingConfig.AdditionalVersionWeights` table do a weighted pick
+/// across the alias's primary `function_version` plus the additional
+/// True when `prev` is byte-equivalent to `live` for every field
+/// that `PublishVersion` would otherwise capture into a new snapshot.
+/// Used to short-circuit a no-op publish (AWS-style idempotency:
+/// re-publishing without any change returns the previous version
+/// unchanged). The comparison spans code identity (sha + size),
+/// configuration (runtime/handler/role/timeout/memory/env/layers/...)
+/// and every advanced field round-tripped through
+/// `function_config_json`. The caller is responsible for resolving
+/// the `effective_description` (caller-supplied override wins over
+/// the live `$LATEST` description, matching real PublishVersion
+/// semantics).
 fn function_config_unchanged_for_publish(
     prev: &LambdaFunction,
     live: &LambdaFunction,

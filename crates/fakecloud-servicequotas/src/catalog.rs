@@ -471,7 +471,7 @@ pub const QUOTAS: &[QuotaDef] = &[
             "L-2ACBD22F",
             "Function and layer storage",
             300.0,
-            true,
+            false,
         ),
         "Gigabytes",
     )),
@@ -572,7 +572,7 @@ mod tests {
             ("iam", "L-C07B4B0D", 2048.0, Some(8192.0), true),
             ("iam", "L-BF35879D", 20.0, Some(20.0), true),
             ("iam", "L-858F3967", 100.0, Some(700.0), true),
-            ("lambda", "L-2ACBD22F", 300.0, None, true),
+            ("lambda", "L-2ACBD22F", 300.0, None, false),
         ];
         for &(service, code, default, max_value, adjustable) in cases {
             let q = quota(service, code).unwrap_or_else(|| panic!("{code} missing"));
