@@ -312,11 +312,6 @@ impl Cli {
     /// The server-wide quota settings the flags describe: what the server
     /// starts with and what a reset restores.
     pub fn quota_settings(&self) -> Result<fakecloud_servicequotas::QuotaSettings, String> {
-        let resolve = |reference: &str| {
-            fakecloud_servicequotas::catalog::parse_ref(reference.trim()).ok_or_else(|| {
-                format!("unknown quota {reference:?}: expected SERVICE_CODE/QUOTA_CODE from the Service Quotas catalog")
-            })
-        };
         let mut settings = fakecloud_servicequotas::QuotaSettings {
             enforce_all: self.enforce_quotas,
             request_approval: self.quota_requests.map(Into::into).unwrap_or_default(),
@@ -330,7 +325,9 @@ impl Cli {
                 .collect()
         };
         let resolve_enforceable = |reference: &str| {
-            let def = resolve(reference)?;
+            let def = fakecloud_servicequotas::catalog::parse_ref(reference).ok_or_else(|| {
+                format!("unknown quota {reference:?}: expected SERVICE_CODE/QUOTA_CODE from the Service Quotas catalog")
+            })?;
             if !def.enforceable {
                 return Err(format!(
                     "quota {reference} ({}) is not enforceable: no fakecloud service checks requests against it",

@@ -1236,6 +1236,26 @@ mod tests {
             .get("123456789012")
             .is_some_and(|d| d.applied.is_empty()));
         assert!(state.servicequotas_settings.read().enforce_all);
+        // A per-account reset keeps the organization template marker, so the
+        // template is not applied to the account a second time.
+        {
+            let mut sq = state.servicequotas.write();
+            let data = sq.get_or_create("123456789012");
+            data.template_checked = Some("111111111111@marker".into());
+            data.applied.insert("us-east-1|vpc|L-2AFB9258".into(), 9.0);
+        }
+        state
+            .reset_service_for_account("servicequotas", "123456789012")
+            .expect("reset servicequotas for account");
+        {
+            let sq = state.servicequotas.read();
+            let data = sq.get("123456789012").unwrap();
+            assert!(data.applied.is_empty());
+            assert_eq!(
+                data.template_checked.as_deref(),
+                Some("111111111111@marker")
+            );
+        }
 
         state.reset_service("ec2").expect("reset ec2");
         state.reset_service("rds").expect("reset rds");

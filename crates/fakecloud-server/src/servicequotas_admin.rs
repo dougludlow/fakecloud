@@ -96,9 +96,18 @@ async fn get_enforcement(State(svc): State<Svc>) -> Response {
 }
 
 async fn put_enforcement(State(svc): State<Svc>, body: axum::body::Bytes) -> Response {
-    let result =
-        parse_body::<PutEnforcementRequest>(&body).and_then(|b| svc.introspect_put_enforcement(&b));
-    respond_saved(&svc, result).await
+    let body = match parse_body::<PutEnforcementRequest>(&body) {
+        Ok(b) => b,
+        Err(e) => return respond(Err(e)),
+    };
+    let result = svc.introspect_put_enforcement(&body);
+    // Only per-account overrides are persisted account data; the global
+    // switch and server-wide overrides are not.
+    if body.overrides.iter().any(|o| o.account_id.is_some()) {
+        respond_saved(&svc, result).await
+    } else {
+        respond(result)
+    }
 }
 
 async fn get_request_approval(State(svc): State<Svc>) -> Response {

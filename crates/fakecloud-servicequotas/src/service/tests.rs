@@ -1033,3 +1033,25 @@ fn an_override_on_a_quota_no_service_checks_is_refused() {
         .introspect_put_quota("lambda", "L-B99A9384", &body)
         .is_ok());
 }
+
+#[test]
+fn approving_a_request_already_met_is_a_no_op_not_a_conflict() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(10.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Meanwhile groups go to 12 and rules to 120: 10 x 120 would pass the
+    // product limit, but approving changes nothing.
+    for (code, v) in [("L-2AFB9258", 12.0), ("L-0EA8095F", 120.0)] {
+        let b: PutQuotaRequest = serde_json::from_value(json!({ "value": v })).unwrap();
+        s.introspect_put_quota("vpc", code, &b).unwrap();
+    }
+    let decided = s.introspect_decide_request(&id, Decision::Approve).unwrap();
+    assert_eq!(decided["status"], "APPROVED");
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 12.0);
+}

@@ -410,7 +410,7 @@ and accepts, or is created through `CreateAccount`. Naming an
 | `/_fakecloud/service-quotas/enforcement` | GET / PUT | The global switch and per-quota overrides (server-wide and per account). |
 | `/_fakecloud/service-quotas/request-approval` | GET / PUT | `{mode: "auto" \| "manual"}`: how increase requests are decided. |
 | `/_fakecloud/service-quotas/requests` | GET | Increase requests across accounts, newest first. Query: `accountId`, `status`. |
-| `/_fakecloud/service-quotas/requests/{id}/approve` | POST | Approve a `PENDING` or `CASE_OPENED` request and raise the applied value. |
+| `/_fakecloud/service-quotas/requests/{id}/approve` | POST | Approve a `PENDING` or `CASE_OPENED` request and raise the applied value (never lower it). 409 if AWS would no longer approve the value (past its maximum or the security-group product limit). |
 | `/_fakecloud/service-quotas/requests/{id}/deny` | POST | Close a pending request without raising the quota. Body `{status?}` (`DENIED` default, `NOT_APPROVED`, `CASE_CLOSED`, `INVALID_REQUEST`). |
 
 See [Service Quotas](/docs/services/servicequotas/#introspection) for semantics.

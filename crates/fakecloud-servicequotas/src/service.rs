@@ -31,13 +31,13 @@ use fakecloud_persistence::SnapshotStore;
 use crate::catalog::{self, QuotaDef};
 use crate::persistence::save_snapshot;
 use crate::provider::{
-    applied_value, apply_template_if_new, approvable, new_request_id, quota_arn, quota_region,
-    requester,
+    applied_value, apply_template_if_new, decide_submission, new_request_id, quota_arn,
+    quota_region, requester,
 };
-use crate::settings::{RequestApproval, SharedQuotaSettings};
+use crate::settings::SharedQuotaSettings;
 use crate::state::{
-    applied_key, template_key, AutoManagement, QuotaRequest, SharedServiceQuotasState,
-    TemplateEntry, UtilizationEntry, UtilizationReport,
+    template_key, AutoManagement, QuotaRequest, SharedServiceQuotasState, TemplateEntry,
+    UtilizationEntry, UtilizationReport,
 };
 use crate::validate::{
     check_str, illegal_argument, opt_bool, opt_enum, opt_int, opt_plain_str, opt_str, req_double,
@@ -636,23 +636,10 @@ impl ServiceQuotasService {
             requester: requester(&req.account_id, &caller),
             quota_arn: quota_arn(&req.region, &req.account_id, def),
         };
-        // The request is returned as AWS returns it on submission (PENDING).
-        // Under automatic approval it is decided straight away, so every later
-        // read sees the outcome; under manual approval it waits for the
-        // introspection API.
+        // The request is returned as AWS returns it on submission (PENDING);
+        // every later read sees the decision (see `decide_submission`).
         let response = request_json(&request);
-        // A value AWS would never approve is NOT_APPROVED straight away in
-        // either mode; only an approvable request waits under manual approval.
-        let approved = approvable(data, &req.region, def, desired);
-        if !approved {
-            request.status = "NOT_APPROVED".to_string();
-        } else if approval == RequestApproval::Auto {
-            request.status = "APPROVED".to_string();
-            data.applied.insert(
-                applied_key(&req.region, def.global, def.service_code, def.quota_code),
-                desired,
-            );
-        }
+        request.status = decide_submission(data, &req.region, def, desired, approval).to_string();
         data.requests.insert(id, request);
         ok(json!({ "RequestedQuota": response }))
     }

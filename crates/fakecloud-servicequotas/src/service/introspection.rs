@@ -500,7 +500,10 @@ impl ServiceQuotasService {
                 // limits (a documented maximum, the security-group product)
                 // still hold: values may have changed since submission.
                 if let Some(def) = catalog::quota(&request.service_code, &request.quota_code) {
-                    if !approvable(data, &request.region, def, request.desired_value) {
+                    let current = applied_value(Some(data), &request.region, def);
+                    if request.desired_value > current
+                        && !approvable(data, &request.region, def, request.desired_value)
+                    {
                         return Err(IntrospectionError {
                             status: StatusCode::CONFLICT,
                             message: format!(
@@ -512,7 +515,6 @@ impl ServiceQuotasService {
                             ),
                         });
                     }
-                    let current = applied_value(Some(data), &request.region, def);
                     data.applied.insert(
                         applied_key(
                             &request.region,

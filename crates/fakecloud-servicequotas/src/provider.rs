@@ -152,24 +152,7 @@ pub fn apply_template_if_new(
         }
         // Template entries are submitted as ordinary increase requests, so
         // they are decided on the same terms.
-        let status = if !approvable(data, &entry.aws_region, def, entry.desired_value) {
-            "NOT_APPROVED"
-        } else if approval == RequestApproval::Manual {
-            "PENDING"
-        } else {
-            "APPROVED"
-        };
-        if status == "APPROVED" {
-            data.applied.insert(
-                applied_key(
-                    &entry.aws_region,
-                    def.global,
-                    def.service_code,
-                    def.quota_code,
-                ),
-                entry.desired_value,
-            );
-        }
+        let status = decide_submission(data, &entry.aws_region, def, entry.desired_value, approval);
         let caller =
             fakecloud_aws::arn::Arn::global_in(&entry.aws_region, "iam", &management, "root")
                 .to_string();
@@ -192,6 +175,30 @@ pub fn apply_template_if_new(
         );
     }
     true
+}
+
+/// Decide a newly submitted increase request and return its status: a value
+/// AWS would never approve is `NOT_APPROVED` in either mode; otherwise it is
+/// `APPROVED` (and the applied value raised) under automatic approval, or left
+/// `PENDING` for the introspection API under manual approval.
+pub fn decide_submission(
+    data: &mut ServiceQuotasData,
+    region: &str,
+    def: &QuotaDef,
+    desired: f64,
+    approval: RequestApproval,
+) -> &'static str {
+    if !approvable(data, region, def, desired) {
+        return "NOT_APPROVED";
+    }
+    if approval == RequestApproval::Manual {
+        return "PENDING";
+    }
+    data.applied.insert(
+        applied_key(region, def.global, def.service_code, def.quota_code),
+        desired,
+    );
+    "APPROVED"
 }
 
 /// Whether AWS would approve raising `def` to `desired`: not above the
