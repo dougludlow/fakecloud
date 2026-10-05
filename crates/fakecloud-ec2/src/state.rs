@@ -1250,7 +1250,7 @@ pub struct IpamInternetRegistryAssociation {
     pub id: String,
     pub ipam_id: String,
     pub region: String,
-    /// `Rir`: ripe | apnic | arin | lacnic.
+    /// `Rir`: ripe | apnic | arin | lacnic | nicbr.
     pub rir: String,
     pub organization_handle: String,
     pub description: Option<String>,
@@ -1529,6 +1529,50 @@ pub struct ClientVpnEndpoint {
     /// Ingress authorization rule target CIDRs.
     #[serde(default)]
     pub auth_rules: Vec<String>,
+    /// `ConnectionLogOptions` as last set by Create/Modify.
+    #[serde(default)]
+    pub connection_log: ClientVpnConnectionLog,
+    /// Device trust providers from `DevicePostureOptions`. Empty when device
+    /// posture evaluation is disabled.
+    #[serde(default)]
+    pub trust_providers: Vec<ClientVpnTrustProvider>,
+    /// The endpoint's authorization policy, if one was set with
+    /// `ModifyClientVpnEndpointAuthorizationPolicy`.
+    #[serde(default)]
+    pub authorization_policy: Option<ClientVpnAuthorizationPolicy>,
+}
+
+/// Client connection logging options of a Client VPN endpoint.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClientVpnConnectionLog {
+    pub enabled: bool,
+    pub log_group: Option<String>,
+    pub log_stream: Option<String>,
+    pub include_authorization_policy_context: Option<bool>,
+}
+
+/// A device trust provider configured on a Client VPN endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientVpnTrustProvider {
+    /// `crowdstrike` | `jamf` | `jumpcloud`.
+    pub trust_provider_type: Option<String>,
+    pub tenant_id: Option<String>,
+    pub public_signing_key_url: Option<String>,
+}
+
+/// The (single) Cedar authorization policy of a Client VPN endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClientVpnAuthorizationPolicy {
+    pub policy_document: String,
+    pub description: Option<String>,
+    /// `enabled` | `disabled`.
+    pub shadow_mode: String,
+    /// `ClientVpnAuthorizationPolicyStatus`.
+    pub status: String,
+    /// `ClientToken` -> (request fingerprint, status that call returned), so a
+    /// retried Modify replays its original answer.
+    #[serde(default)]
+    pub client_tokens: BTreeMap<String, (String, String)>,
 }
 
 /// A Transit Gateway peering attachment.

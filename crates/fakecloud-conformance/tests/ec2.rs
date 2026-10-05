@@ -14062,3 +14062,122 @@ async fn ec2_validate_security_group_quotas_for_interface() {
 fn body_has_code(body: &str, code: &str) -> bool {
     body.contains(&format!("<Code>{code}</Code>"))
 }
+
+// ---- Client VPN authorization policy (not yet in aws-sdk-ec2) ----
+
+const CVPN_POLICY: &str = "permit%28principal%2C%20action%2C%20resource%29%3B";
+
+#[test_action(
+    "ec2",
+    "ModifyClientVpnEndpointAuthorizationPolicy",
+    checksum = "5d19b553"
+)]
+#[tokio::test]
+async fn ec2_modify_client_vpn_endpoint_authorization_policy() {
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+    let id = make_cvpn(&c).await;
+    let body = ec2_raw(
+        &server,
+        &format!(
+            "Action=ModifyClientVpnEndpointAuthorizationPolicy&Version=2016-11-15\
+             &ClientVpnEndpointId={id}&PolicyDocument={CVPN_POLICY}&ShadowMode=enabled"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(body.contains("<status>creating</status>"), "{body}");
+    let body = ec2_raw(
+        &server,
+        &format!(
+            "Action=ModifyClientVpnEndpointAuthorizationPolicy&Version=2016-11-15\
+             &ClientVpnEndpointId={id}&Description=updated"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(body.contains("<status>updating</status>"), "{body}");
+}
+
+#[test_action(
+    "ec2",
+    "GetClientVpnEndpointAuthorizationPolicy",
+    checksum = "c7eb9066"
+)]
+#[tokio::test]
+async fn ec2_get_client_vpn_endpoint_authorization_policy() {
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+    let id = make_cvpn(&c).await;
+    ec2_raw(
+        &server,
+        &format!(
+            "Action=ModifyClientVpnEndpointAuthorizationPolicy&Version=2016-11-15\
+             &ClientVpnEndpointId={id}&PolicyDocument={CVPN_POLICY}&Description=d"
+        ),
+    )
+    .await;
+    let body = ec2_raw(
+        &server,
+        &format!(
+            "Action=GetClientVpnEndpointAuthorizationPolicy&Version=2016-11-15&ClientVpnEndpointId={id}"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(
+        body.contains("<policyDocument>permit(principal, action, resource);</policyDocument>"),
+        "{body}"
+    );
+    assert!(body.contains("<description>d</description>"), "{body}");
+    assert!(body.contains("<shadowMode>disabled</shadowMode>"), "{body}");
+    assert!(body.contains("<status>active</status>"), "{body}");
+}
+
+#[test_action(
+    "ec2",
+    "DeleteClientVpnEndpointAuthorizationPolicy",
+    checksum = "583cd37f"
+)]
+#[tokio::test]
+async fn ec2_delete_client_vpn_endpoint_authorization_policy() {
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+    let id = make_cvpn(&c).await;
+    ec2_raw(
+        &server,
+        &format!(
+            "Action=ModifyClientVpnEndpointAuthorizationPolicy&Version=2016-11-15\
+             &ClientVpnEndpointId={id}&PolicyDocument={CVPN_POLICY}"
+        ),
+    )
+    .await;
+    let body = ec2_raw(
+        &server,
+        &format!(
+            "Action=DeleteClientVpnEndpointAuthorizationPolicy&Version=2016-11-15&ClientVpnEndpointId={id}"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(body.contains("<status>deleting</status>"), "{body}");
+    let body = ec2_raw(
+        &server,
+        &format!(
+            "Action=GetClientVpnEndpointAuthorizationPolicy&Version=2016-11-15&ClientVpnEndpointId={id}"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(!body.contains("<policyDocument>"), "{body}");
+}

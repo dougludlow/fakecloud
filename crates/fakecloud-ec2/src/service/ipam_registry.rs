@@ -37,7 +37,7 @@ use crate::state::{
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, Tag,
 };
 
-const RIRS: &[&str] = &["ripe", "apnic", "arin", "lacnic"];
+const RIRS: &[&str] = &["ripe", "apnic", "arin", "lacnic", "nicbr"];
 
 /// `MaxResults` and the raw `NextToken` for the module's paginated reads.
 /// `IpamMaxResults` carries `@range 5..1000`.
@@ -1662,6 +1662,41 @@ mod tests {
                 description: String::new(),
             },
         );
+    }
+
+    /// `nicbr` (NIC.br, Brazil's national registry) is a `Rir` the model
+    /// accepts; an unknown registry is still refused.
+    #[test]
+    fn association_accepts_nicbr_and_rejects_unknown_rir() {
+        let svc = Ec2Service::new();
+        seed_ipam(&svc);
+        let created = body(
+            create_ipam_internet_registry_association(
+                &svc,
+                &req(
+                    "CreateIpamInternetRegistryAssociation",
+                    &[
+                        ("IpamId", "ipam-1"),
+                        ("Rir", "nicbr"),
+                        ("OrganizationHandle", "ORG-BR"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(created.contains("<rir>nicbr</rir>"), "{created}");
+        let err = err_of(create_ipam_internet_registry_association(
+            &svc,
+            &req(
+                "CreateIpamInternetRegistryAssociation",
+                &[
+                    ("IpamId", "ipam-1"),
+                    ("Rir", "afrinic-x"),
+                    ("OrganizationHandle", "ORG-X"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
     }
 
     /// Create an association, without enabling it: it cannot publish yet.
