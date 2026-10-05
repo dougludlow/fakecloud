@@ -2195,3 +2195,74 @@ async fn paged_lists_walk_by_next_token() {
     .await;
     assert_eq!((status, code.as_str()), (400, "ValidationException"));
 }
+
+#[tokio::test]
+async fn dry_run_progress_reports_the_requested_dry_run() {
+    let svc = service();
+    call(
+        &svc,
+        req(
+            Method::POST,
+            &format!("{OS}/opensearch/domain"),
+            json!({"DomainName": "dry"}),
+        ),
+    )
+    .await;
+    let progress_path = format!("{OS}/opensearch/domain/dry/dryRun");
+    // No dry run yet: nothing to report rather than a made-up run.
+    assert_eq!(
+        call_err(&svc, req(Method::GET, &progress_path, json!({}))).await,
+        (409, "ResourceNotFoundException".to_string())
+    );
+
+    let mut ids = Vec::new();
+    for size in [20, 30] {
+        let dry = json_of(
+            &call(
+                &svc,
+                req(
+                    Method::POST,
+                    &format!("{OS}/opensearch/domain/dry/config"),
+                    json!({
+                        "EBSOptions": {"EBSEnabled": true, "VolumeSize": size},
+                        "DryRun": true,
+                    }),
+                ),
+            )
+            .await,
+        );
+        ids.push(dry["DryRunProgressStatus"]["DryRunId"].clone());
+    }
+    let progress = |id: Option<&str>| {
+        let r = req(Method::GET, &progress_path, json!({}));
+        match id {
+            Some(id) => with_query(r, "dryRunId", id),
+            None => r,
+        }
+    };
+    // No DryRunId: the latest run. A DryRunId: that run, even an older one.
+    let latest = json_of(&call(&svc, progress(None)).await);
+    assert_eq!(latest["DryRunProgressStatus"]["DryRunId"], ids[1]);
+    for id in &ids {
+        let got = json_of(&call(&svc, progress(id.as_str())).await);
+        assert_eq!(got["DryRunProgressStatus"]["DryRunId"], *id);
+    }
+    assert_eq!(
+        call_err(&svc, progress(Some("00000000-0000-4000-8000-000000000000"))).await,
+        (409, "ResourceNotFoundException".to_string())
+    );
+
+    // An unknown domain is not found.
+    assert_eq!(
+        call_err(
+            &svc,
+            req(
+                Method::GET,
+                &format!("{OS}/opensearch/domain/ghost/dryRun"),
+                json!({}),
+            ),
+        )
+        .await,
+        (409, "ResourceNotFoundException".to_string())
+    );
+}

@@ -106,6 +106,7 @@ impl ResourceProvisioner {
             service_software_status: None,
             last_change: None,
             last_dry_run: None,
+            dry_runs: Vec::new(),
         };
 
         let mut guard = self.opensearch_state.write();

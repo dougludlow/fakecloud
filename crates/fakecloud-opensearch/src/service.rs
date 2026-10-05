@@ -1235,6 +1235,7 @@ impl OpenSearchService {
             service_software_status: None,
             last_change: None,
             last_dry_run: None,
+            dry_runs: Vec::new(),
         };
         // A domain's tags live on the domain itself (`d.tags`); `AddTags` /
         // `RemoveTags` / `ListTags` all operate there via `apply_tag_target`.
@@ -1419,7 +1420,14 @@ impl OpenSearchService {
             };
             out["DryRunResults"] = json!({"DeploymentType": "None", "Message": "No changes"});
             out["DryRunProgressStatus"] = dry_run_progress_json(&run);
-            d.last_dry_run = Some(run);
+            if let Some(prev) = d.last_dry_run.replace(run) {
+                d.dry_runs.push(prev);
+                let excess = d
+                    .dry_runs
+                    .len()
+                    .saturating_sub(crate::state::MAX_DRY_RUN_HISTORY - 1);
+                d.dry_runs.drain(..excess);
+            }
         }
         out["DomainConfig"] = domain_config(d, api);
         Ok(ok(out))
@@ -2937,24 +2945,34 @@ impl OpenSearchService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let dom = label(l.domain.as_deref())?;
-        let last_dry_run = {
-            let accounts = self.state.read();
-            accounts
-                .get(&req.account_id)
-                .and_then(|st| st.domains.get(&dom))
-                .and_then(|d| d.last_dry_run.clone())
-        };
-        if let Some(run) = last_dry_run {
-            return Ok(ok(
-                json!({ "DryRunProgressStatus": dry_run_progress_json(&run) }),
-            ));
+        let dry_run_id = req.query_params.get("dryRunId").filter(|id| !id.is_empty());
+        let accounts = self.state.read();
+        let d = accounts
+            .get(&req.account_id)
+            .and_then(|st| st.domains.get(&dom))
+            .ok_or_else(|| not_found_domain(&dom))?;
+        // The requested dry run, or the latest one when no DryRunId is given.
+        let run = match dry_run_id {
+            Some(id) => d
+                .last_dry_run
+                .iter()
+                .chain(d.dry_runs.iter().rev())
+                .find(|r| &r.dry_run_id == id),
+            None => d.last_dry_run.as_ref(),
         }
-        Ok(ok(json!({ "DryRunProgressStatus": {
-            "DryRunId": short_id(),
-            "DryRunStatus": "completed",
-            "CreationDate": Utc::now().to_rfc3339(),
-            "UpdateDate": Utc::now().to_rfc3339(),
-        }})))
+        .ok_or_else(|| {
+            AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "ResourceNotFoundException",
+                match dry_run_id {
+                    Some(id) => format!("Dry run {id} not found for domain {dom}."),
+                    None => format!("No dry run found for domain {dom}."),
+                },
+            )
+        })?;
+        Ok(ok(
+            json!({ "DryRunProgressStatus": dry_run_progress_json(run) }),
+        ))
     }
 
     fn cancel_domain_config_change(
