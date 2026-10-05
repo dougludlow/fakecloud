@@ -2691,6 +2691,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oac_always_amz_auth_signing_behavior_round_trips() {
+        let svc = CloudFrontService::new(make_state());
+        let created = svc
+            .handle(make_request(
+                http::Method::POST,
+                "/2020-05-31/origin-access-control",
+                "",
+                r#"<OriginAccessControlConfig xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Name>oac-lambda</Name><SigningProtocol>sigv4</SigningProtocol><SigningBehavior>always-amz-auth</SigningBehavior><OriginAccessControlOriginType>lambda</OriginAccessControlOriginType></OriginAccessControlConfig>"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status, StatusCode::CREATED);
+        let created_xml = std::str::from_utf8(created.body.expect_bytes()).unwrap();
+        assert_eq!(first_tag(created_xml, "SigningBehavior"), "always-amz-auth");
+        let id = first_tag(created_xml, "Id");
+        let got = svc
+            .handle(make_request(
+                http::Method::GET,
+                &format!("/2020-05-31/origin-access-control/{id}/config"),
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        let got_xml = std::str::from_utf8(got.body.expect_bytes()).unwrap();
+        assert_eq!(first_tag(got_xml, "SigningBehavior"), "always-amz-auth");
+        assert_eq!(
+            first_tag(got_xml, "OriginAccessControlOriginType"),
+            "lambda"
+        );
+    }
+
+    #[tokio::test]
     async fn policies_and_functions_are_scoped_to_the_callers_account() {
         const A: &str = "111111111111";
         const B: &str = "222222222222";
