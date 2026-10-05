@@ -312,9 +312,10 @@ pub struct SsmResourcePolicy {
     pub policy_hash: String,
     pub policy: String,
     pub resource_arn: String,
-    /// For a `Document` policy: the consumer accounts the policy shared the
-    /// document with (added to its `Share` permission list), so deleting the
-    /// policy can remove exactly that sharing.
+    /// For a `Document` policy: the consumer accounts the policy shares the
+    /// document with. The document's effective `Share` list is its custom
+    /// sharing plus every policy's grants, so deleting a policy removes only
+    /// the accounts no other source still grants.
     #[serde(default)]
     pub shared_account_ids: Vec<String>,
 }

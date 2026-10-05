@@ -6461,3 +6461,101 @@ fn describe_parameters_filters_by_data_type() {
         .collect();
     assert_eq!(names, vec!["/ami"]);
 }
+
+#[test]
+fn deleting_document_policy_keeps_sharing_from_other_sources() {
+    let svc = make_service();
+    svc.create_document(&make_request(
+        "CreateDocument",
+        json!({
+            "Name": "MixedShareDoc",
+            "Content": "{\"schemaVersion\":\"2.2\",\"mainSteps\":[]}",
+            "DocumentType": "Command"
+        }),
+    ))
+    .unwrap();
+    let arn = "arn:aws:ssm:us-east-1:123456789012:document/MixedShareDoc";
+    // Custom sharing with A, then policies granting A, B (twice) and C.
+    svc.modify_document_permission(&make_request(
+        "ModifyDocumentPermission",
+        json!({"Name": "MixedShareDoc", "PermissionType": "Share",
+               "AccountIdsToAdd": ["111111111111"]}),
+    ))
+    .unwrap();
+    let (id_a, hash_a) = put_document_share_policy(&svc, arn, "111111111111");
+    let (id_b1, hash_b1) = put_document_share_policy(&svc, arn, "222222222222");
+    put_document_share_policy(&svc, arn, "222222222222");
+    let (id_c, hash_c) = put_document_share_policy(&svc, arn, "333333333333");
+    assert_eq!(
+        document_share_accounts(&svc, "MixedShareDoc"),
+        vec!["111111111111", "222222222222", "333333333333"]
+    );
+
+    let delete = |id: &str, hash: &str| {
+        svc.delete_resource_policy(&make_request(
+            "DeleteResourcePolicy",
+            json!({"ResourceArn": arn, "PolicyId": id, "PolicyHash": hash}),
+        ))
+        .unwrap();
+    };
+    // A stays: custom sharing grants it independently of the policy.
+    delete(&id_a, &hash_a);
+    // B stays: the second policy still grants it.
+    delete(&id_b1, &hash_b1);
+    // C goes: only the deleted policy granted it.
+    delete(&id_c, &hash_c);
+    assert_eq!(
+        document_share_accounts(&svc, "MixedShareDoc"),
+        vec!["111111111111", "222222222222"]
+    );
+
+    // Removing a policy-granted account through custom sharing leaves the
+    // policy's grant in place.
+    svc.modify_document_permission(&make_request(
+        "ModifyDocumentPermission",
+        json!({"Name": "MixedShareDoc", "PermissionType": "Share",
+               "AccountIdsToRemove": ["111111111111", "222222222222"]}),
+    ))
+    .unwrap();
+    assert_eq!(
+        document_share_accounts(&svc, "MixedShareDoc"),
+        vec!["222222222222"]
+    );
+}
+
+#[test]
+fn legacy_document_sharing_is_split_from_policy_grants() {
+    // State persisted before custom sharing was tracked separately: the
+    // `Share` list mixes a custom share with a policy's grant.
+    let svc = make_service();
+    svc.create_document(&make_request(
+        "CreateDocument",
+        json!({
+            "Name": "LegacyShareDoc",
+            "Content": "{\"schemaVersion\":\"2.2\",\"mainSteps\":[]}",
+            "DocumentType": "Command"
+        }),
+    ))
+    .unwrap();
+    let arn = "arn:aws:ssm:us-east-1:123456789012:document/LegacyShareDoc";
+    let (id, hash) = put_document_share_policy(&svc, arn, "222222222222");
+    {
+        let mut accounts = svc.state.write();
+        let st = accounts.regional_mut("123456789012", "us-east-1");
+        let doc = st.documents.get_mut("LegacyShareDoc").unwrap();
+        doc.permissions.remove("__custom_share");
+        doc.permissions.insert(
+            "Share".to_string(),
+            vec!["111111111111".to_string(), "222222222222".to_string()],
+        );
+    }
+    svc.delete_resource_policy(&make_request(
+        "DeleteResourcePolicy",
+        json!({"ResourceArn": arn, "PolicyId": id, "PolicyHash": hash}),
+    ))
+    .unwrap();
+    assert_eq!(
+        document_share_accounts(&svc, "LegacyShareDoc"),
+        vec!["111111111111"]
+    );
+}

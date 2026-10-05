@@ -756,6 +756,7 @@ impl SsmService {
 
         let mut accounts = self.state.write();
         let state = accounts.regional_mut(&req.account_id, &req.region);
+        let grants = policy_grants(&state.resource_policies, name);
         let doc = state.documents.get_mut(name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -764,22 +765,22 @@ impl SsmService {
             )
         })?;
 
+        // These edit only the document's custom sharing; accounts a resource
+        // policy shares it with stay shared until that policy goes.
+        let mut custom = custom_shares(doc, &grants);
         if let Some(add_ids) = accounts_to_add {
-            let ids = validate_account_ids(add_ids)?;
-            let entry = doc.permissions.entry("Share".to_string()).or_default();
-            for id in ids {
-                if !entry.contains(&id) {
-                    entry.push(id);
+            for id in validate_account_ids(add_ids)? {
+                if !custom.contains(&id) {
+                    custom.push(id);
                 }
             }
         }
 
         if let Some(remove_ids) = accounts_to_remove {
             let ids = validate_account_ids(remove_ids)?;
-            if let Some(entry) = doc.permissions.get_mut("Share") {
-                entry.retain(|id| !ids.contains(id));
-            }
+            custom.retain(|id| !ids.contains(id));
         }
+        set_document_sharing(doc, custom, &grants);
 
         // Persist the shared version so DescribeDocumentPermission reflects it.
         // Stored under a reserved key separate from the "Share" account list.
@@ -994,6 +995,12 @@ impl SsmService {
             }
             None => Vec::new(),
         };
+        // The document's custom sharing, captured before this policy changes
+        // the set of policy grants it is told apart from.
+        let custom = shared_document.as_deref().and_then(|n| {
+            let grants = policy_grants(&state.resource_policies, n);
+            state.documents.get(n).map(|d| custom_shares(d, &grants))
+        });
 
         // If PolicyId is provided, update existing
         if let Some(ref pid) = policy_id {
@@ -1015,14 +1022,9 @@ impl SsmService {
                 existing.policy = policy;
                 let new_hash = format!("{:x}", md5::compute(existing.policy.as_bytes()));
                 existing.policy_hash = new_hash.clone();
-                let previously_shared =
-                    std::mem::replace(&mut existing.shared_account_ids, shared_account_ids.clone());
-                if let Some(doc) = shared_document
-                    .as_ref()
-                    .and_then(|n| state.documents.get_mut(n))
-                {
-                    unshare_document(doc, &previously_shared);
-                    share_document(doc, &shared_account_ids);
+                existing.shared_account_ids = shared_account_ids;
+                if let (Some(name), Some(custom)) = (shared_document.as_deref(), custom) {
+                    resync_document_sharing(state, name, custom);
                 }
                 return Ok(AwsResponse::ok_json(json!({
                     "PolicyId": pid,
@@ -1034,12 +1036,6 @@ impl SsmService {
         // Create new
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_hash = format!("{:x}", md5::compute(policy.as_bytes()));
-        if let Some(doc) = shared_document
-            .as_ref()
-            .and_then(|n| state.documents.get_mut(n))
-        {
-            share_document(doc, &shared_account_ids);
-        }
         state.resource_policies.push(SsmResourcePolicy {
             policy_id: new_id.clone(),
             policy_hash: new_hash.clone(),
@@ -1047,6 +1043,9 @@ impl SsmService {
             resource_arn,
             shared_account_ids,
         });
+        if let (Some(name), Some(custom)) = (shared_document.as_deref(), custom) {
+            resync_document_sharing(state, name, custom);
+        }
 
         Ok(AwsResponse::ok_json(json!({
             "PolicyId": new_id,
@@ -1136,13 +1135,24 @@ impl SsmService {
                         "The policy hash does not match.".to_string(),
                     ));
                 }
+                let doc_name = document_name_from_arn(resource_arn).map(str::to_string);
+                let custom = doc_name.as_deref().and_then(|n| {
+                    let grants = policy_grants(&state.resource_policies, n);
+                    state.documents.get(n).map(|d| custom_shares(d, &grants))
+                });
                 let removed = state.resource_policies.remove(i);
-                if !rollback_migration {
-                    if let Some(doc) = document_name_from_arn(&removed.resource_arn)
-                        .and_then(|n| state.documents.get_mut(n))
-                    {
-                        unshare_document(doc, &removed.shared_account_ids);
+                if let (Some(name), Some(mut custom)) = (doc_name.as_deref(), custom) {
+                    // RollbackMigration turns the policy's grants into custom
+                    // sharing; RemoveSharing drops only what no other source
+                    // (custom sharing or another policy) still grants.
+                    if rollback_migration {
+                        for id in removed.shared_account_ids {
+                            if !custom.contains(&id) {
+                                custom.push(id);
+                            }
+                        }
                     }
+                    resync_document_sharing(state, name, custom);
                 }
                 Ok(AwsResponse::ok_json(json!({})))
             }
@@ -1209,18 +1219,66 @@ fn policy_principal_accounts(policy: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn share_document(doc: &mut crate::state::SsmDocument, account_ids: &[String]) {
-    let entry = doc.permissions.entry("Share".to_string()).or_default();
-    for id in account_ids {
-        if !entry.contains(id) {
-            entry.push(id.clone());
+/// Reserved `permissions` key holding the accounts a document is shared with
+/// through custom sharing (`ModifyDocumentPermission`), kept apart from the
+/// effective `Share` list so removing a resource policy cannot drop them.
+const CUSTOM_SHARE_KEY: &str = "__custom_share";
+
+/// Every account the resource policies on document `name` share it with.
+fn policy_grants(policies: &[SsmResourcePolicy], name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in policies
+        .iter()
+        .filter(|p| document_name_from_arn(&p.resource_arn) == Some(name))
+    {
+        for id in &p.shared_account_ids {
+            if !out.contains(id) {
+                out.push(id.clone());
+            }
         }
+    }
+    out
+}
+
+/// The document's custom sharing. State written before custom sharing was
+/// tracked separately has no `CUSTOM_SHARE_KEY`; there, it is the `Share`
+/// accounts no current policy grants.
+fn custom_shares(doc: &SsmDocument, grants: &[String]) -> Vec<String> {
+    match doc.permissions.get(CUSTOM_SHARE_KEY) {
+        Some(custom) => custom.clone(),
+        None => doc
+            .permissions
+            .get("Share")
+            .map(|share| {
+                share
+                    .iter()
+                    .filter(|id| !grants.contains(id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
-fn unshare_document(doc: &mut crate::state::SsmDocument, account_ids: &[String]) {
-    if let Some(entry) = doc.permissions.get_mut("Share") {
-        entry.retain(|id| !account_ids.contains(id));
+/// Store the custom sharing and set the effective `Share` list to custom
+/// sharing plus every policy grant.
+fn set_document_sharing(doc: &mut SsmDocument, custom: Vec<String>, grants: &[String]) {
+    let mut share = custom.clone();
+    for id in grants {
+        if !share.contains(id) {
+            share.push(id.clone());
+        }
+    }
+    doc.permissions.insert(CUSTOM_SHARE_KEY.to_string(), custom);
+    doc.permissions.insert("Share".to_string(), share);
+}
+
+/// Recompute document `name`'s effective sharing from `custom` and the
+/// current policy set.
+fn resync_document_sharing(state: &mut SsmState, name: &str, custom: Vec<String>) {
+    let grants = policy_grants(&state.resource_policies, name);
+    if let Some(doc) = state.documents.get_mut(name) {
+        set_document_sharing(doc, custom, &grants);
     }
 }
 
