@@ -619,6 +619,24 @@ fn step_up_needs_essentials_or_plus() {
 }
 
 #[test]
+fn step_up_masks_unknown_user_when_existence_errors_are_prevented() {
+    let f = fixture("ESSENTIALS", false);
+    let ghost = json!({ "USERNAME": "ghost", "TARGET_ACR_VALUES": "urn:cognito:loa:1" });
+    // PreventUserExistenceErrors unset (LEGACY): the unknown user is reported.
+    assert_eq!(err_code(f.initiate(ghost.clone())), "UserNotFoundException");
+    f.svc
+        .state
+        .write()
+        .get_or_create("123456789012")
+        .user_pool_clients
+        .get_mut(&f.client_id)
+        .unwrap()
+        .prevent_user_existence_errors = Some("ENABLED".to_string());
+    // ENABLED: the same generic failure as a wrong password.
+    assert_eq!(err_code(f.initiate(ghost)), "NotAuthorizedException");
+}
+
+#[test]
 fn admin_initiate_auth_runs_user_auth_with_step_up() {
     let f = fixture("ESSENTIALS", true);
     let select = json_of(

@@ -353,7 +353,7 @@ impl CognitoService {
         // Step-up: TARGET_ACR_VALUES (optionally with the ACCESS_TOKEN of an
         // earlier sign-in and MAX_AGE) picks a target ACR level that the
         // following challenges work toward.
-        let step_up = self.resolve_step_up(pool_id, username, auth_params, req)?;
+        let step_up = self.resolve_step_up(pool_id, client_id, username, auth_params, req)?;
         if let Some(su) = step_up.as_ref() {
             // The access token already proved the password: go straight to
             // the factor the target still needs.
@@ -449,6 +449,7 @@ impl CognitoService {
     pub(super) fn resolve_step_up(
         &self,
         pool_id: &str,
+        client_id: &str,
         username: &str,
         auth_params: &serde_json::Map<String, Value>,
         req: &AwsRequest,
@@ -518,11 +519,27 @@ impl CognitoService {
             .get(pool_id)
             .and_then(|users| users.get(username))
             .ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "UserNotFoundException",
-                    "User does not exist.",
-                )
+                // PreventUserExistenceErrors=ENABLED: an unknown user gets the
+                // same generic failure as a wrong password, so step-up does
+                // not reveal which usernames exist.
+                let masks_existence = state
+                    .user_pool_clients
+                    .get(client_id)
+                    .and_then(|c| c.prevent_user_existence_errors.as_deref())
+                    == Some("ENABLED");
+                if masks_existence {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "NotAuthorizedException",
+                        "Incorrect username or password.",
+                    )
+                } else {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "UserNotFoundException",
+                        "User does not exist.",
+                    )
+                }
             })?;
 
         let mut credited: Vec<String> = Vec::new();
