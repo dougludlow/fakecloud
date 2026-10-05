@@ -13,8 +13,8 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_snapshot;
 use crate::state::{
-    default_region_status, AlternateContact, PendingEmailUpdate, SharedAccountState,
-    ALTERNATE_CONTACT_TYPES, REGIONS,
+    default_region_status, AccountData, AlternateContact, PendingEmailUpdate, PhoneVerification,
+    SharedAccountState, ALTERNATE_CONTACT_TYPES, REGIONS, VERIFICATION_OTP,
 };
 
 /// Every operation name in the AWS Account Smithy model.
@@ -34,7 +34,9 @@ pub const ACCOUNT_ACTIONS: &[&str] = &[
     "PutAccountName",
     "PutAlternateContact",
     "PutContactInformation",
+    "SendPhoneNumberVerification",
     "StartPrimaryEmailUpdate",
+    "VerifyPhoneNumber",
 ];
 
 /// A resolved route (each op is a distinct `POST /<verb>` path in restJson1).
@@ -54,7 +56,9 @@ enum Route {
     PutAccountName,
     PutAlternateContact,
     PutContactInformation,
+    SendPhoneNumberVerification,
     StartPrimaryEmailUpdate,
+    VerifyPhoneNumber,
 }
 
 impl Route {
@@ -72,7 +76,9 @@ impl Route {
                 | Route::PutAccountName
                 | Route::PutAlternateContact
                 | Route::PutContactInformation
+                | Route::SendPhoneNumberVerification
                 | Route::StartPrimaryEmailUpdate
+                | Route::VerifyPhoneNumber
         )
     }
 }
@@ -133,7 +139,11 @@ impl AccountService {
             (&Method::POST, ["putAccountName"]) => Some(Route::PutAccountName),
             (&Method::POST, ["putAlternateContact"]) => Some(Route::PutAlternateContact),
             (&Method::POST, ["putContactInformation"]) => Some(Route::PutContactInformation),
+            (&Method::POST, ["sendPhoneNumberVerification"]) => {
+                Some(Route::SendPhoneNumberVerification)
+            }
             (&Method::POST, ["startPrimaryEmailUpdate"]) => Some(Route::StartPrimaryEmailUpdate),
+            (&Method::POST, ["verifyPhoneNumber"]) => Some(Route::VerifyPhoneNumber),
             _ => None,
         }
     }
@@ -223,6 +233,16 @@ impl AccountService {
         let info = info.clone();
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&account);
+        // A verification (pending or complete) belongs to the number it was
+        // issued for; replacing the phone number resets it to UNVERIFIED.
+        let new_phone = info.get("PhoneNumber").and_then(Value::as_str);
+        if st
+            .phone_verification
+            .as_ref()
+            .is_some_and(|v| Some(v.phone_number.as_str()) != new_phone)
+        {
+            st.phone_verification = None;
+        }
         st.contact_information = Some(info);
         Ok(empty_ok())
     }
@@ -231,13 +251,78 @@ impl AccountService {
         let body = parse_json(&req.body)?;
         let account = target_account(&body, req)?;
         let accounts = self.state.read();
-        let info = accounts
-            .get(&account)
+        let st = accounts.get(&account);
+        let info = st
             .and_then(|s| s.contact_information.clone())
             .ok_or_else(|| not_found("No contact information found for this account."))?;
+        let status = st.map_or("UNVERIFIED", phone_verification_status);
         Ok(AwsResponse::json_value(
             StatusCode::OK,
-            json!({ "ContactInformation": info }),
+            json!({ "ContactInformation": info, "VerificationStatus": status }),
+        ))
+    }
+
+    fn send_phone_number_verification(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body = parse_json(&req.body)?;
+        let account = target_account(&body, req)?;
+        let mut accounts = self.state.write();
+        let st = accounts.get_or_create(&account);
+        let phone = contact_phone(st)?;
+        if phone_verification_status(st) == "VERIFIED" {
+            return Err(conflict(
+                "The phone number in the primary contact information is already verified.",
+            ));
+        }
+        // fakecloud delivers no SMS: the passcode is the fixed, documented
+        // VERIFICATION_OTP. Re-sending replaces any outstanding passcode.
+        st.phone_verification = Some(PhoneVerification {
+            phone_number: phone,
+            status: "PENDING".to_string(),
+            otp: Some(VERIFICATION_OTP.to_string()),
+        });
+        Ok(AwsResponse::json_value(
+            StatusCode::OK,
+            json!({ "Status": "PENDING" }),
+        ))
+    }
+
+    fn verify_phone_number(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = parse_json(&req.body)?;
+        let account = target_account(&body, req)?;
+        let otp = require_str(&body, "Otp")?;
+        // Otp: @pattern ^[a-zA-Z0-9]{6}$.
+        if otp.len() != 6 || !otp.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(validation("Otp must be exactly 6 alphanumeric characters."));
+        }
+        let mut accounts = self.state.write();
+        let st = accounts.get_or_create(&account);
+        contact_phone(st)?;
+        match phone_verification_status(st) {
+            "VERIFIED" => {
+                return Err(conflict(
+                    "The phone number in the primary contact information is already verified.",
+                ))
+            }
+            "PENDING" => {}
+            _ => return Err(conflict(
+                "No phone number verification is pending. Call SendPhoneNumberVerification first.",
+            )),
+        }
+        let pending = st
+            .phone_verification
+            .as_mut()
+            .expect("PENDING status implies a verification record");
+        if pending.otp.as_deref() != Some(otp) {
+            return Err(validation("The one-time passcode is not valid."));
+        }
+        pending.status = "VERIFIED".to_string();
+        pending.otp = None;
+        Ok(AwsResponse::json_value(
+            StatusCode::OK,
+            json!({ "Status": "VERIFIED" }),
         ))
     }
 
@@ -345,7 +430,7 @@ impl AccountService {
         // A fixed OTP keeps the flow testable; the real service emails a code.
         st.pending_email_update = Some(PendingEmailUpdate {
             email,
-            otp: "000000".to_string(),
+            otp: VERIFICATION_OTP.to_string(),
         });
         st.primary_email_update_at = Some(Utc::now());
         Ok(AwsResponse::json_value(
@@ -528,7 +613,9 @@ impl AwsService for AccountService {
             Route::PutAccountName => self.put_account_name(&req),
             Route::PutAlternateContact => self.put_alternate_contact(&req),
             Route::PutContactInformation => self.put_contact_information(&req),
+            Route::SendPhoneNumberVerification => self.send_phone_number_verification(&req),
             Route::StartPrimaryEmailUpdate => self.start_primary_email_update(&req),
+            Route::VerifyPhoneNumber => self.verify_phone_number(&req),
         };
         if mutates && result.is_ok() {
             self.persist().await;
@@ -656,6 +743,41 @@ fn validate_email(email: &str) -> Result<(), AwsServiceError> {
 
 fn validation(msg: &str) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", msg)
+}
+
+fn conflict(msg: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::CONFLICT, "ConflictException", msg)
+}
+
+/// The primary contact's phone number, or `ResourceNotFoundException` when no
+/// contact information has been put (there is no number to verify).
+fn contact_phone(st: &AccountData) -> Result<String, AwsServiceError> {
+    st.contact_information
+        .as_ref()
+        .and_then(|i| i.get("PhoneNumber"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| not_found("No contact information found for this account."))
+}
+
+/// The contact phone number's `PhoneNumberVerificationStatus`: the recorded
+/// status when it was issued for the current number, otherwise `UNVERIFIED`.
+fn phone_verification_status(st: &AccountData) -> &'static str {
+    let current = st
+        .contact_information
+        .as_ref()
+        .and_then(|i| i.get("PhoneNumber"))
+        .and_then(Value::as_str);
+    match &st.phone_verification {
+        Some(v) if Some(v.phone_number.as_str()) == current => {
+            if v.status == "VERIFIED" {
+                "VERIFIED"
+            } else {
+                "PENDING"
+            }
+        }
+        _ => "UNVERIFIED",
+    }
 }
 
 fn not_found(msg: &str) -> AwsServiceError {
@@ -950,6 +1072,100 @@ mod tests {
     fn service_name_and_actions() {
         let s = svc();
         assert_eq!(s.service_name(), "account");
-        assert_eq!(s.supported_actions().len(), 16);
+        assert_eq!(s.supported_actions().len(), 18);
+    }
+
+    fn contact(phone: &str) -> Value {
+        json!({
+            "ContactInformation": {
+                "FullName": "Jane Doe",
+                "AddressLine1": "1 Main St",
+                "City": "Seattle",
+                "CountryCode": "US",
+                "PhoneNumber": phone,
+                "PostalCode": "98101"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn phone_number_verification_flow() {
+        let s = svc();
+        // No contact information -> nothing to verify.
+        let e = err(&s, "/sendPhoneNumberVerification", json!({})).await;
+        assert_eq!(e.code(), "ResourceNotFoundException");
+
+        s.handle(req("/putContactInformation", contact("+12065550100")))
+            .await
+            .unwrap();
+        let v = body_of(&s, "/getContactInformation", json!({})).await;
+        assert_eq!(v["VerificationStatus"], "UNVERIFIED");
+
+        // Verifying before a passcode was sent is a conflict.
+        let e = err(&s, "/verifyPhoneNumber", json!({"Otp": "000000"})).await;
+        assert_eq!(e.code(), "ConflictException");
+        assert_eq!(e.status(), StatusCode::CONFLICT);
+
+        let v = body_of(&s, "/sendPhoneNumberVerification", json!({})).await;
+        assert_eq!(v, json!({"Status": "PENDING"}));
+        let v = body_of(&s, "/getContactInformation", json!({})).await;
+        assert_eq!(v["VerificationStatus"], "PENDING");
+
+        // Malformed and wrong passcodes are rejected; status stays PENDING.
+        let e = err(&s, "/verifyPhoneNumber", json!({"Otp": "12"})).await;
+        assert_eq!(e.code(), "ValidationException");
+        let e = err(&s, "/verifyPhoneNumber", json!({})).await;
+        assert_eq!(e.code(), "ValidationException");
+        let e = err(&s, "/verifyPhoneNumber", json!({"Otp": "123456"})).await;
+        assert_eq!(e.code(), "ValidationException");
+        let v = body_of(&s, "/getContactInformation", json!({})).await;
+        assert_eq!(v["VerificationStatus"], "PENDING");
+
+        let v = body_of(&s, "/verifyPhoneNumber", json!({"Otp": VERIFICATION_OTP})).await;
+        assert_eq!(v, json!({"Status": "VERIFIED"}));
+        let v = body_of(&s, "/getContactInformation", json!({})).await;
+        assert_eq!(v["VerificationStatus"], "VERIFIED");
+        let e = err(&s, "/sendPhoneNumberVerification", json!({})).await;
+        assert_eq!(e.code(), "ConflictException");
+
+        // Re-putting the same number keeps the verification...
+        s.handle(req("/putContactInformation", contact("+12065550100")))
+            .await
+            .unwrap();
+        let v = body_of(&s, "/getContactInformation", json!({})).await;
+        assert_eq!(v["VerificationStatus"], "VERIFIED");
+        // ...changing it resets to UNVERIFIED.
+        s.handle(req("/putContactInformation", contact("+12065550199")))
+            .await
+            .unwrap();
+        let v = body_of(&s, "/getContactInformation", json!({})).await;
+        assert_eq!(v["VerificationStatus"], "UNVERIFIED");
+        let e = err(&s, "/verifyPhoneNumber", json!({"Otp": "000000"})).await;
+        assert_eq!(e.code(), "ConflictException");
+    }
+
+    #[tokio::test]
+    async fn phone_verification_targets_member_account() {
+        let s = svc();
+        let mut put = contact("+12065550100");
+        put["AccountId"] = json!("444455556666");
+        s.handle(req("/putContactInformation", put)).await.unwrap();
+        let v = body_of(
+            &s,
+            "/sendPhoneNumberVerification",
+            json!({"AccountId": "444455556666"}),
+        )
+        .await;
+        assert_eq!(v["Status"], "PENDING");
+        // The caller's own account has no contact information.
+        let e = err(&s, "/sendPhoneNumberVerification", json!({})).await;
+        assert_eq!(e.code(), "ResourceNotFoundException");
+        let v = body_of(
+            &s,
+            "/verifyPhoneNumber",
+            json!({"AccountId": "444455556666", "Otp": "000000"}),
+        )
+        .await;
+        assert_eq!(v["Status"], "VERIFIED");
     }
 }

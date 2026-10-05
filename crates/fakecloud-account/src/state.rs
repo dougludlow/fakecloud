@@ -32,6 +32,24 @@ pub struct PendingEmailUpdate {
     pub otp: String,
 }
 
+/// The OTP every verification flow (primary email, contact phone number)
+/// issues. fakecloud sends no email or SMS, so the code is fixed and
+/// documented rather than delivered out of band.
+pub const VERIFICATION_OTP: &str = "000000";
+
+/// Verification state for the primary contact's phone number.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoneVerification {
+    /// The contact phone number this verification applies to. Changing the
+    /// contact's `PhoneNumber` invalidates it (status back to `UNVERIFIED`).
+    pub phone_number: String,
+    /// PENDING (passcode sent, awaiting `VerifyPhoneNumber`) | VERIFIED.
+    pub status: String,
+    /// The outstanding one-time passcode while `PENDING`.
+    #[serde(default)]
+    pub otp: Option<String>,
+}
+
 /// Per-account state. Contact information is stored as the raw request `Value`
 /// so the full `ContactInformation` shape round-trips faithfully.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +60,10 @@ pub struct AccountData {
     /// The primary `ContactInformation` object, if `PutContactInformation` ran.
     #[serde(default)]
     pub contact_information: Option<serde_json::Value>,
+    /// Phone-number verification of the primary contact
+    /// (`SendPhoneNumberVerification` / `VerifyPhoneNumber`).
+    #[serde(default)]
+    pub phone_verification: Option<PhoneVerification>,
     /// The account name (`PutAccountName`), if set.
     #[serde(default)]
     pub account_name: Option<String>,
@@ -69,6 +91,7 @@ impl Default for AccountData {
         Self {
             alternate_contacts: BTreeMap::new(),
             contact_information: None,
+            phone_verification: None,
             account_name: None,
             created_date: Utc::now(),
             account_state: "ACTIVE".to_string(),

@@ -17,7 +17,9 @@ use helpers::TestServer;
 #[test_action("account", "PutAccountName", checksum = "fe6872ea")]
 #[test_action("account", "PutAlternateContact", checksum = "661f88b6")]
 #[test_action("account", "PutContactInformation", checksum = "012826c9")]
+#[test_action("account", "SendPhoneNumberVerification", checksum = "94ac45e4")]
 #[test_action("account", "StartPrimaryEmailUpdate", checksum = "4503fb90")]
+#[test_action("account", "VerifyPhoneNumber", checksum = "ec1d3c30")]
 #[tokio::test]
 async fn account_probe() {
     let _server = TestServer::start().await;

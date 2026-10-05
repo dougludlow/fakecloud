@@ -1,8 +1,9 @@
 //! AWS Account Management (`account`) restJson1 service for fakecloud.
 //!
-//! The full 15-operation control plane from the AWS Smithy model: alternate
+//! The full 18-operation control plane from the AWS Smithy model: alternate
 //! contacts (Get/Put/DeleteAlternateContact), primary contact information
-//! (Get/PutContactInformation), account information (GetAccountInformation,
+//! (Get/PutContactInformation) and its phone-number verification
+//! (SendPhoneNumberVerification, VerifyPhoneNumber), account information (GetAccountInformation,
 //! PutAccountName, GetGovCloudAccountInformation), primary-email management
 //! (GetPrimaryEmail, Start/AcceptPrimaryEmailUpdate), and Region opt-in control
 //! (ListRegions, GetRegionOptStatus, Enable/DisableRegion). Every operation is
