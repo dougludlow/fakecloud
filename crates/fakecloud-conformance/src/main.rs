@@ -251,15 +251,15 @@ fn cmd_operations(models_dir: &std::path::Path) {
 }
 
 fn cmd_checksums(models_dir: &std::path::Path) {
-    let models = load_models(models_dir);
+    let models = checksum::model_checksums(models_dir).unwrap_or_else(|e| {
+        eprintln!("Error computing checksums: {}", e);
+        std::process::exit(1);
+    });
 
-    for (service_name, model) in &models {
-        println!("{}:", service_name);
-        for op in &model.operations {
-            match checksum::operation_checksum(model, &op.name) {
-                Some(cs) => println!("  {}  {}", cs, op.name),
-                None => println!("  ????????  {} (error)", op.name),
-            }
+    for model in &models {
+        println!("{}:", model.service_name);
+        for (op, cs) in &model.operations {
+            println!("  {}  {}", cs, op);
         }
         println!();
     }
