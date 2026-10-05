@@ -1762,3 +1762,165 @@ export interface CloudFrontDistributionStatusRequest {
 export interface Elbv2WafCountsResponse {
   counts: unknown;
 }
+
+// -- Service Quotas --------------------------------------------------
+
+/** Why a quota is or is not enforced. */
+export type QuotaEnforcementSource =
+  | "not_enforceable"
+  | "account_override"
+  | "override"
+  | "global";
+
+/** One Service Quotas catalog quota as seen by an account and region. */
+export interface Quota {
+  serviceCode: string;
+  quotaCode: string;
+  quotaName: string;
+  global: boolean;
+  adjustable: boolean;
+  unit: string;
+  /** The AWS default value. */
+  defaultValue: number;
+  /** The value in effect for the account (default unless changed). */
+  appliedValue: number;
+  /** Current usage, or `null` when no fakecloud service measures it. */
+  usage: number | null;
+  /** Whether a fakecloud service checks requests against this quota. */
+  enforceable: boolean;
+  enforced: boolean;
+  enforcementSource: QuotaEnforcementSource;
+}
+
+/** Response from `GET /_fakecloud/service-quotas/quotas`. */
+export interface QuotasResponse {
+  accountId: string;
+  region: string;
+  quotas: Quota[];
+}
+
+/** Filters for `GET /_fakecloud/service-quotas/quotas`. */
+export interface GetQuotasOptions {
+  /** Account to report on (default: the server's account). */
+  accountId?: string;
+  /** Region to report on (default: the server's region). */
+  region?: string;
+  /** Only quotas of this service (e.g. `"ec2"`). */
+  serviceCode?: string;
+}
+
+/**
+ * Body for `PUT /_fakecloud/service-quotas/quotas/{service}/{quota}`.
+ *
+ * `enforce` is tri-state on the wire: `true` enforces the quota, `false`
+ * ignores it, `null` clears the override, and leaving it `undefined` omits
+ * the key so enforcement stays as it is.
+ */
+export interface PutQuotaRequest {
+  /**
+   * Account whose applied value is set (default: the server's account).
+   * When given, `enforce` overrides enforcement for this account only;
+   * otherwise it applies to every account.
+   */
+  accountId?: string;
+  /** Region of a regional quota (default: the server's region). */
+  region?: string;
+  /** Applied value to set. May be below the AWS default. */
+  value?: number;
+  /** `true` enforce, `false` ignore, `null` clear, `undefined` unchanged. */
+  enforce?: boolean | null;
+}
+
+/** Options for `DELETE /_fakecloud/service-quotas/quotas/{service}/{quota}`. */
+export interface DeleteQuotaOptions {
+  /**
+   * Account to reset (default: the server's account). When given, only that
+   * account's enforcement override is dropped; otherwise the server-wide one.
+   */
+  accountId?: string;
+  /** Region of a regional quota (default: the server's region). */
+  region?: string;
+}
+
+/** A server-wide enforcement override. */
+export interface QuotaEnforcementOverride {
+  serviceCode: string;
+  quotaCode: string;
+  enforce: boolean;
+}
+
+/** An enforcement override scoped to one account. */
+export interface QuotaAccountEnforcementOverride {
+  accountId: string;
+  serviceCode: string;
+  quotaCode: string;
+  enforce: boolean;
+}
+
+/** Response from `GET`/`PUT /_fakecloud/service-quotas/enforcement`. */
+export interface QuotaEnforcementResponse {
+  enforceAll: boolean;
+  overrides: QuotaEnforcementOverride[];
+  accountOverrides: QuotaAccountEnforcementOverride[];
+}
+
+/** One override change in `PUT /_fakecloud/service-quotas/enforcement`. */
+export interface QuotaEnforcementOverrideChange {
+  serviceCode: string;
+  quotaCode: string;
+  /** Scope the override to one account; omitted applies to every account. */
+  accountId?: string;
+  /** `true` enforce, `false` ignore, `null` (or omitted) clear. */
+  enforce?: boolean | null;
+}
+
+/** Body for `PUT /_fakecloud/service-quotas/enforcement`. */
+export interface PutQuotaEnforcementRequest {
+  enforceAll?: boolean;
+  overrides?: QuotaEnforcementOverrideChange[];
+}
+
+/** How quota increase requests are decided. */
+export type QuotaRequestApprovalMode = "auto" | "manual";
+
+/** Response from `GET`/`PUT /_fakecloud/service-quotas/request-approval`. */
+export interface QuotaRequestApprovalResponse {
+  mode: QuotaRequestApprovalMode;
+}
+
+/** One quota increase request. */
+export interface QuotaRequest {
+  accountId: string;
+  requestId: string;
+  serviceCode: string;
+  quotaCode: string;
+  quotaName: string;
+  /** Empty for global quotas. */
+  region: string;
+  desiredValue: number;
+  status: string;
+  caseId: string | null;
+  /** RFC 3339 timestamp. */
+  created: string;
+  /** RFC 3339 timestamp. */
+  lastUpdated: string;
+}
+
+/** Response from `GET /_fakecloud/service-quotas/requests`. */
+export interface QuotaRequestsResponse {
+  requests: QuotaRequest[];
+}
+
+/** Filters for `GET /_fakecloud/service-quotas/requests`. */
+export interface GetQuotaRequestsOptions {
+  accountId?: string;
+  /** e.g. `"PENDING"`, `"APPROVED"`. */
+  status?: string;
+}
+
+/** Terminal status a denied request is left in. */
+export type QuotaDenyStatus =
+  | "DENIED"
+  | "NOT_APPROVED"
+  | "CASE_CLOSED"
+  | "INVALID_REQUEST";

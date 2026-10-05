@@ -1,4 +1,6 @@
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace FakeCloud;
 
@@ -55,6 +57,7 @@ public sealed class FakeCloudClient : IDisposable
         Kms = new KmsClient(_http);
         WafV2 = new WafV2Client(_http);
         CloudFront = new CloudFrontClient(_http);
+        ServiceQuotas = new ServiceQuotasClient(_http);
     }
 
     internal static string TrimTrailingSlashes(string url)
@@ -181,6 +184,7 @@ public sealed class FakeCloudClient : IDisposable
     public KmsClient Kms { get; }
     public WafV2Client WafV2 { get; }
     public CloudFrontClient CloudFront { get; }
+    public ServiceQuotasClient ServiceQuotas { get; }
 
     // ── Sub-clients ────────────────────────────────────────────────
 
@@ -1234,5 +1238,205 @@ public sealed class FakeCloudClient : IDisposable
                 "/_fakecloud/cloudfront/distributions/"
                     + HttpTransport.EncodePath(distributionId) + "/status",
                 new CloudFrontDistributionStatusRequest(status), ct);
+    }
+
+    /// <summary>
+    /// Service Quotas admin sub-client. Wraps the
+    /// <c>/_fakecloud/service-quotas/*</c> endpoints that read every quota's
+    /// applied value, usage and enforcement state; set applied values
+    /// directly (including below the AWS default, so a test can hit a limit
+    /// without creating the default number of resources); switch enforcement
+    /// on or off globally, per quota or per account; and decide increase
+    /// requests held <c>PENDING</c> under manual approval.
+    /// </summary>
+    public sealed class ServiceQuotasClient
+    {
+        private const string Base = "/_fakecloud/service-quotas";
+
+        private readonly HttpTransport _http;
+        internal ServiceQuotasClient(HttpTransport http) => _http = http;
+
+        private static string QuotaPath(string serviceCode, string quotaCode) =>
+            Base + "/quotas/" + HttpTransport.EncodePath(serviceCode) + "/"
+                + HttpTransport.EncodePath(quotaCode);
+
+        /// <summary>Append the non-null <paramref name="pairs"/> as a query string.</summary>
+        private static string WithQuery(string path, params (string Key, string? Value)[] pairs)
+        {
+            var sb = new StringBuilder(path);
+            var sep = '?';
+            foreach (var (key, value) in pairs)
+            {
+                if (value is null)
+                {
+                    continue;
+                }
+                sb.Append(sep).Append(key).Append('=').Append(HttpTransport.EncodePath(value));
+                sep = '&';
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// The JSON value of an enforcement setting: <c>true</c>,
+        /// <c>false</c>, or an explicit <c>null</c> that clears the override.
+        /// </summary>
+        private static JsonNode? EnforceNode(QuotaEnforcement enforcement) => enforcement switch
+        {
+            QuotaEnforcement.Enforce => JsonValue.Create(true),
+            QuotaEnforcement.Ignore => JsonValue.Create(false),
+            _ => null,
+        };
+
+        /// <summary>
+        /// List every catalog quota (or one service's) with its applied
+        /// value, usage and enforcement state for an account and region.
+        /// Each argument defaults server-side when null (the server's
+        /// account, the server's region, every service). Throws
+        /// <see cref="FakeCloudException"/> with status 404 for an unknown
+        /// service code.
+        /// </summary>
+        public Task<ServiceQuotasResponse> GetQuotasAsync(
+            string? accountId = null, string? region = null, string? serviceCode = null,
+            CancellationToken ct = default) =>
+            _http.GetAsync<ServiceQuotasResponse>(
+                WithQuery(Base + "/quotas",
+                    ("accountId", accountId), ("region", region), ("serviceCode", serviceCode)),
+                ct);
+
+        /// <summary>
+        /// Set one quota's applied value and/or enforcement override. The
+        /// value may be below the AWS default. A null
+        /// <see cref="PutServiceQuotaRequest.Enforcement"/> leaves enforcement
+        /// unchanged (the <c>enforce</c> key is omitted);
+        /// <see cref="QuotaEnforcement.Default"/> clears the override. When
+        /// <see cref="PutServiceQuotaRequest.AccountId"/> is set the override
+        /// applies to that account only, otherwise to every account.
+        /// </summary>
+        public Task<ServiceQuota> PutQuotaAsync(
+            string serviceCode, string quotaCode, PutServiceQuotaRequest req,
+            CancellationToken ct = default)
+        {
+            var body = new JsonObject();
+            if (req.AccountId is not null)
+            {
+                body["accountId"] = req.AccountId;
+            }
+            if (req.Region is not null)
+            {
+                body["region"] = req.Region;
+            }
+            if (req.Value is { } value)
+            {
+                body["value"] = value;
+            }
+            if (req.Enforcement is { } enforcement)
+            {
+                body["enforce"] = EnforceNode(enforcement);
+            }
+            return _http.PutJsonAsync<ServiceQuota>(QuotaPath(serviceCode, quotaCode), body, ct);
+        }
+
+        /// <summary>
+        /// Put a quota back to its AWS default value and drop its enforcement
+        /// override: the account's when <paramref name="accountId"/> is
+        /// given, else the server-wide one.
+        /// </summary>
+        public Task<ServiceQuota> DeleteQuotaAsync(
+            string serviceCode, string quotaCode, string? accountId = null, string? region = null,
+            CancellationToken ct = default) =>
+            _http.DeleteAsync<ServiceQuota>(
+                WithQuery(QuotaPath(serviceCode, quotaCode), ("accountId", accountId), ("region", region)),
+                ct);
+
+        /// <summary>Read the global enforcement switch and every override.</summary>
+        public Task<ServiceQuotaEnforcementResponse> GetEnforcementAsync(CancellationToken ct = default) =>
+            _http.GetAsync<ServiceQuotaEnforcementResponse>(Base + "/enforcement", ct);
+
+        /// <summary>
+        /// Change the global enforcement switch and/or a batch of overrides.
+        /// Every change is validated before any is applied; an override with
+        /// <see cref="QuotaEnforcement.Default"/> clears it.
+        /// </summary>
+        public Task<ServiceQuotaEnforcementResponse> PutEnforcementAsync(
+            PutServiceQuotaEnforcementRequest req, CancellationToken ct = default)
+        {
+            var body = new JsonObject();
+            if (req.EnforceAll is { } enforceAll)
+            {
+                body["enforceAll"] = enforceAll;
+            }
+            if (req.Overrides is { } overrides)
+            {
+                var list = new JsonArray();
+                foreach (var o in overrides)
+                {
+                    var entry = new JsonObject
+                    {
+                        ["serviceCode"] = o.ServiceCode,
+                        ["quotaCode"] = o.QuotaCode,
+                    };
+                    if (o.AccountId is not null)
+                    {
+                        entry["accountId"] = o.AccountId;
+                    }
+                    entry["enforce"] = EnforceNode(o.Enforcement);
+                    list.Add(entry);
+                }
+                body["overrides"] = list;
+            }
+            return _http.PutJsonAsync<ServiceQuotaEnforcementResponse>(Base + "/enforcement", body, ct);
+        }
+
+        /// <summary>Read how increase requests are decided (<c>auto</c> or <c>manual</c>).</summary>
+        public Task<ServiceQuotaRequestApprovalResponse> GetRequestApprovalAsync(
+            CancellationToken ct = default) =>
+            _http.GetAsync<ServiceQuotaRequestApprovalResponse>(Base + "/request-approval", ct);
+
+        /// <summary>
+        /// Set how increase requests are decided: <c>"auto"</c> decides them
+        /// on submission (approved unless AWS would refuse the value),
+        /// <c>"manual"</c> holds them
+        /// <c>PENDING</c> until <see cref="ApproveRequestAsync"/> or
+        /// <see cref="DenyRequestAsync"/> decides them.
+        /// </summary>
+        public Task<ServiceQuotaRequestApprovalResponse> SetRequestApprovalAsync(
+            string mode, CancellationToken ct = default) =>
+            _http.PutJsonAsync<ServiceQuotaRequestApprovalResponse>(
+                Base + "/request-approval", new JsonObject { ["mode"] = mode }, ct);
+
+        /// <summary>
+        /// List increase requests across accounts (or one), newest first,
+        /// optionally filtered by status.
+        /// </summary>
+        public Task<ServiceQuotaRequestsResponse> GetRequestsAsync(
+            string? accountId = null, string? status = null, CancellationToken ct = default) =>
+            _http.GetAsync<ServiceQuotaRequestsResponse>(
+                WithQuery(Base + "/requests", ("accountId", accountId), ("status", status)), ct);
+
+        /// <summary>
+        /// Approve a <c>PENDING</c> or <c>CASE_OPENED</c> increase request,
+        /// raising the account's applied value to the requested one. Throws
+        /// <see cref="FakeCloudException"/> with status 404 for an unknown
+        /// request and 409 for one already decided.
+        /// </summary>
+        public Task<ServiceQuotaRequest> ApproveRequestAsync(string requestId, CancellationToken ct = default) =>
+            _http.PostEmptyAsync<ServiceQuotaRequest>(
+                Base + "/requests/" + HttpTransport.EncodePath(requestId) + "/approve", ct);
+
+        /// <summary>
+        /// Close a <c>PENDING</c> or <c>CASE_OPENED</c> increase request
+        /// without raising the quota. <paramref name="status"/> is one of
+        /// <c>DENIED</c> (the default when null), <c>NOT_APPROVED</c>,
+        /// <c>CASE_CLOSED</c>, <c>INVALID_REQUEST</c>.
+        /// </summary>
+        public Task<ServiceQuotaRequest> DenyRequestAsync(
+            string requestId, string? status = null, CancellationToken ct = default)
+        {
+            var path = Base + "/requests/" + HttpTransport.EncodePath(requestId) + "/deny";
+            return status is null
+                ? _http.PostEmptyAsync<ServiceQuotaRequest>(path, ct)
+                : _http.PostJsonAsync<ServiceQuotaRequest>(path, new JsonObject { ["status"] = status }, ct);
+        }
     }
 }

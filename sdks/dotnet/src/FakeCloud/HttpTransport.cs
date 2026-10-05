@@ -108,6 +108,15 @@ internal sealed class HttpTransport : IDisposable
         return status;
     }
 
+    internal async Task<T> PutJsonAsync<T>(string path, object body, CancellationToken ct = default)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Put, Url(path))
+        {
+            Content = JsonContent(body),
+        };
+        return await SendAsync<T>(req, ct).ConfigureAwait(false);
+    }
+
     internal async Task<T> PostTextAsync<T>(string path, string body, CancellationToken ct = default)
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, Url(path))

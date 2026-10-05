@@ -293,6 +293,40 @@ Top-level client. Defaults to `http://localhost:4566`.
 | ---------------- | --------------------------- |
 | `tickRotation()` | Tick the rotation scheduler |
 
+### `fc.serviceQuotas`
+
+| Method                                                         | Description                                                                                        |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `getQuotas({ accountId?, region?, serviceCode? })`             | List quotas with applied value, usage and enforcement state (default account/region: the server's) |
+| `putQuota(serviceCode, quotaCode, req)`                        | Set a quota's applied value (may be below the AWS default) and/or its enforcement override         |
+| `deleteQuota(serviceCode, quotaCode, { accountId?, region? })` | Reset a quota to its AWS default and drop its enforcement override                                 |
+| `getEnforcement()`                                             | Read the global enforcement switch and every server-wide and per-account override                  |
+| `putEnforcement(req)`                                          | Change the global switch and/or a batch of overrides                                               |
+| `getRequestApproval()`                                         | Read how increase requests are decided (`auto` or `manual`)                                        |
+| `setRequestApproval(mode)`                                     | Set `auto` or `manual` approval; `manual` holds new requests `PENDING`                             |
+| `getRequests({ accountId?, status? })`                         | List increase requests, newest first                                                               |
+| `approveRequest(requestId)`                                    | Approve a pending request, raising the account's applied value                                     |
+| `denyRequest(requestId, status?)`                              | Close a pending request (`DENIED` default, or `NOT_APPROVED` / `CASE_CLOSED` / `INVALID_REQUEST`)  |
+
+`enforce` in `putQuota` is tri-state: `true` enforces, `false` ignores, `null`
+clears the override, and leaving it `undefined` omits the key so enforcement
+stays as it is. When `accountId` is given the override applies to that account
+only; otherwise it is server-wide. In `putEnforcement` overrides, `null` or an
+omitted `enforce` clears the override.
+
+```typescript
+// Cap security groups at 2 inbound/outbound rules instead of 60.
+await fc.serviceQuotas.putQuota("vpc", "L-0EA8095F", {
+  value: 2,
+  enforce: true,
+});
+
+// Hold increase requests for the test to decide.
+await fc.serviceQuotas.setRequestApproval("manual");
+const { requests } = await fc.serviceQuotas.getRequests({ status: "PENDING" });
+await fc.serviceQuotas.approveRequest(requests[0].requestId);
+```
+
 ### `fc.ses`
 
 | Method                                | Description                                                            |

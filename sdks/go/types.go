@@ -1,6 +1,9 @@
 package fakecloud
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // ── Health & Reset ─────────────────────────────────────────────────
 
@@ -1867,4 +1870,206 @@ type CloudFrontDistributionsResponse struct {
 // GET /_fakecloud/elbv2/waf-counts.
 type Elbv2WafCountsResponse struct {
 	Counts json.RawMessage `json:"counts"`
+}
+
+// -- Service Quotas --------------------------------------------------
+
+// QuotaEnforcement is the tri-state enforcement override of one quota:
+// QuotaEnforcementEnforce (sent as true), QuotaEnforcementIgnore (false) or
+// QuotaEnforcementDefault (null, which clears the override so the quota
+// follows the global switch again). The zero value is QuotaEnforcementDefault.
+type QuotaEnforcement string
+
+const (
+	// QuotaEnforcementEnforce makes fakecloud reject requests past the quota.
+	QuotaEnforcementEnforce QuotaEnforcement = "enforce"
+	// QuotaEnforcementIgnore lets requests past the quota through.
+	QuotaEnforcementIgnore QuotaEnforcement = "ignore"
+	// QuotaEnforcementDefault clears the override.
+	QuotaEnforcementDefault QuotaEnforcement = "default"
+)
+
+// Ptr returns a pointer to e, for the optional Enforcement field of
+// ServiceQuotasPutQuotaRequest.
+func (e QuotaEnforcement) Ptr() *QuotaEnforcement { return &e }
+
+// MarshalJSON encodes the enforcement as true, false or null.
+func (e QuotaEnforcement) MarshalJSON() ([]byte, error) {
+	switch e {
+	case QuotaEnforcementEnforce:
+		return []byte("true"), nil
+	case QuotaEnforcementIgnore:
+		return []byte("false"), nil
+	case QuotaEnforcementDefault, "":
+		return []byte("null"), nil
+	}
+	return nil, fmt.Errorf("fakecloud: unknown QuotaEnforcement %q", string(e))
+}
+
+// UnmarshalJSON decodes true, false or null.
+func (e *QuotaEnforcement) UnmarshalJSON(data []byte) error {
+	switch string(data) {
+	case "true":
+		*e = QuotaEnforcementEnforce
+	case "false":
+		*e = QuotaEnforcementIgnore
+	case "null":
+		*e = QuotaEnforcementDefault
+	default:
+		return fmt.Errorf("fakecloud: invalid quota enforcement %s", string(data))
+	}
+	return nil
+}
+
+// ServiceQuota is one quota as surfaced by
+// GET /_fakecloud/service-quotas/quotas: its AWS default, the value applied
+// to the account, measured usage and whether fakecloud enforces it.
+type ServiceQuota struct {
+	ServiceCode  string  `json:"serviceCode"`
+	QuotaCode    string  `json:"quotaCode"`
+	QuotaName    string  `json:"quotaName"`
+	Global       bool    `json:"global"`
+	Adjustable   bool    `json:"adjustable"`
+	Unit         string  `json:"unit"`
+	DefaultValue float64 `json:"defaultValue"`
+	AppliedValue float64 `json:"appliedValue"`
+	// Usage is nil when no fakecloud service measures this quota.
+	Usage       *float64 `json:"usage"`
+	Enforceable bool     `json:"enforceable"`
+	Enforced    bool     `json:"enforced"`
+	// EnforcementSource says what decided Enforced: "not_enforceable",
+	// "account_override", "override" or "global".
+	EnforcementSource string `json:"enforcementSource"`
+}
+
+// ServiceQuotasResponse is returned by GET /_fakecloud/service-quotas/quotas.
+type ServiceQuotasResponse struct {
+	AccountID string         `json:"accountId"`
+	Region    string         `json:"region"`
+	Quotas    []ServiceQuota `json:"quotas"`
+}
+
+// ServiceQuotasListOptions filters GET /_fakecloud/service-quotas/quotas.
+// Empty fields fall back to the server's account and region, and to every
+// service.
+type ServiceQuotasListOptions struct {
+	AccountID   string
+	Region      string
+	ServiceCode string
+}
+
+// ServiceQuotasPutQuotaRequest is the body for
+// PUT /_fakecloud/service-quotas/quotas/{serviceCode}/{quotaCode}.
+type ServiceQuotasPutQuotaRequest struct {
+	// AccountID scopes the change to one account. When set, Enforcement is an
+	// override for that account only; otherwise it applies server-wide.
+	AccountID string `json:"accountId,omitempty"`
+	// Region of a regional quota (default: the server's region).
+	Region string `json:"region,omitempty"`
+	// Value is the applied value to set. It may be below the AWS default.
+	Value *float64 `json:"value,omitempty"`
+	// Enforcement nil leaves enforcement unchanged; QuotaEnforcementDefault
+	// clears the override.
+	Enforcement *QuotaEnforcement `json:"enforce,omitempty"`
+}
+
+// ServiceQuotasDeleteQuotaOptions scopes
+// DELETE /_fakecloud/service-quotas/quotas/{serviceCode}/{quotaCode}.
+type ServiceQuotasDeleteQuotaOptions struct {
+	// AccountID drops that account's override; empty drops the server-wide
+	// one (and resets the server account's applied value).
+	AccountID string
+	Region    string
+}
+
+// ServiceQuotasOverride is a server-wide enforcement override.
+type ServiceQuotasOverride struct {
+	ServiceCode string `json:"serviceCode"`
+	QuotaCode   string `json:"quotaCode"`
+	Enforce     bool   `json:"enforce"`
+}
+
+// ServiceQuotasAccountOverride is an enforcement override for one account.
+type ServiceQuotasAccountOverride struct {
+	AccountID   string `json:"accountId"`
+	ServiceCode string `json:"serviceCode"`
+	QuotaCode   string `json:"quotaCode"`
+	Enforce     bool   `json:"enforce"`
+}
+
+// ServiceQuotasEnforcementResponse is returned by
+// GET and PUT /_fakecloud/service-quotas/enforcement.
+type ServiceQuotasEnforcementResponse struct {
+	EnforceAll       bool                           `json:"enforceAll"`
+	Overrides        []ServiceQuotasOverride        `json:"overrides"`
+	AccountOverrides []ServiceQuotasAccountOverride `json:"accountOverrides"`
+}
+
+// ServiceQuotasOverrideChange is one entry of
+// ServiceQuotasPutEnforcementRequest.Overrides.
+type ServiceQuotasOverrideChange struct {
+	ServiceCode string `json:"serviceCode"`
+	QuotaCode   string `json:"quotaCode"`
+	// AccountID scopes the override to one account; empty applies to every
+	// account.
+	AccountID string `json:"accountId,omitempty"`
+	// Enforcement QuotaEnforcementDefault (or the zero value) clears the
+	// override.
+	Enforcement QuotaEnforcement `json:"enforce"`
+}
+
+// ServiceQuotasPutEnforcementRequest is the body for
+// PUT /_fakecloud/service-quotas/enforcement.
+type ServiceQuotasPutEnforcementRequest struct {
+	// EnforceAll nil leaves the global switch unchanged.
+	EnforceAll *bool                         `json:"enforceAll,omitempty"`
+	Overrides  []ServiceQuotasOverrideChange `json:"overrides,omitempty"`
+}
+
+// ServiceQuotasRequestApprovalResponse is returned by
+// GET and PUT /_fakecloud/service-quotas/request-approval. Mode is "auto" or
+// "manual".
+type ServiceQuotasRequestApprovalResponse struct {
+	Mode string `json:"mode"`
+}
+
+// ServiceQuotasRequestApprovalRequest is the body for
+// PUT /_fakecloud/service-quotas/request-approval.
+type ServiceQuotasRequestApprovalRequest struct {
+	Mode string `json:"mode"`
+}
+
+// ServiceQuotaRequest is one quota increase request.
+type ServiceQuotaRequest struct {
+	AccountID   string `json:"accountId"`
+	RequestID   string `json:"requestId"`
+	ServiceCode string `json:"serviceCode"`
+	QuotaCode   string `json:"quotaCode"`
+	QuotaName   string `json:"quotaName"`
+	// Region is empty for global quotas.
+	Region       string  `json:"region"`
+	DesiredValue float64 `json:"desiredValue"`
+	Status       string  `json:"status"`
+	CaseID       *string `json:"caseId"`
+	// Created and LastUpdated are RFC 3339 timestamps.
+	Created     string `json:"created"`
+	LastUpdated string `json:"lastUpdated"`
+}
+
+// ServiceQuotaRequestsResponse is returned by
+// GET /_fakecloud/service-quotas/requests.
+type ServiceQuotaRequestsResponse struct {
+	Requests []ServiceQuotaRequest `json:"requests"`
+}
+
+// ServiceQuotaRequestsOptions filters GET /_fakecloud/service-quotas/requests.
+type ServiceQuotaRequestsOptions struct {
+	AccountID string
+	Status    string
+}
+
+// ServiceQuotasDenyRequest is the body for
+// POST /_fakecloud/service-quotas/requests/{requestId}/deny.
+type ServiceQuotasDenyRequest struct {
+	Status string `json:"status,omitempty"`
 }

@@ -71,6 +71,14 @@ final class HttpTransport {
         return send(req, type);
     }
 
+    <T> T putJson(String path, Object body, Class<T> type) {
+        byte[] payload = serialize(body);
+        HttpRequest.Builder req = HttpRequest.newBuilder(uri(path))
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofByteArray(payload));
+        return send(req, type);
+    }
+
     /**
      * POST a JSON body where the server replies with no content (204) on
      * success. Throws {@link FakeCloudError} on non-2xx; on success, returns

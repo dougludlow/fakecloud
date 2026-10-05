@@ -1,10 +1,11 @@
 //! The quotas Service Quotas knows about: their codes, names, AWS default
 //! values and whether they can be raised.
 //!
-//! Values are the published AWS defaults for a new account. Quotas other
-//! fakecloud services enforce (security groups per network interface, rules
-//! per security group) read their applied value from here through
-//! [`fakecloud_core::quota::QuotaProvider`].
+//! Values are the published AWS defaults for a new account. Quotas another
+//! fakecloud service can enforce are marked [`QuotaDef::enforceable`]; the
+//! enforcing service reads their applied value from here through
+//! [`fakecloud_core::quota::QuotaProvider`] once the user switched
+//! enforcement on.
 
 /// A service that has quotas.
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +38,9 @@ pub struct QuotaDef {
     /// documents one. A request above it is not approved.
     pub max_value: Option<f64>,
     pub usage_metric: Option<UsageMetric>,
+    /// Whether a fakecloud service checks requests against this quota once
+    /// enforcement is switched on for it.
+    pub enforceable: bool,
 }
 
 pub use fakecloud_core::quota::{
@@ -96,7 +100,13 @@ const fn q(
         global: false,
         max_value: None,
         usage_metric: None,
+        enforceable: false,
     }
+}
+
+const fn enforceable(mut d: QuotaDef) -> QuotaDef {
+    d.enforceable = true;
+    d
 }
 
 const fn global(mut d: QuotaDef) -> QuotaDef {
@@ -143,7 +153,7 @@ const fn vcpu_metric(
 
 pub const QUOTAS: &[QuotaDef] = &[
     // ---- Amazon VPC ----
-    max(
+    enforceable(max(
         q(
             VPC,
             SECURITY_GROUPS_PER_INTERFACE,
@@ -152,14 +162,14 @@ pub const QUOTAS: &[QuotaDef] = &[
             true,
         ),
         16.0,
-    ),
-    q(
+    )),
+    enforceable(q(
         VPC,
         RULES_PER_SECURITY_GROUP,
         "Inbound or outbound rules per security group",
         fakecloud_core::quota::DEFAULT_RULES_PER_SECURITY_GROUP as f64,
         true,
-    ),
+    )),
     q(VPC, "L-F678F1CE", "VPCs per Region", 5.0, true),
     q(VPC, "L-A4707A72", "Internet gateways per Region", 5.0, true),
     q(VPC, "L-407747CB", "Subnets per VPC", 200.0, true),
@@ -472,6 +482,13 @@ pub const QUOTAS: &[QuotaDef] = &[
         true,
     ),
 ];
+
+/// Parse a `service_code/quota_code` reference (as the CLI flags and the
+/// introspection API take it) into its catalog entry.
+pub fn parse_ref(reference: &str) -> Option<&'static QuotaDef> {
+    let (service_code, quota_code) = reference.split_once('/')?;
+    quota(service_code, quota_code)
+}
 
 pub fn service(code: &str) -> Option<&'static ServiceDef> {
     SERVICES.iter().find(|s| s.code == code)

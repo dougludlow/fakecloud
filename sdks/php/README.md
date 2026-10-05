@@ -352,6 +352,49 @@ $fc = new FakeCloud('http://localhost:4566'); // explicit base URL
 | `getDistributions()`                            | List CloudFront distributions (id, domain, served)   |
 | `setDistributionStatus($distributionId, $status)` | Force a CloudFront distribution into a status        |
 
+### `$fc->serviceQuotas()`
+
+| Method                                                           | Description                                                                                  |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `getQuotas(?$accountId, ?$region, ?$serviceCode)`                | List quotas with applied value, usage and enforcement state (default account/region: the server's) |
+| `putQuota($serviceCode, $quotaCode, $req)`                       | Set a quota's applied value (may be below the AWS default) and/or enforcement override       |
+| `deleteQuota($serviceCode, $quotaCode, ?$accountId, ?$region)`   | Reset a quota to its AWS default and drop its override (the account's when `$accountId` is given) |
+| `getEnforcement()`                                               | Read the global `enforceAll` switch and every per-quota / per-account override               |
+| `putEnforcement($req)`                                           | Change the global switch and/or a batch of overrides (all validated before any is applied)   |
+| `getRequestApproval()`                                           | Read how increase requests are decided (`auto` or `manual`)                                  |
+| `setRequestApproval($mode)`                                      | Switch between `auto` and `manual` approval                                                  |
+| `getRequests(?$accountId, ?$status)`                             | List quota increase requests, newest first                                                   |
+| `approveRequest($requestId)`                                     | Approve a pending request, raising the applied value                                         |
+| `denyRequest($requestId, ?$status)`                              | Close a pending request (`DENIED` by default, or `NOT_APPROVED` / `CASE_CLOSED` / `INVALID_REQUEST`) |
+
+Enforcement is tri-state via the `QuotaEnforcement` enum: `Enforce` sends `true`, `Ignore` sends `false`, and `Default` sends `null` to clear the override. In `PutServiceQuotaRequest`, leaving `enforcement` null omits the key entirely and leaves enforcement unchanged.
+
+```php
+use FakeCloud\PutServiceQuotaEnforcementRequest;
+use FakeCloud\PutServiceQuotaRequest;
+use FakeCloud\QuotaEnforcement;
+use FakeCloud\ServiceQuotaEnforcementChange;
+
+// Lower "Inbound or outbound rules per security group" to 2 and enforce
+// it, so the third AuthorizeSecurityGroupIngress rule fails without
+// creating sixty rules first.
+$fc->serviceQuotas()->putQuota('vpc', 'L-0EA8095F', new PutServiceQuotaRequest(
+    value: 2,
+    enforcement: QuotaEnforcement::Enforce,
+));
+
+// Clear that override again, leaving the applied value alone.
+$fc->serviceQuotas()->putEnforcement(new PutServiceQuotaEnforcementRequest(
+    overrides: [new ServiceQuotaEnforcementChange('vpc', 'L-0EA8095F', QuotaEnforcement::Default)],
+));
+
+// Hold increase requests for a manual decision.
+$fc->serviceQuotas()->setRequestApproval('manual');
+foreach ($fc->serviceQuotas()->getRequests(status: 'PENDING')->requests as $r) {
+    $fc->serviceQuotas()->approveRequest($r->requestId);
+}
+```
+
 #### Full test loop — asserting on Bedrock calls
 
 ```php

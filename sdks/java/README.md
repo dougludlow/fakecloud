@@ -386,6 +386,45 @@ System.out.println(dist.served());     // true once the data plane serves it
 // main fakecloud endpoint (http://localhost:4566).
 ```
 
+### `fc.serviceQuotas()`
+
+| Method                                                    | Description                                                                                  |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `getQuotas()` / `getQuotas(accountId, region, serviceCode)` | List every quota (or one service's) with applied value, usage and enforcement state; `null` args use the server defaults |
+| `putQuota(serviceCode, quotaCode, req)`                   | Set a quota's applied value (may be below the AWS default) and/or enforcement override       |
+| `deleteQuota(serviceCode, quotaCode)` / `deleteQuota(serviceCode, quotaCode, accountId, region)` | Reset a quota to its AWS default and drop its override (account-scoped when `accountId` is set) |
+| `getEnforcement()`                                        | Read the global `enforceAll` switch and every server-wide and per-account override           |
+| `putEnforcement(req)`                                     | Change the global switch and/or a batch of overrides (validated before any is applied)       |
+| `getRequestApproval()` / `setRequestApproval(mode)`       | Read or set how increase requests are decided (`auto` / `manual`)                            |
+| `getRequests()` / `getRequests(accountId, status)`        | List increase requests, newest first, optionally filtered                                    |
+| `approveRequest(requestId)`                               | Approve a pending request, raising the account's applied value                               |
+| `denyRequest(requestId)` / `denyRequest(requestId, status)` | Close a pending request (`DENIED` by default, or `NOT_APPROVED` / `CASE_CLOSED` / `INVALID_REQUEST`) |
+
+Enforcement is tri-state via `Types.QuotaEnforcement`: `ENFORCE` sends `true`, `IGNORE` sends `false`, and `DEFAULT` sends `null` to clear the override. Leaving the enforcement `null` on a `ServiceQuotasPutQuotaRequest` omits the `enforce` key, so enforcement is left unchanged.
+
+```java
+import dev.fakecloud.FakeCloud;
+import dev.fakecloud.Types.QuotaEnforcement;
+import dev.fakecloud.Types.ServiceQuotasPutQuotaRequest;
+
+FakeCloud fc = new FakeCloud();
+
+// Cap rules per security group at 2 and enforce it, so the third
+// AuthorizeSecurityGroupIngress rule fails without adding the AWS default
+// number of rules first.
+fc.serviceQuotas().putQuota("vpc", "L-0EA8095F",
+        new ServiceQuotasPutQuotaRequest(null, null, 2.0, QuotaEnforcement.ENFORCE));
+
+// Hold increase requests for a manual decision.
+fc.serviceQuotas().setRequestApproval("manual");
+// ... the app calls RequestServiceQuotaIncrease ...
+var pending = fc.serviceQuotas().getRequests(null, "PENDING").requests();
+fc.serviceQuotas().approveRequest(pending.get(0).requestId());
+
+// Back to the AWS default with no override.
+fc.serviceQuotas().deleteQuota("vpc", "L-0EA8095F");
+```
+
 #### Full test loop — asserting on Bedrock calls
 
 ```java

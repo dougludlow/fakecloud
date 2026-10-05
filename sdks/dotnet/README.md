@@ -363,6 +363,34 @@ var fc = new FakeCloudClient("http://localhost:4566"); // explicit base URL
 | `GetDistributionsAsync()`                            | List CloudFront distributions with their `<id>.cloudfront.net` domain and serving state    |
 | `SetDistributionStatusAsync(distributionId, status)` | Flip a stored CloudFront Distribution's status (`Deployed` / `InProgress`) without waiting |
 
+### `fc.ServiceQuotas`
+
+| Method                                                         | Description                                                                                          |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `GetQuotasAsync(accountId?, region?, serviceCode?)`            | List quotas with applied value, measured usage and enforcement state                                 |
+| `PutQuotaAsync(serviceCode, quotaCode, req)`                   | Set a quota's applied value (may be below the AWS default) and/or its enforcement override           |
+| `DeleteQuotaAsync(serviceCode, quotaCode, accountId?, region?)`| Reset a quota to its AWS default and drop its enforcement override                                   |
+| `GetEnforcementAsync()`                                        | Read the global enforcement switch and every server-wide and per-account override                    |
+| `PutEnforcementAsync(req)`                                     | Change the global switch and/or a batch of overrides                                                 |
+| `GetRequestApprovalAsync()`                                    | Read how increase requests are decided (`auto` / `manual`)                                           |
+| `SetRequestApprovalAsync(mode)`                                | Set `auto` (decided on submission) or `manual` (held `PENDING` until approved or denied)             |
+| `GetRequestsAsync(accountId?, status?)`                        | List quota increase requests, newest first                                                           |
+| `ApproveRequestAsync(requestId)`                               | Approve a pending request and raise the applied value                                                |
+| `DenyRequestAsync(requestId, status?)`                         | Close a pending request as `DENIED` (default), `NOT_APPROVED`, `CASE_CLOSED` or `INVALID_REQUEST`    |
+
+Enforcement is tri-state via `QuotaEnforcement`: `Enforce` (sent as `true`), `Ignore` (`false`) and `Default` (an explicit `null` that clears the override). In `PutServiceQuotaRequest`, leaving `Enforcement` null omits the field and keeps the current setting.
+
+```csharp
+// Hit the rules-per-security-group limit after two rules instead of sixty.
+await fc.ServiceQuotas.PutQuotaAsync("vpc", "L-0EA8095F",
+    new PutServiceQuotaRequest(Value: 2, Enforcement: QuotaEnforcement.Enforce));
+
+// Hold increase requests so code that polls their status can be tested.
+await fc.ServiceQuotas.SetRequestApprovalAsync("manual");
+var pending = (await fc.ServiceQuotas.GetRequestsAsync(status: "PENDING")).Requests!;
+await fc.ServiceQuotas.ApproveRequestAsync(pending[0].RequestId!);
+```
+
 #### Full test loop — asserting on Bedrock calls
 
 ```csharp

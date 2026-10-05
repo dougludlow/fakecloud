@@ -2502,9 +2502,7 @@ pub(crate) fn modify_instance_attribute(
     validate_enum(&req.query_params, "Attribute", ATTRIBUTE_VALUES)?;
     let p = &req.query_params;
     crate::service::quota::check_group_count(
-        svc,
-        &req.account_id,
-        &req.region,
+        svc.enforced_security_groups_per_interface(&req.account_id, &req.region),
         crate::service::quota::GroupHolder::Instance,
         crate::service::quota::distinct_count(&indexed_list(p, "GroupId")),
     )?;

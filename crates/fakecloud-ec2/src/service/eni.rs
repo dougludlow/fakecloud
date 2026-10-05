@@ -89,9 +89,7 @@ pub(crate) fn create_network_interface(
         &["efa", "efa-only", "branch", "trunk"],
     )?;
     crate::service::quota::check_group_count(
-        svc,
-        &req.account_id,
-        &req.region,
+        svc.enforced_security_groups_per_interface(&req.account_id, &req.region),
         crate::service::quota::GroupHolder::Interface,
         crate::service::quota::distinct_count(&indexed_list(&req.query_params, "SecurityGroupId")),
     )?;
@@ -393,9 +391,7 @@ pub(crate) fn modify_network_interface_attribute(
 ) -> Result<AwsResponse, AwsServiceError> {
     let eni_id = require(&req.query_params, "NetworkInterfaceId")?;
     crate::service::quota::check_group_count(
-        svc,
-        &req.account_id,
-        &req.region,
+        svc.enforced_security_groups_per_interface(&req.account_id, &req.region),
         crate::service::quota::GroupHolder::Interface,
         crate::service::quota::distinct_count(&indexed_list(&req.query_params, "SecurityGroupId")),
     )?;

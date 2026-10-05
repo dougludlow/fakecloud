@@ -114,6 +114,10 @@ mod tests {
         let mut accounts: MultiAccountState<ServiceQuotasData> =
             MultiAccountState::new("000000000000", "us-east-1", "");
         accounts.get_or_create("111122223333");
+        accounts
+            .get_or_create("111122223333")
+            .enforcement
+            .insert("vpc/L-0EA8095F".into(), true);
         let snap = ServiceQuotasSnapshot {
             schema_version: SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION,
             accounts,
@@ -124,7 +128,14 @@ mod tests {
             load_into(&store, &restored).unwrap(),
             LoadOutcome::Loaded(2)
         );
-        assert!(restored.read().get("111122223333").is_some());
+        // Per-account enforcement overrides are account data and persist.
+        assert_eq!(
+            restored
+                .read()
+                .get("111122223333")
+                .and_then(|d| d.enforcement.get("vpc/L-0EA8095F").copied()),
+            Some(true)
+        );
     }
 
     #[test]

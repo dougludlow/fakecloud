@@ -161,6 +161,7 @@ public final class FakeCloud {
     private final KmsClient kms;
     private final WafV2Client wafv2;
     private final CloudFrontClient cloudfront;
+    private final ServiceQuotasClient serviceQuotas;
 
     public FakeCloud() {
         this(DEFAULT_BASE_URL);
@@ -202,6 +203,7 @@ public final class FakeCloud {
         this.kms = new KmsClient(http);
         this.wafv2 = new WafV2Client(http);
         this.cloudfront = new CloudFrontClient(http);
+        this.serviceQuotas = new ServiceQuotasClient(http);
     }
 
     static String trimTrailingSlashes(String url) {
@@ -340,6 +342,7 @@ public final class FakeCloud {
     public KmsClient kms() { return kms; }
     public WafV2Client wafv2() { return wafv2; }
     public CloudFrontClient cloudfront() { return cloudfront; }
+    public ServiceQuotasClient serviceQuotas() { return serviceQuotas; }
 
     // ── Sub-clients ────────────────────────────────────────────────
 
@@ -1559,6 +1562,166 @@ public final class FakeCloud {
                             + encodePath(distributionId)
                             + "/status",
                     new CloudFrontDistributionStatusRequest(status));
+        }
+    }
+
+    /**
+     * Service Quotas admin sub-client. Wraps the
+     * {@code /_fakecloud/service-quotas/*} endpoints: read every quota's
+     * applied value, usage and enforcement state, set applied values directly
+     * (including below the AWS default, so a test can hit a limit without
+     * creating the default number of resources), switch enforcement on or off
+     * globally, per quota or per account, and decide increase requests held
+     * {@code PENDING} under manual approval.
+     */
+    public static final class ServiceQuotasClient {
+        private static final String BASE = "/_fakecloud/service-quotas";
+
+        private final HttpTransport http;
+        ServiceQuotasClient(HttpTransport http) { this.http = http; }
+
+        /** Every quota for the server's default account and region. */
+        public Types.ServiceQuotasResponse getQuotas() {
+            return getQuotas(null, null, null);
+        }
+
+        /**
+         * Every quota (or one service's) with its applied value, usage and
+         * enforcement state. Each argument may be {@code null}: the account
+         * and region default to the server's, and a {@code null}
+         * {@code serviceCode} lists every service.
+         */
+        public Types.ServiceQuotasResponse getQuotas(
+                String accountId, String region, String serviceCode) {
+            String path = BASE + "/quotas" + query(
+                    "accountId", accountId, "region", region, "serviceCode", serviceCode);
+            return http.get(path, Types.ServiceQuotasResponse.class);
+        }
+
+        /**
+         * Set one quota's applied value and/or enforcement override. See
+         * {@link Types.ServiceQuotasPutQuotaRequest} for the field semantics.
+         */
+        public Types.ServiceQuota putQuota(
+                String serviceCode, String quotaCode, Types.ServiceQuotasPutQuotaRequest req) {
+            return http.putJson(
+                    quotaPath(serviceCode, quotaCode), req.toBody(), Types.ServiceQuota.class);
+        }
+
+        /** Reset a quota for the server's default account and region. */
+        public Types.ServiceQuota deleteQuota(String serviceCode, String quotaCode) {
+            return deleteQuota(serviceCode, quotaCode, null, null);
+        }
+
+        /**
+         * Put a quota back to its AWS default and drop its enforcement
+         * override: the account's when {@code accountId} is given, else the
+         * server-wide one. {@code accountId} and {@code region} may be
+         * {@code null}.
+         */
+        public Types.ServiceQuota deleteQuota(
+                String serviceCode, String quotaCode, String accountId, String region) {
+            String path = quotaPath(serviceCode, quotaCode)
+                    + query("accountId", accountId, "region", region);
+            return http.delete(path, Types.ServiceQuota.class);
+        }
+
+        /** The global enforcement switch and every override. */
+        public Types.ServiceQuotasEnforcementResponse getEnforcement() {
+            return http.get(BASE + "/enforcement", Types.ServiceQuotasEnforcementResponse.class);
+        }
+
+        /**
+         * Change the global switch and/or a batch of overrides. Every change
+         * is validated before any is applied.
+         */
+        public Types.ServiceQuotasEnforcementResponse putEnforcement(
+                Types.ServiceQuotasPutEnforcementRequest req) {
+            return http.putJson(
+                    BASE + "/enforcement",
+                    req.toBody(),
+                    Types.ServiceQuotasEnforcementResponse.class);
+        }
+
+        /** How increase requests are decided ({@code auto} or {@code manual}). */
+        public Types.ServiceQuotasRequestApprovalResponse getRequestApproval() {
+            return http.get(
+                    BASE + "/request-approval", Types.ServiceQuotasRequestApprovalResponse.class);
+        }
+
+        /**
+         * Switch how increase requests are decided: {@code "auto"} approves
+         * them immediately, {@code "manual"} holds them {@code PENDING} until
+         * {@link #approveRequest} or {@link #denyRequest}.
+         */
+        public Types.ServiceQuotasRequestApprovalResponse setRequestApproval(String mode) {
+            return http.putJson(
+                    BASE + "/request-approval",
+                    Map.of("mode", mode),
+                    Types.ServiceQuotasRequestApprovalResponse.class);
+        }
+
+        /** Every increase request across accounts, newest first. */
+        public Types.ServiceQuotaRequestsResponse getRequests() {
+            return getRequests(null, null);
+        }
+
+        /**
+         * Increase requests, newest first, optionally narrowed to one
+         * account and/or status. Either argument may be {@code null}.
+         */
+        public Types.ServiceQuotaRequestsResponse getRequests(String accountId, String status) {
+            String path = BASE + "/requests" + query("accountId", accountId, "status", status);
+            return http.get(path, Types.ServiceQuotaRequestsResponse.class);
+        }
+
+        /**
+         * Approve a {@code PENDING} or {@code CASE_OPENED} request, raising
+         * the account's applied value to the requested one. Throws
+         * {@link FakeCloudError} with status 409 when it is already decided.
+         */
+        public Types.ServiceQuotaRequest approveRequest(String requestId) {
+            return http.postEmpty(
+                    requestPath(requestId) + "/approve", Types.ServiceQuotaRequest.class);
+        }
+
+        /** Deny a pending request with status {@code DENIED}. */
+        public Types.ServiceQuotaRequest denyRequest(String requestId) {
+            return denyRequest(requestId, null);
+        }
+
+        /**
+         * Close a pending request without raising the quota. {@code status}
+         * is one of {@code DENIED}, {@code NOT_APPROVED}, {@code CASE_CLOSED}
+         * or {@code INVALID_REQUEST}; {@code null} means {@code DENIED}.
+         */
+        public Types.ServiceQuotaRequest denyRequest(String requestId, String status) {
+            Map<String, Object> body = status == null ? Map.of() : Map.of("status", status);
+            return http.postJson(
+                    requestPath(requestId) + "/deny", body, Types.ServiceQuotaRequest.class);
+        }
+
+        private static String quotaPath(String serviceCode, String quotaCode) {
+            return BASE + "/quotas/" + encodePath(serviceCode) + "/" + encodePath(quotaCode);
+        }
+
+        private static String requestPath(String requestId) {
+            return BASE + "/requests/" + encodePath(requestId);
+        }
+
+        /** A query string from name/value pairs, skipping {@code null} values. */
+        static String query(String... pairs) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i + 1 < pairs.length; i += 2) {
+                if (pairs[i + 1] == null) {
+                    continue;
+                }
+                sb.append(sb.length() == 0 ? '?' : '&')
+                        .append(pairs[i])
+                        .append('=')
+                        .append(encodePath(pairs[i + 1]));
+            }
+            return sb.toString();
         }
     }
 }

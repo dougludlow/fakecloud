@@ -5,12 +5,13 @@
 //! quota request template and its association, tags on applied quotas,
 //! automatic quota management and quota utilization reports.
 //!
-//! An increase request is decided as soon as it is made: it is approved (and
-//! the applied value raised) unless it asks for more than AWS allows for the
-//! quota, in which case it is `NOT_APPROVED` and the applied value stays.
-//! Services that enforce a quota read the applied value through
-//! [`crate::ServiceQuotasProvider`], so an approved increase changes what they
-//! accept.
+//! By default an increase request is decided as soon as it is made: it is
+//! approved (and the applied value raised) unless it asks for more than AWS
+//! allows for the quota, in which case it is `NOT_APPROVED` and the applied
+//! value stays. Under [`RequestApproval::Manual`] it stays `PENDING` until the
+//! introspection API approves or denies it. Services that enforce a quota read
+//! the applied value through [`crate::ServiceQuotasProvider`], so an approved
+//! increase changes what they accept.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,12 +31,13 @@ use fakecloud_persistence::SnapshotStore;
 use crate::catalog::{self, QuotaDef};
 use crate::persistence::save_snapshot;
 use crate::provider::{
-    applied_value, apply_template_if_new, approvable, new_request_id, quota_arn, quota_region,
-    requester,
+    applied_value, apply_template_if_new, decide_submission, new_request_id, quota_arn,
+    quota_region, requester,
 };
+use crate::settings::SharedQuotaSettings;
 use crate::state::{
-    applied_key, template_key, AutoManagement, QuotaRequest, SharedServiceQuotasState,
-    TemplateEntry, UtilizationEntry, UtilizationReport,
+    template_key, AutoManagement, QuotaRequest, SharedServiceQuotasState, TemplateEntry,
+    UtilizationEntry, UtilizationReport,
 };
 use crate::validate::{
     check_str, illegal_argument, opt_bool, opt_enum, opt_int, opt_plain_str, opt_str, req_double,
@@ -97,6 +99,10 @@ const SERVICE_PRINCIPAL: &str = "servicequotas.amazonaws.com";
 pub struct ServiceQuotasService {
     state: SharedServiceQuotasState,
     orgs: SharedOrganizationsState,
+    /// Server-wide enforcement and approval settings, shared with the
+    /// [`crate::ServiceQuotasProvider`]. They come from the startup flags and
+    /// last until a restart or reset; they are not persisted.
+    settings: SharedQuotaSettings,
     usage_sources: Vec<Arc<dyn QuotaUsageSource>>,
     /// Persists Organizations state, which associating the template changes
     /// (it enables trusted access for Service Quotas).
@@ -106,10 +112,17 @@ pub struct ServiceQuotasService {
 }
 
 impl ServiceQuotasService {
-    pub fn new(state: SharedServiceQuotasState, orgs: SharedOrganizationsState) -> Self {
+    /// `settings` must be the ones the [`crate::ServiceQuotasProvider`] reads,
+    /// so introspection changes reach the enforcing services.
+    pub fn new(
+        state: SharedServiceQuotasState,
+        orgs: SharedOrganizationsState,
+        settings: SharedQuotaSettings,
+    ) -> Self {
         Self {
             state,
             orgs,
+            settings,
             usage_sources: Vec::new(),
             orgs_snapshot_hook: None,
             snapshot_store: None,
@@ -157,9 +170,10 @@ impl ServiceQuotasService {
             })
             .collect();
         let now = Utc::now();
+        let approval = self.settings.read().request_approval;
         let mut changed = false;
         for account in &members {
-            changed |= apply_template_if_new(&self.state, &self.orgs, account, now);
+            changed |= apply_template_if_new(&self.state, &self.orgs, approval, account, now);
         }
         if changed {
             self.save().await;
@@ -180,7 +194,8 @@ impl ServiceQuotasService {
         }))
     }
 
-    async fn save(&self) {
+    /// Persist the Service Quotas snapshot (a no-op in memory mode).
+    pub async fn save(&self) {
         save_snapshot(
             &self.state,
             self.snapshot_store.clone(),
@@ -199,8 +214,14 @@ impl AwsService for ServiceQuotasService {
     async fn handle(&self, request: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         // Applying the organization's template to a new account changes its
         // state, so it counts as a mutation even on a read.
-        let template_applied =
-            apply_template_if_new(&self.state, &self.orgs, &request.account_id, Utc::now());
+        let approval = self.settings.read().request_approval;
+        let template_applied = apply_template_if_new(
+            &self.state,
+            &self.orgs,
+            approval,
+            &request.account_id,
+            Utc::now(),
+        );
 
         let mutates = is_mutating(request.action.as_str());
         let result = dispatch(self, &request);
@@ -573,6 +594,7 @@ impl ServiceQuotasService {
                 fakecloud_aws::arn::Arn::global_in(&req.region, "iam", &req.account_id, "root")
                     .to_string()
             });
+        let approval = self.settings.read().request_approval;
         let mut guard = self.state.write();
         let data = guard.get_or_create(&req.account_id);
         let current = applied_value(Some(data), &req.region, def);
@@ -600,7 +622,6 @@ impl ServiceQuotasService {
             ));
         }
 
-        let approved = approvable(data, &req.region, def, desired);
         let id = new_request_id();
         let mut request = QuotaRequest {
             id: id.clone(),
@@ -616,15 +637,9 @@ impl ServiceQuotasService {
             quota_arn: quota_arn(&req.region, &req.account_id, def),
         };
         // The request is returned as AWS returns it on submission (PENDING);
-        // it is decided straight away, so every later read sees the outcome.
+        // every later read sees the decision (see `decide_submission`).
         let response = request_json(&request);
-        request.status = if approved { "APPROVED" } else { "NOT_APPROVED" }.to_string();
-        if approved {
-            data.applied.insert(
-                applied_key(&req.region, def.global, def.service_code, def.quota_code),
-                desired,
-            );
-        }
+        request.status = decide_submission(data, &req.region, def, desired, approval).to_string();
         data.requests.insert(id, request);
         ok(json!({ "RequestedQuota": response }))
     }
@@ -1281,6 +1296,11 @@ fn template_entry_not_found(def: &QuotaDef) -> AwsServiceError {
         def.quota_code, def.service_code
     ))
 }
+
+mod introspection;
+pub use introspection::{
+    Decision, IntrospectionError, OverrideChange, PutEnforcementRequest, PutQuotaRequest,
+};
 
 #[cfg(test)]
 mod tests;

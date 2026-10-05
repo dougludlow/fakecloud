@@ -46,6 +46,10 @@ pub(crate) struct ResetState {
     pub wafv2: fakecloud_wafv2::SharedWafv2State,
     pub athena: fakecloud_athena::SharedAthenaState,
     pub organizations: fakecloud_organizations::SharedOrganizationsState,
+    pub servicequotas: fakecloud_servicequotas::SharedServiceQuotasState,
+    pub servicequotas_settings: fakecloud_servicequotas::SharedQuotaSettings,
+    /// The quota settings the server started with, which a reset restores.
+    pub servicequotas_baseline: fakecloud_servicequotas::QuotaSettings,
     pub container_runtime: Option<Arc<fakecloud_lambda::runtime::ContainerRuntime>>,
     pub rds_runtime: Option<Arc<fakecloud_rds::runtime::RdsRuntime>>,
     pub elasticache_runtime: Option<Arc<fakecloud_elasticache::runtime::ElastiCacheRuntime>>,
@@ -212,9 +216,17 @@ impl ResetState {
         }
     }
 
+    /// Reset Service Quotas: every account's applied values, requests and
+    /// overrides, and the enforcement settings back to the startup flags.
+    fn reset_servicequotas(&self) {
+        self.servicequotas.write().reset();
+        *self.servicequotas_settings.write() = self.servicequotas_baseline.clone();
+    }
+
     pub(crate) fn reset_service(&self, service: &str) -> Result<Teardown, String> {
         let mut teardown = Teardown::default();
         match service {
+            "servicequotas" => self.reset_servicequotas(),
             "iam" | "sts" => {
                 // The reset drops the execution-role sessions warm Lambda
                 // instances hold: stop handing them invocations in the same
@@ -385,6 +397,18 @@ impl ResetState {
     ) -> Result<Teardown, String> {
         let mut teardown = Teardown::default();
         match service {
+            "servicequotas" => {
+                if let Some(data) = self.servicequotas.write().get_mut(account_id) {
+                    // The account still exists in its organization, and AWS
+                    // applies the quota request template once, at creation:
+                    // keep the marker so a reset does not apply it again.
+                    let template_checked = data.template_checked.take();
+                    *data = fakecloud_servicequotas::ServiceQuotasData {
+                        template_checked,
+                        ..Default::default()
+                    };
+                }
+            }
             "iam" | "sts" => {
                 if let Some(ref rt) = self.container_runtime {
                     rt.mark_credentials_revoked(Some(account_id));
@@ -723,6 +747,9 @@ impl ResetState {
         // a full reset drops every organization so subsequent runs start
         // with none, matching the no-in-use default state.
         self.organizations.write().clear();
+        // Quota values and overrides change what other services accept, so a
+        // reset puts them back to the startup configuration too.
+        self.reset_servicequotas();
         tracing::info!("state reset via reset API");
         (
             axum::Json(types::ResetResponse {
@@ -1163,6 +1190,20 @@ mod tests {
             organizations: Arc::new(parking_lot::RwLock::new(
                 fakecloud_organizations::OrganizationsRegistry::default(),
             )),
+            servicequotas: Arc::new(parking_lot::RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            servicequotas_settings: Arc::new(parking_lot::RwLock::new(
+                fakecloud_servicequotas::QuotaSettings::default(),
+            )),
+            servicequotas_baseline: fakecloud_servicequotas::QuotaSettings {
+                enforce_all: true,
+                ..Default::default()
+            },
             container_runtime: None,
             rds_runtime: None,
             elasticache_runtime: None,
@@ -1176,6 +1217,45 @@ mod tests {
             )),
             ec2_runtime: None,
         };
+
+        // Service Quotas: a reset drops applied values and restores the
+        // startup enforcement settings.
+        state
+            .servicequotas
+            .write()
+            .get_or_create("123456789012")
+            .applied
+            .insert("us-east-1|vpc|L-2AFB9258".into(), 1.0);
+        state.servicequotas_settings.write().enforce_all = false;
+        state
+            .reset_service("servicequotas")
+            .expect("reset servicequotas");
+        assert!(state
+            .servicequotas
+            .read()
+            .get("123456789012")
+            .is_some_and(|d| d.applied.is_empty()));
+        assert!(state.servicequotas_settings.read().enforce_all);
+        // A per-account reset keeps the organization template marker, so the
+        // template is not applied to the account a second time.
+        {
+            let mut sq = state.servicequotas.write();
+            let data = sq.get_or_create("123456789012");
+            data.template_checked = Some("111111111111@marker".into());
+            data.applied.insert("us-east-1|vpc|L-2AFB9258".into(), 9.0);
+        }
+        state
+            .reset_service_for_account("servicequotas", "123456789012")
+            .expect("reset servicequotas for account");
+        {
+            let sq = state.servicequotas.read();
+            let data = sq.get("123456789012").unwrap();
+            assert!(data.applied.is_empty());
+            assert_eq!(
+                data.template_checked.as_deref(),
+                Some("111111111111@marker")
+            );
+        }
 
         state.reset_service("ec2").expect("reset ec2");
         state.reset_service("rds").expect("reset rds");

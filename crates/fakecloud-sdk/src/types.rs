@@ -2541,3 +2541,148 @@ pub struct Ec2InstanceNetwork {
 pub struct Ec2InstanceNetworksResponse {
     pub instance_networks: Vec<Ec2InstanceNetwork>,
 }
+
+// ── Service Quotas ──────────────────────────────────────────────────
+
+/// One quota as `/_fakecloud/service-quotas/quotas` reports it for an account
+/// and region. `enforcementSource` is one of `not_enforceable`,
+/// `account_override`, `override`, `global`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceQuota {
+    pub service_code: String,
+    pub quota_code: String,
+    pub quota_name: String,
+    pub global: bool,
+    pub adjustable: bool,
+    pub unit: String,
+    pub default_value: f64,
+    pub applied_value: f64,
+    /// Current usage, when a fakecloud service counts it.
+    pub usage: Option<f64>,
+    /// Whether a fakecloud service checks requests against this quota.
+    pub enforceable: bool,
+    pub enforced: bool,
+    pub enforcement_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceQuotasResponse {
+    pub account_id: String,
+    pub region: String,
+    pub quotas: Vec<ServiceQuota>,
+}
+
+/// Whether a quota is enforced: `Enforce` and `Ignore` set an override,
+/// `Default` clears it so the next level decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaEnforcement {
+    Enforce,
+    Ignore,
+    Default,
+}
+
+impl QuotaEnforcement {
+    fn wire(self) -> Option<bool> {
+        match self {
+            Self::Enforce => Some(true),
+            Self::Ignore => Some(false),
+            Self::Default => None,
+        }
+    }
+}
+
+impl Serialize for QuotaEnforcement {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.wire().serialize(serializer)
+    }
+}
+
+/// Body of `PUT /_fakecloud/service-quotas/quotas/{service}/{quota}`.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutServiceQuotaRequest {
+    /// The account to change (default: the server's). When set, `enforce`
+    /// is an override for this account only; otherwise it applies to every
+    /// account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// The applied value; may be below the AWS default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    /// `None` leaves enforcement as it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforce: Option<QuotaEnforcement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaOverride {
+    /// Set on an account-scoped override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub service_code: String,
+    pub quota_code: String,
+    pub enforce: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEnforcementResponse {
+    pub enforce_all: bool,
+    pub overrides: Vec<QuotaOverride>,
+    pub account_overrides: Vec<QuotaOverride>,
+}
+
+/// One override change of [`PutQuotaEnforcementRequest`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaOverrideChange {
+    pub service_code: String,
+    pub quota_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub enforce: QuotaEnforcement,
+}
+
+/// Body of `PUT /_fakecloud/service-quotas/enforcement`.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutQuotaEnforcementRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforce_all: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<QuotaOverrideChange>,
+}
+
+/// `auto` or `manual`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaRequestApproval {
+    pub mode: String,
+}
+
+/// A Service Quotas increase request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaIncreaseRequest {
+    pub account_id: String,
+    pub request_id: String,
+    pub service_code: String,
+    pub quota_code: String,
+    pub quota_name: String,
+    /// Empty for a global quota.
+    pub region: String,
+    pub desired_value: f64,
+    pub status: String,
+    pub case_id: Option<String>,
+    pub created: String,
+    pub last_updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaIncreaseRequestsResponse {
+    pub requests: Vec<QuotaIncreaseRequest>,
+}

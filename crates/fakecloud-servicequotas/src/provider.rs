@@ -11,6 +11,7 @@ use fakecloud_organizations::SharedOrganizationsState;
 use fakecloud_persistence::SnapshotHook;
 
 use crate::catalog::{self, QuotaDef};
+use crate::settings::{enforcement, RequestApproval, SharedQuotaSettings};
 use crate::state::{
     applied_key, QuotaRequest, ServiceQuotasData, SharedServiceQuotasState, TemplateEntry,
 };
@@ -83,9 +84,13 @@ pub fn new_request_id() -> String {
 /// service enforcing a quota) gives the same observable result: by the time
 /// anything reads the account's quotas, the template has been applied and the
 /// requests are in its history.
+///
+/// Under [`RequestApproval::Manual`] the requests are left `PENDING` for the
+/// introspection API to decide, like any other request.
 pub fn apply_template_if_new(
     state: &SharedServiceQuotasState,
     orgs: &SharedOrganizationsState,
+    approval: RequestApproval,
     account_id: &str,
     now: DateTime<Utc>,
 ) -> bool {
@@ -146,19 +151,8 @@ pub fn apply_template_if_new(
             continue;
         }
         // Template entries are submitted as ordinary increase requests, so
-        // they are approved on the same terms.
-        let approved = approvable(data, &entry.aws_region, def, entry.desired_value);
-        if approved {
-            data.applied.insert(
-                applied_key(
-                    &entry.aws_region,
-                    def.global,
-                    def.service_code,
-                    def.quota_code,
-                ),
-                entry.desired_value,
-            );
-        }
+        // they are decided on the same terms.
+        let status = decide_submission(data, &entry.aws_region, def, entry.desired_value, approval);
         let caller =
             fakecloud_aws::arn::Arn::global_in(&entry.aws_region, "iam", &management, "root")
                 .to_string();
@@ -171,7 +165,7 @@ pub fn apply_template_if_new(
                 service_code: def.service_code.to_string(),
                 quota_code: def.quota_code.to_string(),
                 desired_value: entry.desired_value,
-                status: if approved { "APPROVED" } else { "NOT_APPROVED" }.to_string(),
+                status: status.to_string(),
                 case_id: None,
                 created: now,
                 last_updated: now,
@@ -181,6 +175,30 @@ pub fn apply_template_if_new(
         );
     }
     true
+}
+
+/// Decide a newly submitted increase request and return its status: a value
+/// AWS would never approve is `NOT_APPROVED` in either mode; otherwise it is
+/// `APPROVED` (and the applied value raised) under automatic approval, or left
+/// `PENDING` for the introspection API under manual approval.
+pub fn decide_submission(
+    data: &mut ServiceQuotasData,
+    region: &str,
+    def: &QuotaDef,
+    desired: f64,
+    approval: RequestApproval,
+) -> &'static str {
+    if !approvable(data, region, def, desired) {
+        return "NOT_APPROVED";
+    }
+    if approval == RequestApproval::Manual {
+        return "PENDING";
+    }
+    data.applied.insert(
+        applied_key(region, def.global, def.service_code, def.quota_code),
+        desired,
+    );
+    "APPROVED"
 }
 
 /// Whether AWS would approve raising `def` to `desired`: not above the
@@ -205,16 +223,22 @@ pub fn approvable(data: &ServiceQuotasData, region: &str, def: &QuotaDef, desire
 pub struct ServiceQuotasProvider {
     state: SharedServiceQuotasState,
     orgs: SharedOrganizationsState,
+    settings: SharedQuotaSettings,
     /// Persists Service Quotas state when a lookup applies a template. Set
     /// once the service's snapshot store exists (persistent mode only).
     snapshot_hook: OnceLock<SnapshotHook>,
 }
 
 impl ServiceQuotasProvider {
-    pub fn new(state: SharedServiceQuotasState, orgs: SharedOrganizationsState) -> Self {
+    pub fn new(
+        state: SharedServiceQuotasState,
+        orgs: SharedOrganizationsState,
+        settings: SharedQuotaSettings,
+    ) -> Self {
         Self {
             state,
             orgs,
+            settings,
             snapshot_hook: OnceLock::new(),
         }
     }
@@ -223,6 +247,24 @@ impl ServiceQuotasProvider {
     /// the organization's template to an account.
     pub fn set_snapshot_hook(&self, hook: SnapshotHook) {
         let _ = self.snapshot_hook.set(hook);
+    }
+}
+
+impl ServiceQuotasProvider {
+    /// Apply the organization's template to `account_id` if it is due,
+    /// persisting the change.
+    fn apply_template(&self, account_id: &str) {
+        let approval = self.settings.read().request_approval;
+        if apply_template_if_new(&self.state, &self.orgs, approval, account_id, Utc::now()) {
+            // The lookup is synchronous; the snapshot write runs on the
+            // runtime the enforcing service is called from.
+            if let (Some(hook), Ok(rt)) = (
+                self.snapshot_hook.get(),
+                tokio::runtime::Handle::try_current(),
+            ) {
+                rt.spawn(hook());
+            }
+        }
     }
 }
 
@@ -235,18 +277,26 @@ impl QuotaProvider for ServiceQuotasProvider {
         quota_code: &str,
     ) -> Option<f64> {
         let def = catalog::quota(service_code, quota_code)?;
-        if apply_template_if_new(&self.state, &self.orgs, account_id, Utc::now()) {
-            // The lookup is synchronous; the snapshot write runs on the
-            // runtime the enforcing service is called from.
-            if let (Some(hook), Ok(rt)) = (
-                self.snapshot_hook.get(),
-                tokio::runtime::Handle::try_current(),
-            ) {
-                rt.spawn(hook());
-            }
-        }
+        self.apply_template(account_id);
         let guard = self.state.read();
         Some(applied_value(guard.get(account_id), region, def))
+    }
+
+    fn enforced_limit(
+        &self,
+        account_id: &str,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+    ) -> Option<f64> {
+        let def = catalog::quota(service_code, quota_code).filter(|d| d.enforceable)?;
+        self.apply_template(account_id);
+        let settings = self.settings.read();
+        let guard = self.state.read();
+        let data = guard.get(account_id);
+        enforcement(&settings, data, def)
+            .0
+            .then(|| applied_value(data, region, def))
     }
 }
 

@@ -4383,3 +4383,305 @@ final class CloudFrontDistributionsResponse
         return new self(array_map(CloudFrontDistribution::fromArray(...), $data['distributions'] ?? []));
     }
 }
+
+// -- Service Quotas ----------------------------------------------
+
+/**
+ * Tri-state enforcement override for a Service Quotas quota.
+ *
+ * - `Enforce` sends `true` (requests over the applied value are refused).
+ * - `Ignore` sends `false` (the quota is not checked).
+ * - `Default` sends `null`, clearing the override so the quota follows
+ *   the next level up (account override, server-wide override, then the
+ *   global `enforceAll` switch).
+ *
+ * Where an enforcement field is optional (e.g. {@see PutServiceQuotaRequest}),
+ * leaving it null omits the `enforce` key entirely, which leaves the
+ * current enforcement unchanged; that is distinct from `Default`.
+ */
+enum QuotaEnforcement
+{
+    case Enforce;
+    case Ignore;
+    case Default;
+
+    /** The wire value: `true`, `false` or `null`. */
+    public function toJson(): ?bool
+    {
+        return match ($this) {
+            self::Enforce => true,
+            self::Ignore => false,
+            self::Default => null,
+        };
+    }
+}
+
+final class ServiceQuota
+{
+    public function __construct(
+        public readonly string $serviceCode,
+        public readonly string $quotaCode,
+        public readonly string $quotaName,
+        public readonly bool $global,
+        public readonly bool $adjustable,
+        public readonly string $unit,
+        public readonly float $defaultValue,
+        public readonly float $appliedValue,
+        /** Current usage, or null when no fakecloud service measures it. */
+        public readonly ?float $usage,
+        /** Whether a fakecloud service checks requests against this quota. */
+        public readonly bool $enforceable,
+        public readonly bool $enforced,
+        /** `not_enforceable`, `account_override`, `override` or `global`. */
+        public readonly string $enforcementSource,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (string) ($data['serviceCode'] ?? ''),
+            (string) ($data['quotaCode'] ?? ''),
+            (string) ($data['quotaName'] ?? ''),
+            (bool) ($data['global'] ?? false),
+            (bool) ($data['adjustable'] ?? false),
+            (string) ($data['unit'] ?? ''),
+            (float) ($data['defaultValue'] ?? 0),
+            (float) ($data['appliedValue'] ?? 0),
+            isset($data['usage']) ? (float) $data['usage'] : null,
+            (bool) ($data['enforceable'] ?? false),
+            (bool) ($data['enforced'] ?? false),
+            (string) ($data['enforcementSource'] ?? ''),
+        );
+    }
+}
+
+final class ServiceQuotasResponse
+{
+    public function __construct(
+        public readonly string $accountId,
+        public readonly string $region,
+        /** @var ServiceQuota[] */
+        public readonly array $quotas,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (string) ($data['accountId'] ?? ''),
+            (string) ($data['region'] ?? ''),
+            array_map(ServiceQuota::fromArray(...), $data['quotas'] ?? []),
+        );
+    }
+}
+
+final class PutServiceQuotaRequest
+{
+    public function __construct(
+        /**
+         * The account whose applied value is set (null: the server's
+         * account). When given, $enforcement is an override for this
+         * account only; otherwise it applies to every account.
+         */
+        public readonly ?string $accountId = null,
+        /** The region of a regional quota (null: the server's region). */
+        public readonly ?string $region = null,
+        /** The applied value to set. May be below the AWS default. */
+        public readonly ?float $value = null,
+        /**
+         * null omits `enforce` (enforcement unchanged);
+         * {@see QuotaEnforcement::Default} sends `null` (override cleared).
+         */
+        public readonly ?QuotaEnforcement $enforcement = null,
+    ) {}
+
+    public function toArray(): array
+    {
+        $out = [];
+        if ($this->accountId !== null) {
+            $out['accountId'] = $this->accountId;
+        }
+        if ($this->region !== null) {
+            $out['region'] = $this->region;
+        }
+        if ($this->value !== null) {
+            $out['value'] = $this->value;
+        }
+        if ($this->enforcement !== null) {
+            $out['enforce'] = $this->enforcement->toJson();
+        }
+        return $out;
+    }
+}
+
+/** One override change in {@see PutServiceQuotaEnforcementRequest}. */
+final class ServiceQuotaEnforcementChange
+{
+    public function __construct(
+        public readonly string $serviceCode,
+        public readonly string $quotaCode,
+        /** {@see QuotaEnforcement::Default} clears the override. */
+        public readonly QuotaEnforcement $enforcement,
+        /** Scope the override to one account; null applies to every account. */
+        public readonly ?string $accountId = null,
+    ) {}
+
+    public function toArray(): array
+    {
+        $out = [
+            'serviceCode' => $this->serviceCode,
+            'quotaCode' => $this->quotaCode,
+        ];
+        if ($this->accountId !== null) {
+            $out['accountId'] = $this->accountId;
+        }
+        $out['enforce'] = $this->enforcement->toJson();
+        return $out;
+    }
+}
+
+final class PutServiceQuotaEnforcementRequest
+{
+    public function __construct(
+        /** The global switch; null leaves it unchanged. */
+        public readonly ?bool $enforceAll = null,
+        /** @var ServiceQuotaEnforcementChange[] */
+        public readonly array $overrides = [],
+    ) {}
+
+    public function toArray(): array
+    {
+        $out = [];
+        if ($this->enforceAll !== null) {
+            $out['enforceAll'] = $this->enforceAll;
+        }
+        if ($this->overrides !== []) {
+            $out['overrides'] = array_map(
+                fn (ServiceQuotaEnforcementChange $o) => $o->toArray(),
+                array_values($this->overrides),
+            );
+        }
+        return $out;
+    }
+}
+
+final class ServiceQuotaEnforcementOverride
+{
+    public function __construct(
+        public readonly string $serviceCode,
+        public readonly string $quotaCode,
+        public readonly bool $enforce,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (string) ($data['serviceCode'] ?? ''),
+            (string) ($data['quotaCode'] ?? ''),
+            (bool) ($data['enforce'] ?? false),
+        );
+    }
+}
+
+final class ServiceQuotaAccountEnforcementOverride
+{
+    public function __construct(
+        public readonly string $accountId,
+        public readonly string $serviceCode,
+        public readonly string $quotaCode,
+        public readonly bool $enforce,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (string) ($data['accountId'] ?? ''),
+            (string) ($data['serviceCode'] ?? ''),
+            (string) ($data['quotaCode'] ?? ''),
+            (bool) ($data['enforce'] ?? false),
+        );
+    }
+}
+
+final class ServiceQuotaEnforcementResponse
+{
+    public function __construct(
+        public readonly bool $enforceAll,
+        /** @var ServiceQuotaEnforcementOverride[] */
+        public readonly array $overrides,
+        /** @var ServiceQuotaAccountEnforcementOverride[] */
+        public readonly array $accountOverrides,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (bool) ($data['enforceAll'] ?? false),
+            array_map(ServiceQuotaEnforcementOverride::fromArray(...), $data['overrides'] ?? []),
+            array_map(ServiceQuotaAccountEnforcementOverride::fromArray(...), $data['accountOverrides'] ?? []),
+        );
+    }
+}
+
+final class ServiceQuotaRequestApprovalResponse
+{
+    public function __construct(
+        /** `auto` or `manual`. */
+        public readonly string $mode,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self((string) ($data['mode'] ?? ''));
+    }
+}
+
+/** A quota increase request as tracked by fakecloud. */
+final class ServiceQuotaIncreaseRequest
+{
+    public function __construct(
+        public readonly string $accountId,
+        public readonly string $requestId,
+        public readonly string $serviceCode,
+        public readonly string $quotaCode,
+        public readonly string $quotaName,
+        /** Empty for global quotas. */
+        public readonly string $region,
+        public readonly float $desiredValue,
+        public readonly string $status,
+        public readonly ?string $caseId,
+        /** RFC 3339 timestamp. */
+        public readonly string $created,
+        /** RFC 3339 timestamp. */
+        public readonly string $lastUpdated,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (string) ($data['accountId'] ?? ''),
+            (string) ($data['requestId'] ?? ''),
+            (string) ($data['serviceCode'] ?? ''),
+            (string) ($data['quotaCode'] ?? ''),
+            (string) ($data['quotaName'] ?? ''),
+            (string) ($data['region'] ?? ''),
+            (float) ($data['desiredValue'] ?? 0),
+            (string) ($data['status'] ?? ''),
+            $data['caseId'] ?? null,
+            (string) ($data['created'] ?? ''),
+            (string) ($data['lastUpdated'] ?? ''),
+        );
+    }
+}
+
+final class ServiceQuotaIncreaseRequestsResponse
+{
+    public function __construct(
+        /** @var ServiceQuotaIncreaseRequest[] */
+        public readonly array $requests,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(array_map(ServiceQuotaIncreaseRequest::fromArray(...), $data['requests'] ?? []));
+    }
+}

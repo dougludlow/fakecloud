@@ -726,27 +726,13 @@ fn get_account_summary() {
 /// provider does not know keep their AWS default.
 #[test]
 fn get_account_summary_reports_applied_service_quotas() {
-    struct Applied;
-    impl fakecloud_core::quota::QuotaProvider for Applied {
-        fn applied_value(
-            &self,
-            account_id: &str,
-            _region: &str,
-            service_code: &str,
-            quota_code: &str,
-        ) -> Option<f64> {
-            assert_eq!((account_id, service_code), ("123456789012", "iam"));
-            match quota_code {
-                "L-0DA4ABF3" => Some(25.0),
-                "L-FE177D64" => Some(4000.0),
-                _ => None,
-            }
-        }
-    }
     let state: SharedIamState = Arc::new(RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
     ));
-    let svc = IamService::new(state).with_quota_provider(Some(Arc::new(Applied)));
+    let applied = fakecloud_core::quota::FixedQuotas::default()
+        .with("iam", "L-0DA4ABF3", 25.0)
+        .with("iam", "L-FE177D64", 4000.0);
+    let svc = IamService::new(state).with_quota_provider(Some(Arc::new(applied)));
     let resp = svc.handle_sync("GetAccountSummary", vec![]);
     assert!(resp.contains("<key>AttachedPoliciesPerRoleQuota</key><value>25</value>"));
     assert!(resp.contains("<key>RolesQuota</key><value>4000</value>"));

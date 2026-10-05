@@ -623,7 +623,7 @@ fn authorize(
     let owner = req.account_id.clone();
     let region = req.region.clone();
     // Resolved before the EC2 lock is taken: Service Quotas answers it.
-    let rule_limit = svc.rules_per_security_group(&req.account_id, &req.region);
+    let rule_limit = svc.enforced_rules_per_security_group(&req.account_id, &req.region);
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -636,13 +636,7 @@ fn authorize(
             .ok_or_else(|| sg_not_found(&group_id))?;
         let after: Vec<SecurityGroupRule> =
             sg.rules.iter().chain(new_rules.iter()).cloned().collect();
-        if let Some((count, direction)) = weights.side_grown_past(&sg.rules, &after, rule_limit) {
-            return Err(rules_limit_exceeded(format!(
-                "The maximum number of rules per security group has been reached: the \
-                 security group '{group_id}' would have {count} {direction} rules, limit \
-                 {rule_limit}"
-            )));
-        }
+        weights.check_edit(&group_id, &sg.rules, &after, rule_limit)?;
         sg.rules = after;
     }
     // New rules change what traffic is allowed — re-apply the firewall (ph3).
@@ -760,7 +754,7 @@ pub(crate) fn modify_security_group_rules(
 ) -> Result<AwsResponse, AwsServiceError> {
     let group_id = require(&req.query_params, "GroupId")?;
     let p = &req.query_params;
-    let rule_limit = svc.rules_per_security_group(&req.account_id, &req.region);
+    let rule_limit = svc.enforced_rules_per_security_group(&req.account_id, &req.region);
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -830,13 +824,7 @@ pub(crate) fn modify_security_group_rules(
             }
             n += 1;
         }
-        if let Some((count, direction)) = weights.side_grown_past(&sg.rules, &rules, rule_limit) {
-            return Err(rules_limit_exceeded(format!(
-                "The maximum number of rules per security group has been reached: the \
-                 security group '{group_id}' would have {count} {direction} rules, limit \
-                 {rule_limit}"
-            )));
-        }
+        weights.check_edit(&group_id, &sg.rules, &rules, rule_limit)?;
         sg.rules = rules;
     }
     // Rule changes alter allowed traffic — re-apply the firewall (ph3).
@@ -1142,10 +1130,10 @@ pub(crate) fn validate_security_group_quotas_for_interface(
         }
     }
 
+    // Validation answers against the applied values whether or not they are
+    // enforced: asking whether groups fit the quotas is what it is for.
     check_group_count(
-        svc,
-        &req.account_id,
-        &req.region,
+        Some(svc.security_groups_per_interface(&req.account_id, &req.region)),
         GroupHolder::Interface,
         group_ids.len(),
     )?;
@@ -1922,7 +1910,7 @@ mod modify_tests {
 
     #[test]
     fn authorize_weighs_a_prefix_list_rule_by_its_max_entries() {
-        let svc = Ec2Service::new();
+        let svc = crate::test_support::svc_enforcing_sg_quotas();
         seed_sized_group(&svc, "sg-a", 0, 0);
         {
             let mut accounts = svc.state.write();
@@ -1966,6 +1954,31 @@ mod modify_tests {
         assert!(authorize_pl("pl-small").is_ok());
         let err = crate::test_support::err_of(authorize_pl("pl-small"));
         assert_eq!(err.code(), "RulesPerSecurityGroupLimitExceeded");
+    }
+
+    #[test]
+    fn rules_quota_is_not_checked_unless_enforced() {
+        let svc = Ec2Service::new();
+        seed_sized_group(
+            &svc,
+            "sg-a",
+            crate::service::quota::DEFAULT_RULES_PER_SECURITY_GROUP,
+            0,
+        );
+        authorize_security_group_ingress(
+            &svc,
+            &req(
+                "AuthorizeSecurityGroupIngress",
+                &[
+                    ("GroupId", "sg-a"),
+                    ("IpPermissions.1.IpProtocol", "tcp"),
+                    ("IpPermissions.1.FromPort", "1"),
+                    ("IpPermissions.1.ToPort", "1"),
+                    ("IpPermissions.1.IpRanges.1.CidrIp", "192.0.2.0/24"),
+                ],
+            ),
+        )
+        .expect("the 61st rule is accepted while the quota is not enforced");
     }
 
     fn validate_quotas(svc: &Ec2Service, query: &[(&str, &str)]) -> String {

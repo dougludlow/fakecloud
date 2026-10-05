@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::QuotaSettings;
 use bytes::Bytes;
 use fakecloud_core::multi_account::MultiAccountState;
 use fakecloud_organizations::{MemberAccount, OrganizationState, OrganizationsRegistry};
@@ -21,6 +22,7 @@ fn svc_with(orgs: SharedOrganizationsState) -> ServiceQuotasService {
             "",
         ))),
         orgs,
+        Arc::new(RwLock::new(QuotaSettings::default())),
     )
 }
 
@@ -599,7 +601,7 @@ fn provider_reports_applied_values() {
     let mut body = sg_quota("L-0EA8095F");
     body["DesiredValue"] = json!(100.0);
     call(&s, "RequestServiceQuotaIncrease", body);
-    let p = crate::ServiceQuotasProvider::new(s.state.clone(), s.orgs.clone());
+    let p = provider(&s);
     assert_eq!(
         p.applied_value("000000000000", "us-east-1", "vpc", "L-0EA8095F"),
         Some(100.0)
@@ -671,4 +673,385 @@ fn template_applied_on_membership_change_survives_disassociation() {
     run(&s, MGMT, "DisassociateServiceQuotaTemplate", json!({})).unwrap();
     let member_quota = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
     assert_eq!(member_quota["Quota"]["Value"], 8.0);
+}
+
+fn provider(s: &ServiceQuotasService) -> crate::ServiceQuotasProvider {
+    crate::ServiceQuotasProvider::new(s.state.clone(), s.orgs.clone(), s.settings.clone())
+}
+
+const ACCT: &str = "000000000000";
+
+#[test]
+fn nothing_is_enforced_until_switched_on() {
+    use fakecloud_core::quota::QuotaProvider;
+    let s = svc();
+    let p = provider(&s);
+    assert_eq!(
+        p.enforced_limit(ACCT, "us-east-1", "vpc", "L-0EA8095F"),
+        None
+    );
+
+    // The global switch turns on every enforceable quota.
+    s.introspect_put_enforcement(&PutEnforcementRequest {
+        enforce_all: Some(true),
+        overrides: vec![],
+    })
+    .unwrap();
+    assert_eq!(
+        p.enforced_limit(ACCT, "us-east-1", "vpc", "L-0EA8095F"),
+        Some(60.0)
+    );
+    // A quota no service checks stays unenforced.
+    assert_eq!(
+        p.enforced_limit(ACCT, "us-east-1", "lambda", "L-B99A9384"),
+        None
+    );
+
+    // A server-wide ignore beats the global switch; an account override
+    // beats both.
+    s.introspect_put_enforcement(&PutEnforcementRequest {
+        enforce_all: None,
+        overrides: vec![
+            OverrideChange {
+                service_code: "vpc".into(),
+                quota_code: "L-0EA8095F".into(),
+                account_id: None,
+                enforce: Some(false),
+            },
+            OverrideChange {
+                service_code: "vpc".into(),
+                quota_code: "L-0EA8095F".into(),
+                account_id: Some(MEMBER.into()),
+                enforce: Some(true),
+            },
+        ],
+    })
+    .unwrap();
+    assert_eq!(
+        p.enforced_limit(ACCT, "us-east-1", "vpc", "L-0EA8095F"),
+        None
+    );
+    assert_eq!(
+        p.enforced_limit(MEMBER, "us-east-1", "vpc", "L-0EA8095F"),
+        Some(60.0)
+    );
+    let view = s.introspect_enforcement();
+    assert_eq!(view["enforceAll"], true);
+    assert_eq!(view["overrides"][0]["enforce"], false);
+    assert_eq!(view["accountOverrides"][0]["accountId"], MEMBER);
+}
+
+#[test]
+fn put_quota_sets_values_below_the_default_and_enforces() {
+    use fakecloud_core::quota::QuotaProvider;
+    let s = svc();
+    let body: PutQuotaRequest =
+        serde_json::from_value(json!({ "value": 2.0, "enforce": true })).unwrap();
+    let view = s.introspect_put_quota("vpc", "L-2AFB9258", &body).unwrap();
+    assert_eq!(view["appliedValue"], 2.0);
+    assert_eq!(view["defaultValue"], 5.0);
+    assert_eq!(view["enforced"], true);
+    assert_eq!(view["enforcementSource"], "override");
+    assert_eq!(
+        provider(&s).enforced_limit(ACCT, "us-east-1", "vpc", "L-2AFB9258"),
+        Some(2.0)
+    );
+    // The Service Quotas API reports the same applied value.
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 2.0);
+
+    // An explicit null clears the override but keeps the value.
+    let body: PutQuotaRequest = serde_json::from_value(json!({ "enforce": null })).unwrap();
+    let view = s.introspect_put_quota("vpc", "L-2AFB9258", &body).unwrap();
+    assert_eq!(view["enforced"], false);
+    assert_eq!(view["appliedValue"], 2.0);
+
+    // DELETE restores the AWS default.
+    let view = s
+        .introspect_delete_quota("vpc", "L-2AFB9258", None, None)
+        .unwrap();
+    assert_eq!(view["appliedValue"], 5.0);
+}
+
+#[test]
+fn put_quota_rejects_bad_input() {
+    let s = svc();
+    let put = |svc_code: &str, code: &str, body: Value| {
+        let body: PutQuotaRequest = serde_json::from_value(body).unwrap();
+        s.introspect_put_quota(svc_code, code, &body).unwrap_err()
+    };
+    assert_eq!(
+        put("vpc", "L-NOPE", json!({"value": 1.0})).status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        put("vpc", "L-2AFB9258", json!({})).status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        put("vpc", "L-2AFB9258", json!({"value": -1.0})).status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        put(
+            "vpc",
+            "L-2AFB9258",
+            json!({"value": 1.0, "accountId": "abc"})
+        )
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    // Switching on a quota no service checks would silently do nothing.
+    let e = put("lambda", "L-B99A9384", json!({"enforce": true}));
+    assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    assert!(e.message.contains("not enforceable"), "{}", e.message);
+    assert!(serde_json::from_value::<PutQuotaRequest>(json!({"bogus": 1})).is_err());
+}
+
+#[test]
+fn global_quota_values_ignore_the_region() {
+    let s = svc();
+    let body: PutQuotaRequest =
+        serde_json::from_value(json!({ "value": 3.0, "region": "eu-west-1" })).unwrap();
+    s.introspect_put_quota("iam", "L-FE177D64", &body).unwrap();
+    let all = s
+        .introspect_quotas(None, Some("us-west-2"), Some("iam"))
+        .unwrap();
+    let roles = all["quotas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["quotaCode"] == "L-FE177D64")
+        .unwrap();
+    assert_eq!(roles["appliedValue"], 3.0);
+    assert_eq!(roles["global"], true);
+}
+
+#[test]
+fn introspect_quotas_lists_the_catalog_with_usage() {
+    struct Count;
+    impl QuotaUsageSource for Count {
+        fn service_codes(&self) -> &[&str] {
+            &["vpc"]
+        }
+        fn usage(&self, _: &str, _: &str, _: &str, quota_code: &str) -> Option<f64> {
+            (quota_code == "L-F678F1CE").then_some(3.0)
+        }
+    }
+    let s = svc().with_usage_source(Arc::new(Count));
+    let all = s.introspect_quotas(None, None, None).unwrap();
+    assert_eq!(all["accountId"], ACCT);
+    assert_eq!(all["region"], "us-east-1");
+    assert_eq!(
+        all["quotas"].as_array().unwrap().len(),
+        catalog::QUOTAS.len()
+    );
+    let vpc = s.introspect_quotas(None, None, Some("vpc")).unwrap();
+    let vpcs = vpc["quotas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["quotaCode"] == "L-F678F1CE")
+        .unwrap()
+        .clone();
+    assert_eq!(vpcs["usage"], 3.0);
+    assert_eq!(vpcs["enforcementSource"], "not_enforceable");
+    assert_eq!(
+        s.introspect_quotas(None, None, Some("nope"))
+            .unwrap_err()
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[test]
+fn manual_approval_holds_requests_pending_until_decided() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    assert_eq!(s.introspect_request_approval()["mode"], "manual");
+    let mut body = sg_quota("L-0EA8095F");
+    body["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = |s: &ServiceQuotasService| {
+        run(
+            s,
+            ACCT,
+            "GetRequestedServiceQuotaChange",
+            json!({ "RequestId": id }),
+        )
+        .unwrap()["RequestedQuota"]["Status"]
+            .clone()
+    };
+    assert_eq!(status(&s), "PENDING");
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 60.0);
+
+    // A pending request can open a support case now.
+    run(&s, ACCT, "CreateSupportCase", json!({ "RequestId": id })).unwrap();
+    assert_eq!(status(&s), "CASE_OPENED");
+
+    let pending = s.introspect_requests(None, Some("CASE_OPENED")).unwrap();
+    assert_eq!(pending["requests"][0]["requestId"], id.as_str());
+
+    let decided = s.introspect_decide_request(&id, Decision::Approve).unwrap();
+    assert_eq!(decided["status"], "APPROVED");
+    assert_eq!(status(&s), "APPROVED");
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 100.0);
+
+    // A decided request cannot be decided again.
+    let e = s
+        .introspect_decide_request(&id, Decision::deny(None).unwrap())
+        .unwrap_err();
+    assert_eq!(e.status, StatusCode::CONFLICT);
+}
+
+#[test]
+fn denying_a_request_keeps_the_applied_value() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    let mut body = sg_quota("L-0EA8095F");
+    body["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(Decision::deny(Some("APPROVED")).is_err());
+    let decided = s
+        .introspect_decide_request(&id, Decision::deny(Some("CASE_CLOSED")).unwrap())
+        .unwrap();
+    assert_eq!(decided["status"], "CASE_CLOSED");
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 60.0);
+    assert_eq!(
+        s.introspect_decide_request("nope", Decision::Approve)
+            .unwrap_err()
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(s.introspect_set_request_approval("sometimes").is_err());
+}
+
+#[test]
+fn manual_approval_leaves_template_entries_pending() {
+    let o = org_with_member(3600);
+    let s = svc_with(o);
+    s.introspect_set_request_approval("manual").unwrap();
+    run(
+        &s,
+        MGMT,
+        "PutServiceQuotaIncreaseRequestIntoTemplate",
+        json!({ "ServiceCode": "vpc", "QuotaCode": "L-2AFB9258", "AwsRegion": "us-east-1", "DesiredValue": 8.0 }),
+    )
+    .unwrap();
+    run(&s, MGMT, "AssociateServiceQuotaTemplate", json!({})).unwrap();
+    let member_quota = run(&s, MEMBER, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(member_quota["Quota"]["Value"], 5.0);
+    let hist = run(
+        &s,
+        MEMBER,
+        "ListRequestedServiceQuotaChangeHistory",
+        json!({ "Status": "PENDING" }),
+    )
+    .unwrap();
+    assert_eq!(hist["RequestedQuotas"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn approving_never_lowers_a_quota_set_higher_meanwhile() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    let mut body = sg_quota("L-0EA8095F");
+    body["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let raise: PutQuotaRequest = serde_json::from_value(json!({ "value": 150.0 })).unwrap();
+    s.introspect_put_quota("vpc", "L-0EA8095F", &raise).unwrap();
+    s.introspect_decide_request(&id, Decision::Approve).unwrap();
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-0EA8095F")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 150.0);
+}
+
+#[test]
+fn manual_approval_still_refuses_values_aws_would_not_approve() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    // 100 groups per interface is past the documented maximum of 16.
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(100.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = run(
+        &s,
+        ACCT,
+        "GetRequestedServiceQuotaChange",
+        json!({ "RequestId": id }),
+    )
+    .unwrap();
+    assert_eq!(r["RequestedQuota"]["Status"], "NOT_APPROVED");
+
+    // An approvable request that stops being approvable while it waits
+    // (rules per group raised so groups x rules would pass 1000) cannot be
+    // approved.
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(10.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rules: PutQuotaRequest = serde_json::from_value(json!({ "value": 200.0 })).unwrap();
+    s.introspect_put_quota("vpc", "L-0EA8095F", &rules).unwrap();
+    let e = s
+        .introspect_decide_request(&id, Decision::Approve)
+        .unwrap_err();
+    assert_eq!(e.status, StatusCode::CONFLICT);
+    assert!(s
+        .introspect_decide_request(&id, Decision::deny(None).unwrap())
+        .is_ok());
+}
+
+#[test]
+fn an_override_on_a_quota_no_service_checks_is_refused() {
+    let s = svc();
+    for enforce in [json!(true), json!(false)] {
+        let body: PutQuotaRequest = serde_json::from_value(json!({ "enforce": enforce })).unwrap();
+        let e = s
+            .introspect_put_quota("lambda", "L-B99A9384", &body)
+            .unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    }
+    // Clearing is always allowed.
+    let body: PutQuotaRequest = serde_json::from_value(json!({ "enforce": null })).unwrap();
+    assert!(s
+        .introspect_put_quota("lambda", "L-B99A9384", &body)
+        .is_ok());
+}
+
+#[test]
+fn approving_a_request_already_met_is_a_no_op_not_a_conflict() {
+    let s = svc();
+    s.introspect_set_request_approval("manual").unwrap();
+    let mut body = sg_quota("L-2AFB9258");
+    body["DesiredValue"] = json!(10.0);
+    let id = call(&s, "RequestServiceQuotaIncrease", body)["RequestedQuota"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Meanwhile groups go to 12 and rules to 120: 10 x 120 would pass the
+    // product limit, but approving changes nothing.
+    for (code, v) in [("L-2AFB9258", 12.0), ("L-0EA8095F", 120.0)] {
+        let b: PutQuotaRequest = serde_json::from_value(json!({ "value": v })).unwrap();
+        s.introspect_put_quota("vpc", code, &b).unwrap();
+    }
+    let decided = s.introspect_decide_request(&id, Decision::Approve).unwrap();
+    assert_eq!(decided["status"], "APPROVED");
+    let q = run(&s, ACCT, "GetServiceQuota", sg_quota("L-2AFB9258")).unwrap();
+    assert_eq!(q["Quota"]["Value"], 12.0);
 }

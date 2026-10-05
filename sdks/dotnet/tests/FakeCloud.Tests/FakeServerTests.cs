@@ -189,4 +189,172 @@ public sealed class FakeServerTests : IDisposable
         Assert.True(res.Authoritative);
         Assert.Equal("10.0.0.5", Assert.Single(res.Records!).Value);
     }
+
+    private const string QuotaJson = """
+        {"serviceCode":"ec2","quotaCode":"L-0263D0A3","quotaName":"EC2-VPC Elastic IPs",
+         "global":false,"adjustable":true,"unit":"None","defaultValue":5.0,"appliedValue":2.0,
+         "usage":1.0,"enforceable":true,"enforced":true,"enforcementSource":"override"}
+        """;
+
+    private const string RequestJson = """
+        {"accountId":"123456789012","requestId":"req-1","serviceCode":"ec2",
+         "quotaCode":"L-0263D0A3","quotaName":"EC2-VPC Elastic IPs","region":"us-east-1",
+         "desiredValue":10.0,"status":"APPROVED","caseId":null,
+         "created":"2026-01-01T00:00:00+00:00","lastUpdated":"2026-01-01T00:00:01+00:00"}
+        """;
+
+    [Fact]
+    public async Task ServiceQuotasGetQuotasBuildsQueryAndDeserializes()
+    {
+        _routes["GET /_fakecloud/service-quotas/quotas?accountId=123456789012&serviceCode=ec2"] =
+            (200, "{\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"quotas\":[" + QuotaJson + "]}");
+        _routes["GET /_fakecloud/service-quotas/quotas"] = (200, """
+            {"accountId":"000000000000","region":"us-east-1","quotas":[
+             {"serviceCode":"s3","quotaCode":"L-DC2B2D3D","quotaName":"Buckets","global":true,
+              "adjustable":true,"unit":"None","defaultValue":10000,"appliedValue":10000,
+              "usage":null,"enforceable":false,"enforced":false,
+              "enforcementSource":"not_enforceable"}]}
+            """);
+        var fc = new FakeCloudClient(_baseUrl);
+
+        var res = await fc.ServiceQuotas.GetQuotasAsync(accountId: "123456789012", serviceCode: "ec2");
+        Assert.Equal("123456789012", res.AccountId);
+        var q = Assert.Single(res.Quotas!);
+        Assert.Equal("L-0263D0A3", q.QuotaCode);
+        Assert.Equal(5.0, q.DefaultValue);
+        Assert.Equal(2.0, q.AppliedValue);
+        Assert.Equal(1.0, q.Usage);
+        Assert.False(q.Global);
+        Assert.True(q.Enforced);
+        Assert.Equal("override", q.EnforcementSource);
+
+        var all = Assert.Single((await fc.ServiceQuotas.GetQuotasAsync()).Quotas!);
+        Assert.Null(all.Usage);
+        Assert.True(all.Global);
+        Assert.Equal("not_enforceable", all.EnforcementSource);
+    }
+
+    [Fact]
+    public async Task ServiceQuotasPutQuotaDistinguishesOmittedNullAndTrue()
+    {
+        const string path = "/_fakecloud/service-quotas/quotas/ec2/L-0263D0A3";
+        _routes["PUT " + path] = (200, QuotaJson);
+        var fc = new FakeCloudClient(_baseUrl);
+
+        await fc.ServiceQuotas.PutQuotaAsync("ec2", "L-0263D0A3", new PutServiceQuotaRequest(Value: 2));
+        await fc.ServiceQuotas.PutQuotaAsync("ec2", "L-0263D0A3",
+            new PutServiceQuotaRequest(Enforcement: QuotaEnforcement.Default));
+        await fc.ServiceQuotas.PutQuotaAsync("ec2", "L-0263D0A3",
+            new PutServiceQuotaRequest(AccountId: "123456789012", Region: "eu-west-1",
+                Enforcement: QuotaEnforcement.Enforce));
+        await fc.ServiceQuotas.PutQuotaAsync("ec2", "L-0263D0A3",
+            new PutServiceQuotaRequest(Enforcement: QuotaEnforcement.Ignore));
+
+        var bodies = _requests.Where(r => r.Method == "PUT" && r.Path == path).Select(r => r.Body).ToList();
+        Assert.Equal(4, bodies.Count);
+        Assert.Equal("{\"value\":2}", bodies[0]);
+        Assert.Equal("{\"enforce\":null}", bodies[1]);
+        Assert.Equal(
+            "{\"accountId\":\"123456789012\",\"region\":\"eu-west-1\",\"enforce\":true}",
+            bodies[2]);
+        Assert.Equal("{\"enforce\":false}", bodies[3]);
+    }
+
+    [Fact]
+    public async Task ServiceQuotasDeleteQuotaSendsScopeAsQuery()
+    {
+        _routes["DELETE /_fakecloud/service-quotas/quotas/ec2/L-0263D0A3?accountId=123456789012&region=us-east-1"] =
+            (200, QuotaJson);
+        var fc = new FakeCloudClient(_baseUrl);
+        var q = await fc.ServiceQuotas.DeleteQuotaAsync("ec2", "L-0263D0A3", "123456789012", "us-east-1");
+        Assert.Equal("ec2", q.ServiceCode);
+    }
+
+    [Fact]
+    public async Task ServiceQuotasPutEnforcementSerializesOverrides()
+    {
+        const string resp = """
+            {"enforceAll":true,
+             "overrides":[{"serviceCode":"ec2","quotaCode":"L-0263D0A3","enforce":false}],
+             "accountOverrides":[{"accountId":"123456789012","serviceCode":"ec2",
+               "quotaCode":"L-1216C47A","enforce":true}]}
+            """;
+        _routes["PUT /_fakecloud/service-quotas/enforcement"] = (200, resp);
+        _routes["GET /_fakecloud/service-quotas/enforcement"] = (200, resp);
+        var fc = new FakeCloudClient(_baseUrl);
+
+        var res = await fc.ServiceQuotas.PutEnforcementAsync(new PutServiceQuotaEnforcementRequest(
+            EnforceAll: true,
+            Overrides:
+            [
+                new ServiceQuotaOverrideChange("ec2", "L-0263D0A3", QuotaEnforcement.Ignore),
+                new ServiceQuotaOverrideChange("ec2", "L-1216C47A", QuotaEnforcement.Enforce, "123456789012"),
+                new ServiceQuotaOverrideChange("ec2", "L-34B43A08", QuotaEnforcement.Default),
+            ]));
+        var body = _requests.Single(r => r.Method == "PUT").Body;
+        Assert.Equal(
+            "{\"enforceAll\":true,\"overrides\":["
+                + "{\"serviceCode\":\"ec2\",\"quotaCode\":\"L-0263D0A3\",\"enforce\":false},"
+                + "{\"serviceCode\":\"ec2\",\"quotaCode\":\"L-1216C47A\",\"accountId\":\"123456789012\",\"enforce\":true},"
+                + "{\"serviceCode\":\"ec2\",\"quotaCode\":\"L-34B43A08\",\"enforce\":null}]}",
+            body);
+        Assert.True(res.EnforceAll);
+        Assert.False(Assert.Single(res.Overrides!).Enforce);
+        var acct = Assert.Single(res.AccountOverrides!);
+        Assert.Equal("123456789012", acct.AccountId);
+        Assert.True(acct.Enforce);
+
+        var got = await fc.ServiceQuotas.GetEnforcementAsync();
+        Assert.Equal("L-1216C47A", Assert.Single(got.AccountOverrides!).QuotaCode);
+    }
+
+    [Fact]
+    public async Task ServiceQuotasRequestApprovalRoundTrips()
+    {
+        _routes["PUT /_fakecloud/service-quotas/request-approval"] = (200, """{"mode":"manual"}""");
+        _routes["GET /_fakecloud/service-quotas/request-approval"] = (200, """{"mode":"auto"}""");
+        var fc = new FakeCloudClient(_baseUrl);
+
+        Assert.Equal("manual", (await fc.ServiceQuotas.SetRequestApprovalAsync("manual")).Mode);
+        Assert.Equal("{\"mode\":\"manual\"}", _requests.Single(r => r.Method == "PUT").Body);
+        Assert.Equal("auto", (await fc.ServiceQuotas.GetRequestApprovalAsync()).Mode);
+    }
+
+    [Fact]
+    public async Task ServiceQuotasRequestsListApproveAndDeny()
+    {
+        _routes["GET /_fakecloud/service-quotas/requests?accountId=123456789012&status=PENDING"] =
+            (200, "{\"requests\":[" + RequestJson + "]}");
+        _routes["POST /_fakecloud/service-quotas/requests/req-1/approve"] = (200, RequestJson);
+        _routes["POST /_fakecloud/service-quotas/requests/req-2/deny"] = (200, RequestJson);
+        _routes["POST /_fakecloud/service-quotas/requests/req-3/deny"] = (200, RequestJson);
+        var fc = new FakeCloudClient(_baseUrl);
+
+        var list = await fc.ServiceQuotas.GetRequestsAsync("123456789012", "PENDING");
+        var r = Assert.Single(list.Requests!);
+        Assert.Equal("req-1", r.RequestId);
+        Assert.Equal(10.0, r.DesiredValue);
+        Assert.Null(r.CaseId);
+        Assert.Equal("2026-01-01T00:00:01+00:00", r.LastUpdated);
+
+        Assert.Equal("APPROVED", (await fc.ServiceQuotas.ApproveRequestAsync("req-1")).Status);
+        await fc.ServiceQuotas.DenyRequestAsync("req-2");
+        await fc.ServiceQuotas.DenyRequestAsync("req-3", "CASE_CLOSED");
+
+        Assert.Equal("", _requests.Single(x => x.Path.EndsWith("/req-1/approve")).Body);
+        Assert.Equal("", _requests.Single(x => x.Path.EndsWith("/req-2/deny")).Body);
+        Assert.Equal("{\"status\":\"CASE_CLOSED\"}", _requests.Single(x => x.Path.EndsWith("/req-3/deny")).Body);
+    }
+
+    [Fact]
+    public async Task ServiceQuotasErrorPropagatesStatusAndBody()
+    {
+        _routes["PUT /_fakecloud/service-quotas/request-approval"] =
+            (400, """{"error":"mode must be auto or manual, got \"sometimes\""}""");
+        var fc = new FakeCloudClient(_baseUrl);
+        var err = await Assert.ThrowsAsync<FakeCloudException>(
+            () => fc.ServiceQuotas.SetRequestApprovalAsync("sometimes"));
+        Assert.Equal(400, err.Status);
+        Assert.Contains("mode must be auto or manual", err.Body);
+    }
 }

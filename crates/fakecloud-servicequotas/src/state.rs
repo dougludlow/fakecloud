@@ -4,7 +4,8 @@
 //! [`crate::catalog`]; this state holds only what an account changed: applied
 //! values raised by approved increase requests, the request history, the
 //! Organizations quota request template, tags on applied quotas, automatic
-//! management settings and quota utilization reports.
+//! management settings, quota utilization reports and per-quota enforcement
+//! overrides.
 //!
 //! Map keys are plain strings (never tuples) so the snapshot round-trips
 //! through JSON.
@@ -115,6 +116,11 @@ pub struct ServiceQuotasData {
     /// Utilization reports keyed by report id.
     #[serde(default)]
     pub reports: BTreeMap<String, UtilizationReport>,
+    /// Per-quota enforcement overrides for this account, keyed by
+    /// [`crate::settings::quota_ref`]: `true` enforces, `false` ignores. They
+    /// take precedence over the server-wide settings.
+    #[serde(default)]
+    pub enforcement: BTreeMap<String, bool>,
 }
 
 impl AccountState for ServiceQuotasData {

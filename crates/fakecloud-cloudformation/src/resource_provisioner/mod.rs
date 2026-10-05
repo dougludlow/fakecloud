@@ -6464,7 +6464,10 @@ mod tests {
                     "ToPort": 2000 + i, "CidrIp": "10.0.0.0/8"})
             })
             .collect();
-        let prov = make_provisioner();
+        let mut prov = make_provisioner();
+        prov.quota_provider = Some(Arc::new(
+            fakecloud_core::quota::FixedQuotas::security_group_defaults(),
+        ));
         let vpc = prov
             .create_resource(&make_resource(
                 "AWS::EC2::VPC",
@@ -6501,7 +6504,10 @@ mod tests {
                     "ToPort": 1000 + i, "CidrIp": "10.0.0.0/8"})
             })
             .collect();
-        let prov = make_provisioner();
+        let mut prov = make_provisioner();
+        prov.quota_provider = Some(Arc::new(
+            fakecloud_core::quota::FixedQuotas::security_group_defaults(),
+        ));
         let vpc = prov
             .create_resource(&make_resource(
                 "AWS::EC2::VPC",
