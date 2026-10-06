@@ -1,11 +1,12 @@
 //! The Service Quotas quota S3 enforces: "General purpose buckets"
 //! (`s3`/`L-DC2B2D3D`).
 //!
-//! The quota is per account across all Regions, and S3 manages it from one
-//! Region of the partition: US East (N. Virginia) for the commercial
-//! partition and AWS GovCloud (US-West) for GovCloud (the partition's primary
-//! Region, likewise in the other partitions). fakecloud reads its applied
-//! value from that Region whichever Region the bucket is created in.
+//! The quota is per account across all Regions (Service Quotas lists it as a
+//! global quota), and S3 manages it from one Region of the partition: US East
+//! (N. Virginia) for the commercial partition and AWS GovCloud (US-West) for
+//! GovCloud (the partition's primary Region, likewise in the other
+//! partitions). fakecloud asks for its applied value in that Region whichever
+//! Region the bucket is created in.
 //! Enforcement is opt-in: the quota is only checked once the user switched it
 //! on in Service Quotas, and an `S3Service` without a quota provider enforces
 //! nothing.

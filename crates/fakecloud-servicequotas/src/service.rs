@@ -416,6 +416,19 @@ fn quota_json(region: &str, account_id: &str, def: &QuotaDef, value: f64) -> Val
     if let Some(m) = usage_metric_json(def) {
         out["UsageMetric"] = m;
     }
+    if let Some(p) = def.period {
+        out["Period"] = json!({ "PeriodValue": p.value, "PeriodUnit": p.unit });
+    }
+    if let Some(c) = def.context {
+        let mut ctx = json!({ "ContextScope": c.scope });
+        if let Some(t) = c.scope_type {
+            ctx["ContextScopeType"] = Value::String(t.to_string());
+        }
+        out["QuotaContext"] = ctx;
+    }
+    if !def.description.is_empty() {
+        out["Description"] = Value::String(def.description.to_string());
+    }
     out
 }
 
@@ -472,9 +485,7 @@ impl ServiceQuotasService {
     // ===== services and quotas =====
 
     fn list_services(&self, b: &Value) -> Result<AwsResponse, AwsServiceError> {
-        let mut all: Vec<_> = catalog::SERVICES.iter().collect();
-        all.sort_by(|a, b| a.code.cmp(b.code));
-        let (items, token) = page(&all, b, 100, 100)?;
+        let (items, token) = page(catalog::services(), b, 100, 100)?;
         let services: Vec<Value> = items
             .iter()
             .map(|s| json!({ "ServiceCode": s.code, "ServiceName": s.name }))
@@ -499,8 +510,7 @@ impl ServiceQuotasService {
         b: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         let svc = service_code(b)?;
-        let all = catalog::quotas_of(svc);
-        let (items, token) = page(&all, b, 100, 100)?;
+        let (items, token) = page(catalog::quotas_of(svc), b, 100, 100)?;
         let quotas: Vec<Value> = items
             .iter()
             .map(|d| quota_json(&req.region, "", d, d.default))
@@ -535,7 +545,7 @@ impl ServiceQuotasService {
         let svc = service_code(b)?;
         let quota_code = opt_str(b, "QuotaCode", &QUOTA_CODE)?;
         let level = opt_enum(b, "QuotaAppliedAtLevel", APPLIED_LEVELS)?;
-        let mut all = catalog::quotas_of(svc);
+        let mut all: Vec<&QuotaDef> = catalog::quotas_of(svc).iter().collect();
         if let Some(code) = quota_code {
             all.retain(|d| d.quota_code == code);
         }

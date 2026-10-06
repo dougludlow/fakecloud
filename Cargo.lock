@@ -6871,6 +6871,7 @@ dependencies = [
  "fakecloud-core",
  "fakecloud-organizations",
  "fakecloud-persistence",
+ "flate2",
  "http 1.4.0",
  "parking_lot",
  "rand 0.8.5",

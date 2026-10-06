@@ -429,7 +429,7 @@ pub(crate) fn vpn_connections(state: &Ec2State) -> usize {
 // ---- vCPU quotas ----
 
 /// The On-Demand vCPU quota an instance type counts toward, `None` for a
-/// family with a quota fakecloud does not model (Trn, DL, HPC, Mac).
+/// family whose quota fakecloud does not enforce (Trn, DL, HPC, Mac).
 pub(crate) fn on_demand_quota(instance_type: &str) -> Option<CountQuota> {
     let family = instance_type.split('.').next().unwrap_or_default();
     let starts = |p: &str| family.starts_with(p);

@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn nothing_is_enforced_by_default() {
-        for def in catalog::QUOTAS {
+        for def in catalog::quotas() {
             assert!(!enforcement(&QuotaSettings::default(), None, def).0);
         }
     }

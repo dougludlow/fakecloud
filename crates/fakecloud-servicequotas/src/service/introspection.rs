@@ -267,10 +267,10 @@ impl ServiceQuotasService {
                 return Err(not_found(format!("unknown service code {code:?}")));
             }
         }
-        let defs: Vec<&QuotaDef> = catalog::QUOTAS
-            .iter()
-            .filter(|d| service_code.is_none_or(|c| d.service_code == c))
-            .collect();
+        let defs: &[QuotaDef] = match service_code {
+            Some(code) => catalog::quotas_of(code),
+            None => catalog::quotas(),
+        };
         let usage: Vec<Option<f64>> = defs
             .iter()
             .map(|d| self.measured_usage(&account, &region, d))

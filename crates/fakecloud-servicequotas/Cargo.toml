@@ -14,6 +14,7 @@ fakecloud-organizations = { workspace = true }
 fakecloud-persistence = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+flate2 = { workspace = true }
 http = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }

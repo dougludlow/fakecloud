@@ -88,11 +88,30 @@ async fn catalog_lookups() {
     let server = TestServer::start().await;
     let (sq, _) = clients(&server).await;
 
-    let services = sq.list_services().send().await.unwrap();
-    assert!(services
-        .services()
-        .iter()
-        .any(|s| s.service_code() == Some(VPC)));
+    // Every service AWS lists, over several pages of at most 100.
+    let mut codes = Vec::new();
+    let mut token = None;
+    loop {
+        let page = sq
+            .list_services()
+            .set_next_token(token)
+            .send()
+            .await
+            .unwrap();
+        assert!(page.services().len() <= 100);
+        codes.extend(
+            page.services()
+                .iter()
+                .filter_map(|s| s.service_code().map(str::to_string)),
+        );
+        token = page.next_token().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(codes.len(), 320);
+    assert!(codes.iter().any(|c| c == VPC));
+    assert!(codes.iter().any(|c| c == "AWSCloudMap"));
 
     let default = sq
         .get_aws_default_service_quota()
