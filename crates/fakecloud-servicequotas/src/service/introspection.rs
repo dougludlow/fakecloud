@@ -8,6 +8,8 @@
 //! The methods are synchronous and leave persistence to the caller, which
 //! saves the snapshot after a successful change.
 
+use std::collections::HashSet;
+
 use chrono::Utc;
 use http::StatusCode;
 use serde::{Deserialize, Deserializer};
@@ -256,7 +258,8 @@ impl ServiceQuotasService {
     /// service code, every quota of that service; without one, only the
     /// quotas worth looking at across the whole catalog: those a fakecloud
     /// service can enforce, those a usage source measures, and those the
-    /// account (or the server) changed with an applied value or an override.
+    /// account (or the server) changed: an applied value in any region, an
+    /// enforcement override, or an open increase request.
     pub fn introspect_quotas(
         &self,
         account_id: Option<&str>,
@@ -281,20 +284,28 @@ impl ServiceQuotasService {
         let settings = self.settings.read();
         let guard = self.state.read();
         let data = guard.get(&account);
+        // Quotas the account or server changed, collected once so the
+        // catalog-wide filter allocates nothing per quota.
+        let mut changed: HashSet<(&str, &str)> = HashSet::new();
+        if service_code.is_none() {
+            changed.extend(settings.overrides.keys().filter_map(|k| k.split_once('/')));
+            if let Some(data) = data {
+                changed.extend(data.enforcement.keys().filter_map(|k| k.split_once('/')));
+                changed.extend(data.applied.keys().filter_map(|k| {
+                    let mut parts = k.splitn(3, '|');
+                    let (_region, svc, code) = (parts.next()?, parts.next()?, parts.next()?);
+                    Some((svc, code))
+                }));
+                changed.extend(
+                    data.requests
+                        .values()
+                        .filter(|r| matches!(r.status.as_str(), "PENDING" | "CASE_OPENED"))
+                        .map(|r| (r.service_code.as_str(), r.quota_code.as_str())),
+                );
+            }
+        }
         let interesting = |d: &QuotaDef, usage: Option<f64>| {
-            let key = quota_ref(d);
-            d.enforceable
-                || usage.is_some()
-                || settings.overrides.contains_key(&key)
-                || data.is_some_and(|data| {
-                    data.enforcement.contains_key(&key)
-                        || data.applied.contains_key(&applied_key(
-                            &region,
-                            d.global,
-                            d.service_code,
-                            d.quota_code,
-                        ))
-                })
+            d.enforceable || usage.is_some() || changed.contains(&(d.service_code, d.quota_code))
         };
         let quotas: Vec<Value> = defs
             .iter()

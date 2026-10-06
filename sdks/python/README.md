@@ -234,7 +234,7 @@ Called as a method on the main client: `fc.organizations()`.
 
 | Method | Description |
 |---|---|
-| `get_quotas(account_id=None, region=None, service_code=None)` | Every quota (or one service's) with applied value, usage and enforcement state |
+| `get_quotas(account_id=None, region=None, service_code=None)` | Quotas with applied value, usage and enforcement state; without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
 | `put_quota(service_code, quota_code, *, account_id=None, region=None, value=None, enforcement=None)` | Set a quota's applied value (may be below the AWS default) and/or its enforcement override |
 | `delete_quota(service_code, quota_code, account_id=None, region=None)` | Reset a quota to its AWS default and drop its override |
 | `get_enforcement()` | Global `enforce_all` switch plus server-wide and per-account overrides |

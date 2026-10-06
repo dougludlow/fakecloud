@@ -352,7 +352,7 @@ func main() {
 
 | Method | Description |
 |--------|-------------|
-| `GetQuotas(ctx, opts)` | List quotas (optionally one account/region/service) with default, applied value, usage and enforcement state |
+| `GetQuotas(ctx, opts)` | List quotas (optionally one account/region/service) with default, applied value, usage and enforcement state; without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
 | `PutQuota(ctx, serviceCode, quotaCode, req)` | Set a quota's applied value (may be below the AWS default) and/or its enforcement override |
 | `DeleteQuota(ctx, serviceCode, quotaCode, opts)` | Reset a quota to its AWS default and drop its override |
 | `GetEnforcement(ctx)` | Read the global enforcement switch and every server-wide and per-account override |

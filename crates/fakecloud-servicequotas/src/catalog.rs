@@ -88,54 +88,51 @@ pub const EC2: &str = "ec2";
 pub const SG_RULES_PRODUCT_LIMIT: f64 = 1000.0;
 
 /// The quotas a fakecloud service checks requests against once enforcement
-/// is switched on. Every other quota is informational.
+/// is switched on. Every other quota is informational. Sorted by service code
+/// then quota code, so [`is_enforceable`] can binary search it.
 pub const ENFORCEABLE: &[(&str, &str)] = &[
-    // EC2 (VPC resources).
-    (VPC, SECURITY_GROUPS_PER_INTERFACE),
-    (VPC, RULES_PER_SECURITY_GROUP),
-    (VPC, "L-F678F1CE"), // VPCs per Region
-    (VPC, "L-A4707A72"), // Internet gateways per Region
-    (VPC, "L-407747CB"), // Subnets per VPC
-    (VPC, "L-E79EC296"), // VPC security groups per Region
-    (VPC, "L-589F43AA"), // Route tables per VPC
-    (VPC, "L-93826ACB"), // Routes per route table
-    (VPC, "L-B4A6D682"), // Network ACLs per VPC
-    (VPC, "L-2AEEBF1A"), // Rules per network ACL
-    (VPC, "L-FE5A380F"), // NAT gateways per Availability Zone
-    (VPC, "L-DF5E4CA3"), // Network interfaces per Region
-    (VPC, "L-83CA0A9D"), // IPv4 CIDR blocks per VPC
-    (VPC, "L-7E9ECCDB"), // Active VPC peering connections per VPC
-    (VPC, "L-DC9F7029"), // Outstanding VPC peering connection requests
-    (VPC, "L-1B52E74A"), // Gateway VPC endpoints per Region
-    (VPC, "L-29B6F2EB"), // Interface VPC endpoints per VPC
-    // EC2 (instances, addresses, VPN).
-    (EC2, "L-1216C47A"), // Running On-Demand Standard instances (vCPUs)
-    (EC2, "L-34B43A08"), // All Standard Spot Instance Requests (vCPUs)
-    (EC2, "L-0263D0A3"), // EC2-VPC Elastic IPs
-    (EC2, "L-74FC7D96"), // Running On-Demand F instances
-    (EC2, "L-DB2E81BA"), // Running On-Demand G and VT instances
-    (EC2, "L-1945791B"), // Running On-Demand Inf instances
-    (EC2, "L-417A185B"), // Running On-Demand P instances
-    (EC2, "L-7295265B"), // Running On-Demand X instances
-    (EC2, "L-43DA4232"), // Running On-Demand High Memory instances
-    (EC2, "L-3E6EC3A3"), // VPN connections per region
-    // IAM.
-    ("iam", "L-F55AF5E4"), // Users per account
-    ("iam", "L-FE177D64"), // Roles per account
-    ("iam", "L-F4A5425F"), // Groups per account
-    ("iam", "L-0DA4ABF3"), // Managed policies per role
-    ("iam", "L-4019AD8B"), // Managed policies per user
-    ("iam", "L-384571C4"), // Managed policies per group
-    ("iam", "L-E95E4862"), // Customer managed policies per account
-    ("iam", "L-BF35879D"), // Server certificates per account
-    ("iam", "L-858F3967"), // OpenId connect providers per account
-    ("iam", "L-6E65F664"), // Instance profiles per account
-    ("iam", "L-C07B4B0D"), // Role trust policy length
-    // Lambda, S3, DynamoDB, KMS.
+    ("dynamodb", "L-F98FE922"), // Maximum number of tables
+    ("ec2", "L-0263D0A3"),      // EC2-VPC Elastic IPs
+    ("ec2", "L-1216C47A"),      // Running On-Demand Standard instances (vCPUs)
+    ("ec2", "L-1945791B"),      // Running On-Demand Inf instances
+    ("ec2", "L-34B43A08"),      // All Standard Spot Instance Requests (vCPUs)
+    ("ec2", "L-3E6EC3A3"),      // VPN connections per region
+    ("ec2", "L-417A185B"),      // Running On-Demand P instances
+    ("ec2", "L-43DA4232"),      // Running On-Demand High Memory instances
+    ("ec2", "L-7295265B"),      // Running On-Demand X instances
+    ("ec2", "L-74FC7D96"),      // Running On-Demand F instances
+    ("ec2", "L-DB2E81BA"),      // Running On-Demand G and VT instances
+    ("iam", "L-0DA4ABF3"),      // Managed policies per role
+    ("iam", "L-384571C4"),      // Managed policies per group
+    ("iam", "L-4019AD8B"),      // Managed policies per user
+    ("iam", "L-6E65F664"),      // Instance profiles per account
+    ("iam", "L-858F3967"),      // OpenId connect providers per account
+    ("iam", "L-BF35879D"),      // Server certificates per account
+    ("iam", "L-C07B4B0D"),      // Role trust policy length
+    ("iam", "L-E95E4862"),      // Customer managed policies per account
+    ("iam", "L-F4A5425F"),      // Groups per account
+    ("iam", "L-F55AF5E4"),      // Users per account
+    ("iam", "L-FE177D64"),      // Roles per account
+    ("kms", "L-C2F1777E"),      // Customer Master Keys (CMKs)
     ("lambda", "L-2ACBD22F"),   // Function and layer storage
     ("s3", "L-DC2B2D3D"),       // General purpose buckets
-    ("dynamodb", "L-F98FE922"), // Maximum number of tables
-    ("kms", "L-C2F1777E"),      // Customer Master Keys (CMKs)
+    ("vpc", "L-0EA8095F"),      // Inbound or outbound rules per security group
+    ("vpc", "L-1B52E74A"),      // Gateway VPC endpoints per Region
+    ("vpc", "L-29B6F2EB"),      // Interface VPC endpoints per VPC
+    ("vpc", "L-2AEEBF1A"),      // Rules per network ACL
+    ("vpc", "L-2AFB9258"),      // Security groups per network interface
+    ("vpc", "L-407747CB"),      // Subnets per VPC
+    ("vpc", "L-589F43AA"),      // Route tables per VPC
+    ("vpc", "L-7E9ECCDB"),      // Active VPC peering connections per VPC
+    ("vpc", "L-83CA0A9D"),      // IPv4 CIDR blocks per VPC
+    ("vpc", "L-93826ACB"),      // Routes per route table
+    ("vpc", "L-A4707A72"),      // Internet gateways per Region
+    ("vpc", "L-B4A6D682"),      // Network ACLs per VPC
+    ("vpc", "L-DC9F7029"),      // Outstanding VPC peering connection requests
+    ("vpc", "L-DF5E4CA3"),      // Network interfaces per Region
+    ("vpc", "L-E79EC296"),      // VPC security groups per Region
+    ("vpc", "L-F678F1CE"),      // VPCs per Region
+    ("vpc", "L-FE5A380F"),      // NAT gateways per Availability Zone
 ];
 
 /// Maximum values AWS documents for adjustable quotas (Amazon VPC quotas,
@@ -277,7 +274,7 @@ fn decode() -> Catalog {
                 unit: intern.get(q.unit),
                 adjustable: q.adjustable,
                 global: q.global_quota,
-                max_value: max_value(code, quota_code),
+                max_value: None,
                 usage_metric: q.usage_metric.map(|m| UsageMetric {
                     namespace: intern.get(m.metric_namespace),
                     name: intern.get(m.metric_name),
@@ -298,7 +295,7 @@ fn decode() -> Catalog {
                     scope: intern.get(c.context_scope),
                     scope_type: c.context_scope_type.map(|t| intern.get(t)),
                 }),
-                enforceable: is_enforceable(code, quota_code),
+                enforceable: false,
             });
         }
         ranges.push(start..quotas.len());
@@ -307,11 +304,23 @@ fn decode() -> Catalog {
             name: leak(s.service_name),
         });
     }
-    Catalog {
+    let mut catalog = Catalog {
         services,
         ranges,
         quotas,
+    };
+    // The overlay is short; look each entry up in the sorted data.
+    for &(svc, code) in ENFORCEABLE {
+        if let Some(i) = catalog.index(svc, code) {
+            catalog.quotas[i].enforceable = true;
+        }
     }
+    for &(svc, code, max) in MAX_VALUES {
+        if let Some(i) = catalog.index(svc, code) {
+            catalog.quotas[i].max_value = Some(max);
+        }
+    }
+    catalog
 }
 
 impl Catalog {
@@ -321,6 +330,16 @@ impl Catalog {
 
     fn quotas_of(&self, service: usize) -> &[QuotaDef] {
         &self.quotas[self.ranges[service].clone()]
+    }
+
+    /// Position of a quota in [`Catalog::quotas`].
+    fn index(&self, service_code: &str, quota_code: &str) -> Option<usize> {
+        let service = self.service_index(service_code)?;
+        let range = &self.ranges[service];
+        self.quotas[range.clone()]
+            .binary_search_by(|q| q.quota_code.cmp(quota_code))
+            .ok()
+            .map(|i| range.start + i)
     }
 }
 
@@ -340,16 +359,8 @@ pub(crate) fn catalog_reads() -> usize {
 /// [`ENFORCEABLE`] overlay). Answered without decoding the catalog.
 pub fn is_enforceable(service_code: &str, quota_code: &str) -> bool {
     ENFORCEABLE
-        .iter()
-        .any(|&(s, q)| s == service_code && q == quota_code)
-}
-
-/// The documented maximum of a quota (the [`MAX_VALUES`] overlay).
-fn max_value(service_code: &str, quota_code: &str) -> Option<f64> {
-    MAX_VALUES
-        .iter()
-        .find(|&&(s, q, _)| s == service_code && q == quota_code)
-        .map(|&(_, _, m)| m)
+        .binary_search_by(|&(s, q)| s.cmp(service_code).then_with(|| q.cmp(quota_code)))
+        .is_ok()
 }
 
 fn catalog() -> &'static Catalog {
@@ -383,11 +394,7 @@ pub fn service(code: &str) -> Option<&'static ServiceDef> {
 
 pub fn quota(service_code: &str, quota_code: &str) -> Option<&'static QuotaDef> {
     let c = catalog();
-    let quotas = c.quotas_of(c.service_index(service_code)?);
-    quotas
-        .binary_search_by(|q| q.quota_code.cmp(quota_code))
-        .ok()
-        .map(|i| &quotas[i])
+    c.index(service_code, quota_code).map(|i| &c.quotas[i])
 }
 
 /// Every quota of `service_code`, ordered by quota code. Empty for an
@@ -663,6 +670,17 @@ mod tests {
             quotas().iter().filter(|q| q.enforceable).count(),
             ENFORCEABLE.len()
         );
+    }
+
+    #[test]
+    fn enforceable_list_is_sorted_for_binary_search() {
+        assert!(
+            ENFORCEABLE.windows(2).all(|w| w[0] < w[1]),
+            "ENFORCEABLE must be sorted"
+        );
+        for &(svc, code) in ENFORCEABLE {
+            assert!(is_enforceable(svc, code), "{svc}/{code}");
+        }
     }
 
     /// The overlay answers enforceability without touching the catalog, and

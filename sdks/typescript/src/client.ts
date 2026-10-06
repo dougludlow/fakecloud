@@ -1241,8 +1241,11 @@ export class ServiceQuotasClient {
   }
 
   /**
-   * List every quota (or one service's) with its applied value, usage and
-   * enforcement state. Account and region default to the server's.
+   * List quotas with their applied value, usage and enforcement state.
+   * Without `serviceCode` it returns the quotas that are enforceable,
+   * measured, or changed (an applied value, an override, or an open
+   * request); pass `serviceCode` for a whole service. Account and region
+   * default to the server's.
    */
   async getQuotas(opts?: GetQuotasOptions): Promise<QuotasResponse> {
     const qs = ServiceQuotasClient.query({

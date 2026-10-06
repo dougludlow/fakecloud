@@ -28,8 +28,10 @@ func withQuery(path string, q url.Values) string {
 	return path + "?" + q.Encode()
 }
 
-// GetQuotas lists every catalog quota (or one service's) with its applied
-// value, usage and enforcement state for an account and region. opts may be
+// GetQuotas lists quotas with their applied value, usage and enforcement
+// state for an account and region. Without a ServiceCode it returns the
+// quotas that are enforceable, measured, or changed (an applied value, an
+// override, or an open request); set ServiceCode for a whole service. opts may be
 // nil to use the server's account and region. Returns an APIError
 // (StatusCode 404) for an unknown service code.
 func (c *ServiceQuotasClient) GetQuotas(ctx context.Context, opts *ServiceQuotasListOptions) (*ServiceQuotasResponse, error) {

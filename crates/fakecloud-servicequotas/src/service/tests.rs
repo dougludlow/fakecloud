@@ -1071,6 +1071,26 @@ fn introspect_quotas_lists_the_catalog_with_usage() {
     let listed = codes(&s.introspect_quotas(None, None, None).unwrap());
     assert_eq!(listed.len(), catalog::ENFORCEABLE.len() + 1);
     assert!(listed.contains(&"lambda/L-B99A9384".to_string()));
+    // An applied value set in another region counts as a change too.
+    s.introspect_put_quota(
+        "vpc",
+        "L-45FE3B85",
+        &PutQuotaRequest {
+            region: Some("eu-west-1".into()),
+            value: Some(9.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // So does an open increase request.
+    s.introspect_set_request_approval("manual").unwrap();
+    let mut open = sg_quota("L-2C462E13");
+    open["DesiredValue"] = json!(150.0);
+    call(&s, "RequestServiceQuotaIncrease", open);
+    let listed = codes(&s.introspect_quotas(None, None, None).unwrap());
+    assert!(listed.contains(&"vpc/L-45FE3B85".to_string()));
+    assert!(listed.contains(&"vpc/L-2C462E13".to_string()));
+    assert_eq!(listed.len(), catalog::ENFORCEABLE.len() + 3);
     // A measured quota that is not enforceable shows up too.
     struct Eigw;
     impl QuotaUsageSource for Eigw {

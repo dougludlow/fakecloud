@@ -297,7 +297,7 @@ Top-level client. Defaults to `http://localhost:4566`.
 
 | Method                                                         | Description                                                                                        |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `getQuotas({ accountId?, region?, serviceCode? })`             | List quotas with applied value, usage and enforcement state (default account/region: the server's) |
+| `getQuotas({ accountId?, region?, serviceCode? })`             | List quotas with applied value, usage and enforcement state (default account/region: the server's); without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
 | `putQuota(serviceCode, quotaCode, req)`                        | Set a quota's applied value (may be below the AWS default) and/or its enforcement override         |
 | `deleteQuota(serviceCode, quotaCode, { accountId?, region? })` | Reset a quota to its AWS default and drop its enforcement override                                 |
 | `getEnforcement()`                                             | Read the global enforcement switch and every server-wide and per-account override                  |

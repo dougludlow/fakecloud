@@ -1289,10 +1289,12 @@ public sealed class FakeCloudClient : IDisposable
         };
 
         /// <summary>
-        /// List every catalog quota (or one service's) with its applied
-        /// value, usage and enforcement state for an account and region.
-        /// Each argument defaults server-side when null (the server's
-        /// account, the server's region, every service). Throws
+        /// List quotas with their applied value, usage and enforcement state
+        /// for an account and region. Without a service code it returns the
+        /// quotas that are enforceable, measured, or changed (an applied
+        /// value, an override, or an open request); pass a service code for
+        /// a whole service. The account and region default server-side when
+        /// null. Throws
         /// <see cref="FakeCloudException"/> with status 404 for an unknown
         /// service code.
         /// </summary>
