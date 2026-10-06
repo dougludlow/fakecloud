@@ -1190,7 +1190,7 @@ const CLUSTER_VERSIONS: &[ClusterVersionRow] = &[
         release: "2024-09-26",
         end_of_standard: "2025-11-26",
         end_of_extended: "2026-11-26",
-        default: true,
+        default: false,
     },
     ClusterVersionRow {
         version: "1.32",
@@ -1217,32 +1217,34 @@ const CLUSTER_VERSIONS: &[ClusterVersionRow] = &[
         release: "2025-10-02",
         end_of_standard: "2026-12-02",
         end_of_extended: "2027-12-02",
-        default: false,
+        default: true,
     },
 ];
 
-/// The support tier of a version on `as_of`, as the `(status, versionStatus)`
-/// pair: the deprecated `status` uses the `ClusterVersionStatus` enum
-/// (`standard-support`), `versionStatus` the `VersionStatus` enum
-/// (`STANDARD_SUPPORT`). ISO dates compare correctly as strings.
-fn support_status(row: &ClusterVersionRow, as_of: &str) -> (&'static str, &'static str) {
+/// The support tier of a version on `as_of`, as a `VersionStatus` value
+/// (`STANDARD_SUPPORT`). AWS emits this same value in the deprecated
+/// `status` member too, even though the model types that member as the
+/// hyphenated `ClusterVersionStatus` enum; the model deprecates `status` for
+/// exactly that reason ("use `versionStatus` instead, as that field matches
+/// for input and output"). ISO dates compare correctly as strings.
+fn support_status(row: &ClusterVersionRow, as_of: &str) -> &'static str {
     if as_of < row.end_of_standard {
-        ("standard-support", "STANDARD_SUPPORT")
+        "STANDARD_SUPPORT"
     } else if as_of < row.end_of_extended {
-        ("extended-support", "EXTENDED_SUPPORT")
+        "EXTENDED_SUPPORT"
     } else {
-        ("unsupported", "UNSUPPORTED")
+        "UNSUPPORTED"
     }
 }
 
 /// The `DescribeClusterVersions` catalog: every Kubernetes minor EKS offered
 /// on `CLUSTER_VERSIONS_AS_OF`, ascending, with its support status on that
-/// date. 1.31 is the default.
+/// date. 1.34 is the default (see `DEFAULT_K8S_VERSION`).
 pub(crate) fn cluster_version_catalog(cluster_type: &str) -> Vec<Value> {
     CLUSTER_VERSIONS
         .iter()
         .map(|row| {
-            let (status, version_status) = support_status(row, CLUSTER_VERSIONS_AS_OF);
+            let status = support_status(row, CLUSTER_VERSIONS_AS_OF);
             json!({
                 "clusterVersion": row.version,
                 "clusterType": cluster_type,
@@ -1252,7 +1254,7 @@ pub(crate) fn cluster_version_catalog(cluster_type: &str) -> Vec<Value> {
                 "endOfStandardSupportDate": date_to_number(row.end_of_standard),
                 "endOfExtendedSupportDate": date_to_number(row.end_of_extended),
                 "status": status,
-                "versionStatus": version_status,
+                "versionStatus": status,
                 "kubernetesPatchVersion": row.patch,
             })
         })

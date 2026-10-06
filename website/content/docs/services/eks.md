@@ -16,7 +16,7 @@ in persistent mode.
 
 - **Cluster lifecycle** — `CreateCluster`, `DescribeCluster`, `ListClusters`,
   `DeleteCluster`. Clusters are created with the requested `roleArn`,
-  `resourcesVpcConfig`, `version` (default 1.31), and tags, and transition
+  `resourcesVpcConfig`, `version` (default 1.34), and tags, and transition
   `CREATING` -> `ACTIVE` on describe (deterministic, no background timer).
   Like EKS, `CreateCluster` (and `AWS::EKS::Cluster`) creates the cluster
   security group in EC2, in the VPC of the cluster's subnets: named

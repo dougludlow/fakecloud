@@ -22,8 +22,12 @@ use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 pub const EKS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 /// The default Kubernetes version a cluster is created with when the caller
-/// omits `version`.
-pub const DEFAULT_K8S_VERSION: &str = "1.31";
+/// omits `version`, and the one `DescribeClusterVersions` flags
+/// `defaultVersion`. No public capture shows the default on the catalog's
+/// 2025-11-25 pin, so this follows the pattern AWS shows: the newest minor
+/// becomes the default some weeks after release (1.34 shipped 2025-10-02).
+/// 1.31, the earlier value, left standard support the day after the pin.
+pub const DEFAULT_K8S_VERSION: &str = "1.34";
 
 /// Tags on a resource, stored by ARN so `TagResource` / `UntagResource` /
 /// `ListTagsForResource` work uniformly.
