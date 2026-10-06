@@ -10880,7 +10880,10 @@ mod tests {
                 serde_json::json!({ "ClusterName": "cfn-c134", "AddonName": "adot" }),
             ))
             .unwrap_err();
-        assert_eq!(err, "Addon specified is not supported");
+        assert_eq!(
+            err,
+            "Addon adot specified is not supported in 1.34 kubernetes version"
+        );
         assert!(!prov
             .eks_state
             .read()

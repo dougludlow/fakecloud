@@ -11,9 +11,10 @@ compatibilities (including the `defaultVersion` flag), and the
 
 The snapshot is pinned to the same date as fakecloud's DescribeClusterVersions
 table (`CLUSTER_VERSIONS` in `crates/fakecloud-eks/src/eks_helpers.rs`), so the
-two stay consistent: only the AWS-owned and EKS-published community add-ons are
-kept (Marketplace listings depend on third-party subscriptions), and only the
-compatibilities for the cluster versions in that table.
+two stay consistent: every add-on is kept (AWS-owned, EKS community and AWS
+Marketplace listings, the latter with their `marketplaceInformation`), with
+only the compatibilities for the cluster versions in that table. EKS rejects a
+CreateAddon for a name absent here, so the catalog must hold every listing.
 
 Run:  python3 scripts/generate-eks-addon-catalog.py
 (network: downloads one capture file from GitHub; no AWS credentials needed.)
@@ -28,7 +29,7 @@ CAPTURE_REPO = "plumdog/eks-addon-configuration"
 CAPTURE_COMMIT = "1a07655bd15e8759a55b2f514b9a4c08c2b5d647"
 CAPTURED_AT = "2025-11-25T00:35:57Z"
 CLUSTER_VERSIONS = ["1.28", "1.29", "1.30", "1.31", "1.32", "1.33", "1.34"]
-OWNERS = ("aws", "community")
+OWNERS = ("aws", "community", "aws-marketplace")
 
 OUT = os.path.join(
     os.path.dirname(__file__),
@@ -79,16 +80,17 @@ def trim(capture):
             )
         if not versions:
             continue
-        addons.append(
-            {
-                "addonName": addon["addonName"],
-                "type": addon["type"],
-                "owner": addon["owner"],
-                "publisher": addon["publisher"],
-                "defaultNamespace": addon["defaultNamespace"],
-                "addonVersions": versions,
-            }
-        )
+        entry = {
+            "addonName": addon["addonName"],
+            "type": addon["type"],
+            "owner": addon["owner"],
+            "publisher": addon["publisher"],
+            "defaultNamespace": addon["defaultNamespace"],
+        }
+        if addon.get("marketplaceInformation"):
+            entry["marketplaceInformation"] = addon["marketplaceInformation"]
+        entry["addonVersions"] = versions
+        addons.append(entry)
     return addons
 
 

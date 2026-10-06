@@ -319,7 +319,10 @@ async fn eks_addon_versions_are_checked_against_cluster_version() {
         .unwrap_err()
         .into_service_error();
     assert!(err.is_invalid_parameter_exception(), "{err:?}");
-    assert_eq!(err.message(), Some("Addon specified is not supported"));
+    assert_eq!(
+        err.message(),
+        Some("Addon adot specified is not supported in 1.34 kubernetes version")
+    );
 
     // The 1.34 default, not the default cluster version's.
     let created = client
@@ -371,4 +374,51 @@ async fn eks_addon_versions_are_checked_against_cluster_version() {
         .await
         .unwrap();
     assert!(updated.update().is_some());
+
+    // Unknown add-on names are refused, as on a live cluster.
+    let err = client
+        .create_addon()
+        .cluster_name("k134")
+        .addon_name("not-an-addon")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_invalid_parameter_exception(), "{err:?}");
+    assert_eq!(
+        err.message(),
+        Some("Addon not-an-addon specified is not supported in 1.34 kubernetes version")
+    );
+
+    // AWS Marketplace listings are in the catalog, with their listing info
+    // (none had a 1.34 build yet on the 2025-11-25 snapshot; 1.33 is newest).
+    let listed = client
+        .describe_addon_versions()
+        .kubernetes_version("1.33")
+        .addon_name("akuity_agent")
+        .send()
+        .await
+        .unwrap();
+    let listing = &listed.addons()[0];
+    assert_eq!(listing.owner(), Some("aws-marketplace"));
+    assert!(listing
+        .marketplace_information()
+        .and_then(|m| m.product_url())
+        .is_some_and(|u| u.contains("marketplace")));
+
+    // UpdateAddon on a missing add-on: AWS's wording, before the version check.
+    let err = client
+        .update_addon()
+        .cluster_name("k134")
+        .addon_name("coredns")
+        .addon_version("v9.9.9-eksbuild.1")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_resource_not_found_exception(), "{err:?}");
+    assert_eq!(
+        err.message(),
+        Some("The requested resource does not exist.")
+    );
 }
