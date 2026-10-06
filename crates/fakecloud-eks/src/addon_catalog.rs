@@ -33,6 +33,9 @@ struct AddonEntry {
     owner: String,
     publisher: String,
     default_namespace: String,
+    /// `productId` / `productUrl` for AWS Marketplace listings.
+    #[serde(default)]
+    marketplace_information: Option<Value>,
     /// Newest first, the order AWS lists them in.
     addon_versions: Vec<AddonVersionEntry>,
 }
@@ -111,14 +114,18 @@ pub(crate) fn addon_catalog(cluster_version: Option<&str>) -> Vec<Value> {
             if versions.is_empty() {
                 return None;
             }
-            Some(json!({
+            let mut info = json!({
                 "addonName": addon.addon_name,
                 "type": addon.addon_type,
                 "addonVersions": versions,
                 "publisher": addon.publisher,
                 "owner": addon.owner,
                 "defaultNamespace": addon.default_namespace,
-            }))
+            });
+            if let Some(mp) = &addon.marketplace_information {
+                info["marketplaceInformation"] = mp.clone();
+            }
+            Some(info)
         })
         .collect()
 }
@@ -139,12 +146,17 @@ fn catalog_default(addon_name: &str, cluster_version: &str) -> Option<&'static s
 }
 
 /// Why an add-on version can't be installed on a cluster. Both surface as
-/// `InvalidParameterException` with the message EKS returns.
+/// `InvalidParameterException` with the message EKS returns (captured from a
+/// live 1.37 cluster).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AddonVersionError {
-    /// The add-on has no build for the cluster's Kubernetes version.
-    #[error("Addon specified is not supported")]
-    AddonNotSupported,
+    /// The add-on is unknown or has no build for the cluster's Kubernetes
+    /// version. EKS reports this even when a version was requested.
+    #[error("Addon {addon} specified is not supported in {cluster_version} kubernetes version")]
+    AddonNotSupported {
+        addon: String,
+        cluster_version: String,
+    },
     /// The requested `addonVersion` is not offered for the cluster's
     /// Kubernetes version.
     #[error("Addon version specified is not supported")]
@@ -155,29 +167,39 @@ pub enum AddonVersionError {
 /// `AWS::EKS::Addon`) install for `addon_name` on a cluster running
 /// `cluster_version`, as EKS resolves it:
 ///
+/// - an add-on that is not in the catalog, or has no build for that
+///   Kubernetes minor, is `AddonNotSupported`, whether or not a version was
+///   requested (EKS checks this first);
 /// - no `requested` version: the catalog version flagged `defaultVersion` for
-///   that Kubernetes minor, or `AddonNotSupported` when the add-on has no
-///   build for it (adot on 1.34, or any add-on on a minor EKS no longer
-///   offers);
+///   that minor;
 /// - a `requested` version: accepted only when the catalog lists it as
-///   compatible with that minor, else `VersionNotSupported`.
+///   compatible with that minor, else `VersionNotSupported` (also for version
+///   strings that don't exist at all).
 ///
-/// Add-ons outside the catalog (AWS Marketplace listings, which depend on a
-/// third-party subscription) are not modeled, so their requested version is
-/// echoed and an omitted one becomes `v1.0.0-eksbuild.1`.
+/// The catalog holds every add-on AWS listed, AWS Marketplace ones included,
+/// so an unknown name is refused the way EKS refuses it. Marketplace
+/// subscriptions are not modeled: a listed Marketplace add-on installs.
 pub fn resolve_addon_version(
     addon_name: &str,
     cluster_version: &str,
     requested: Option<&str>,
 ) -> Result<String, AddonVersionError> {
-    let Some(addon) = catalog().iter().find(|a| a.addon_name == addon_name) else {
-        return Ok(requested.unwrap_or("v1.0.0-eksbuild.1").to_string());
+    let not_supported = || AddonVersionError::AddonNotSupported {
+        addon: addon_name.to_string(),
+        cluster_version: cluster_version.to_string(),
     };
+    let addon = catalog()
+        .iter()
+        .find(|a| a.addon_name == addon_name)
+        .ok_or_else(not_supported)?;
     let compatible = |ver: &&AddonVersionEntry| {
         ver.compatibilities
             .iter()
             .any(|c| c.cluster_version == cluster_version)
     };
+    if !addon.addon_versions.iter().any(|ver| compatible(&ver)) {
+        return Err(not_supported());
+    }
     match requested {
         Some(v) => addon
             .addon_versions
@@ -188,7 +210,7 @@ pub fn resolve_addon_version(
             .ok_or(AddonVersionError::VersionNotSupported),
         None => catalog_default(addon_name, cluster_version)
             .map(str::to_string)
-            .ok_or(AddonVersionError::AddonNotSupported),
+            .ok_or_else(not_supported),
     }
 }
 
@@ -281,10 +303,14 @@ mod tests {
         }
         // Released after the snapshot date, so not in the catalog.
         assert!(!names.contains(&"aws-ec2-local-instance-store-csi-driver"));
-        // Only AWS-owned and EKS-published community add-ons.
+        // AWS-owned, EKS community and AWS Marketplace listings; only the
+        // Marketplace ones carry marketplaceInformation.
         assert!(catalog()
             .iter()
-            .all(|a| a.owner == "aws" || a.owner == "community"));
+            .all(|a| matches!(a.owner.as_str(), "aws" | "community" | "aws-marketplace")));
+        assert!(catalog()
+            .iter()
+            .all(|a| (a.owner == "aws-marketplace") == a.marketplace_information.is_some()));
     }
 
     #[test]
@@ -363,22 +389,30 @@ mod tests {
         // adot has no 1.34 build in the snapshot: no fallback to another
         // minor's default, EKS refuses the add-on.
         assert!(versions_on_opt("adot", "1.34").is_none());
+        let adot_err = AddonVersionError::AddonNotSupported {
+            addon: "adot".to_string(),
+            cluster_version: "1.34".to_string(),
+        };
+        let adot_on_134 = Err(adot_err.clone());
+        assert_eq!(resolve_addon_version("adot", "1.34", None), adot_on_134);
+        // Checked before the requested version, even a real adot build.
         assert_eq!(
-            resolve_addon_version("adot", "1.34", None),
-            Err(AddonVersionError::AddonNotSupported)
+            resolve_addon_version("adot", "1.34", Some("v0.131.0-eksbuild.1")),
+            adot_on_134
         );
         assert_eq!(
             resolve_addon_version("adot", "1.33", None).as_deref(),
             Ok("v0.131.0-eksbuild.1")
         );
         // A minor EKS does not offer has no builds of anything.
-        assert_eq!(
+        assert!(matches!(
             resolve_addon_version("vpc-cni", "1.18", None),
-            Err(AddonVersionError::AddonNotSupported)
-        );
+            Err(AddonVersionError::AddonNotSupported { .. })
+        ));
+        // EKS's wording, from a live 1.37 cluster.
         assert_eq!(
-            AddonVersionError::AddonNotSupported.to_string(),
-            "Addon specified is not supported"
+            adot_err.to_string(),
+            "Addon adot specified is not supported in 1.34 kubernetes version"
         );
     }
 
@@ -402,15 +436,40 @@ mod tests {
             AddonVersionError::VersionNotSupported.to_string(),
             "Addon version specified is not supported"
         );
-        // Add-ons outside the catalog are not modeled.
+        // A malformed version string gets the same answer.
         assert_eq!(
-            resolve_addon_version("vendor_addon", "1.31", Some("v9.9.9")).as_deref(),
-            Ok("v9.9.9")
+            resolve_addon_version("kube-proxy", "1.31", Some("not-a-version")),
+            Err(AddonVersionError::VersionNotSupported)
         );
-        assert_eq!(
-            resolve_addon_version("vendor_addon", "1.31", None).as_deref(),
-            Ok("v1.0.0-eksbuild.1")
-        );
+    }
+
+    #[test]
+    fn unknown_addons_are_refused_and_marketplace_listings_install() {
+        for requested in [None, Some("v9.9.9")] {
+            assert_eq!(
+                resolve_addon_version("not-an-addon", "1.31", requested)
+                    .unwrap_err()
+                    .to_string(),
+                "Addon not-an-addon specified is not supported in 1.31 kubernetes version"
+            );
+        }
+        // Marketplace add-ons are in the catalog, with their listing.
+        let akuity = addon_catalog(Some("1.31"))
+            .into_iter()
+            .find(|a| a["addonName"] == "akuity_agent")
+            .expect("akuity_agent listed for 1.31");
+        assert_eq!(akuity["owner"], "aws-marketplace");
+        assert!(akuity["marketplaceInformation"]["productUrl"]
+            .as_str()
+            .unwrap()
+            .contains("marketplace"));
+        assert!(resolve_addon_version("akuity_agent", "1.31", None).is_ok());
+        // AWS-owned add-ons carry no marketplaceInformation.
+        let vpc_cni = addon_catalog(Some("1.31"))
+            .into_iter()
+            .find(|a| a["addonName"] == "vpc-cni")
+            .unwrap();
+        assert!(vpc_cni.get("marketplaceInformation").is_none());
     }
 
     fn versions_on_opt(addon_name: &str, cluster_version: &str) -> Option<Vec<Value>> {

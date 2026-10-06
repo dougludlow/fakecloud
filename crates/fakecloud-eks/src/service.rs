@@ -1796,12 +1796,20 @@ impl EksService {
             .ok_or_else(not_found_cluster(cluster_name))?
             .version
             .clone();
+        // UpdateAddon words a missing add-on differently from DescribeAddon
+        // (checked against a live cluster), and before any version check.
         let (addon_arn, namespace) = state
             .addons
             .get(cluster_name)
             .and_then(|m| m.get(name))
             .map(|a| (a.arn.clone(), a.namespace.clone()))
-            .ok_or_else(not_found_addon(name))?;
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::NOT_FOUND,
+                    "ResourceNotFoundException",
+                    "The requested resource does not exist.",
+                )
+            })?;
         // A new version must be offered for the cluster's Kubernetes version;
         // checked before the pod identity associations are reconciled so a
         // refused update changes nothing.

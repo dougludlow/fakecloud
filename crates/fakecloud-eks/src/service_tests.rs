@@ -1261,7 +1261,10 @@ async fn create_addon_refuses_addon_without_a_build_for_the_cluster_version() {
         .unwrap();
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     assert_eq!(err.code(), "InvalidParameterException");
-    assert_eq!(err.message(), "Addon specified is not supported");
+    assert_eq!(
+        err.message(),
+        "Addon adot specified is not supported in 1.34 kubernetes version"
+    );
     let resp = svc
         .handle(make_request(Method::GET, "/clusters/c134/addons", ""))
         .await
@@ -3766,4 +3769,41 @@ async fn update_cluster_config_merges_network_config() {
     let vpc = &c["cluster"]["resourcesVpcConfig"];
     assert_eq!(vpc["subnetIds"], json!(["subnet-1", "subnet-2"]));
     assert_eq!(vpc["endpointPrivateAccess"], true);
+}
+
+#[tokio::test]
+async fn addon_errors_match_a_live_eks_cluster() {
+    let svc = EksService::new(make_state());
+    create_cluster_on(&svc, "live", "1.31").await;
+    let call =
+        |method: Method, path: &str, body: Value| make_request(method, path, &body.to_string());
+    // Unknown add-on names are refused, with or without a version.
+    for body in [
+        json!({ "addonName": "not-an-addon" }),
+        json!({ "addonName": "not-an-addon", "addonVersion": "v1.0.0-eksbuild.1" }),
+    ] {
+        let err = svc
+            .handle(call(Method::POST, "/clusters/live/addons", body))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "InvalidParameterException");
+        assert_eq!(
+            err.message(),
+            "Addon not-an-addon specified is not supported in 1.31 kubernetes version"
+        );
+    }
+    // UpdateAddon on a missing add-on is a not-found before any version check.
+    let err = svc
+        .handle(call(
+            Method::POST,
+            "/clusters/live/addons/kube-proxy/update",
+            json!({ "addonVersion": "v9.9.9-eksbuild.1" }),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    assert_eq!(err.code(), "ResourceNotFoundException");
+    assert_eq!(err.message(), "The requested resource does not exist.");
 }

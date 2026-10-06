@@ -54,15 +54,20 @@ in persistent mode.
   aws-network-flow-monitoring-agent, sriov-network-metrics-exporter and the
   SageMaker HyperPod and Spaces add-ons) and every EKS-published community
   add-on (metrics-server, kube-state-metrics, prometheus-node-exporter,
-  cert-manager, external-dns, fluent-bit), with AWS's version strings,
+  cert-manager, external-dns, fluent-bit), plus the 40 AWS Marketplace
+  listings offered for 1.28-1.34 (with `marketplaceInformation`; Marketplace
+  subscriptions are not modeled, so they install), with AWS's version strings,
   architectures, compute types, and per-Kubernetes-version compatibilities
   flagging the default version. `kubernetesVersion`, `addonName`, `types`,
   `owners`, and `publishers` filter it, and `CreateAddon` (or an
   `AWS::EKS::Addon` without `AddonVersion`) installs the default for the
   cluster's version. An add-on with no build for the cluster's Kubernetes
-  version, or an `addonVersion` not offered for it (on create or update), is
-  refused with `InvalidParameterException` ("Addon specified is not supported"
-  / "Addon version specified is not supported"). `DescribeAddonConfiguration` recommends the documented
+  version, or an unknown add-on name, is refused with
+  `InvalidParameterException` ("Addon <name> specified is not supported in
+  <version> kubernetes version", checked before any requested version); an
+  `addonVersion` not offered for the cluster's version, on create or update, is
+  refused with "Addon version specified is not supported". Messages match a
+  live EKS cluster. `DescribeAddonConfiguration` recommends the documented
   pod identity service account and managed policies (for example
   `external-dns` -> `AmazonRoute53FullAccess`). An add-on's
   `podIdentityAssociations` become real pod identity associations in the
