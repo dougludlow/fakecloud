@@ -17,6 +17,25 @@ use std::sync::Arc;
 /// so invoking a present hook is always a real persist.
 pub type SnapshotHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Build a [`SnapshotHook`] from a service's shared state, its store and its
+/// serializing lock: each invocation calls `save` with clones of the three.
+/// `save` is the service's own save routine, so the serialization stays in
+/// the owning crate.
+pub fn snapshot_hook<S, L, F, Fut>(
+    state: S,
+    store: Arc<dyn SnapshotStore>,
+    lock: L,
+    save: F,
+) -> SnapshotHook
+where
+    S: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
+    F: Fn(S, Arc<dyn SnapshotStore>, L) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move || Box::pin(save(state.clone(), store.clone(), lock.clone())))
+}
+
 /// Generic opaque-blob snapshot store used by services that persist their
 /// whole state as a single serialized document (DynamoDB tables, SQS queues,
 /// etc.). Unlike the fine-grained [`crate::s3::S3Store`] which tracks
@@ -96,6 +115,33 @@ impl SnapshotStore for DiskSnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_hook_saves_through_the_given_routine() {
+        let saved: Arc<parking_lot::Mutex<Vec<(u32, String)>>> = Arc::default();
+        let store: Arc<dyn SnapshotStore> = Arc::new(MemorySnapshotStore::new());
+        let sink = saved.clone();
+        let hook = snapshot_hook(
+            7u32,
+            store,
+            Arc::new(String::from("lock")),
+            move |state, _store, lock| {
+                let saved = sink.clone();
+                async move {
+                    saved.lock().push((state, lock.to_string()));
+                }
+            },
+        );
+        for _ in 0..2 {
+            let mut fut = hook();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(fut.as_mut().poll(&mut cx).is_ready());
+        }
+        assert_eq!(
+            *saved.lock(),
+            vec![(7, "lock".to_string()), (7, "lock".to_string())]
+        );
+    }
 
     #[test]
     fn memory_store_is_noop() {

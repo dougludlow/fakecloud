@@ -135,6 +135,37 @@ fn rewrite_localhost_env(env: &mut [(String, String)], target_host: &str) {
 /// every spawned job.
 pub type RunningContainers = Arc<Mutex<HashMap<String, String>>>;
 
+/// The live build containers of a [`crate::CodeBuildService`], for callers
+/// that end builds from outside the service (the reset endpoints).
+#[derive(Clone)]
+pub struct RunningBuilds {
+    pub(crate) backend: Option<Arc<CodeBuildBackend>>,
+    pub(crate) running: RunningContainers,
+}
+
+impl RunningBuilds {
+    /// Take the containers backing `build_ids` out of tracking,
+    /// synchronously, so a build started later is never reached; end them
+    /// with [`Self::kill`].
+    pub fn take(&self, build_ids: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut running = self.running.lock();
+        build_ids
+            .into_iter()
+            .filter_map(|id| running.remove(&id))
+            .collect()
+    }
+
+    /// Kill and remove containers [`Self::take`] returned.
+    pub async fn kill(&self, containers: Vec<String>) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        for container in containers {
+            kill_container(backend.cli(), &container).await;
+        }
+    }
+}
+
 /// Everything a spawned execution task needs, without borrowing the service.
 pub struct BuildJob {
     pub backend: Arc<CodeBuildBackend>,
@@ -1443,6 +1474,25 @@ fn zip_files(files: &[(String, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn running_builds_take_only_the_named_builds() {
+        let running: RunningContainers = Arc::new(Mutex::new(HashMap::from([
+            ("p:1".to_string(), "c1".to_string()),
+            ("p:2".to_string(), "c2".to_string()),
+        ])));
+        let handle = RunningBuilds {
+            backend: None,
+            running: running.clone(),
+        };
+        assert_eq!(
+            handle.take(["p:1".to_string(), "p:9".to_string()]),
+            vec!["c1".to_string()]
+        );
+        assert_eq!(running.lock().len(), 1);
+        assert!(running.lock().contains_key("p:2"));
+    }
+
     use super::*;
 
     #[test]

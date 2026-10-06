@@ -125,16 +125,14 @@ impl IdentityStoreService {
     /// mode.
     pub fn snapshot_hook(&self) -> Option<fakecloud_persistence::SnapshotHook> {
         let store = self.snapshot_store.clone()?;
-        let state = self.state.clone();
-        let lock = self.snapshot_lock.clone();
-        Some(Arc::new(move || {
-            let state = state.clone();
-            let store = store.clone();
-            let lock = lock.clone();
-            Box::pin(async move {
+        Some(fakecloud_persistence::snapshot_hook(
+            self.state.clone(),
+            store,
+            self.snapshot_lock.clone(),
+            |state, store, lock| async move {
                 save_snapshot(&state, Some(store), &lock).await;
-            })
-        }))
+            },
+        ))
     }
 
     async fn save(&self) {

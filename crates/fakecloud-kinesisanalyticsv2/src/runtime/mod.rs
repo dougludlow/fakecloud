@@ -210,6 +210,11 @@ impl FlinkRuntime {
         self.reap_stale_containers(app_arn).await;
     }
 
+    /// The application ARN of every backing container this runtime tracks.
+    pub fn tracked_apps(&self) -> Vec<String> {
+        self.containers.read().keys().cloned().collect()
+    }
+
     /// Stop every tracked cluster container (graceful shutdown / reset).
     pub async fn stop_all(&self) {
         let containers: Vec<RunningFlink> = {

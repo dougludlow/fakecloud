@@ -1407,6 +1407,14 @@ impl CodeBuildService {
         env
     }
 
+    /// Handle on this service's live build containers.
+    pub fn running_builds(&self) -> crate::runtime::RunningBuilds {
+        crate::runtime::RunningBuilds {
+            backend: self.backend.clone(),
+            running: self.running.clone(),
+        }
+    }
+
     /// Kill the live container backing `build_id` (best-effort, off-thread).
     fn kill_running(&self, build_id: &str) {
         let Some(backend) = self.backend.clone() else {

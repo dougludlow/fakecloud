@@ -62,11 +62,11 @@ Every implemented service persists its control-plane state in this mode — a sn
 
 The reset endpoints write the reset state through to disk before they reply, so a restart against the same data directory keeps it reset instead of bringing the old resources back:
 
-- `POST /_reset` resets every service and persists each one's now-empty state; S3 buckets are deleted from the data directory.
-- `POST /_fakecloud/reset/{service}` persists that service's snapshot (both API Gateway APIs for `apigateway`).
-- `POST /_fakecloud/reset/{service}/{account_id}` persists the service with only that account cleared.
+- `POST /_reset` resets every service and rewrites each existing snapshot with the now-empty state; S3 buckets are deleted from the data directory.
+- `POST /_fakecloud/reset/{service}` rewrites that service's snapshot (both API Gateway APIs for `apigateway`).
+- `POST /_fakecloud/reset/{service}/{account_id}` rewrites the service's snapshot with only that account cleared. Organizations has no per-account state and answers `400`; reset it with `/_fakecloud/reset/organizations`.
 
-Backing containers and their data volumes (RDS, ElastiCache, EC2, ECS, MQ, MSK, Managed Service for Apache Flink) are torn down by the same reset.
+A reset also ends the backing containers of what it clears, scoped the same way (one account for a per-account reset): Lambda warm instances, ECS task containers, running CodeBuild builds, RDS, ElastiCache and EC2 containers with their data volumes, Amazon MQ brokers, MSK brokers, and Managed Service for Apache Flink clusters.
 
 ## Container-backed service data
 

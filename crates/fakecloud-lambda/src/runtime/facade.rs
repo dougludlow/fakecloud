@@ -217,6 +217,20 @@ async fn endpoint_reachable(endpoint: &str, timeout: Duration) -> bool {
     )
 }
 
+/// Warm instances taken out of the pool by
+/// [`LambdaRuntime::take_account_instances`], awaiting termination.
+pub struct TakenInstances(Vec<Arc<WarmEntry>>);
+
+impl TakenInstances {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 pub struct LambdaRuntime {
     backend: Arc<dyn LambdaBackend>,
     /// Per-function pool of warm instances. Each instance serves one
@@ -907,6 +921,29 @@ impl LambdaRuntime {
         self.terminate_instances(pool).await;
     }
 
+    /// Take the warm instances of every function in `account_id` (every
+    /// account's for `None`) out of the pool, synchronously, for a later
+    /// [`Self::terminate_taken`]. Called under the reset's state lock, so an
+    /// instance a function created after the reset warms up is never taken.
+    pub fn take_account_instances(&self, account_id: Option<&str>) -> TakenInstances {
+        let mut map = self.instances.write();
+        let keys: Vec<String> = map
+            .keys()
+            .filter(|k| account_id.is_none_or(|a| fakecloud_aws::arn::account_of(k) == Some(a)))
+            .cloned()
+            .collect();
+        TakenInstances(
+            keys.into_iter()
+                .flat_map(|k| map.remove(&k).unwrap_or_default())
+                .collect(),
+        )
+    }
+
+    /// Stop and remove instances [`Self::take_account_instances`] took.
+    pub async fn terminate_taken(&self, taken: TakenInstances) {
+        self.terminate_instances(taken.0).await;
+    }
+
     /// Stop and remove all warm instances (used on server shutdown or reset).
     pub async fn stop_all(&self) {
         let pools: Vec<(String, Vec<Arc<WarmEntry>>)> =
@@ -1486,6 +1523,44 @@ mod tests {
             .get(&key("f"))
             .expect("recreated function pool must survive");
         assert_eq!(f.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn take_account_instances_takes_only_that_account() {
+        let backend = CountingBackend::new("127.0.0.1:1");
+        let rt = runtime_with(backend.clone(), 10);
+        let mk = |id: &str| {
+            Arc::new(super::WarmEntry {
+                instance: WarmInstance {
+                    endpoint: "127.0.0.1:1".to_string(),
+                    handle: BackendHandle::Container { id: id.to_string() },
+                },
+                last_used: RwLock::new(std::time::Instant::now()),
+                deploy_id: "d".to_string(),
+                credentials: None,
+                retiring: std::sync::atomic::AtomicBool::new(false),
+                busy: Arc::new(tokio::sync::Mutex::new(())),
+            })
+        };
+        let other = "arn:aws:lambda:us-east-1:222222222222:function:g:$LATEST".to_string();
+        rt.instances.write().insert(key("f"), vec![mk("a")]);
+        rt.instances
+            .write()
+            .insert(other.clone(), vec![mk("b"), mk("c")]);
+
+        let taken = rt.take_account_instances(Some("222222222222"));
+        assert_eq!(taken.len(), 2);
+        assert!(rt.instances.read().get(&other).is_none());
+        // A pool warmed up after the take is not the taken set's business.
+        rt.instances.write().insert(other.clone(), vec![mk("new")]);
+        rt.terminate_taken(taken).await;
+        assert_eq!(backend.terminates.load(SeqCst), 2);
+        assert_eq!(rt.instances.read().get(&other).map(Vec::len), Some(1));
+        assert_eq!(rt.instances.read().get(&key("f")).map(Vec::len), Some(1));
+
+        let all = rt.take_account_instances(None);
+        assert_eq!(all.len(), 2);
+        assert!(rt.instances.read().is_empty());
     }
 
     /// Issuer double: mints sequential keys with a configurable lifetime

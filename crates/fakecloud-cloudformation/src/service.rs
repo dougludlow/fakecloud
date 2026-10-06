@@ -1294,14 +1294,12 @@ impl CloudFormationService {
     /// in memory mode.
     pub fn snapshot_hook(&self) -> Option<SnapshotHook> {
         let store = self.snapshot_store.clone()?;
-        let state = self.state.clone();
-        let lock = self.snapshot_lock.clone();
-        Some(Arc::new(move || {
-            let state = state.clone();
-            let store = store.clone();
-            let lock = lock.clone();
-            Box::pin(save_snapshot_static(state, Some(store), lock))
-        }))
+        Some(fakecloud_persistence::snapshot_hook(
+            self.state.clone(),
+            store,
+            self.snapshot_lock.clone(),
+            |state, store, lock| save_snapshot_static(state, Some(store), lock),
+        ))
     }
 
     pub(crate) async fn save_snapshot(&self) {

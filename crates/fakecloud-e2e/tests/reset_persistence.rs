@@ -317,6 +317,15 @@ async fn per_account_reset_survives_restart() {
             .await
             .unwrap();
     }
+    // Organizations has no per-account state: refused, not silently ignored.
+    let err = fc
+        .reset_service_for_account("organizations", OTHER_ACCOUNT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, fakecloud_sdk::Error::Api { status: 400, .. }),
+        "{err}"
+    );
 
     server.restart().await;
     let own = server.aws_config().await;

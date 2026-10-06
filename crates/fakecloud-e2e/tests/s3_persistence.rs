@@ -1551,9 +1551,9 @@ async fn persistence_untagged_create_clears_an_orphan_tag_file() {
 
 #[tokio::test]
 async fn persistence_create_after_reset_reuses_the_name() {
-    // `/_fakecloud/reset/s3` clears in-memory state and deletes the reset
-    // buckets from the store. Re-creating those names has to keep working, and
-    // the re-created bucket must not adopt anything of the old incarnation.
+    // `/_fakecloud/reset/s3` drops the bucket from memory and deletes its
+    // directory. Re-creating the name works, and the new bucket starts empty,
+    // without the old tag set, and stays that way across a restart.
     let tmp = tempfile::tempdir().unwrap();
     let server = TestServer::start_persistent(tmp.path()).await;
     let client = server.s3_client().await;
@@ -1643,6 +1643,108 @@ async fn persistence_create_after_reset_reuses_the_name() {
         tags.is_err(),
         "the pre-reset tag set was adopted by the re-created bucket"
     );
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn persistence_create_over_a_leftover_bucket_dir_starts_clean() {
+    // A bucket directory can outlive its bucket in memory: a delete that
+    // stopped partway, or a reset whose deletion failed. Its meta.toml is
+    // readable, so this is not a load refusal -- the name is free, and a
+    // create must start clean instead of adopting the old objects or tags.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+    let bucket_dir = tmp.path().join("s3").join("buckets").join("leftover");
+    let saved = tmp.path().join("saved-leftover");
+
+    client
+        .create_bucket()
+        .bucket("leftover")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("leftover")
+        .key("old.txt")
+        .body(ByteStream::from_static(b"old"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_tagging()
+        .bucket("leftover")
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("era").value("old").build().unwrap())
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(bucket_dir.join("meta.toml").exists(), "{bucket_dir:?}");
+
+    // Construct the leftover: the bucket's files on disk, the bucket gone
+    // from memory.
+    copy_dir(&bucket_dir, &saved);
+    client
+        .delete_object()
+        .bucket("leftover")
+        .key("old.txt")
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_bucket()
+        .bucket("leftover")
+        .send()
+        .await
+        .unwrap();
+    copy_dir(&saved, &bucket_dir);
+    assert!(bucket_dir.join("meta.toml").exists());
+
+    client
+        .create_bucket()
+        .bucket("leftover")
+        .send()
+        .await
+        .expect("creating over a leftover directory must succeed");
+    for restarted in [false, true] {
+        if restarted {
+            server.restart().await;
+        }
+        let client = server.s3_client().await;
+        let list = client
+            .list_objects_v2()
+            .bucket("leftover")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            list.contents().is_empty(),
+            "the leftover objects were adopted (restarted: {restarted}): {:?}",
+            list.contents()
+        );
+        let tags = client.get_bucket_tagging().bucket("leftover").send().await;
+        assert!(
+            tags.is_err(),
+            "the leftover tag set was adopted (restarted: {restarted})"
+        );
+    }
 }
 
 #[tokio::test]
