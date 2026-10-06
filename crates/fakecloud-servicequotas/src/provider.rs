@@ -11,7 +11,7 @@ use fakecloud_organizations::SharedOrganizationsState;
 use fakecloud_persistence::SnapshotHook;
 
 use crate::catalog::{self, QuotaDef};
-use crate::settings::{enforcement, RequestApproval, SharedQuotaSettings};
+use crate::settings::{enforcement_of, RequestApproval, SharedQuotaSettings};
 use crate::state::{
     applied_key, QuotaRequest, ServiceQuotasData, SharedServiceQuotasState, TemplateEntry,
 };
@@ -289,20 +289,77 @@ impl QuotaProvider for ServiceQuotasProvider {
         service_code: &str,
         quota_code: &str,
     ) -> Option<f64> {
-        let def = catalog::quota(service_code, quota_code).filter(|d| d.enforceable)?;
+        // Whether the quota is enforced is answered from the static overlay
+        // and the settings; the catalog is only decoded for a quota that is.
+        if !catalog::is_enforceable(service_code, quota_code) {
+            return None;
+        }
         self.apply_template(account_id);
         let settings = self.settings.read();
         let guard = self.state.read();
         let data = guard.get(account_id);
-        enforcement(&settings, data, def)
-            .0
-            .then(|| applied_value(data, region, def))
+        if !enforcement_of(&settings, data, service_code, quota_code).0 {
+            return None;
+        }
+        let def = catalog::quota(service_code, quota_code)?;
+        Some(applied_value(data, region, def))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider(settings: crate::settings::QuotaSettings) -> ServiceQuotasProvider {
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        ServiceQuotasProvider::new(
+            Arc::new(RwLock::new(MultiAccountState::new(
+                "000000000000",
+                "us-east-1",
+                "",
+            ))),
+            Arc::new(RwLock::new(Default::default())),
+            Arc::new(RwLock::new(settings)),
+        )
+    }
+
+    /// With enforcement off, an enforcing service's limit lookup on its
+    /// request path never touches (or decodes) the catalog.
+    #[test]
+    fn unenforced_limit_lookups_do_not_read_the_catalog() {
+        let p = provider(Default::default());
+        let before = catalog::catalog_reads();
+        for (svc, code) in [
+            ("s3", "L-DC2B2D3D"),
+            (catalog::VPC, "L-F678F1CE"),
+            ("iam", "L-FE177D64"),
+            ("lambda", "L-B99A9384"),
+            ("nope", "L-00000000"),
+        ] {
+            assert_eq!(
+                p.enforced_limit("000000000000", "us-east-1", svc, code),
+                None
+            );
+        }
+        assert_eq!(catalog::catalog_reads(), before);
+    }
+
+    #[test]
+    fn enforced_limit_returns_the_applied_value_when_enforced() {
+        let p = provider(crate::settings::QuotaSettings {
+            enforce_all: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            p.enforced_limit("000000000000", "eu-west-1", catalog::VPC, "L-F678F1CE"),
+            Some(5.0)
+        );
+        assert_eq!(
+            p.enforced_limit("000000000000", "eu-west-1", "lambda", "L-B99A9384"),
+            None
+        );
+    }
 
     fn def(service: &str, code: &str) -> &'static QuotaDef {
         catalog::quota(service, code).unwrap()

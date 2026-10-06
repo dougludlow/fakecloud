@@ -97,7 +97,33 @@ impl EnforcementSource {
 /// `service_code/quota_code`, the key overrides are stored under and the form
 /// the CLI flags take.
 pub fn quota_ref(def: &QuotaDef) -> String {
-    format!("{}/{}", def.service_code, def.quota_code)
+    quota_ref_of(def.service_code, def.quota_code)
+}
+
+/// [`quota_ref`] from the codes.
+pub fn quota_ref_of(service_code: &str, quota_code: &str) -> String {
+    format!("{service_code}/{quota_code}")
+}
+
+/// Resolve a `service_code/quota_code` reference to an enforceable quota (as
+/// `--enforce-quota` / `--ignore-quota` take it) into its override key. The
+/// quota must exist in the vendored catalog (decoded here, at startup, only
+/// when such a flag is given) and be one a fakecloud service checks.
+pub fn resolve_enforceable(reference: &str) -> Result<String, String> {
+    let def = crate::catalog::parse_ref(reference).ok_or_else(|| {
+        format!(
+            "unknown quota {reference:?}: expected SERVICE_CODE/QUOTA_CODE from the Service \
+             Quotas catalog"
+        )
+    })?;
+    if !def.enforceable {
+        return Err(format!(
+            "quota {reference} ({}) is not enforceable: no fakecloud service checks requests \
+             against it",
+            def.name
+        ));
+    }
+    Ok(quota_ref(def))
 }
 
 /// Whether `def` is enforced for the account holding `data`, and why.
@@ -106,10 +132,22 @@ pub fn enforcement(
     data: Option<&ServiceQuotasData>,
     def: &QuotaDef,
 ) -> (bool, EnforcementSource) {
-    if !def.enforceable {
+    enforcement_of(settings, data, def.service_code, def.quota_code)
+}
+
+/// [`enforcement`] by codes. Reads only the static enforceable overlay, never
+/// the decoded catalog, so the request path of a service that enforces nothing
+/// stays cheap.
+pub fn enforcement_of(
+    settings: &QuotaSettings,
+    data: Option<&ServiceQuotasData>,
+    service_code: &str,
+    quota_code: &str,
+) -> (bool, EnforcementSource) {
+    if !crate::catalog::is_enforceable(service_code, quota_code) {
         return (false, EnforcementSource::NotEnforceable);
     }
-    let key = quota_ref(def);
+    let key = quota_ref_of(service_code, quota_code);
     if let Some(on) = data.and_then(|d| d.enforcement.get(&key)) {
         return (*on, EnforcementSource::AccountOverride);
     }
@@ -126,7 +164,7 @@ mod tests {
 
     #[test]
     fn nothing_is_enforced_by_default() {
-        for def in catalog::QUOTAS {
+        for def in catalog::quotas() {
             assert!(!enforcement(&QuotaSettings::default(), None, def).0);
         }
     }
@@ -168,5 +206,29 @@ mod tests {
             enforcement(&settings, None, def),
             (false, EnforcementSource::NotEnforceable)
         );
+    }
+
+    #[test]
+    fn enforce_flag_references_resolve_through_the_vendored_data() {
+        assert_eq!(
+            resolve_enforceable("vpc/L-2AFB9258").unwrap(),
+            "vpc/L-2AFB9258"
+        );
+        // Codes are matched exactly as AWS publishes them.
+        assert!(resolve_enforceable("VPC/L-2AFB9258")
+            .unwrap_err()
+            .contains("unknown quota"));
+        assert!(resolve_enforceable("vpc/L-2afb9258")
+            .unwrap_err()
+            .contains("unknown quota"));
+        assert!(resolve_enforceable("vpc")
+            .unwrap_err()
+            .contains("unknown quota"));
+        let err = resolve_enforceable("lambda/L-B99A9384").unwrap_err();
+        assert!(err.contains("not enforceable") && err.contains("Concurrent executions"));
+        // Every overlay entry is a real quota in the data.
+        for (svc, code) in crate::catalog::ENFORCEABLE {
+            assert!(resolve_enforceable(&format!("{svc}/{code}")).is_ok());
+        }
     }
 }

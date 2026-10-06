@@ -54,14 +54,11 @@ fn catalog() -> &'static [ManagedPolicy] {
     static CATALOG: OnceLock<Vec<ManagedPolicy>> = OnceLock::new();
     CATALOG
         .get_or_init(|| {
-            use std::io::Read;
-            let mut json = String::new();
-            flate2::read::GzDecoder::new(CATALOG_GZ)
-                .read_to_string(&mut json)
-                .expect("embedded AWS-managed policy catalog must gunzip");
-            let parsed: CatalogFile = serde_json::from_str(&json)
-                .expect("embedded AWS-managed policy catalog must be valid JSON");
-            parsed.policies
+            fakecloud_core::embedded::decode_gz_json::<CatalogFile>(
+                CATALOG_GZ,
+                "AWS-managed policy catalog",
+            )
+            .policies
         })
         .as_slice()
 }

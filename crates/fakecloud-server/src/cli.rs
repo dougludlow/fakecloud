@@ -324,27 +324,13 @@ impl Cli {
                 .filter(|r| !r.is_empty())
                 .collect()
         };
-        let resolve_enforceable = |reference: &str| {
-            let def = fakecloud_servicequotas::catalog::parse_ref(reference).ok_or_else(|| {
-                format!("unknown quota {reference:?}: expected SERVICE_CODE/QUOTA_CODE from the Service Quotas catalog")
-            })?;
-            if !def.enforceable {
-                return Err(format!(
-                    "quota {reference} ({}) is not enforceable: no fakecloud service checks requests against it",
-                    def.name
-                ));
-            }
-            Ok(def)
-        };
+        let resolve_enforceable = fakecloud_servicequotas::settings::resolve_enforceable;
         for reference in named(&self.enforce_quota) {
-            let def = resolve_enforceable(&reference)?;
-            settings
-                .overrides
-                .insert(fakecloud_servicequotas::settings::quota_ref(def), true);
+            let key = resolve_enforceable(&reference)?;
+            settings.overrides.insert(key, true);
         }
         for reference in named(&self.ignore_quota) {
-            let key =
-                fakecloud_servicequotas::settings::quota_ref(resolve_enforceable(&reference)?);
+            let key = resolve_enforceable(&reference)?;
             if settings.overrides.insert(key, false) == Some(true) {
                 return Err(format!(
                     "quota {reference} is given to both --enforce-quota and --ignore-quota"

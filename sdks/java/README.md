@@ -390,7 +390,7 @@ System.out.println(dist.served());     // true once the data plane serves it
 
 | Method                                                    | Description                                                                                  |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `getQuotas()` / `getQuotas(accountId, region, serviceCode)` | List every quota (or one service's) with applied value, usage and enforcement state; `null` args use the server defaults |
+| `getQuotas()` / `getQuotas(accountId, region, serviceCode)` | List quotas with applied value, usage and enforcement state; `null` args use the server defaults; without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
 | `putQuota(serviceCode, quotaCode, req)`                   | Set a quota's applied value (may be below the AWS default) and/or enforcement override       |
 | `deleteQuota(serviceCode, quotaCode)` / `deleteQuota(serviceCode, quotaCode, accountId, region)` | Reset a quota to its AWS default and drop its override (account-scoped when `accountId` is set) |
 | `getEnforcement()`                                        | Read the global `enforceAll` switch and every server-wide and per-account override           |

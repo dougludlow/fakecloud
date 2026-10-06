@@ -356,7 +356,7 @@ $fc = new FakeCloud('http://localhost:4566'); // explicit base URL
 
 | Method                                                           | Description                                                                                  |
 | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `getQuotas(?$accountId, ?$region, ?$serviceCode)`                | List quotas with applied value, usage and enforcement state (default account/region: the server's) |
+| `getQuotas(?$accountId, ?$region, ?$serviceCode)`                | List quotas with applied value, usage and enforcement state (default account/region: the server's); without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
 | `putQuota($serviceCode, $quotaCode, $req)`                       | Set a quota's applied value (may be below the AWS default) and/or enforcement override       |
 | `deleteQuota($serviceCode, $quotaCode, ?$accountId, ?$region)`   | Reset a quota to its AWS default and drop its override (the account's when `$accountId` is given) |
 | `getEnforcement()`                                               | Read the global `enforceAll` switch and every per-quota / per-account override               |

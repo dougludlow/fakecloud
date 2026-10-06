@@ -120,6 +120,182 @@ fn default_and_applied_quota_shapes() {
     );
 }
 
+/// `Description`, `Period` and `QuotaContext` come from AWS's published
+/// defaults, verbatim.
+#[test]
+fn quota_description_period_and_context() {
+    let s = svc();
+    let rate = call(
+        &s,
+        "GetAWSDefaultServiceQuota",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-2394664B" }),
+    );
+    assert_eq!(
+        rate["Quota"]["QuotaName"],
+        "ModifySnapshotTier request bucket refill rate"
+    );
+    assert_eq!(
+        rate["Quota"]["Description"],
+        "The refill rate per second for the ModifySnapshotTier API request bucket"
+    );
+    assert_eq!(
+        rate["Quota"]["Period"],
+        json!({ "PeriodValue": 1, "PeriodUnit": "SECOND" })
+    );
+    assert!(rate["Quota"].get("QuotaContext").is_none());
+
+    let per_tgw = call(
+        &s,
+        "GetServiceQuota",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-43872EB7" }),
+    );
+    assert_eq!(
+        per_tgw["Quota"]["Description"],
+        "Number of transit gateway route tables per transit gateway."
+    );
+    assert_eq!(
+        per_tgw["Quota"]["Period"],
+        json!({ "PeriodValue": 5, "PeriodUnit": "MINUTE" })
+    );
+    assert_eq!(
+        per_tgw["Quota"]["QuotaContext"],
+        json!({ "ContextScope": "RESOURCE", "ContextScopeType": "AWS::EC2::TransitGateway" })
+    );
+
+    // A quota without a period has none.
+    let expiry = call(&s, "GetAWSDefaultServiceQuota", sg_quota("L-8312C5BB"));
+    assert!(expiry["Quota"].get("Period").is_none());
+    assert!(expiry["Quota"]["Description"].as_str().is_some());
+}
+
+#[test]
+fn context_id_refusal_describes_the_quota_truthfully() {
+    let s = svc();
+    // An account-only quota never takes a ContextId.
+    let mut body = sg_quota("L-F678F1CE");
+    body["ContextId"] = json!("vpc-123");
+    let e = call_err(&s, "GetServiceQuota", body.clone());
+    assert_eq!(e.code(), "IllegalArgumentException");
+    assert!(
+        e.message().contains("applied at the account level"),
+        "{}",
+        e.message()
+    );
+    body["DesiredValue"] = json!(10.0);
+    let e = call_err(&s, "RequestServiceQuotaIncrease", body);
+    assert!(e.message().contains("applied at the account level"));
+
+    // A quota AWS scopes per transit gateway: resource-level values are what
+    // fakecloud lacks.
+    let mut per_tgw = json!({
+        "ServiceCode": "ec2",
+        "QuotaCode": "L-43872EB7",
+        "ContextId": "tgw-123",
+    });
+    let e = call_err(&s, "GetServiceQuota", per_tgw.clone());
+    assert_eq!(e.code(), "IllegalArgumentException");
+    assert!(
+        e.message()
+            .contains("does not support resource-level applied values"),
+        "{}",
+        e.message()
+    );
+    per_tgw["DesiredValue"] = json!(30.0);
+    let e = call_err(&s, "RequestServiceQuotaIncrease", per_tgw);
+    assert!(e
+        .message()
+        .contains("does not support resource-level applied values"));
+    // Its account-level value is still readable, at the ACCOUNT level.
+    let q = call(
+        &s,
+        "GetServiceQuota",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-43872EB7" }),
+    );
+    assert_eq!(q["Quota"]["QuotaAppliedAtLevel"], "ACCOUNT");
+}
+
+#[test]
+fn list_service_quotas_quota_code_filter() {
+    let s = svc();
+    let one = call(
+        &s,
+        "ListServiceQuotas",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-1216C47A" }),
+    );
+    let quotas = one["Quotas"].as_array().unwrap();
+    assert_eq!(quotas.len(), 1);
+    assert_eq!(quotas[0]["QuotaCode"], "L-1216C47A");
+    assert!(one.get("NextToken").is_none());
+    let none = call(
+        &s,
+        "ListServiceQuotas",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-00000000" }),
+    );
+    assert_eq!(none["Quotas"], json!([]));
+    let resource = call(
+        &s,
+        "ListServiceQuotas",
+        json!({ "ServiceCode": "ec2", "QuotaCode": "L-43872EB7", "QuotaAppliedAtLevel": "RESOURCE" }),
+    );
+    assert_eq!(resource["Quotas"], json!([]));
+}
+
+/// Walk every page of a list operation and return the items under `key`.
+fn all_pages(s: &ServiceQuotasService, action: &str, body: Value, key: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut body = body;
+    loop {
+        let page = call(s, action, body.clone());
+        let items = page[key].as_array().unwrap();
+        assert!(items.len() <= 100);
+        out.extend(items.iter().cloned());
+        match page.get("NextToken").and_then(Value::as_str) {
+            Some(t) => body["NextToken"] = json!(t),
+            None => return out,
+        }
+    }
+}
+
+#[test]
+fn list_operations_page_through_the_whole_catalog() {
+    let s = svc();
+    let services = all_pages(&s, "ListServices", json!({}), "Services");
+    assert_eq!(services.len(), catalog::services().len());
+    assert!(services.len() > 300);
+    let codes: Vec<&str> = services
+        .iter()
+        .map(|v| v["ServiceCode"].as_str().unwrap())
+        .collect();
+    assert!(codes.windows(2).all(|w| w[0] < w[1]));
+    assert!(codes.contains(&"AWSCloudMap") && codes.contains(&"vpc"));
+
+    let ec2 = catalog::quotas_of("ec2");
+    for action in ["ListAWSDefaultServiceQuotas", "ListServiceQuotas"] {
+        let quotas = all_pages(&s, action, json!({ "ServiceCode": "ec2" }), "Quotas");
+        assert_eq!(quotas.len(), ec2.len(), "{action}");
+        let got: Vec<&str> = quotas
+            .iter()
+            .map(|q| q["QuotaCode"].as_str().unwrap())
+            .collect();
+        let want: Vec<&str> = ec2.iter().map(|d| d.quota_code).collect();
+        assert_eq!(got, want, "{action}");
+    }
+    let small = all_pages(
+        &s,
+        "ListAWSDefaultServiceQuotas",
+        json!({ "ServiceCode": "ec2", "MaxResults": 7 }),
+        "Quotas",
+    );
+    assert_eq!(small.len(), ec2.len());
+    // A service AWS lists with no quotas has an empty list.
+    let none = call(
+        &s,
+        "ListAWSDefaultServiceQuotas",
+        json!({ "ServiceCode": "health-agent" }),
+    );
+    assert_eq!(none["Quotas"], json!([]));
+}
+
 #[test]
 fn unknown_service_and_quota_are_no_such_resource() {
     let s = svc();
@@ -203,15 +379,25 @@ fn increase_must_exceed_current_value_and_quota_must_be_adjustable() {
         call_err(&s, "RequestServiceQuotaIncrease", fixed).code(),
         "IllegalArgumentException"
     );
-    // Lambda function and layer storage is not increasable on AWS.
+    // The Lambda function timeout is not increasable on AWS.
+    let timeout = json!({
+        "ServiceCode": "lambda",
+        "QuotaCode": "L-9FEEFFC0",
+        "DesiredValue": 1000.0,
+    });
+    assert_eq!(
+        call_err(&s, "RequestServiceQuotaIncrease", timeout).code(),
+        "IllegalArgumentException"
+    );
+    // Function and layer storage is.
     let storage = json!({
         "ServiceCode": "lambda",
         "QuotaCode": "L-2ACBD22F",
         "DesiredValue": 400.0,
     });
     assert_eq!(
-        call_err(&s, "RequestServiceQuotaIncrease", storage).code(),
-        "IllegalArgumentException"
+        call(&s, "RequestServiceQuotaIncrease", storage)["RequestedQuota"]["Status"],
+        "PENDING"
     );
 }
 
@@ -852,9 +1038,80 @@ fn introspect_quotas_lists_the_catalog_with_usage() {
     let all = s.introspect_quotas(None, None, None).unwrap();
     assert_eq!(all["accountId"], ACCT);
     assert_eq!(all["region"], "us-east-1");
+    // Without a service code: the enforceable quotas, plus the measured one
+    // and the ones the account changed, not the whole catalog.
+    let codes = |v: &Value| -> Vec<String> {
+        v["quotas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| {
+                format!(
+                    "{}/{}",
+                    q["serviceCode"].as_str().unwrap(),
+                    q["quotaCode"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    let listed = codes(&all);
+    assert_eq!(listed.len(), catalog::ENFORCEABLE.len());
+    for (svc, code) in catalog::ENFORCEABLE {
+        assert!(listed.contains(&format!("{svc}/{code}")), "{svc}/{code}");
+    }
+    s.introspect_put_quota(
+        "lambda",
+        "L-B99A9384",
+        &PutQuotaRequest {
+            value: Some(2000.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let listed = codes(&s.introspect_quotas(None, None, None).unwrap());
+    assert_eq!(listed.len(), catalog::ENFORCEABLE.len() + 1);
+    assert!(listed.contains(&"lambda/L-B99A9384".to_string()));
+    // An applied value set in another region counts as a change too.
+    s.introspect_put_quota(
+        "vpc",
+        "L-45FE3B85",
+        &PutQuotaRequest {
+            region: Some("eu-west-1".into()),
+            value: Some(9.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // So does an open increase request.
+    s.introspect_set_request_approval("manual").unwrap();
+    let mut open = sg_quota("L-2C462E13");
+    open["DesiredValue"] = json!(150.0);
+    call(&s, "RequestServiceQuotaIncrease", open);
+    let listed = codes(&s.introspect_quotas(None, None, None).unwrap());
+    assert!(listed.contains(&"vpc/L-45FE3B85".to_string()));
+    assert!(listed.contains(&"vpc/L-2C462E13".to_string()));
+    assert_eq!(listed.len(), catalog::ENFORCEABLE.len() + 3);
+    // A measured quota that is not enforceable shows up too.
+    struct Eigw;
+    impl QuotaUsageSource for Eigw {
+        fn service_codes(&self) -> &[&str] {
+            &["vpc"]
+        }
+        fn usage(&self, _: &str, _: &str, _: &str, quota_code: &str) -> Option<f64> {
+            (quota_code == "L-45FE3B85").then_some(1.0)
+        }
+    }
+    let measured = svc().with_usage_source(Arc::new(Eigw));
+    let listed = codes(&measured.introspect_quotas(None, None, None).unwrap());
+    assert!(listed.contains(&"vpc/L-45FE3B85".to_string()));
+    assert_eq!(listed.len(), catalog::ENFORCEABLE.len() + 1);
+    // With a service code, every quota of the service.
     assert_eq!(
-        all["quotas"].as_array().unwrap().len(),
-        catalog::QUOTAS.len()
+        s.introspect_quotas(None, None, Some("ec2")).unwrap()["quotas"]
+            .as_array()
+            .unwrap()
+            .len(),
+        catalog::quotas_of("ec2").len()
     );
     let vpc = s.introspect_quotas(None, None, Some("vpc")).unwrap();
     let vpcs = vpc["quotas"]

@@ -1580,16 +1580,22 @@ public final class FakeCloud {
         private final HttpTransport http;
         ServiceQuotasClient(HttpTransport http) { this.http = http; }
 
-        /** Every quota for the server's default account and region. */
+        /**
+         * The enforceable, measured or changed quotas (an applied value, an
+         * override, or an open request) for the server's default account
+         * and region.
+         */
         public Types.ServiceQuotasResponse getQuotas() {
             return getQuotas(null, null, null);
         }
 
         /**
-         * Every quota (or one service's) with its applied value, usage and
-         * enforcement state. Each argument may be {@code null}: the account
-         * and region default to the server's, and a {@code null}
-         * {@code serviceCode} lists every service.
+         * Quotas with their applied value, usage and enforcement state. Each
+         * argument may be {@code null}: the account and region default to
+         * the server's. Without a {@code serviceCode} it returns the quotas
+         * that are enforceable, measured, or changed (an applied value, an
+         * override, or an open request); pass a {@code serviceCode} for a
+         * whole service.
          */
         public Types.ServiceQuotasResponse getQuotas(
                 String accountId, String region, String serviceCode) {

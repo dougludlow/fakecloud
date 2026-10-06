@@ -1184,8 +1184,11 @@ class ServiceQuotasClient:
         region: Optional[str] = None,
         service_code: Optional[str] = None,
     ) -> ServiceQuotasResponse:
-        """List every quota (or one service's) for an account and region
-        (default: the server's)."""
+        """List quotas for an account and region (default: the server's).
+
+        Without ``service_code`` it returns the quotas that are enforceable,
+        measured, or changed (an applied value, an override, or an open
+        request); pass ``service_code`` for a whole service."""
         resp = await self._client.get(
             f"{self._base}/_fakecloud/service-quotas/quotas",
             params=_sq_quota_params(account_id, region, service_code),
@@ -2175,6 +2178,11 @@ class _SyncServiceQuotasClient:
         region: Optional[str] = None,
         service_code: Optional[str] = None,
     ) -> ServiceQuotasResponse:
+        """List quotas for an account and region (default: the server's).
+
+        Without ``service_code`` it returns the quotas that are enforceable,
+        measured, or changed (an applied value, an override, or an open
+        request); pass ``service_code`` for a whole service."""
         resp = self._client.get(
             f"{self._base}/_fakecloud/service-quotas/quotas",
             params=_sq_quota_params(account_id, region, service_code),

@@ -367,7 +367,7 @@ var fc = new FakeCloudClient("http://localhost:4566"); // explicit base URL
 
 | Method                                                         | Description                                                                                          |
 | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `GetQuotasAsync(accountId?, region?, serviceCode?)`            | List quotas with applied value, measured usage and enforcement state                                 |
+| `GetQuotasAsync(accountId?, region?, serviceCode?)`            | List quotas with applied value, measured usage and enforcement state; without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
 | `PutQuotaAsync(serviceCode, quotaCode, req)`                   | Set a quota's applied value (may be below the AWS default) and/or its enforcement override           |
 | `DeleteQuotaAsync(serviceCode, quotaCode, accountId?, region?)`| Reset a quota to its AWS default and drop its enforcement override                                   |
 | `GetEnforcementAsync()`                                        | Read the global enforcement switch and every server-wide and per-account override                    |

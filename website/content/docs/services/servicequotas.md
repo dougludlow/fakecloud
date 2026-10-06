@@ -1,6 +1,6 @@
 +++
 title = "Service Quotas"
-description = "Service Quotas on fakecloud: all 26 operations, a catalog of real quota codes with AWS default values, increase requests that raise the applied value, the Organizations quota request template, tags, automatic management and utilization reports. Opt-in enforcement (globally or per quota), applied values settable below the AWS default, and manual request approval through the introspection API."
+description = "Service Quotas on fakecloud: all 26 operations, the default quotas AWS publishes for every service it lists, increase requests that raise the applied value, the Organizations quota request template, tags, automatic management and utilization reports. Opt-in enforcement (globally or per quota), applied values settable below the AWS default, and manual request approval through the introspection API."
 weight = 81
 +++
 
@@ -22,17 +22,29 @@ more resources than a fresh AWS account allows keeps working. See
 
 ## Quota catalog
 
-fakecloud carries real quota codes, names and AWS default values for a new
-account:
+fakecloud carries every quota AWS publishes: **every service** `ListServices`
+returns and **all of its default quotas** from `ListAWSDefaultServiceQuotas`,
+dumped from AWS in `us-east-1`. Each quota keeps its real code, name,
+description, default value, unit, adjustability, global flag, and the
+`Period`, CloudWatch usage metric and quota context (per-resource quotas)
+whenever AWS reports them, exactly as AWS returns them, for example `vpc`/`L-F678F1CE` VPCs per Region
+(5), `ec2`/`L-1216C47A` Running On-Demand Standard instances (5 vCPUs, with its
+`AWS/Usage` `ResourceCount` metric) or `iam`/`L-FE177D64` Roles per account
+(1000, global).
 
-| Service code | Quotas |
-|---|---|
-| `vpc` | 25 quotas, including `L-2AFB9258` Security groups per network interface (5), `L-0EA8095F` Inbound or outbound rules per security group (60), `L-F678F1CE` VPCs per Region (5), `L-407747CB` Subnets per VPC (200), `L-E79EC296` VPC security groups per Region (2500), `L-93826ACB` Routes per route table (500) |
-| `ec2` | On-Demand and Spot vCPU quotas (`L-1216C47A`, `L-34B43A08`, with their `AWS/Usage` usage metric), EC2-VPC Elastic IPs (`L-0263D0A3`), the accelerated-instance families, transit gateways, Site-to-Site VPN connections |
-| `iam` | Users, roles, groups, instance profiles, managed policies per role (20)/user/group, customer managed policies, role trust policy length, server certificates, OIDC providers (global quotas) |
-| `lambda`, `s3`, `dynamodb`, `kms` | Concurrent executions and function and layer storage (300 GB, not adjustable: an increase request is an `IllegalArgumentException`, but the introspection API can still set its applied value), general purpose buckets, tables, customer managed keys |
+The dump is vendored in the `fakecloud-servicequotas` crate
+(`data/quotas.json.gz`) and decoded once, on first use. To refresh it from a
+newer AWS listing, run `scripts/gen-service-quotas-catalog.py` (`dump` calls
+the AWS CLI with your profile, `build` writes the vendored file
+deterministically; see the script header). Two things the API does not
+publish are kept by hand on top of the dump: which quotas a fakecloud service
+can enforce (see [Enforceable quotas](#enforceable-quotas)) and the documented
+maximum an increase request can be approved for (VPC and IAM quotas, see
+[Increase requests](#increase-requests)).
 
-`ListServices` returns these services. An unknown service code or quota code
+`ListServices` returns every service and `ListAWSDefaultServiceQuotas` /
+`ListServiceQuotas` every quota of a service, paginated (`MaxResults` up to
+100; `ec2` alone has well over a thousand). An unknown service code or quota code
 returns `NoSuchResourceException`.
 
 ## Supported features
@@ -46,10 +58,17 @@ returns `NoSuchResourceException`.
   value, with an applied-quota ARN
   (`arn:<partition>:servicequotas:<region>:<account>:<service>/<quota>`).
   The partition follows the region (`aws-cn` for `cn-*`, `aws-us-gov` for
-  `us-gov-*`), and global quotas (IAM) leave the region empty in both forms.
+  `us-gov-*`), and global quotas (IAM, S3 general purpose buckets and the
+  other quotas AWS marks `GlobalQuota`) leave the region empty in both forms.
   `QuotaCode` and `QuotaAppliedAtLevel` filter the list.
-  Every catalog quota applies at the account level, so `RESOURCE` matches
-  nothing and a `ContextId` is rejected.
+- Both forms carry the quota's `Description`, and `Period`, `UsageMetric` and
+  `QuotaContext` when AWS publishes them.
+- Every applied value is the account-level one (`QuotaAppliedAtLevel`
+  `ACCOUNT`), so the `RESOURCE` filter matches nothing. A `ContextId` is an
+  `IllegalArgumentException`: for an account-only quota because the quota is
+  applied at the account level, and for a quota whose `QuotaContext` is
+  `RESOURCE` because fakecloud does not support resource-level applied values
+  (see [Known limitations](#known-limitations)).
 
 ### Increase requests
 
@@ -166,7 +185,7 @@ persist across restarts in persistent mode.
 | Outstanding VPC peering connection requests (`vpc`/`L-DC9F7029`) | `CreateVpcPeeringConnection` (`OutstandingVpcPeeringConnectionLimitExceeded`) |
 | Gateway VPC endpoints per Region (`vpc`/`L-1B52E74A`), Interface VPC endpoints per VPC (`vpc`/`L-29B6F2EB`) | `CreateVpcEndpoint` (`VpcEndpointLimitExceeded`) |
 | EC2-VPC Elastic IPs (`ec2`/`L-0263D0A3`) | `AllocateAddress` (`AddressLimitExceeded`) |
-| Site-to-Site VPN connections per Region (`ec2`/`L-3E6EC3A3`) | `CreateVpnConnection` (`VpnConnectionLimitExceeded`) |
+| VPN connections per region (`ec2`/`L-3E6EC3A3`) | `CreateVpnConnection` (`VpnConnectionLimitExceeded`) |
 | Running On-Demand Standard, F, G and VT, Inf, P, X and High Memory instances (`ec2`/`L-1216C47A`, `L-74FC7D96`, `L-DB2E81BA`, `L-1945791B`, `L-417A185B`, `L-7295265B`, `L-43DA4232`) | `RunInstances`, `StartInstances`, Auto Scaling and CloudFormation launches (`VcpuLimitExceeded`) |
 | All Standard Spot Instance Requests (`ec2`/`L-34B43A08`) | `RunInstances` with `InstanceMarketOptions.MarketType=spot`, `RequestSpotInstances` (`MaxSpotInstanceCountExceeded`) |
 | Users per account (`iam`/`L-F55AF5E4`) | `CreateUser` (`LimitExceeded`, `Cannot exceed quota for UsersPerAccount: N`) |
@@ -180,7 +199,7 @@ persist across restarts in persistent mode.
 | Role trust policy length (`iam`/`L-C07B4B0D`) | `CreateRole`, `UpdateAssumeRolePolicy` (`LimitExceeded`, `ACLSizePerRole`); characters of the trust policy, not counting white space |
 | Maximum number of tables (`dynamodb`/`L-F98FE922`) | `CreateTable`, `RestoreTableFromBackup`, `RestoreTableToPointInTime`, `ImportTable`, and `UpdateTable` adding a replica (counted in the replica's region) (`LimitExceededException`) |
 | Customer Master Keys (`kms`/`L-C2F1777E`) | `CreateKey`, `ReplicateKey` (counted in the replica's region) (`LimitExceededException`); customer managed keys in any key state count, including pending deletion, AWS managed keys do not |
-| General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); per account across all regions, with the applied value read from the partition's primary region, where S3 manages it (`us-east-1`; `us-gov-west-1` in GovCloud, `cn-north-1` in China) |
+| General purpose buckets (`s3`/`L-DC2B2D3D`) | `CreateBucket` (`TooManyBuckets`); a global quota: one applied value per account, counting buckets across all regions |
 | Function and layer storage (`lambda`/`L-2ACBD22F`) | `CreateFunction`, `UpdateFunctionCode`, `PublishVersion`, `PublishLayerVersion` (`CodeStorageExceededException`); the code of every function's `$LATEST`, published version and layer version counts, container images do not |
 
 IAM refusals are HTTP 409 with IAM's `Cannot exceed quota for <Name>: <limit>`
@@ -237,7 +256,7 @@ ACL) reports its busiest resource as its `usage` and in utilization reports.
 `ValidateSecurityGroupQuotasForInterface` exists to ask whether groups fit the
 quotas, so it always answers against the applied values, enforced or not.
 
-Every other catalog quota is reported with `enforceable: false`; an override
+Every other quota is reported with `enforceable: false`; an override
 on one (on or off) is refused rather than silently doing nothing.
 
 ## Introspection
@@ -250,7 +269,7 @@ decided). An omitted `accountId` or `region` means the server's.
 
 | Endpoint | What it does |
 |---|---|
-| `GET /_fakecloud/service-quotas/quotas?accountId=&region=&serviceCode=` | Every quota (or one service's) with `defaultValue`, `appliedValue`, `usage` (when fakecloud counts it), `enforceable`, `enforced` and `enforcementSource` (`not_enforceable`, `account_override`, `override`, `global`) |
+| `GET /_fakecloud/service-quotas/quotas?accountId=&region=&serviceCode=` | With `serviceCode`, every quota of that service; without it, only the quotas a fakecloud service can enforce, the ones a usage source measures, and the ones the account or server changed (an applied value in any region, an enforcement override, or an open increase request). Each with `defaultValue`, `appliedValue`, `usage` (when fakecloud counts it), `enforceable`, `enforced` and `enforcementSource` (`not_enforceable`, `account_override`, `override`, `global`) |
 | `PUT /_fakecloud/service-quotas/quotas/{service}/{quota}` | Body `{accountId?, region?, value?, enforce?}`. Sets the applied value, **even below the AWS default** (AWS never lowers a quota; a test can, to hit a limit without creating the default number of resources). `enforce`: `true` enforces, `false` ignores, `null` clears the override, absent leaves it. With `accountId` the override is for that account only, otherwise server-wide |
 | `DELETE /_fakecloud/service-quotas/quotas/{service}/{quota}?accountId=&region=` | Back to the AWS default, and drops the override (the account's when `accountId` is given, else the server-wide one) |
 | `GET` / `PUT /_fakecloud/service-quotas/enforcement` | `{enforceAll, overrides, accountOverrides}`; `PUT` takes `{enforceAll?, overrides?: [{serviceCode, quotaCode, accountId?, enforce}]}` (`null` clears) and applies the batch only if every entry is valid |
@@ -296,7 +315,7 @@ that concurrency limit, as Lambda always does.
 ## Known limitations
 
 - Only the quotas listed under [Enforceable quotas](#enforceable-quotas) are
-  enforceable. Other catalog
+  enforceable. Other
   quotas are reported and can be raised or lowered, but fakecloud does not
   refuse requests that go past them. Among the EC2 and VPC quotas, egress-only
   internet gateways per Region and transit gateways per account are counted
@@ -312,11 +331,19 @@ that concurrency limit, as Lambda always does.
   generated. While a vCPU quota is enforced, launching or requesting as Spot
   an instance type missing from the table, such as one newer than the table,
   is refused with `InvalidParameterValue`; while it is not enforced, such a
-  type is accepted and counts 0 vCPUs, also when it is started later. The Trn, DL, HPC
-  and Mac families have quotas outside the catalog.
+  type is accepted and counts 0 vCPUs, also when it is started later. The
+  Trn, DL, HPC and Mac families' quotas are reported but not enforced.
 - Lambda "Concurrent executions" (`L-B99A9384`) is not enforceable: invocations
   from event source mappings, SNS, S3, EventBridge and other services run the
   function without passing the `Invoke` concurrency gate, so fakecloud cannot
   count in-flight executions account-wide. Reserved concurrency per function is
   still enforced on `Invoke`.
-- The catalog covers the services above, not every AWS service.
+- Quotas whose `QuotaContext` is `RESOURCE` (per transit gateway, per
+  Connect instance, per web ACL, ...) have only their account-level applied
+  value: resource-level applied values are not supported, so
+  `GetServiceQuota` and `RequestServiceQuotaIncrease` refuse a `ContextId`
+  (saying so) and `ListServiceQuotas` with `QuotaAppliedAtLevel` `RESOURCE`
+  returns nothing.
+- Default values are the ones AWS publishes in `us-east-1`. AWS sets some
+  defaults per region; fakecloud reports the `us-east-1` value in every
+  region.

@@ -2622,9 +2622,11 @@ impl ServiceQuotasClient<'_> {
         )
     }
 
-    /// Every quota (or one service's) with its applied value, usage and
-    /// enforcement state. An omitted account or region defaults to the
-    /// server's.
+    /// Quotas with their applied value, usage and enforcement state. Without
+    /// a service code it returns the quotas that are enforceable, measured,
+    /// or changed (an applied value, an override, or an open request); pass
+    /// a service code for a whole service. An omitted account or region
+    /// defaults to the server's.
     pub async fn get_quotas(
         &self,
         account_id: Option<&str>,
