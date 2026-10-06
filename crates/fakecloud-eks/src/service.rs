@@ -3023,29 +3023,34 @@ impl EksService {
     fn describe_cluster_versions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let next_token = req.query_params.get("nextToken").cloned();
         let max_results = match req.query_params.get("maxResults") {
-            Some(raw) => {
-                let n: i64 = raw
-                    .parse()
-                    .map_err(|_| invalid_parameter("maxResults must be an integer"))?;
-                if !(1..=100).contains(&n) {
-                    return Err(invalid_parameter("maxResults must be between 1 and 100"));
-                }
-                n as usize
-            }
+            Some(raw) => match raw.parse::<i64>() {
+                Ok(n) if (1..=100).contains(&n) => n as usize,
+                _ => return Err(invalid_parameter("MaxResults must be between 0 to 100")),
+            },
             None => 100,
         };
-        // Enum query params reject values outside the model's declared enum
-        // values (`ClusterVersionStatus` is `standard-support`, hyphenated).
-        if let Some(status) = req.query_params.get("status") {
-            if !["unsupported", "standard-support", "extended-support"].contains(&status.as_str()) {
-                return Err(invalid_parameter(format!("Invalid status: {status}")));
+        // Both status params take `VersionStatus` values on the wire
+        // (`STANDARD_SUPPORT`), and AWS words the rejection the same way for
+        // either. The model types the deprecated `status` as the hyphenated
+        // `ClusterVersionStatus` enum, but AWS refuses those values.
+        let status_param = |name: &str| -> Result<Option<String>, AwsServiceError> {
+            match req.query_params.get(name) {
+                Some(v)
+                    if ["UNSUPPORTED", "STANDARD_SUPPORT", "EXTENDED_SUPPORT"]
+                        .contains(&v.as_str()) =>
+                {
+                    Ok(Some(v.clone()))
+                }
+                Some(v) => Err(invalid_parameter(format!(
+                    "Provided Cluster Status is invalid: {v}"
+                ))),
+                None => Ok(None),
             }
-        }
-        if let Some(vs) = req.query_params.get("versionStatus") {
-            if !["UNSUPPORTED", "STANDARD_SUPPORT", "EXTENDED_SUPPORT"].contains(&vs.as_str()) {
-                return Err(invalid_parameter(format!("Invalid versionStatus: {vs}")));
-            }
-        }
+        };
+        let status = status_param("status")?;
+        let version_status = status_param("versionStatus")?;
+        // When both are given, `versionStatus` wins and `status` is ignored.
+        let tier_filter = version_status.or(status);
         let default_only = req
             .query_params
             .get("defaultOnly")
@@ -3058,14 +3063,15 @@ impl EksService {
             .get("includeAll")
             .map(|v| v == "true")
             .unwrap_or(false);
-        let status_filter = req.query_params.get("status").cloned();
-        let version_status_filter = req.query_params.get("versionStatus").cloned();
         let version_filter = parse_multi_query(&req.raw_query, "clusterVersions");
         let cluster_type = req
             .query_params
             .get("clusterType")
             .cloned()
             .unwrap_or_else(|| "eks".to_string());
+        if cluster_type != "eks" {
+            return Err(invalid_parameter("Provided Cluster Type is invalid"));
+        }
 
         let mut catalog: Vec<Value> = cluster_version_catalog(&cluster_type)
             .into_iter()
@@ -3076,26 +3082,25 @@ impl EksService {
                         .any(|f| v["clusterVersion"] == f.as_str())
             })
             .filter(|v| !default_only || v["defaultVersion"] == true)
-            // The `status` (deprecated) and `versionStatus` params narrow to a
-            // specific support tier; previously validated then ignored.
-            .filter(|v| status_filter.as_deref().is_none_or(|s| v["status"] == s))
             .filter(|v| {
-                version_status_filter
+                tier_filter
                     .as_deref()
                     .is_none_or(|s| v["versionStatus"] == s)
             })
-            // Drop UNSUPPORTED rows unless the caller asked to include all, or
-            // explicitly filtered to an unsupported tier.
+            // UNSUPPORTED rows are hidden unless the caller asked for all,
+            // filtered to a tier, or named versions explicitly.
             .filter(|v| {
                 include_all
-                    || status_filter.is_some()
-                    || version_status_filter.is_some()
+                    || tier_filter.is_some()
+                    || !version_filter.is_empty()
                     || v["versionStatus"] != "UNSUPPORTED"
             })
             .collect();
-        // AWS reports the default version first; a stable sort keying non-default
-        // rows after default ones preserves the ascending version order otherwise.
-        catalog.sort_by_key(|v| v["defaultVersion"] != true);
+        // AWS lists newest first, leaving the default version in place; only
+        // an explicit `clusterVersions` list comes back ascending.
+        if version_filter.is_empty() {
+            catalog.reverse();
+        }
 
         let (page, token) = paginate_checked(&catalog, next_token.as_deref(), max_results)
             .map_err(|_| invalid_parameter("Invalid nextToken"))?;

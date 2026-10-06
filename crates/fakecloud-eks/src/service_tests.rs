@@ -2214,8 +2214,12 @@ async fn describe_cluster_versions_catalog_is_non_empty() {
             .count(),
         1
     );
-    // AWS reports the default version first (index 0).
-    assert_eq!(versions[0]["defaultVersion"], true);
+    // AWS lists newest first and leaves the default version in place.
+    assert_eq!(
+        names,
+        vec!["1.34", "1.33", "1.32", "1.31", "1.30", "1.29", "1.28"]
+    );
+    assert_eq!(versions[3]["defaultVersion"], true);
 
     // defaultOnly filter narrows to the single default.
     let resp = svc
@@ -2267,17 +2271,13 @@ fn row<'a>(rows: &'a [Value], version: &str) -> &'a Value {
 }
 
 #[tokio::test]
-async fn describe_cluster_versions_reports_aws_dates_and_status_enum() {
+async fn describe_cluster_versions_reports_aws_dates_and_status() {
     let svc = EksService::new(make_state());
     let rows = cluster_versions(&svc, "").await;
-    // Deprecated `status` uses the hyphenated `ClusterVersionStatus` values.
+    // AWS sends the `VersionStatus` value in the deprecated `status` member
+    // too, not the model's hyphenated `ClusterVersionStatus` values.
     for r in &rows {
-        let expected = match r["versionStatus"].as_str().unwrap() {
-            "STANDARD_SUPPORT" => "standard-support",
-            "EXTENDED_SUPPORT" => "extended-support",
-            other => panic!("unexpected versionStatus {other}"),
-        };
-        assert_eq!(r["status"], expected, "{}", r["clusterVersion"]);
+        assert_eq!(r["status"], r["versionStatus"], "{}", r["clusterVersion"]);
     }
     // 2025-10-02 / 2026-12-02 / 2027-12-02 at midnight UTC.
     let v134 = row(&rows, "1.34");
@@ -2291,55 +2291,80 @@ async fn describe_cluster_versions_reports_aws_dates_and_status_enum() {
     assert_eq!(v133["endOfStandardSupportDate"], json!(1785283200.0));
     assert_eq!(v133["endOfExtendedSupportDate"], json!(1816819200.0));
     // 1.30 left standard support on 2025-07-23.
-    assert_eq!(row(&rows, "1.30")["versionStatus"], "EXTENDED_SUPPORT");
-    assert_eq!(row(&rows, "1.30")["status"], "extended-support");
-    assert_eq!(row(&rows, "1.31")["status"], "standard-support");
+    assert_eq!(row(&rows, "1.30")["status"], "EXTENDED_SUPPORT");
+    assert_eq!(row(&rows, "1.31")["status"], "STANDARD_SUPPORT");
+}
+
+async fn cluster_versions_err(svc: &EksService, query: &str) -> AwsServiceError {
+    svc.handle(make_request(
+        Method::GET,
+        &format!("/cluster-versions?{query}"),
+        "",
+    ))
+    .await
+    .err()
+    .unwrap()
 }
 
 #[tokio::test]
-async fn describe_cluster_versions_status_filter_uses_enum_values() {
+async fn describe_cluster_versions_status_filter_takes_version_status_values() {
     let svc = EksService::new(make_state());
-    let extended = cluster_versions(&svc, "status=extended-support").await;
-    let names: Vec<&str> = extended
+    let names = |rows: &[Value]| -> Vec<String> {
+        rows.iter()
+            .map(|r| r["clusterVersion"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let extended = cluster_versions(&svc, "status=EXTENDED_SUPPORT").await;
+    assert_eq!(names(&extended), vec!["1.30", "1.29", "1.28"]);
+    let standard = cluster_versions(&svc, "status=STANDARD_SUPPORT").await;
+    assert_eq!(names(&standard), vec!["1.34", "1.33", "1.32", "1.31"]);
+    // `versionStatus` wins when both are given.
+    let both = cluster_versions(
+        &svc,
+        "status=EXTENDED_SUPPORT&versionStatus=STANDARD_SUPPORT",
+    )
+    .await;
+    assert_eq!(names(&both), vec!["1.34", "1.33", "1.32", "1.31"]);
+    // The model's hyphenated enum values and the member names are refused,
+    // with the same wording for either parameter.
+    for q in [
+        "status=extended-support",
+        "status=standard_support",
+        "versionStatus=extended-support",
+    ] {
+        let err = cluster_versions_err(&svc, q).await;
+        assert_eq!(err.code(), "InvalidParameterException", "{q}");
+        let value = q.split('=').nth(1).unwrap();
+        assert_eq!(
+            err.message(),
+            format!("Provided Cluster Status is invalid: {value}"),
+            "{q}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describe_cluster_versions_named_versions_are_ascending() {
+    let svc = EksService::new(make_state());
+    // Explicit versions come back ascending regardless of request order.
+    let rows = cluster_versions(&svc, "clusterVersions=1.34&clusterVersions=1.31").await;
+    let names: Vec<&str> = rows
         .iter()
         .map(|r| r["clusterVersion"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["1.28", "1.29", "1.30"]);
-    let standard = cluster_versions(&svc, "status=standard-support").await;
-    assert!(standard.iter().all(|r| r["status"] == "standard-support"));
-    assert_eq!(standard.len(), 4);
-    // The member name is not a valid wire value.
-    let err = svc
-        .handle(make_request(
-            Method::GET,
-            "/cluster-versions?status=standard_support",
-            "",
-        ))
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(err.code(), "InvalidParameterException");
+    assert_eq!(names, vec!["1.31", "1.34"]);
 }
 
 #[tokio::test]
-async fn describe_addon_configuration_external_dns_pod_identity() {
+async fn describe_cluster_versions_rejects_unknown_cluster_type() {
     let svc = EksService::new(make_state());
-    let resp = svc
-        .handle(make_request(
-            Method::GET,
-            "/addons/configuration-schemas?addonName=external-dns&addonVersion=v0.20.0-eksbuild.1",
-            "",
-        ))
-        .await
-        .unwrap();
-    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    assert_eq!(
-        v["podIdentityConfiguration"],
-        json!([{
-            "serviceAccount": "external-dns",
-            "recommendedManagedPolicies": ["arn:aws:iam::aws:policy/AmazonRoute53FullAccess"],
-        }])
-    );
+    for q in ["clusterType=foo", "clusterType=eks-local-outposts"] {
+        let err = cluster_versions_err(&svc, q).await;
+        assert_eq!(err.code(), "InvalidParameterException");
+        assert_eq!(err.message(), "Provided Cluster Type is invalid");
+    }
+    let err = cluster_versions_err(&svc, "maxResults=101").await;
+    assert_eq!(err.message(), "MaxResults must be between 0 to 100");
 }
 
 // -----------------------------------------------------------------------

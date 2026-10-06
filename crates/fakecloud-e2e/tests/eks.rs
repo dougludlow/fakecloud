@@ -111,9 +111,10 @@ async fn eks_create_addon_pod_identity_agent_uses_default_version() {
     assert_eq!(addon.addon_version(), Some("v1.3.10-eksbuild.1"));
 }
 
-/// DescribeClusterVersions reports the AWS support windows and the deprecated
-/// `status` member in its own `ClusterVersionStatus` enum (`standard-support`),
-/// which the SDK only decodes to a known variant when the wire value matches.
+/// DescribeClusterVersions reports the AWS support windows. Like AWS, the
+/// deprecated `status` member carries the `VersionStatus` wire value
+/// (`STANDARD_SUPPORT`), which the SDK cannot map onto its hyphenated
+/// `ClusterVersionStatus` variants, and the `status` filter only accepts it.
 // The deprecated `status` member is exactly what this test pins down.
 #[allow(deprecated)]
 #[tokio::test]
@@ -133,7 +134,7 @@ async fn eks_describe_cluster_versions_matches_aws_lifecycle() {
     };
 
     let v134 = find("1.34");
-    assert_eq!(v134.status(), Some(&ClusterVersionStatus::StandardSupport));
+    assert_eq!(v134.status().map(|s| s.as_str()), Some("STANDARD_SUPPORT"));
     assert_eq!(v134.version_status(), Some(&VersionStatus::StandardSupport));
     assert_eq!(v134.release_date().unwrap().secs(), 1_759_363_200); // 2025-10-02
     assert_eq!(
@@ -154,13 +155,37 @@ async fn eks_describe_cluster_versions_matches_aws_lifecycle() {
     );
 
     let v130 = find("1.30");
-    assert_eq!(v130.status(), Some(&ClusterVersionStatus::ExtendedSupport));
+    assert_eq!(v130.status().map(|s| s.as_str()), Some("EXTENDED_SUPPORT"));
     assert_eq!(v130.version_status(), Some(&VersionStatus::ExtendedSupport));
 
-    // The deprecated `status` filter takes the same enum.
-    let extended = client
+    // Newest first, default left in place.
+    let order: Vec<&str> = versions
+        .iter()
+        .filter_map(|c| c.cluster_version())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["1.34", "1.33", "1.32", "1.31", "1.30", "1.29", "1.28"]
+    );
+
+    // The SDK's own enum variant sends `extended-support`, which AWS refuses.
+    let err = client
         .describe_cluster_versions()
         .status(ClusterVersionStatus::ExtendedSupport)
+        .send()
+        .await
+        .unwrap_err();
+    let err = err.into_service_error();
+    assert!(err.is_invalid_parameter_exception());
+    assert_eq!(
+        err.meta().message(),
+        Some("Provided Cluster Status is invalid: extended-support")
+    );
+
+    // The deprecated `status` filter takes the `VersionStatus` wire value.
+    let extended = client
+        .describe_cluster_versions()
+        .status(ClusterVersionStatus::from("EXTENDED_SUPPORT"))
         .send()
         .await
         .unwrap();
@@ -169,7 +194,7 @@ async fn eks_describe_cluster_versions_matches_aws_lifecycle() {
         .iter()
         .filter_map(|c| c.cluster_version())
         .collect();
-    assert_eq!(names, vec!["1.28", "1.29", "1.30"]);
+    assert_eq!(names, vec!["1.30", "1.29", "1.28"]);
 }
 
 /// The add-on catalog carries AWS's real version strings and the add-ons EKS
