@@ -274,6 +274,15 @@ fn reset_targets(rows: Vec<String>, tracked: Option<Vec<String>>) -> Vec<String>
     targets.into_iter().collect()
 }
 
+/// The tracked ARNs that belong to `account`.
+fn tracked_in_account(tracked: Option<Vec<String>>, account: &str) -> Option<Vec<String>> {
+    tracked.map(|arns| {
+        arns.into_iter()
+            .filter(|arn| fakecloud_aws::arn::account_of(arn) == Some(account))
+            .collect()
+    })
+}
+
 type RunningBuilds = fakecloud_codebuild::runtime::RunningBuilds;
 
 /// The build and build-batch ids of an account's CodeBuild state.
@@ -364,6 +373,10 @@ fn mq_reset(
             };
             stop_brokers(teardown, &all_rt, brokers);
         },
+        // Unlike the full reset, an account reset stops only the brokers of
+        // the account's rows: the runtime tracks containers by broker id,
+        // which does not name an account, so a tracked container whose row is
+        // already gone cannot be attributed to one.
         move |account_id, teardown| {
             let brokers = {
                 let mut mas = state.write();
@@ -424,8 +437,13 @@ fn kafka_reset(
                     .get(account_id)
                     .map(|d| d.clusters.keys().cloned().collect())
                     .unwrap_or_default();
+                // Tracked by cluster ARN, which names the account.
+                let tracked = tracked_in_account(
+                    runtime.as_ref().map(|rt| rt.tracked_clusters()),
+                    account_id,
+                );
                 mas.reset_account(account_id);
-                rows
+                reset_targets(rows, tracked)
             };
             stop_clusters(teardown, &runtime, clusters);
         },
@@ -503,9 +521,12 @@ fn flink_reset(
         move |account_id, teardown| {
             let apps = {
                 let mut mas = state.write();
-                let apps = mas.get(account_id).map(flink_apps).unwrap_or_default();
+                let rows = mas.get(account_id).map(flink_apps).unwrap_or_default();
+                // Tracked by application ARN, which names the account.
+                let tracked =
+                    tracked_in_account(runtime.as_ref().map(|rt| rt.tracked_apps()), account_id);
                 mas.reset_account(account_id);
-                apps
+                flink_targets(rows, tracked)
             };
             remove_clusters(teardown, &runtime, apps);
         },
@@ -608,6 +629,21 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert_eq!(reset_targets(vec!["a".into()], None), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn tracked_in_account_keeps_that_accounts_arns() {
+        let tracked = vec![
+            "arn:aws:kafka:us-east-1:111111111111:cluster/a/1".to_string(),
+            "arn:aws:kafka:us-east-1:222222222222:cluster/b/2".to_string(),
+        ];
+        assert_eq!(
+            tracked_in_account(Some(tracked), "222222222222"),
+            Some(vec![
+                "arn:aws:kafka:us-east-1:222222222222:cluster/b/2".to_string()
+            ])
+        );
+        assert_eq!(tracked_in_account(None, "222222222222"), None);
     }
 
     #[test]

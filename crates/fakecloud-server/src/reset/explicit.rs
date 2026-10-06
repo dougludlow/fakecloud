@@ -117,8 +117,8 @@ pub(super) const EXPLICIT: &[ExplicitService] = &[
         names: &["s3"],
         hooks: &[],
         in_full: true,
-        reset_all: |s, _| s.reset_s3(None),
-        reset_account: Some(|s, account, _| s.reset_s3(Some(account))),
+        reset_all: |s, teardown| s.reset_s3(None, teardown),
+        reset_account: Some(|s, account, teardown| s.reset_s3(Some(account), teardown)),
     },
     ExplicitService {
         names: &["logs"],

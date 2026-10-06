@@ -1474,6 +1474,7 @@ fn zip_files(files: &[(String, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn running_builds_take_only_the_named_builds() {
@@ -1492,8 +1493,6 @@ mod tests {
         assert_eq!(running.lock().len(), 1);
         assert!(running.lock().contains_key("p:2"));
     }
-
-    use super::*;
 
     #[test]
     fn resolves_curated_image_to_default() {

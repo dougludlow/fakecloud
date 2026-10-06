@@ -118,6 +118,12 @@ static SNAPSHOT_STORES: parking_lot::Mutex<BTreeSet<&'static str>> =
 /// wiring can be checked against the full set of stores.
 pub(crate) fn snapshot_store_path(data_path: &Path, dir: &'static str) -> PathBuf {
     SNAPSHOT_STORES.lock().insert(dir);
+    snapshot_file_path(data_path, dir)
+}
+
+/// The snapshot file of the store in `dir` under `data_path`, without
+/// recording a store (for readers of an existing snapshot).
+pub(crate) fn snapshot_file_path(data_path: &Path, dir: &str) -> PathBuf {
     data_path.join(dir).join("snapshot.json")
 }
 
@@ -187,33 +193,18 @@ pub(crate) struct LateReset {
     /// The S3 store, whose buckets live on disk one directory each rather than
     /// in a snapshot.
     s3_store: Option<Arc<dyn S3Store>>,
-    /// The snapshot files behind each hook key (persistent mode).
-    snapshot_files: BTreeMap<&'static str, Vec<PathBuf>>,
 }
 
 impl LateReset {
-    /// `data_path` is the persistent-mode data directory (`None` in memory
-    /// mode), whose recorded snapshot stores the reset checks for files.
     pub(crate) fn new(
         hooks: BTreeMap<&'static str, SnapshotHook>,
         services: Vec<ServiceReset>,
         s3_store: Option<Arc<dyn S3Store>>,
-        data_path: Option<&Path>,
     ) -> Self {
-        let mut snapshot_files: BTreeMap<&'static str, Vec<PathBuf>> = BTreeMap::new();
-        if let Some(data_path) = data_path {
-            for dir in SNAPSHOT_STORES.lock().iter().copied() {
-                snapshot_files
-                    .entry(hook_key_for_store(dir))
-                    .or_default()
-                    .push(data_path.join(dir).join("snapshot.json"));
-            }
-        }
         Self {
             hooks,
             services,
             s3_store,
-            snapshot_files,
         }
     }
 
@@ -374,22 +365,17 @@ impl ResetState {
     }
 
     /// Queue the persist hooks of `keys` on `teardown`, so the reset state is
-    /// written through to disk before the reset replies. A service with no
-    /// snapshot file yet is skipped: there is nothing on disk to bring its old
-    /// state back, and writing an empty one would only cost a write per
-    /// service on every reset. Memory mode registers no hooks, so this queues
-    /// nothing there.
+    /// written through to disk before the reset replies. Each hook serializes
+    /// behind its service's snapshot lock, so it lands after any write already
+    /// in flight. Memory mode registers no hooks, so this queues nothing
+    /// there.
     fn persist(&self, teardown: &mut Teardown, keys: impl IntoIterator<Item = &'static str>) {
         let late = self.late();
         for key in keys {
             let Some(hook) = late.hooks.get(key) else {
                 continue;
             };
-            let on_disk = late
-                .snapshot_files
-                .get(key)
-                .is_none_or(|files| files.iter().any(|f| f.exists()));
-            if !on_disk || teardown.persisted.contains(&key) {
+            if teardown.persisted.contains(&key) {
                 continue;
             }
             teardown.persisted.push(key);
@@ -424,15 +410,17 @@ impl ResetState {
     }
 
     /// Reset Lambda in `account` (every account for `None`), with the warm
-    /// instances of its functions, taken under the same lock so a function
-    /// created after the reset keeps its own.
+    /// instances of its functions.
+    ///
+    /// The state lock is released before the runtime's instance map is
+    /// taken: the runtime nests them the other way round (instances, then
+    /// state, in `list_warm_containers`), so holding both here could
+    /// deadlock. This is the order `DeleteFunction` uses too. A function
+    /// created and warmed in the gap loses that warm instance and cold-starts
+    /// on its next invoke.
     fn reset_lambda(&self, account: Option<&str>, teardown: &mut Teardown) {
-        let taken = {
+        {
             let mut mas = self.lambda.write();
-            let taken = self
-                .container_runtime
-                .as_ref()
-                .map(|rt| rt.take_account_instances(account));
             match account {
                 None => mas.reset(),
                 Some(account) => {
@@ -442,9 +430,9 @@ impl ResetState {
                     }
                 }
             }
-            taken
-        };
-        if let (Some(rt), Some(taken)) = (self.container_runtime.clone(), taken) {
+        }
+        if let Some(rt) = self.container_runtime.clone() {
+            let taken = rt.take_account_instances(account);
             if !taken.is_empty() {
                 teardown.push(async move { rt.terminate_taken(taken).await });
             }
@@ -459,10 +447,15 @@ impl ResetState {
         });
         if let Some(rt) = self.ecs_runtime.clone() {
             if !tasks.is_empty() {
+                // Each `stop_task` waits out its containers' stop timeout:
+                // stop them all at once.
                 teardown.push(async move {
+                    let mut stops = tokio::task::JoinSet::new();
                     for task in tasks {
-                        rt.stop_task(&task, "fakecloud reset").await;
+                        let rt = rt.clone();
+                        stops.spawn(async move { rt.stop_task(&task, "fakecloud reset").await });
                     }
+                    stops.join_all().await;
                 });
             }
         }
@@ -517,36 +510,61 @@ impl ResetState {
     }
 
     /// Reset S3 in `account` (every account for `None`), deleting the reset
-    /// buckets from the store. The deletion happens under the S3 write lock:
-    /// a `CreateBucket` reusing a reset name waits for it, so the directory
-    /// it writes is never the one deleted.
-    fn reset_s3(&self, account: Option<&str>) {
-        let mut mas = self.s3.write();
-        let buckets: Vec<String> = match account {
-            None => {
-                let buckets = mas
-                    .iter()
-                    .flat_map(|(_, s)| s.buckets.keys().cloned())
-                    .collect();
-                mas.reset();
-                buckets
-            }
-            Some(account) => match mas.get_mut(account) {
-                Some(state) => {
-                    let buckets = state.buckets.keys().cloned().collect();
-                    state.reset();
+    /// buckets from the store. Under the S3 write lock each bucket directory
+    /// is only renamed aside (fast and atomic), so a `CreateBucket` reusing a
+    /// reset name, which waits for the lock, never writes into what is being
+    /// removed; the recursive removal runs in the teardown, off the lock.
+    fn reset_s3(&self, account: Option<&str>, teardown: &mut Teardown) {
+        let detached: Vec<PathBuf> = {
+            let mut mas = self.s3.write();
+            let buckets: Vec<String> = match account {
+                None => {
+                    let buckets = mas
+                        .iter()
+                        .flat_map(|(_, s)| s.buckets.keys().cloned())
+                        .collect();
+                    mas.reset();
                     buckets
                 }
-                None => Vec::new(),
-            },
+                Some(account) => match mas.get_mut(account) {
+                    Some(state) => {
+                        let buckets = state.buckets.keys().cloned().collect();
+                        state.reset();
+                        buckets
+                    }
+                    None => Vec::new(),
+                },
+            };
+            let Some(store) = self.late().s3_store.as_ref() else {
+                return;
+            };
+            buckets
+                .iter()
+                .filter_map(|bucket| match store.detach_bucket(bucket) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        tracing::error!(%bucket, %err, "reset could not remove the bucket from disk");
+                        None
+                    }
+                })
+                .collect()
         };
-        if let Some(store) = self.late().s3_store.as_ref() {
-            for bucket in buckets {
-                if let Err(err) = store.delete_bucket(&bucket) {
-                    tracing::error!(%bucket, %err, "reset could not delete the bucket from disk");
-                }
-            }
+        if detached.is_empty() {
+            return;
         }
+        teardown.push(async move {
+            let removed = tokio::task::spawn_blocking(move || {
+                for path in detached {
+                    if let Err(err) = fakecloud_persistence::s3::remove_detached(&path) {
+                        tracing::error!(path = %path.display(), %err, "reset could not delete a detached bucket");
+                    }
+                }
+            })
+            .await;
+            if let Err(err) = removed {
+                tracing::error!(%err, "reset bucket deletion task panicked");
+            }
+        });
     }
 
     /// Reset Service Quotas: every account's applied values, requests and
@@ -1032,11 +1050,8 @@ mod tests {
     }
 
     /// A late wiring with SWF registered as a service reset through an entry,
-    /// a counting hook for every key a reset writes, and `snapshot_files`.
-    fn counting_late(
-        swf: fakecloud_swf::SharedSwfState,
-        snapshot_files: BTreeMap<&'static str, Vec<PathBuf>>,
-    ) -> (LateReset, Counts) {
+    /// and a counting hook for every key a reset writes.
+    fn counting_late(swf: fakecloud_swf::SharedSwfState) -> (LateReset, Counts) {
         let counts: Counts = Arc::default();
         let services = vec![ServiceReset::multi_account(&["swf"], "swf", swf)];
         let hooks = reset_hook_keys(&services)
@@ -1047,7 +1062,6 @@ mod tests {
             hooks,
             services,
             s3_store: None,
-            snapshot_files,
         };
         (late, counts)
     }
@@ -1078,7 +1092,7 @@ mod tests {
     #[tokio::test]
     async fn per_service_reset_persists_that_service() {
         let state = test_state();
-        let (late, counts) = counting_late(swf_state(), BTreeMap::new());
+        let (late, counts) = counting_late(swf_state());
         assert!(state.late.set(late).is_ok());
 
         let teardown = state.reset_service("events").unwrap();
@@ -1109,7 +1123,7 @@ mod tests {
         let swf = swf_state();
         add_domain(&swf, "123456789012");
         add_domain(&swf, "222222222222");
-        let (late, counts) = counting_late(swf.clone(), BTreeMap::new());
+        let (late, counts) = counting_late(swf.clone());
         let expected = late.hooks.len();
         assert!(state.late.set(late).is_ok());
 
@@ -1123,34 +1137,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_skips_services_with_no_snapshot_on_disk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let written = tmp.path().join("sqs.json");
-        std::fs::write(&written, b"{}").unwrap();
-        let files = BTreeMap::from([
-            ("sqs", vec![written]),
-            ("sns", vec![tmp.path().join("never-written.json")]),
-        ]);
-        let state = test_state();
-        let (late, counts) = counting_late(swf_state(), files);
-        assert!(state.late.set(late).is_ok());
-
-        let (_, teardown) = state.reset();
-        assert!(teardown.persisted.contains(&"sqs"));
-        assert!(!teardown.persisted.contains(&"sns"));
-        // A key with no known snapshot file is written (nothing to check).
-        assert!(teardown.persisted.contains(&"swf"));
-        teardown.run().await;
-        let counts = counts.lock().clone();
-        assert_eq!(counts.get("sqs"), Some(&1));
-        assert_eq!(counts.get("sns"), None);
-    }
-
-    #[tokio::test]
     async fn registered_service_resets_per_service_and_per_account() {
         let state = test_state();
         let swf = swf_state();
-        let (late, counts) = counting_late(swf.clone(), BTreeMap::new());
+        let (late, counts) = counting_late(swf.clone());
         assert!(state.late.set(late).is_ok());
 
         add_domain(&swf, "123456789012");
@@ -1254,6 +1244,16 @@ mod tests {
         let reset = reset_hook_keys(&services);
         let gaps = wiring_gaps(stores.iter().map(String::as_str), &hooks, &reset);
         assert!(gaps.is_empty(), "{gaps:#?}");
+    }
+
+    #[test]
+    fn snapshot_file_path_does_not_record_a_store() {
+        let dir = "reset-test-unrecorded-store";
+        let path = snapshot_file_path(Path::new("/data"), dir);
+        assert_eq!(path, Path::new("/data").join(dir).join("snapshot.json"));
+        assert!(!SNAPSHOT_STORES.lock().contains(dir));
+        assert_eq!(snapshot_store_path(Path::new("/data"), dir), path);
+        assert!(SNAPSHOT_STORES.lock().remove(dir));
     }
 
     #[test]

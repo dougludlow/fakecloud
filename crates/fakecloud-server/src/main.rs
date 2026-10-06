@@ -7415,13 +7415,15 @@ async fn main() {
                 xray: xray_state.clone(),
             }),
             Some(s3_store.clone()),
-            persistence_config.data_path.as_deref(),
         );
         // A snapshot-backed service the reset can't reach would come back
         // from disk after `/_fakecloud/reset`. The reset unit tests hold the
-        // wiring complete; this names any gap a build still ships.
-        for gap in late.gaps() {
-            tracing::warn!(%gap, "reset wiring gap: a reset may not persist");
+        // wiring complete; this names any gap a build still ships. Memory
+        // mode registers no hooks, so there is nothing to check there.
+        if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
+            for gap in late.gaps() {
+                tracing::warn!(%gap, "reset wiring gap: a reset may not persist");
+            }
         }
         if reset_late.set(late).is_err() {
             unreachable!("reset wiring is filled once");
@@ -9478,7 +9480,7 @@ async fn main() {
                         {
                             let data_path = std::path::PathBuf::from(data_path);
                             let store = fakecloud_persistence::DiskSnapshotStore::new(
-                                reset::snapshot_store_path(&data_path, "dynamodb"),
+                                reset::snapshot_file_path(&data_path, "dynamodb"),
                             );
                             service
                                 .save_snapshot_to_store(Arc::new(store))
