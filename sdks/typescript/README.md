@@ -295,18 +295,18 @@ Top-level client. Defaults to `http://localhost:4566`.
 
 ### `fc.serviceQuotas`
 
-| Method                                                         | Description                                                                                        |
-| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Method                                                         | Description                                                                                                                                                                                                                                  |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `getQuotas({ accountId?, region?, serviceCode? })`             | List quotas with applied value, usage and enforcement state (default account/region: the server's); without a service code: the enforceable, measured or changed quotas (applied value, override, open request); with one: the whole service |
-| `putQuota(serviceCode, quotaCode, req)`                        | Set a quota's applied value (may be below the AWS default) and/or its enforcement override         |
-| `deleteQuota(serviceCode, quotaCode, { accountId?, region? })` | Reset a quota to its AWS default and drop its enforcement override                                 |
-| `getEnforcement()`                                             | Read the global enforcement switch and every server-wide and per-account override                  |
-| `putEnforcement(req)`                                          | Change the global switch and/or a batch of overrides                                               |
-| `getRequestApproval()`                                         | Read how increase requests are decided (`auto` or `manual`)                                        |
-| `setRequestApproval(mode)`                                     | Set `auto` or `manual` approval; `manual` holds new requests `PENDING`                             |
-| `getRequests({ accountId?, status? })`                         | List increase requests, newest first                                                               |
-| `approveRequest(requestId)`                                    | Approve a pending request, raising the account's applied value                                     |
-| `denyRequest(requestId, status?)`                              | Close a pending request (`DENIED` default, or `NOT_APPROVED` / `CASE_CLOSED` / `INVALID_REQUEST`)  |
+| `putQuota(serviceCode, quotaCode, req)`                        | Set a quota's applied value (may be below the AWS default) and/or its enforcement override                                                                                                                                                   |
+| `deleteQuota(serviceCode, quotaCode, { accountId?, region? })` | Reset a quota to its AWS default and drop its enforcement override                                                                                                                                                                           |
+| `getEnforcement()`                                             | Read the global enforcement switch and every server-wide and per-account override                                                                                                                                                            |
+| `putEnforcement(req)`                                          | Change the global switch and/or a batch of overrides                                                                                                                                                                                         |
+| `getRequestApproval()`                                         | Read how increase requests are decided (`auto` or `manual`)                                                                                                                                                                                  |
+| `setRequestApproval(mode)`                                     | Set `auto` or `manual` approval; `manual` holds new requests `PENDING`                                                                                                                                                                       |
+| `getRequests({ accountId?, status? })`                         | List increase requests, newest first                                                                                                                                                                                                         |
+| `approveRequest(requestId)`                                    | Approve a pending request, raising the account's applied value                                                                                                                                                                               |
+| `denyRequest(requestId, status?)`                              | Close a pending request (`DENIED` default, or `NOT_APPROVED` / `CASE_CLOSED` / `INVALID_REQUEST`)                                                                                                                                            |
 
 `enforce` in `putQuota` is tri-state: `true` enforces, `false` ignores, `null`
 clears the override, and leaving it `undefined` omits the key so enforcement
