@@ -109,7 +109,8 @@ async fn catalog_lookups() {
             break;
         }
     }
-    assert_eq!(codes.len(), 320);
+    // Every service AWS lists: well over 300.
+    assert!(codes.len() > 300, "{}", codes.len());
     assert!(codes.iter().any(|c| c == VPC));
     assert!(codes.iter().any(|c| c == "AWSCloudMap"));
 

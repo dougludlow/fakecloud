@@ -470,6 +470,25 @@ fn template_entry_json(e: &TemplateEntry) -> Value {
     })
 }
 
+/// A `ContextId` names one resource. Account-only quotas never take one;
+/// quotas AWS scopes to a resource could, but fakecloud keeps only their
+/// account-level value, so it says so rather than misdescribing the quota.
+fn context_id_refused(def: &QuotaDef) -> AwsServiceError {
+    if def.context.is_some_and(|c| c.scope == "RESOURCE") {
+        illegal_argument(format!(
+            "The quota {} of service {} can be applied per resource, but fakecloud does not \
+             support resource-level applied values; omit ContextId to use the account-level \
+             value.",
+            def.quota_code, def.service_code
+        ))
+    } else {
+        illegal_argument(format!(
+            "The quota {} is applied at the account level and does not take a ContextId.",
+            def.quota_code
+        ))
+    }
+}
+
 /// `QuotaAppliedAtLevel` / `QuotaRequestedAtLevel` filter: every quota here
 /// applies at the account level, so `RESOURCE` matches nothing.
 fn level_matches(level: Option<&str>) -> bool {
@@ -527,10 +546,7 @@ impl ServiceQuotasService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let def = quota_from(b)?;
         if opt_plain_str(b, "ContextId")?.is_some() {
-            return Err(illegal_argument(format!(
-                "The quota {} is applied at the account level and does not take a ContextId.",
-                def.quota_code
-            )));
+            return Err(context_id_refused(def));
         }
         let guard = self.state.read();
         let value = applied_value(guard.get(&req.account_id), &req.region, def);
@@ -545,14 +561,18 @@ impl ServiceQuotasService {
         let svc = service_code(b)?;
         let quota_code = opt_str(b, "QuotaCode", &QUOTA_CODE)?;
         let level = opt_enum(b, "QuotaAppliedAtLevel", APPLIED_LEVELS)?;
-        let mut all: Vec<&QuotaDef> = catalog::quotas_of(svc).iter().collect();
-        if let Some(code) = quota_code {
-            all.retain(|d| d.quota_code == code);
-        }
-        if !level_matches(level) {
-            all.clear();
-        }
-        let (items, token) = page(&all, b, 100, 100)?;
+        // A QuotaCode names at most one quota; RESOURCE-level applied values
+        // do not exist here, so that filter matches nothing.
+        let all: &[QuotaDef] = if !level_matches(level) {
+            &[]
+        } else if let Some(code) = quota_code {
+            catalog::quota(svc, code)
+                .map(std::slice::from_ref)
+                .unwrap_or(&[])
+        } else {
+            catalog::quotas_of(svc)
+        };
+        let (items, token) = page(all, b, 100, 100)?;
         let guard = self.state.read();
         let data = guard.get(&req.account_id);
         let quotas: Vec<Value> = items
@@ -583,10 +603,7 @@ impl ServiceQuotasService {
         let context_id = opt_plain_str(b, "ContextId")?;
         opt_bool(b, "SupportCaseAllowed")?;
         if context_id.is_some() {
-            return Err(illegal_argument(format!(
-                "The quota {} is applied at the account level and does not take a ContextId.",
-                def.quota_code
-            )));
+            return Err(context_id_refused(def));
         }
         if !def.adjustable {
             return Err(illegal_argument(format!(

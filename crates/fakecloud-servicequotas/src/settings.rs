@@ -97,7 +97,12 @@ impl EnforcementSource {
 /// `service_code/quota_code`, the key overrides are stored under and the form
 /// the CLI flags take.
 pub fn quota_ref(def: &QuotaDef) -> String {
-    format!("{}/{}", def.service_code, def.quota_code)
+    quota_ref_of(def.service_code, def.quota_code)
+}
+
+/// [`quota_ref`] from the codes.
+pub fn quota_ref_of(service_code: &str, quota_code: &str) -> String {
+    format!("{service_code}/{quota_code}")
 }
 
 /// Whether `def` is enforced for the account holding `data`, and why.
@@ -106,10 +111,22 @@ pub fn enforcement(
     data: Option<&ServiceQuotasData>,
     def: &QuotaDef,
 ) -> (bool, EnforcementSource) {
-    if !def.enforceable {
+    enforcement_of(settings, data, def.service_code, def.quota_code)
+}
+
+/// [`enforcement`] by codes. Reads only the static enforceable overlay, never
+/// the decoded catalog, so the request path of a service that enforces nothing
+/// stays cheap.
+pub fn enforcement_of(
+    settings: &QuotaSettings,
+    data: Option<&ServiceQuotasData>,
+    service_code: &str,
+    quota_code: &str,
+) -> (bool, EnforcementSource) {
+    if !crate::catalog::is_enforceable(service_code, quota_code) {
         return (false, EnforcementSource::NotEnforceable);
     }
-    let key = quota_ref(def);
+    let key = quota_ref_of(service_code, quota_code);
     if let Some(on) = data.and_then(|d| d.enforcement.get(&key)) {
         return (*on, EnforcementSource::AccountOverride);
     }

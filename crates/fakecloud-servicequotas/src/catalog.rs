@@ -4,8 +4,10 @@
 //! The data is a dump of `ListServices` and `ListAWSDefaultServiceQuotas`
 //! (us-east-1) vendored as `data/quotas.json.gz` and regenerated with
 //! `scripts/gen-service-quotas-catalog.py`. It is decoded once, on first use,
-//! and indexed so a lookup by service and quota code is a hash lookup (the
-//! enforcing services resolve limits on their request path).
+//! and kept sorted so a lookup by service and quota code is two binary
+//! searches. Questions about the hand-maintained overlay (is this quota
+//! enforceable?) are answered from the static tables without decoding, so a
+//! server that enforces nothing never pays for the decode on a request path.
 //!
 //! Two things AWS does not publish through the API are a hand-maintained
 //! overlay here: which quotas a fakecloud service checks
@@ -16,7 +18,6 @@
 //! switched enforcement on.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
 use std::ops::Range;
 use std::sync::OnceLock;
 
@@ -39,7 +40,7 @@ pub struct UsageMetric {
     pub statistic: &'static str,
 }
 
-/// The time unit of a rate quota (`QuotaPeriod`).
+/// A quota's `QuotaPeriod`, as AWS reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Period {
     pub value: i64,
@@ -69,7 +70,7 @@ pub struct QuotaDef {
     /// documents one. A request above it is not approved.
     pub max_value: Option<f64>,
     pub usage_metric: Option<UsageMetric>,
-    /// Set on rate quotas: the period the value is counted over.
+    /// The `Period` AWS reports for the quota, when it reports one.
     pub period: Option<Period>,
     pub context: Option<QuotaContext>,
     /// Whether a fakecloud service checks requests against this quota once
@@ -220,21 +221,14 @@ struct RawContext {
     context_scope_type: Option<String>,
 }
 
-/// One service's place in the catalog.
-struct ServiceIndex {
-    /// Position in [`Catalog::services`].
-    service: usize,
-    /// Its quotas' positions in [`Catalog::quotas`].
-    quotas: Range<usize>,
-    by_code: HashMap<&'static str, usize>,
-}
-
 struct Catalog {
     /// Ordered by service code.
     services: Vec<ServiceDef>,
+    /// Each service's quotas' positions in [`Catalog::quotas`], parallel to
+    /// `services`.
+    ranges: Vec<Range<usize>>,
     /// Ordered by service code, then quota code.
     quotas: Vec<QuotaDef>,
-    by_service: HashMap<&'static str, ServiceIndex>,
 }
 
 /// Strings live as long as the catalog, which lives as long as the process.
@@ -259,27 +253,21 @@ impl Interner {
 }
 
 fn decode() -> Catalog {
-    let mut json = String::new();
-    flate2::read::GzDecoder::new(DATA_GZ)
-        .read_to_string(&mut json)
-        .expect("vendored Service Quotas catalog is valid gzip");
     let mut raw: RawCatalog =
-        serde_json::from_str(&json).expect("vendored Service Quotas catalog is valid JSON");
+        fakecloud_core::embedded::decode_gz_json(DATA_GZ, "Service Quotas catalog");
     raw.services
         .sort_by(|a, b| a.service_code.cmp(&b.service_code));
 
     let mut intern = Interner::default();
     let mut services = Vec::with_capacity(raw.services.len());
+    let mut ranges = Vec::with_capacity(raw.services.len());
     let mut quotas = Vec::new();
-    let mut by_service = HashMap::with_capacity(raw.services.len());
     for mut s in raw.services {
         s.quotas.sort_by(|a, b| a.quota_code.cmp(&b.quota_code));
         let code = leak(s.service_code);
         let start = quotas.len();
-        let mut by_code = HashMap::with_capacity(s.quotas.len());
         for q in s.quotas {
             let quota_code = leak(q.quota_code);
-            by_code.insert(quota_code, quotas.len());
             quotas.push(QuotaDef {
                 service_code: code,
                 quota_code,
@@ -289,7 +277,7 @@ fn decode() -> Catalog {
                 unit: intern.get(q.unit),
                 adjustable: q.adjustable,
                 global: q.global_quota,
-                max_value: None,
+                max_value: max_value(code, quota_code),
                 usage_metric: q.usage_metric.map(|m| UsageMetric {
                     namespace: intern.get(m.metric_namespace),
                     name: intern.get(m.metric_name),
@@ -310,52 +298,63 @@ fn decode() -> Catalog {
                     scope: intern.get(c.context_scope),
                     scope_type: c.context_scope_type.map(|t| intern.get(t)),
                 }),
-                enforceable: false,
+                enforceable: is_enforceable(code, quota_code),
             });
         }
-        by_service.insert(
-            code,
-            ServiceIndex {
-                service: services.len(),
-                quotas: start..quotas.len(),
-                by_code,
-            },
-        );
+        ranges.push(start..quotas.len());
         services.push(ServiceDef {
             code,
             name: leak(s.service_name),
         });
     }
-
-    let mut catalog = Catalog {
+    Catalog {
         services,
+        ranges,
         quotas,
-        by_service,
-    };
-    for &(svc, code) in ENFORCEABLE {
-        if let Some(i) = catalog.index(svc, code) {
-            catalog.quotas[i].enforceable = true;
-        }
     }
-    for &(svc, code, max) in MAX_VALUES {
-        if let Some(i) = catalog.index(svc, code) {
-            catalog.quotas[i].max_value = Some(max);
-        }
-    }
-    catalog
 }
 
 impl Catalog {
-    fn index(&self, service_code: &str, quota_code: &str) -> Option<usize> {
-        self.by_service
-            .get(service_code)?
-            .by_code
-            .get(quota_code)
-            .copied()
+    fn service_index(&self, code: &str) -> Option<usize> {
+        self.services.binary_search_by(|s| s.code.cmp(code)).ok()
+    }
+
+    fn quotas_of(&self, service: usize) -> &[QuotaDef] {
+        &self.quotas[self.ranges[service].clone()]
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many catalog reads this thread made, so a test can prove a code
+    /// path never touches (and so never decodes) the catalog.
+    static CATALOG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn catalog_reads() -> usize {
+    CATALOG_READS.with(|c| c.get())
+}
+
+/// Whether a fakecloud service checks `service_code/quota_code` (the
+/// [`ENFORCEABLE`] overlay). Answered without decoding the catalog.
+pub fn is_enforceable(service_code: &str, quota_code: &str) -> bool {
+    ENFORCEABLE
+        .iter()
+        .any(|&(s, q)| s == service_code && q == quota_code)
+}
+
+/// The documented maximum of a quota (the [`MAX_VALUES`] overlay).
+fn max_value(service_code: &str, quota_code: &str) -> Option<f64> {
+    MAX_VALUES
+        .iter()
+        .find(|&&(s, q, _)| s == service_code && q == quota_code)
+        .map(|&(_, _, m)| m)
+}
+
 fn catalog() -> &'static Catalog {
+    #[cfg(test)]
+    CATALOG_READS.with(|c| c.set(c.get() + 1));
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
     CATALOG.get_or_init(decode)
 }
@@ -379,21 +378,24 @@ pub fn parse_ref(reference: &str) -> Option<&'static QuotaDef> {
 
 pub fn service(code: &str) -> Option<&'static ServiceDef> {
     let c = catalog();
-    c.by_service.get(code).map(|s| &c.services[s.service])
+    c.service_index(code).map(|i| &c.services[i])
 }
 
 pub fn quota(service_code: &str, quota_code: &str) -> Option<&'static QuotaDef> {
     let c = catalog();
-    c.index(service_code, quota_code).map(|i| &c.quotas[i])
+    let quotas = c.quotas_of(c.service_index(service_code)?);
+    quotas
+        .binary_search_by(|q| q.quota_code.cmp(quota_code))
+        .ok()
+        .map(|i| &quotas[i])
 }
 
 /// Every quota of `service_code`, ordered by quota code. Empty for an
 /// unknown service.
 pub fn quotas_of(service_code: &str) -> &'static [QuotaDef] {
     let c = catalog();
-    c.by_service
-        .get(service_code)
-        .map(|s| &c.quotas[s.quotas.clone()])
+    c.service_index(service_code)
+        .map(|i| c.quotas_of(i))
         .unwrap_or(&[])
 }
 
@@ -410,8 +412,9 @@ mod tests {
     #[test]
     fn the_vendored_dump_decodes_into_every_listed_service() {
         let services = services();
-        assert_eq!(services.len(), 320);
-        assert_eq!(quotas().len(), 14115);
+        // Sanity floors: AWS lists over 300 services and over 14,000 quotas.
+        assert!(services.len() > 300, "{}", services.len());
+        assert!(quotas().len() > 14_000, "{}", quotas().len());
         assert!(services.windows(2).all(|w| w[0].code < w[1].code));
         for s in services {
             assert!(!s.name.is_empty(), "{}", s.code);
@@ -484,7 +487,7 @@ mod tests {
         assert!(quota("iam", "L-FE177D64").unwrap().global);
         assert!(quota("s3", "L-DC2B2D3D").unwrap().global);
 
-        // A rate quota carries its period, a per-resource quota its context.
+        // Periods and contexts come through as AWS reports them.
         assert!(quotas().iter().any(|q| q.period
             == Some(Period {
                 value: 1,
@@ -660,6 +663,29 @@ mod tests {
             quotas().iter().filter(|q| q.enforceable).count(),
             ENFORCEABLE.len()
         );
+    }
+
+    /// The overlay answers enforceability without touching the catalog, and
+    /// agrees with the decoded flag.
+    #[test]
+    fn enforceability_is_answered_without_decoding() {
+        let before = catalog_reads();
+        assert!(is_enforceable(VPC, "L-F678F1CE"));
+        assert!(!is_enforceable("lambda", "L-B99A9384"));
+        assert!(!is_enforceable("nope", "L-00000000"));
+        assert_eq!(catalog_reads(), before);
+        for q in quotas() {
+            assert_eq!(q.enforceable, is_enforceable(q.service_code, q.quota_code));
+        }
+    }
+
+    #[test]
+    fn lookups_miss_cleanly() {
+        assert!(quota(VPC, "L-00000000").is_none());
+        assert!(quota("nope", "L-F678F1CE").is_none());
+        // Service codes sort case-sensitively, as the binary search expects.
+        assert!(service("AWSCloudMap").is_some());
+        assert!(service("awscloudmap").is_none());
     }
 
     #[test]

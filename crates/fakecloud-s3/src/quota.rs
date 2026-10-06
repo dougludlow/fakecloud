@@ -1,12 +1,9 @@
 //! The Service Quotas quota S3 enforces: "General purpose buckets"
 //! (`s3`/`L-DC2B2D3D`).
 //!
-//! The quota is per account across all Regions (Service Quotas lists it as a
-//! global quota), and S3 manages it from one Region of the partition: US East
-//! (N. Virginia) for the commercial partition and AWS GovCloud (US-West) for
-//! GovCloud (the partition's primary Region, likewise in the other
-//! partitions). fakecloud asks for its applied value in that Region whichever
-//! Region the bucket is created in.
+//! The quota is per account across all Regions: Service Quotas lists it as a
+//! global quota, so it has one applied value whichever Region it is read or
+//! raised in, and every bucket the account owns counts toward it.
 //! Enforcement is opt-in: the quota is only checked once the user switched it
 //! on in Service Quotas, and an `S3Service` without a quota provider enforces
 //! nothing.
@@ -24,11 +21,6 @@ pub const SERVICE_CODE: &str = "s3";
 /// "General purpose buckets".
 pub const BUCKETS: &str = "L-DC2B2D3D";
 
-/// The Region the bucket quota of `region`'s partition is managed from.
-pub fn quota_region(region: &str) -> &'static str {
-    fakecloud_aws::arn::partition_primary_region(region)
-}
-
 /// The bucket limit of `account_id` when it is enforced. Resolve it before
 /// taking the S3 state lock.
 pub fn enforced_bucket_limit(
@@ -36,13 +28,7 @@ pub fn enforced_bucket_limit(
     account_id: &str,
     region: &str,
 ) -> Option<usize> {
-    fakecloud_core::quota::enforced_count(
-        provider,
-        account_id,
-        quota_region(region),
-        SERVICE_CODE,
-        BUCKETS,
-    )
+    fakecloud_core::quota::enforced_count(provider, account_id, region, SERVICE_CODE, BUCKETS)
 }
 
 /// Refuse one more bucket for the account `state` holds when it already owns
@@ -88,19 +74,5 @@ impl QuotaUsageSource for S3QuotaUsage {
         }
         let accounts = self.state.read();
         Some(accounts.get(account_id).map_or(0, |s| s.buckets.len()) as f64)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_quota_lives_in_the_partitions_home_region() {
-        assert_eq!(quota_region("eu-west-1"), "us-east-1");
-        assert_eq!(quota_region("us-east-1"), "us-east-1");
-        assert_eq!(quota_region("us-gov-east-1"), "us-gov-west-1");
-        assert_eq!(quota_region("cn-northwest-1"), "cn-north-1");
-        assert_eq!(quota_region("us-iso-west-1"), "us-iso-east-1");
     }
 }

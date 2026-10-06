@@ -251,9 +251,12 @@ impl ServiceQuotasService {
         }
     }
 
-    /// `GET /_fakecloud/service-quotas/quotas`: every catalog quota (or one
-    /// service's) with its applied value, usage and enforcement state for an
-    /// account and region.
+    /// `GET /_fakecloud/service-quotas/quotas`: quotas with their applied
+    /// value, usage and enforcement state for an account and region. With a
+    /// service code, every quota of that service; without one, only the
+    /// quotas worth looking at across the whole catalog: those a fakecloud
+    /// service can enforce, those a usage source measures, and those the
+    /// account (or the server) changed with an applied value or an override.
     pub fn introspect_quotas(
         &self,
         account_id: Option<&str>,
@@ -278,9 +281,25 @@ impl ServiceQuotasService {
         let settings = self.settings.read();
         let guard = self.state.read();
         let data = guard.get(&account);
+        let interesting = |d: &QuotaDef, usage: Option<f64>| {
+            let key = quota_ref(d);
+            d.enforceable
+                || usage.is_some()
+                || settings.overrides.contains_key(&key)
+                || data.is_some_and(|data| {
+                    data.enforcement.contains_key(&key)
+                        || data.applied.contains_key(&applied_key(
+                            &region,
+                            d.global,
+                            d.service_code,
+                            d.quota_code,
+                        ))
+                })
+        };
         let quotas: Vec<Value> = defs
             .iter()
             .zip(usage)
+            .filter(|(d, u)| service_code.is_some() || interesting(d, *u))
             .map(|(d, u)| Self::quota_view(&settings, data, &region, d, u))
             .collect();
         Ok(json!({ "accountId": account, "region": region, "quotas": quotas }))

@@ -19,7 +19,11 @@ use serde::{Deserialize, Serialize};
 
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
-pub const SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Version 2: a quota's applied value, tags and requests are keyed by the
+/// quota's scope (global or regional) as the AWS-dumped catalog has it.
+/// Version 1 snapshots are migrated on load, see
+/// [`crate::persistence::migrate_quota_scopes`].
+pub const SERVICEQUOTAS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// A quota increase request (`RequestedServiceQuotaChange`).
 #[derive(Debug, Clone, Serialize, Deserialize)]

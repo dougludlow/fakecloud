@@ -1,6 +1,6 @@
 +++
 title = "Service Quotas"
-description = "Service Quotas on fakecloud: all 26 operations, every AWS service's published default quotas (320 services, 14,115 quotas), increase requests that raise the applied value, the Organizations quota request template, tags, automatic management and utilization reports. Opt-in enforcement (globally or per quota), applied values settable below the AWS default, and manual request approval through the introspection API."
+description = "Service Quotas on fakecloud: all 26 operations, the default quotas AWS publishes for every service it lists, increase requests that raise the applied value, the Organizations quota request template, tags, automatic management and utilization reports. Opt-in enforcement (globally or per quota), applied values settable below the AWS default, and manual request approval through the introspection API."
 weight = 81
 +++
 
@@ -22,12 +22,12 @@ more resources than a fresh AWS account allows keeps working. See
 
 ## Quota catalog
 
-fakecloud carries every quota AWS publishes: the **320 services** `ListServices`
-returns and their **14,115 default quotas** from `ListAWSDefaultServiceQuotas`,
+fakecloud carries every quota AWS publishes: **every service** `ListServices`
+returns and **all of its default quotas** from `ListAWSDefaultServiceQuotas`,
 dumped from AWS in `us-east-1`. Each quota keeps its real code, name,
-description, default value, unit, adjustability, global flag, period (rate
-quotas), CloudWatch usage metric and quota context (per-resource quotas)
-exactly as AWS returns them, for example `vpc`/`L-F678F1CE` VPCs per Region
+description, default value, unit, adjustability, global flag, and the
+`Period`, CloudWatch usage metric and quota context (per-resource quotas)
+whenever AWS reports them, exactly as AWS returns them, for example `vpc`/`L-F678F1CE` VPCs per Region
 (5), `ec2`/`L-1216C47A` Running On-Demand Standard instances (5 vCPUs, with its
 `AWS/Usage` `ResourceCount` metric) or `iam`/`L-FE177D64` Roles per account
 (1000, global).
@@ -44,7 +44,7 @@ maximum an increase request can be approved for (VPC and IAM quotas, see
 
 `ListServices` returns every service and `ListAWSDefaultServiceQuotas` /
 `ListServiceQuotas` every quota of a service, paginated (`MaxResults` up to
-100; `ec2` alone has 1,775 quotas). An unknown service code or quota code
+100; `ec2` alone has well over a thousand). An unknown service code or quota code
 returns `NoSuchResourceException`.
 
 ## Supported features
@@ -63,9 +63,12 @@ returns `NoSuchResourceException`.
   `QuotaCode` and `QuotaAppliedAtLevel` filter the list.
 - Both forms carry the quota's `Description`, and `Period`, `UsageMetric` and
   `QuotaContext` when AWS publishes them.
-- Applied values are kept at the account level, so `RESOURCE` matches nothing
-  and a `ContextId` is rejected, also for the quotas whose `QuotaContext` is
-  `RESOURCE` (see [Known limitations](#known-limitations)).
+- Every applied value is the account-level one (`QuotaAppliedAtLevel`
+  `ACCOUNT`), so the `RESOURCE` filter matches nothing. A `ContextId` is an
+  `IllegalArgumentException`: for an account-only quota because the quota is
+  applied at the account level, and for a quota whose `QuotaContext` is
+  `RESOURCE` because fakecloud does not support resource-level applied values
+  (see [Known limitations](#known-limitations)).
 
 ### Increase requests
 
@@ -266,7 +269,7 @@ decided). An omitted `accountId` or `region` means the server's.
 
 | Endpoint | What it does |
 |---|---|
-| `GET /_fakecloud/service-quotas/quotas?accountId=&region=&serviceCode=` | Every quota (all 14,115 without `serviceCode`; pass it to get one service's) with `defaultValue`, `appliedValue`, `usage` (when fakecloud counts it), `enforceable`, `enforced` and `enforcementSource` (`not_enforceable`, `account_override`, `override`, `global`) |
+| `GET /_fakecloud/service-quotas/quotas?accountId=&region=&serviceCode=` | With `serviceCode`, every quota of that service; without it, only the quotas a fakecloud service can enforce, the ones a usage source measures, and the ones the account or server changed (an applied value or an enforcement override). Each with `defaultValue`, `appliedValue`, `usage` (when fakecloud counts it), `enforceable`, `enforced` and `enforcementSource` (`not_enforceable`, `account_override`, `override`, `global`) |
 | `PUT /_fakecloud/service-quotas/quotas/{service}/{quota}` | Body `{accountId?, region?, value?, enforce?}`. Sets the applied value, **even below the AWS default** (AWS never lowers a quota; a test can, to hit a limit without creating the default number of resources). `enforce`: `true` enforces, `false` ignores, `null` clears the override, absent leaves it. With `accountId` the override is for that account only, otherwise server-wide |
 | `DELETE /_fakecloud/service-quotas/quotas/{service}/{quota}?accountId=&region=` | Back to the AWS default, and drops the override (the account's when `accountId` is given, else the server-wide one) |
 | `GET` / `PUT /_fakecloud/service-quotas/enforcement` | `{enforceAll, overrides, accountOverrides}`; `PUT` takes `{enforceAll?, overrides?: [{serviceCode, quotaCode, accountId?, enforce}]}` (`null` clears) and applies the batch only if every entry is valid |
@@ -336,9 +339,11 @@ that concurrency limit, as Lambda always does.
   count in-flight executions account-wide. Reserved concurrency per function is
   still enforced on `Invoke`.
 - Quotas whose `QuotaContext` is `RESOURCE` (per transit gateway, per
-  Connect instance, per web ACL, ...) have one account-level applied value:
-  `GetServiceQuota` and `RequestServiceQuotaIncrease` refuse a `ContextId`, so
-  a value cannot be set for one resource.
+  Connect instance, per web ACL, ...) have only their account-level applied
+  value: resource-level applied values are not supported, so
+  `GetServiceQuota` and `RequestServiceQuotaIncrease` refuse a `ContextId`
+  (saying so) and `ListServiceQuotas` with `QuotaAppliedAtLevel` `RESOURCE`
+  returns nothing.
 - Default values are the ones AWS publishes in `us-east-1`. AWS sets some
   defaults per region; fakecloud reports the `us-east-1` value in every
   region.

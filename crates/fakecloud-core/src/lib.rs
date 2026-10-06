@@ -9,6 +9,7 @@ pub mod dataplane;
 pub mod delivery;
 pub mod dispatch;
 pub mod ecr_uri;
+pub mod embedded;
 pub mod ids;
 pub mod multi_account;
 pub mod pagination;
