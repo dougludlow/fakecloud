@@ -50,6 +50,11 @@ impl Elbv2Accounts {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Elbv2State)> {
         self.accounts.iter()
     }
+
+    /// Drop every resource one account owns.
+    pub fn remove_account(&mut self, account_id: &str) {
+        self.accounts.remove(account_id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

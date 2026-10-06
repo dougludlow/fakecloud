@@ -388,10 +388,9 @@ pub trait S3Store: Send + Sync {
 
     /// Whether the store holds any persisted state for `bucket`.
     ///
-    /// A bucket absent from memory can still have files on disk: after
-    /// `/_fakecloud/reset` (which clears memory and leaves the store alone), or
-    /// from a create or delete that stopped partway. Memory-only stores hold
-    /// nothing, hence the default.
+    /// A bucket absent from memory can still have files on disk: from a
+    /// create or delete that stopped partway, or a reset whose bucket deletion
+    /// failed. Memory-only stores hold nothing, hence the default.
     fn bucket_state_exists(&self, _bucket: &str) -> bool {
         false
     }

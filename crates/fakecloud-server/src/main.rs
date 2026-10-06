@@ -1588,7 +1588,9 @@ async fn main() {
         ecs_runtime: ecs_runtime.clone(),
         ec2: ec2_state.clone(),
         ec2_runtime: ec2_runtime.clone(),
+        late: Arc::new(std::sync::OnceLock::new()),
     };
+    let reset_late = reset_state.late.clone();
     // Step 5: CloudFormation delivery (custom resources can invoke Lambda)
     let delivery_for_cf = {
         let mut bus = DeliveryBus::new().with_sns(sns_delivery_for_cf);
@@ -1749,6 +1751,13 @@ async fn main() {
     // `with_snapshot_hooks`. Keyed by the service names in
     // `service_key_for_type`.
     let mut cfn_snapshot_hooks: std::collections::BTreeMap<
+        &'static str,
+        fakecloud_persistence::SnapshotHook,
+    > = std::collections::BTreeMap::new();
+    // Persist hooks of the snapshot-backed services the CloudFormation
+    // provisioner never touches; together with `cfn_snapshot_hooks` they let
+    // the reset endpoints write a reset through to disk.
+    let mut reset_only_hooks: std::collections::BTreeMap<
         &'static str,
         fakecloud_persistence::SnapshotHook,
     > = std::collections::BTreeMap::new();
@@ -5558,6 +5567,9 @@ async fn main() {
     if let Some(store) = bedrock_agent_runtime_snapshot_store {
         bedrock_agent_runtime_service = bedrock_agent_runtime_service.with_snapshot_store(store);
     }
+    if let Some(h) = bedrock_agent_runtime_service.snapshot_hook() {
+        reset_only_hooks.insert("bedrock-agent-runtime", h);
+    }
     registry.register(Arc::new(bedrock_agent_runtime_service));
     let scheduler_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
@@ -5666,6 +5678,9 @@ async fn main() {
     if let Some(store) = resource_groups_snapshot_store {
         resource_groups_service = resource_groups_service.with_snapshot_store(store);
     }
+    if let Some(h) = resource_groups_service.snapshot_hook() {
+        reset_only_hooks.insert("resource-groups", h);
+    }
     registry.register(Arc::new(resource_groups_service));
 
     // Account Management control plane.
@@ -5694,6 +5709,9 @@ async fn main() {
     let mut account_service = fakecloud_account::AccountService::new(account_state.clone());
     if let Some(store) = account_snapshot_store {
         account_service = account_service.with_snapshot_store(store);
+    }
+    if let Some(h) = account_service.snapshot_hook() {
+        reset_only_hooks.insert("account", h);
     }
     registry.register(Arc::new(account_service));
 
@@ -5741,6 +5759,9 @@ async fn main() {
     if let Some(store) = identitystore_snapshot_store {
         identitystore_service = identitystore_service.with_snapshot_store(store);
     }
+    if let Some(h) = identitystore_service.snapshot_hook() {
+        reset_only_hooks.insert("identitystore", h);
+    }
     registry.register(Arc::new(identitystore_service));
 
     // IAM Identity Center SSO Admin control plane.
@@ -5775,6 +5796,9 @@ async fn main() {
     if let Some(store) = ssoadmin_snapshot_store {
         ssoadmin_service = ssoadmin_service.with_snapshot_store(store);
     }
+    if let Some(h) = ssoadmin_service.snapshot_hook() {
+        reset_only_hooks.insert("ssoadmin", h);
+    }
     registry.register(Arc::new(ssoadmin_service));
 
     // Database Migration Service control plane.
@@ -5806,6 +5830,9 @@ async fn main() {
     if let Some(store) = dms_snapshot_store {
         dms_service = dms_service.with_snapshot_store(store);
     }
+    if let Some(h) = dms_service.snapshot_hook() {
+        reset_only_hooks.insert("dms", h);
+    }
     registry.register(Arc::new(dms_service));
 
     // CloudTrail control plane.
@@ -5836,6 +5863,9 @@ async fn main() {
     if let Some(store) = cloudtrail_snapshot_store {
         cloudtrail_service = cloudtrail_service.with_snapshot_store(store);
     }
+    if let Some(h) = cloudtrail_service.snapshot_hook() {
+        reset_only_hooks.insert("cloudtrail", h);
+    }
     registry.register(Arc::new(cloudtrail_service));
 
     // Cost Explorer control plane.
@@ -5865,6 +5895,9 @@ async fn main() {
     if let Some(store) = ce_snapshot_store {
         ce_service = ce_service.with_snapshot_store(store);
     }
+    if let Some(h) = ce_service.snapshot_hook() {
+        reset_only_hooks.insert("ce", h);
+    }
     registry.register(Arc::new(ce_service));
 
     // Transfer Family control plane.
@@ -5893,6 +5926,9 @@ async fn main() {
     let mut transfer_service = fakecloud_transfer::TransferService::new(transfer_state.clone());
     if let Some(store) = transfer_snapshot_store {
         transfer_service = transfer_service.with_snapshot_store(store);
+    }
+    if let Some(h) = transfer_service.snapshot_hook() {
+        reset_only_hooks.insert("transfer", h);
     }
     registry.register(Arc::new(transfer_service));
 
@@ -5931,6 +5967,9 @@ async fn main() {
     if let Some(store) = verifiedpermissions_snapshot_store {
         verifiedpermissions_service = verifiedpermissions_service.with_snapshot_store(store);
     }
+    if let Some(h) = verifiedpermissions_service.snapshot_hook() {
+        reset_only_hooks.insert("verifiedpermissions", h);
+    }
     registry.register(Arc::new(verifiedpermissions_service));
 
     // MemoryDB control plane.
@@ -5960,6 +5999,9 @@ async fn main() {
         .with_ec2_state(ec2_state.clone());
     if let Some(store) = memorydb_snapshot_store {
         memorydb_service = memorydb_service.with_snapshot_store(store);
+    }
+    if let Some(h) = memorydb_service.snapshot_hook() {
+        reset_only_hooks.insert("memorydb", h);
     }
     registry.register(Arc::new(memorydb_service));
 
@@ -6003,7 +6045,8 @@ async fn main() {
     // in-process S3 reader used to fetch the application's code JAR. `None` when
     // no container CLI is available or the backend is disabled -> the app stays
     // on the control-plane state machine.
-    if let Some(flink_runtime) = fakecloud_kinesisanalyticsv2::FlinkRuntime::new().map(Arc::new) {
+    let flink_runtime = fakecloud_kinesisanalyticsv2::FlinkRuntime::new().map(Arc::new);
+    if let Some(flink_runtime) = flink_runtime.clone() {
         kinesisanalyticsv2_service = kinesisanalyticsv2_service
             .with_runtime(flink_runtime)
             .with_s3(s3_delivery_for_logs.clone());
@@ -7221,14 +7264,22 @@ async fn main() {
     } else {
         None
     };
-    registry.register(Arc::new(
+    let resource_groups_tagging_service =
         fakecloud_resource_groups_tagging::ResourceGroupsTaggingService::new(
             resource_groups_tagging_state.clone(),
             tag_provider_registry.clone(),
             resource_groups_tagging_snapshot_store,
-        ),
-    ));
+        );
+    if let Some(h) = resource_groups_tagging_service.snapshot_hook() {
+        reset_only_hooks.insert("resource-groups-tagging", h);
+    }
+    registry.register(Arc::new(resource_groups_tagging_service));
 
+    if let Some(h) = cloudformation_service.snapshot_hook() {
+        reset_only_hooks.insert("cloudformation", h);
+    }
+    // The reset endpoints persist through the same hooks (see `reset_late`).
+    let mut reset_hooks = cfn_snapshot_hooks.clone();
     let cloudformation_service = cloudformation_service
         .with_s3_store(s3_store.clone())
         .with_kms_hook(kms_hook_for_services.clone())
@@ -7284,7 +7335,112 @@ async fn main() {
     if let Some(store) = cloudcontrol_snapshot_store {
         cloudcontrol_service = cloudcontrol_service.with_snapshot_store(store);
     }
+    if let Some(h) = cloudcontrol_service.snapshot_hook() {
+        reset_only_hooks.insert("cloudcontrol", h);
+    }
     registry.register(Arc::new(cloudcontrol_service));
+    // Every service is built: hand the reset endpoints the wiring they need
+    // to write a reset through to disk and to clear the services that have
+    // no dedicated `ResetState` field.
+    {
+        // Organizations gets its plain persist hook: the provisioner's also
+        // fires StackSets auto-deployment, which a reset has no part in.
+        reset_hooks.append(&mut reset_only_hooks);
+        if let Some(h) = organizations_persist_hook.clone() {
+            reset_hooks.insert("organizations", h);
+        }
+        let late = reset::LateReset {
+            hooks: reset_hooks,
+            services: reset::reset_services(reset::ResetServiceStates {
+                account: account_state.clone(),
+                amplify: amplify_state.clone(),
+                appconfig: appconfig_state.clone(),
+                appsync: appsync_state.clone(),
+                autoscaling: autoscaling_state.clone(),
+                backup: backup_state.clone(),
+                batch: batch_state.clone(),
+                ce: ce_state.clone(),
+                cloudcontrol: cloudcontrol_state.clone(),
+                cloudtrail: cloudtrail_state.clone(),
+                codeartifact: codeartifact_state.clone(),
+                codebuild: codebuild_state.clone(),
+                codecommit: codecommit_state.clone(),
+                codeconnections: codeconnections_state.clone(),
+                codedeploy: codedeploy_state.clone(),
+                codepipeline: codepipeline_state.clone(),
+                comprehend: comprehend_state.clone(),
+                dms: dms_state.clone(),
+                docdb: docdb_state.clone(),
+                dsql: dsql_state.clone(),
+                efs: efs_state.clone(),
+                eks: eks_state.clone(),
+                elasticbeanstalk: beanstalk_state.clone(),
+                elbv2: elbv2_state.clone(),
+                emr: emr_state.clone(),
+                fis: fis_state.clone(),
+                glacier: glacier_state.clone(),
+                identitystore: identitystore_state.clone(),
+                iot: iot_state.clone(),
+                iotdata: iotdata_state.clone(),
+                iotwireless: iotwireless_state.clone(),
+                kafka: kafka_state.clone(),
+                kafka_runtime: kafka_runtime.clone(),
+                kinesisanalyticsv2: kinesisanalyticsv2_state.clone(),
+                flink_runtime: flink_runtime.clone(),
+                lakeformation: lakeformation_state.clone(),
+                managedblockchain: managedblockchain_state.clone(),
+                mediaconvert: mediaconvert_state.clone(),
+                memorydb: memorydb_state.clone(),
+                mq: mq_state.clone(),
+                mq_runtime: mq_runtime.clone(),
+                mwaa: mwaa_state.clone(),
+                neptune: neptune_state.clone(),
+                opensearch: opensearch_state.clone(),
+                pinpoint: pinpoint_state.clone(),
+                pipes: pipes_state.clone(),
+                ram: ram_state.clone(),
+                redshift: redshift_state.clone(),
+                resource_groups: resource_groups_state.clone(),
+                resource_groups_tagging: resource_groups_tagging_state.clone(),
+                s3tables: s3tables_state.clone(),
+                sagemaker: sagemaker_state.clone(),
+                serverlessrepo: serverlessrepo_state.clone(),
+                servicediscovery: servicediscovery_state.clone(),
+                shield: shield_state.clone(),
+                ssoadmin: ssoadmin_state.clone(),
+                support: support_state.clone(),
+                swf: swf_state.clone(),
+                textract: textract_state.clone(),
+                timestream: timestream_state.clone(),
+                transcribe: transcribe_state.clone(),
+                transfer: transfer_state.clone(),
+                translate: translate_state.clone(),
+                verifiedpermissions: verifiedpermissions_state.clone(),
+                xray: xray_state.clone(),
+            }),
+            s3_store: Some(s3_store.clone()),
+        };
+        if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
+            // A snapshot-backed service the reset can't reach would come back
+            // from disk after `/_fakecloud/reset`: refuse to start rather than
+            // ship that.
+            let unreset = late.hooks_without_reset();
+            if !unreset.is_empty() {
+                fatal_exit(format_args!(
+                    "snapshot-backed services missing from the reset endpoints: {unreset:?}"
+                ));
+            }
+            let missing = late.missing_hooks();
+            if !missing.is_empty() {
+                fatal_exit(format_args!(
+                    "reset services without a snapshot persist hook: {missing:?}"
+                ));
+            }
+        }
+        if reset_late.set(late).is_err() {
+            unreachable!("reset wiring is filled once");
+        }
+    }
     // Spawn the Scheduler firing loop as a background task. Mirrors
     // EventBridge's delivery bus so every target type Scheduler
     // routes (`:sqs:`, `:sns:`, `:lambda:`, `:states:`, `:events:`)
@@ -12049,11 +12205,13 @@ async fn main() {
                 let iam = iam_state.clone();
                 let orgs = organizations_state.clone();
                 let persist = organizations_persist_hook.clone();
+                let iam_persist = reset_late.get().and_then(|l| l.hooks.get("iam").cloned());
                 let changed = org_change_hooks.clone();
                 move |axum::Json(body): axum::Json<types::CreateAdminRequest>| {
                     let iam = iam.clone();
                     let orgs = orgs.clone();
                     let persist = persist.clone();
+                    let iam_persist = iam_persist.clone();
                     let changed = changed.clone();
                     async move {
                         // Membership of the NAMED organization, not of any
@@ -12084,6 +12242,11 @@ async fn main() {
                                     .into_response();
                             }
                         };
+                        // The admin user and its access key live in IAM state:
+                        // write them through, or a restart forgets them.
+                        if let Some(hook) = &iam_persist {
+                            hook().await;
+                        }
                         // Only an explicit `organizationId` mutates org state.
                         // A standalone bootstrap leaves every organization
                         // untouched, so there is nothing to persist or notify.

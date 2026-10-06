@@ -58,6 +58,16 @@ Every implemented service persists its control-plane state in this mode — a sn
 - **Organizations** — the organization, OUs, member accounts, service control policies and attachments, handshakes, enabled service access, delegated administrators, responsibility transfers, tags. A `CreateAccount` request left `IN_PROGRESS` resumes and reaches `SUCCEEDED` after restart.
 - **Everything else** — API Gateway v1, ECR, ECS, EventBridge Scheduler, CloudWatch (alarms and dashboards), Application Auto Scaling, and Cognito Identity likewise persist their full control-plane state.
 
+## Resetting in persistent mode
+
+The reset endpoints write the reset state through to disk before they reply, so a restart against the same data directory keeps it reset instead of bringing the old resources back:
+
+- `POST /_reset` resets every service and persists each one's now-empty state; S3 buckets are deleted from the data directory.
+- `POST /_fakecloud/reset/{service}` persists that service's snapshot (both API Gateway APIs for `apigateway`).
+- `POST /_fakecloud/reset/{service}/{account_id}` persists the service with only that account cleared.
+
+Backing containers and their data volumes (RDS, ElastiCache, EC2, ECS, MQ, MSK, Managed Service for Apache Flink) are torn down by the same reset.
+
 ## Container-backed service data
 
 The list above covers each service's **control-plane** state. Services that run real containers (RDS, ElastiCache, EC2, ECS) also have a **data plane**: the bytes inside the database, cache, or instance filesystem. In persistent mode fakecloud keeps that data durable too, by backing each container with a named volume keyed to the resource so a container recreated after a restart reattaches the same data instead of coming back empty:

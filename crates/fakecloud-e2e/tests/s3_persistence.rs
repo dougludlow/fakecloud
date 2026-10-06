@@ -1551,10 +1551,9 @@ async fn persistence_untagged_create_clears_an_orphan_tag_file() {
 
 #[tokio::test]
 async fn persistence_create_after_reset_reuses_the_name() {
-    // `/_fakecloud/reset/s3` clears in-memory state and deliberately leaves the
-    // store alone, so every bucket ever created still has a readable meta.toml
-    // on disk afterwards. Re-creating those names has to keep working -- gating
-    // the "unloaded state" refusal on files existing would brick all of them.
+    // `/_fakecloud/reset/s3` clears in-memory state and deletes the reset
+    // buckets from the store. Re-creating those names has to keep working, and
+    // the re-created bucket must not adopt anything of the old incarnation.
     let tmp = tempfile::tempdir().unwrap();
     let server = TestServer::start_persistent(tmp.path()).await;
     let client = server.s3_client().await;

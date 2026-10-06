@@ -118,6 +118,23 @@ impl ResourceGroupsService {
         self
     }
 
+    /// Persist hook for callers that change this service's state from outside
+    /// (the reset endpoints): writes the current snapshot. `None` in memory
+    /// mode.
+    pub fn snapshot_hook(&self) -> Option<fakecloud_persistence::SnapshotHook> {
+        let store = self.snapshot_store.clone()?;
+        let state = self.state.clone();
+        let lock = self.snapshot_lock.clone();
+        Some(Arc::new(move || {
+            let state = state.clone();
+            let store = store.clone();
+            let lock = lock.clone();
+            Box::pin(async move {
+                save_snapshot(&state, Some(store), &lock).await;
+            })
+        }))
+    }
+
     pub fn with_tag_registry(
         mut self,
         registry: fakecloud_core::tag_index::TagProviderRegistry,

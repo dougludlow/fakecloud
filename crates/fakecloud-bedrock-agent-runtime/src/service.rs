@@ -77,7 +77,7 @@ pub struct BedrockAgentRuntimeService {
     state: SharedBedrockAgentRuntimeState,
     agent_state: Option<fakecloud_bedrock_agent::SharedBedrockAgentState>,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
-    snapshot_lock: AsyncMutex<()>,
+    snapshot_lock: Arc<AsyncMutex<()>>,
 }
 
 impl BedrockAgentRuntimeService {
@@ -86,13 +86,30 @@ impl BedrockAgentRuntimeService {
             state,
             agent_state: None,
             snapshot_store: None,
-            snapshot_lock: AsyncMutex::new(()),
+            snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = Some(store);
         self
+    }
+
+    /// Persist hook for callers that change this service's state from outside
+    /// (the reset endpoints): writes the current snapshot. `None` in memory
+    /// mode.
+    pub fn snapshot_hook(&self) -> Option<fakecloud_persistence::SnapshotHook> {
+        let store = self.snapshot_store.clone()?;
+        let state = self.state.clone();
+        let lock = self.snapshot_lock.clone();
+        Some(Arc::new(move || {
+            let state = state.clone();
+            let store = store.clone();
+            let lock = lock.clone();
+            Box::pin(async move {
+                save_bedrock_agent_runtime_snapshot(&state, Some(store), &lock).await;
+            })
+        }))
     }
 
     /// Persist current state as a snapshot. Held across the

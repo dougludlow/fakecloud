@@ -160,3 +160,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tower = "0.5"
+tempfile = { workspace = true }
