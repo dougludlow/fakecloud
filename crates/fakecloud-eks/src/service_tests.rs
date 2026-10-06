@@ -2214,12 +2214,18 @@ async fn describe_cluster_versions_catalog_is_non_empty() {
             .count(),
         1
     );
-    // AWS lists newest first and leaves the default version in place.
+    // AWS lists newest first and leaves the default version in place; the
+    // flagged default is the version CreateCluster falls back to.
     assert_eq!(
         names,
         vec!["1.34", "1.33", "1.32", "1.31", "1.30", "1.29", "1.28"]
     );
-    assert_eq!(versions[3]["defaultVersion"], true);
+    let flagged: Vec<&str> = versions
+        .iter()
+        .filter(|x| x["defaultVersion"] == true)
+        .map(|x| x["clusterVersion"].as_str().unwrap())
+        .collect();
+    assert_eq!(flagged, vec![DEFAULT_K8S_VERSION]);
 
     // defaultOnly filter narrows to the single default.
     let resp = svc
@@ -2232,7 +2238,10 @@ async fn describe_cluster_versions_catalog_is_non_empty() {
         .unwrap();
     let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(v["clusterVersions"].as_array().unwrap().len(), 1);
-    assert_eq!(v["clusterVersions"][0]["clusterVersion"], "1.31");
+    assert_eq!(
+        v["clusterVersions"][0]["clusterVersion"],
+        DEFAULT_K8S_VERSION
+    );
 }
 
 #[tokio::test]

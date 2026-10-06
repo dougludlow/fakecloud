@@ -1190,7 +1190,7 @@ const CLUSTER_VERSIONS: &[ClusterVersionRow] = &[
         release: "2024-09-26",
         end_of_standard: "2025-11-26",
         end_of_extended: "2026-11-26",
-        default: true,
+        default: false,
     },
     ClusterVersionRow {
         version: "1.32",
@@ -1217,7 +1217,7 @@ const CLUSTER_VERSIONS: &[ClusterVersionRow] = &[
         release: "2025-10-02",
         end_of_standard: "2026-12-02",
         end_of_extended: "2027-12-02",
-        default: false,
+        default: true,
     },
 ];
 
@@ -1239,7 +1239,7 @@ fn support_status(row: &ClusterVersionRow, as_of: &str) -> &'static str {
 
 /// The `DescribeClusterVersions` catalog: every Kubernetes minor EKS offered
 /// on `CLUSTER_VERSIONS_AS_OF`, ascending, with its support status on that
-/// date. 1.31 is the default.
+/// date. 1.34 is the default (see `DEFAULT_K8S_VERSION`).
 pub(crate) fn cluster_version_catalog(cluster_type: &str) -> Vec<Value> {
     CLUSTER_VERSIONS
         .iter()
