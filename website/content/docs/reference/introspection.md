@@ -14,7 +14,7 @@ This page lists every `/_fakecloud/*` endpoint shipped today: 120 routes across 
 | -------- | ------ | ----------- |
 | `/_fakecloud/health` | GET | Returns `{"status":"ok","version":"<v>","services":[...]}`. |
 | `/_fakecloud/reset/{service}` | POST | Reset all state for a single service. |
-| `/_fakecloud/reset/{service}/{account_id}` | POST | Reset a single service for one account (multi-account setups). |
+| `/_fakecloud/reset/{service}/{account_id}` | POST | Reset a single service for one account (multi-account setups). Organizations has no per-account state and returns `400`. |
 
 ## Instance / container credentials
 

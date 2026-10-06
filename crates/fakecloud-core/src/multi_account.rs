@@ -160,6 +160,14 @@ impl<T: AccountState> MultiAccountState<T> {
         );
     }
 
+    /// Reset one account back to empty state, leaving every other account
+    /// untouched. An account with no state yet stays absent.
+    pub fn reset_account(&mut self, account_id: &str) {
+        if let Some(state) = self.accounts.get_mut(account_id) {
+            *state = T::new_for_account(account_id, &self.region, &self.endpoint);
+        }
+    }
+
     /// Find the first account whose state satisfies `predicate` and return
     /// the account id. Useful for resolving globally-unique resources (e.g.
     /// S3 bucket names) back to their owning account.
@@ -585,6 +593,24 @@ mod tests {
         assert_eq!(mas.account_count(), 1);
         assert!(mas.get("111111111111").is_some());
         assert!(mas.get("222222222222").is_none());
+    }
+
+    #[test]
+    fn reset_account_clears_only_that_account() {
+        let mut mas: MultiAccountState<TestState> =
+            MultiAccountState::new("111111111111", "us-east-1", "http://localhost:4566");
+        mas.default_mut().items.push("a".into());
+        mas.get_or_create("222222222222").items.push("b".into());
+        mas.reset_account("222222222222");
+        assert_eq!(mas.account_count(), 2);
+        assert!(mas.get("222222222222").unwrap().items.is_empty());
+        assert_eq!(
+            mas.get("111111111111").unwrap().items,
+            vec!["a".to_string()]
+        );
+        // An account with no state is not created.
+        mas.reset_account("333333333333");
+        assert!(mas.get("333333333333").is_none());
     }
 
     #[test]

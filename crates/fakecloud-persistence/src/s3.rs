@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -373,6 +373,14 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// Delete what [`S3Store::detach_bucket`] moved aside.
+pub fn remove_detached(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 pub trait S3Store: Send + Sync {
     fn load(&self) -> StoreResult<S3State>;
 
@@ -386,12 +394,21 @@ pub trait S3Store: Send + Sync {
     fn delete_bucket_subresource(&self, bucket: &str, kind: BucketSubresource) -> StoreResult<()>;
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()>;
 
+    /// Move `bucket`'s files out of the store in one atomic rename and return
+    /// where they went, for the caller to delete off the hot path with
+    /// [`remove_detached`]. Once this returns the bucket is gone from the
+    /// store, so a bucket created under the name right after is never the
+    /// thing the later removal deletes. `None` when there was nothing to move
+    /// (or the store holds nothing on disk).
+    fn detach_bucket(&self, _bucket: &str) -> StoreResult<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Whether the store holds any persisted state for `bucket`.
     ///
-    /// A bucket absent from memory can still have files on disk: after
-    /// `/_fakecloud/reset` (which clears memory and leaves the store alone), or
-    /// from a create or delete that stopped partway. Memory-only stores hold
-    /// nothing, hence the default.
+    /// A bucket absent from memory can still have files on disk: from a
+    /// create or delete that stopped partway, or a reset whose bucket deletion
+    /// failed. Memory-only stores hold nothing, hence the default.
     fn bucket_state_exists(&self, _bucket: &str) -> bool {
         false
     }
@@ -604,6 +621,13 @@ impl DiskS3Store {
         self.root.join("buckets")
     }
 
+    /// Where [`S3Store::detach_bucket`] moves buckets awaiting removal. A
+    /// sibling of the buckets directory, so the loader never sees it and the
+    /// rename stays on one filesystem.
+    fn trash_dir(&self) -> PathBuf {
+        self.root.join(".trash")
+    }
+
     fn bucket_dir(&self, bucket: &str) -> PathBuf {
         self.buckets_dir()
             .join(crate::key_escape::escape_key_segment(bucket))
@@ -703,6 +727,9 @@ impl S3Store for DiskS3Store {
         // entries over would keep a bucket whose bad file was repaired
         // un-creatable.
         self.load_refused.write().clear();
+        // Buckets detached by a reset the previous process did not finish
+        // deleting.
+        let _ = std::fs::remove_dir_all(self.trash_dir());
         let mut state = S3State::default();
         let buckets_dir = self.buckets_dir();
         if !buckets_dir.exists() {
@@ -991,6 +1018,31 @@ impl S3Store for DiskS3Store {
             .write()
             .remove(&crate::key_escape::escape_key_segment(bucket));
         Ok(())
+    }
+
+    fn detach_bucket(&self, bucket: &str) -> StoreResult<Option<PathBuf>> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = self.bucket_dir(bucket);
+        let trash = self.trash_dir();
+        std::fs::create_dir_all(&trash)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = trash.join(format!(
+            "{}-{}-{nanos}-{seq}",
+            crate::key_escape::escape_key_segment(bucket),
+            std::process::id()
+        ));
+        match std::fs::rename(&dir, &target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::from(e)),
+        }
+        self.load_refused
+            .write()
+            .remove(&crate::key_escape::escape_key_segment(bucket));
+        Ok(Some(target))
     }
 
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()> {
@@ -1390,6 +1442,40 @@ mod disk_tests {
     fn new_store(tmp: &TempDir) -> DiskS3Store {
         let cache = Arc::new(crate::cache::BodyCache::new(1024 * 1024));
         DiskS3Store::new(tmp.path().to_path_buf(), cache)
+    }
+
+    #[test]
+    fn detach_bucket_moves_it_out_and_a_recreate_survives_the_removal() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let meta = BucketMeta {
+            name: "b".into(),
+            ..Default::default()
+        };
+        store.put_bucket_meta("b", &meta).unwrap();
+        let detached = store.detach_bucket("b").unwrap().expect("moved");
+        assert!(!store.bucket_state_exists("b"));
+        assert!(detached.exists());
+        // Recreated under the same name before the removal runs.
+        store.put_bucket_meta("b", &meta).unwrap();
+        remove_detached(&detached).unwrap();
+        assert!(!detached.exists());
+        assert!(store.bucket_state_exists("b"));
+        // Nothing to move the second time round, and removal is idempotent.
+        store.delete_bucket("b").unwrap();
+        assert_eq!(store.detach_bucket("b").unwrap(), None);
+        remove_detached(&detached).unwrap();
+    }
+
+    #[test]
+    fn load_clears_leftover_detached_buckets() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        store.put_bucket_meta("b", &BucketMeta::default()).unwrap();
+        let detached = store.detach_bucket("b").unwrap().unwrap();
+        let state = store.load().unwrap();
+        assert!(state.buckets.is_empty());
+        assert!(!detached.exists());
     }
 
     fn new_store_with_cache(

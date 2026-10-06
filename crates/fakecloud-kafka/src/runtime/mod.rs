@@ -312,6 +312,11 @@ impl KafkaRuntime {
         }
     }
 
+    /// The cluster ARN of every backing container this runtime tracks.
+    pub fn tracked_clusters(&self) -> Vec<String> {
+        self.containers.read().keys().cloned().collect()
+    }
+
     /// Stop every tracked broker container (graceful shutdown / reset).
     pub async fn stop_all(&self) {
         let containers: Vec<RunningBroker> = {

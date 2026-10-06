@@ -381,6 +381,11 @@ impl MqRuntime {
         }
     }
 
+    /// The broker id of every backing container this runtime tracks.
+    pub fn tracked_brokers(&self) -> Vec<String> {
+        self.containers.read().keys().cloned().collect()
+    }
+
     /// Stop every tracked broker container (graceful shutdown / reset).
     pub async fn stop_all(&self) {
         let containers: Vec<RunningBroker> = {

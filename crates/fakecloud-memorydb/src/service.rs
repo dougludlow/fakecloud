@@ -126,6 +126,21 @@ impl MemoryDbService {
         self
     }
 
+    /// Persist hook for callers that change this service's state from outside
+    /// (the reset endpoints): writes the current snapshot. `None` in memory
+    /// mode.
+    pub fn snapshot_hook(&self) -> Option<fakecloud_persistence::SnapshotHook> {
+        let store = self.snapshot_store.clone()?;
+        Some(fakecloud_persistence::snapshot_hook(
+            self.state.clone(),
+            store,
+            self.snapshot_lock.clone(),
+            |state, store, lock| async move {
+                save_snapshot(&state, Some(store), &lock).await;
+            },
+        ))
+    }
+
     async fn save(&self) {
         save_snapshot(
             &self.state,

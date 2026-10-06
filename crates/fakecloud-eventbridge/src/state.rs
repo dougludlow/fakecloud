@@ -401,6 +401,10 @@ impl EventBridgeState {
         self.buses.clear();
         self.rules.clear();
         self.events.clear();
+        self.archives.clear();
+        self.connections.clear();
+        self.api_destinations.clear();
+        self.replays.clear();
         self.partner_event_sources.clear();
         self.endpoints.clear();
         self.lambda_invocations.clear();
@@ -520,6 +524,78 @@ mod tests {
         assert!(!state.buses.contains_key("default"));
         state.reset();
         assert!(state.buses.contains_key("default"));
+    }
+
+    #[test]
+    fn reset_clears_archives_connections_destinations_and_replays() {
+        let mut state = EventBridgeState::new("123456789012", "us-east-1");
+        let now = Utc::now();
+        state.archives.insert(
+            "a".into(),
+            Archive {
+                name: "a".into(),
+                arn: "arn".into(),
+                event_source_arn: "arn".into(),
+                description: None,
+                event_pattern: None,
+                retention_days: 0,
+                state: "ENABLED".into(),
+                creation_time: now,
+                event_count: 0,
+                size_bytes: 0,
+                events: Vec::new(),
+            },
+        );
+        state.connections.insert(
+            "c".into(),
+            Connection {
+                name: "c".into(),
+                arn: "arn".into(),
+                description: None,
+                authorization_type: "API_KEY".into(),
+                auth_parameters: serde_json::Value::Null,
+                connection_state: "AUTHORIZED".into(),
+                secret_arn: "arn".into(),
+                creation_time: now,
+                last_modified_time: now,
+                last_authorized_time: now,
+            },
+        );
+        state.api_destinations.insert(
+            "d".into(),
+            ApiDestination {
+                name: "d".into(),
+                arn: "arn".into(),
+                description: None,
+                connection_arn: "arn".into(),
+                invocation_endpoint: "https://example.com".into(),
+                http_method: "POST".into(),
+                invocation_rate_limit_per_second: None,
+                state: "ACTIVE".into(),
+                creation_time: now,
+                last_modified_time: now,
+            },
+        );
+        state.replays.insert(
+            "r".into(),
+            Replay {
+                name: "r".into(),
+                arn: "arn".into(),
+                description: None,
+                event_source_arn: "arn".into(),
+                destination: serde_json::Value::Null,
+                event_start_time: now,
+                event_end_time: now,
+                state: "COMPLETED".into(),
+                replay_start_time: now,
+                replay_end_time: None,
+            },
+        );
+        state.reset();
+        assert!(state.archives.is_empty());
+        assert!(state.connections.is_empty());
+        assert!(state.api_destinations.is_empty());
+        assert!(state.replays.is_empty());
     }
 }
 

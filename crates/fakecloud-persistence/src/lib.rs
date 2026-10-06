@@ -14,4 +14,6 @@ pub use s3::{
     MemoryS3Store, MpuInit, ObjectMeta, S3State as S3StateSnapshot, S3Store, StoreError,
     StoreResult, TagsSnapshot, UploadPartMeta, ALL_SUBRESOURCES,
 };
-pub use snapshot::{DiskSnapshotStore, MemorySnapshotStore, SnapshotHook, SnapshotStore};
+pub use snapshot::{
+    snapshot_hook, DiskSnapshotStore, MemorySnapshotStore, SnapshotHook, SnapshotStore,
+};

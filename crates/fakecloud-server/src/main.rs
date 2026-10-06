@@ -1588,7 +1588,9 @@ async fn main() {
         ecs_runtime: ecs_runtime.clone(),
         ec2: ec2_state.clone(),
         ec2_runtime: ec2_runtime.clone(),
+        late: Arc::new(std::sync::OnceLock::new()),
     };
+    let reset_late = reset_state.late.clone();
     // Step 5: CloudFormation delivery (custom resources can invoke Lambda)
     let delivery_for_cf = {
         let mut bus = DeliveryBus::new().with_sns(sns_delivery_for_cf);
@@ -1606,7 +1608,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("cloudformation").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "cloudformation");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -1752,6 +1754,13 @@ async fn main() {
         &'static str,
         fakecloud_persistence::SnapshotHook,
     > = std::collections::BTreeMap::new();
+    // Persist hooks of the snapshot-backed services the CloudFormation
+    // provisioner never touches; together with `cfn_snapshot_hooks` they let
+    // the reset endpoints write a reset through to disk.
+    let mut reset_only_hooks: std::collections::BTreeMap<
+        &'static str,
+        fakecloud_persistence::SnapshotHook,
+    > = std::collections::BTreeMap::new();
     let sqs_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
             let data_path = persistence_config
@@ -1759,7 +1768,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("sqs").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "sqs");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -1847,7 +1856,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("sns").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "sns");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => match fakecloud_sns::parse_sns_snapshot(&bytes) {
@@ -1910,7 +1919,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("eventbridge").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "eventbridge");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -1987,7 +1996,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("iam").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "iam");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2073,7 +2082,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ssm").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ssm");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2179,7 +2188,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("lambda").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "lambda");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2257,7 +2266,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("secretsmanager").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "secretsmanager");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2355,7 +2364,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("kms").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "kms");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2422,7 +2431,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("organizations").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "organizations");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2519,7 +2528,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ec2").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ec2");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2700,7 +2709,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("dynamodb").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "dynamodb");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => match fakecloud_dynamodb::parse_dynamodb_snapshot(&bytes) {
@@ -2897,7 +2906,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ses").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ses");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -2980,7 +2989,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("cognito-idp").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "cognito-idp");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3068,7 +3077,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("kinesis").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "kinesis");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3150,7 +3159,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("rds").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "rds");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3272,7 +3281,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("docdb").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "docdb");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3332,7 +3341,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("neptune").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "neptune");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3389,7 +3398,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("elasticache").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "elasticache");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3475,7 +3484,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ecr").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ecr");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3541,7 +3550,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ecs").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ecs");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3640,7 +3649,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("elbv2").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "elbv2");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3717,7 +3726,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("cloudfront").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "cloudfront");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3787,7 +3796,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("route53").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "route53");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3882,7 +3891,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("acm").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "acm");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -3942,7 +3951,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("acm-pca").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "acm-pca");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4002,7 +4011,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("route53resolver").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "route53resolver");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4067,7 +4076,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("config").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "config");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4129,7 +4138,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("firehose").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "firehose");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4186,7 +4195,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("glue").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "glue");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4248,7 +4257,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("emr").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "emr");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_emr::persistence::load_into(&store, &emr_state) {
                 Ok(fakecloud_emr::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4282,7 +4291,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("textract").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "textract");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_textract::persistence::load_into(&store, &textract_state) {
                 Ok(fakecloud_textract::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4316,7 +4325,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("transcribe").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "transcribe");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_transcribe::persistence::load_into(&store, &transcribe_state) {
                 Ok(fakecloud_transcribe::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4352,7 +4361,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("translate").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "translate");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_translate::persistence::load_into(&store, &translate_state) {
                 Ok(fakecloud_translate::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4388,7 +4397,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("swf").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "swf");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_swf::persistence::load_into(&store, &swf_state) {
                 Ok(fakecloud_swf::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4424,7 +4433,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("timestream").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "timestream");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_timestream::persistence::load_into(&store, &timestream_state) {
                 Ok(fakecloud_timestream::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4462,7 +4471,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("shield").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "shield");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_shield::persistence::load_into(&store, &shield_state) {
                 Ok(fakecloud_shield::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4496,7 +4505,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("comprehend").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "comprehend");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_comprehend::persistence::load_into(&store, &comprehend_state) {
                 Ok(fakecloud_comprehend::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4531,7 +4540,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("servicequotas").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "servicequotas");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_servicequotas::persistence::load_into(&store, &servicequotas_state) {
                 Ok(fakecloud_servicequotas::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4592,7 +4601,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("support").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "support");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_support::persistence::load_into(&store, &support_state) {
                 Ok(fakecloud_support::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -4625,7 +4634,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("cloudwatch").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "cloudwatch");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4680,9 +4689,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path
-                .join("application-autoscaling")
-                .join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "application-autoscaling");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4748,7 +4755,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("autoscaling").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "autoscaling");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4820,7 +4827,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("batch").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "batch");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4879,7 +4886,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("pipes").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "pipes");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4937,7 +4944,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("wafv2").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "wafv2");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -4997,7 +5004,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("athena").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "athena");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5057,7 +5064,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("redshift").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "redshift");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5134,7 +5141,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("stepfunctions").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "stepfunctions");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5211,7 +5218,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("apigatewayv2").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "apigatewayv2");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5293,7 +5300,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("apigatewayv1").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "apigatewayv1");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5383,7 +5390,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("bedrock").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "bedrock");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5447,7 +5454,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("bedrock-agent").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "bedrock-agent");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -5505,9 +5512,7 @@ async fn main() {
             .as_ref()
             .expect("validated above")
             .clone();
-        let path = data_path
-            .join("bedrock-agent-runtime")
-            .join("snapshot.json");
+        let path = reset::snapshot_store_path(&data_path, "bedrock-agent-runtime");
         let store = fakecloud_persistence::DiskSnapshotStore::new(path);
         match fakecloud_persistence::SnapshotStore::load(&store) {
             Ok(Some(bytes)) => {
@@ -5558,6 +5563,9 @@ async fn main() {
     if let Some(store) = bedrock_agent_runtime_snapshot_store {
         bedrock_agent_runtime_service = bedrock_agent_runtime_service.with_snapshot_store(store);
     }
+    if let Some(h) = bedrock_agent_runtime_service.snapshot_hook() {
+        reset_only_hooks.insert("bedrock-agent-runtime", h);
+    }
     registry.register(Arc::new(bedrock_agent_runtime_service));
     let scheduler_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
@@ -5566,7 +5574,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("scheduler").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "scheduler");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_scheduler::persistence::load_into(&store, &scheduler_state) {
                 Ok(fakecloud_scheduler::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5603,7 +5611,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("dsql").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "dsql");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_dsql::persistence::load_into(&store, &dsql_state) {
                 Ok(fakecloud_dsql::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5638,7 +5646,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("resource-groups").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "resource-groups");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_resource_groups::persistence::load_into(&store, &resource_groups_state)
             {
@@ -5666,6 +5674,9 @@ async fn main() {
     if let Some(store) = resource_groups_snapshot_store {
         resource_groups_service = resource_groups_service.with_snapshot_store(store);
     }
+    if let Some(h) = resource_groups_service.snapshot_hook() {
+        reset_only_hooks.insert("resource-groups", h);
+    }
     registry.register(Arc::new(resource_groups_service));
 
     // Account Management control plane.
@@ -5676,7 +5687,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("account").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "account");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_account::persistence::load_into(&store, &account_state) {
                 Ok(fakecloud_account::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5695,6 +5706,9 @@ async fn main() {
     if let Some(store) = account_snapshot_store {
         account_service = account_service.with_snapshot_store(store);
     }
+    if let Some(h) = account_service.snapshot_hook() {
+        reset_only_hooks.insert("account", h);
+    }
     registry.register(Arc::new(account_service));
 
     // IAM Identity Center Identity Store control plane.
@@ -5705,7 +5719,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("identitystore").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "identitystore");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_identitystore::persistence::load_into(&store, &identitystore_state) {
                 Ok(fakecloud_identitystore::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5741,6 +5755,9 @@ async fn main() {
     if let Some(store) = identitystore_snapshot_store {
         identitystore_service = identitystore_service.with_snapshot_store(store);
     }
+    if let Some(h) = identitystore_service.snapshot_hook() {
+        reset_only_hooks.insert("identitystore", h);
+    }
     registry.register(Arc::new(identitystore_service));
 
     // IAM Identity Center SSO Admin control plane.
@@ -5751,7 +5768,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ssoadmin").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ssoadmin");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_ssoadmin::persistence::load_into(&store, &ssoadmin_state) {
                 Ok(fakecloud_ssoadmin::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5775,6 +5792,9 @@ async fn main() {
     if let Some(store) = ssoadmin_snapshot_store {
         ssoadmin_service = ssoadmin_service.with_snapshot_store(store);
     }
+    if let Some(h) = ssoadmin_service.snapshot_hook() {
+        reset_only_hooks.insert("ssoadmin", h);
+    }
     registry.register(Arc::new(ssoadmin_service));
 
     // Database Migration Service control plane.
@@ -5785,7 +5805,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("dms").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "dms");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_dms::persistence::load_into(&store, &dms_state) {
                 Ok(fakecloud_dms::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5806,6 +5826,9 @@ async fn main() {
     if let Some(store) = dms_snapshot_store {
         dms_service = dms_service.with_snapshot_store(store);
     }
+    if let Some(h) = dms_service.snapshot_hook() {
+        reset_only_hooks.insert("dms", h);
+    }
     registry.register(Arc::new(dms_service));
 
     // CloudTrail control plane.
@@ -5816,7 +5839,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("cloudtrail").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "cloudtrail");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_cloudtrail::persistence::load_into(&store, &cloudtrail_state) {
                 Ok(fakecloud_cloudtrail::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5836,6 +5859,9 @@ async fn main() {
     if let Some(store) = cloudtrail_snapshot_store {
         cloudtrail_service = cloudtrail_service.with_snapshot_store(store);
     }
+    if let Some(h) = cloudtrail_service.snapshot_hook() {
+        reset_only_hooks.insert("cloudtrail", h);
+    }
     registry.register(Arc::new(cloudtrail_service));
 
     // Cost Explorer control plane.
@@ -5846,7 +5872,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ce").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ce");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_ce::persistence::load_into(&store, &ce_state) {
                 Ok(fakecloud_ce::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5865,6 +5891,9 @@ async fn main() {
     if let Some(store) = ce_snapshot_store {
         ce_service = ce_service.with_snapshot_store(store);
     }
+    if let Some(h) = ce_service.snapshot_hook() {
+        reset_only_hooks.insert("ce", h);
+    }
     registry.register(Arc::new(ce_service));
 
     // Transfer Family control plane.
@@ -5875,7 +5904,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("transfer").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "transfer");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_transfer::persistence::load_into(&store, &transfer_state) {
                 Ok(fakecloud_transfer::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5894,6 +5923,9 @@ async fn main() {
     if let Some(store) = transfer_snapshot_store {
         transfer_service = transfer_service.with_snapshot_store(store);
     }
+    if let Some(h) = transfer_service.snapshot_hook() {
+        reset_only_hooks.insert("transfer", h);
+    }
     registry.register(Arc::new(transfer_service));
 
     // Verified Permissions control plane + Cedar authorization.
@@ -5904,7 +5936,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("verifiedpermissions").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "verifiedpermissions");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_verifiedpermissions::persistence::load_into(
                 &store,
@@ -5931,6 +5963,9 @@ async fn main() {
     if let Some(store) = verifiedpermissions_snapshot_store {
         verifiedpermissions_service = verifiedpermissions_service.with_snapshot_store(store);
     }
+    if let Some(h) = verifiedpermissions_service.snapshot_hook() {
+        reset_only_hooks.insert("verifiedpermissions", h);
+    }
     registry.register(Arc::new(verifiedpermissions_service));
 
     // MemoryDB control plane.
@@ -5941,7 +5976,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("memorydb").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "memorydb");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_memorydb::persistence::load_into(&store, &memorydb_state) {
                 Ok(fakecloud_memorydb::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -5961,6 +5996,9 @@ async fn main() {
     if let Some(store) = memorydb_snapshot_store {
         memorydb_service = memorydb_service.with_snapshot_store(store);
     }
+    if let Some(h) = memorydb_service.snapshot_hook() {
+        reset_only_hooks.insert("memorydb", h);
+    }
     registry.register(Arc::new(memorydb_service));
 
     // Amazon Managed Service for Apache Flink (kinesisanalyticsv2) control plane.
@@ -5971,7 +6009,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("kinesisanalyticsv2").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "kinesisanalyticsv2");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_kinesisanalyticsv2::persistence::load_into(
                 &store,
@@ -6003,7 +6041,8 @@ async fn main() {
     // in-process S3 reader used to fetch the application's code JAR. `None` when
     // no container CLI is available or the backend is disabled -> the app stays
     // on the control-plane state machine.
-    if let Some(flink_runtime) = fakecloud_kinesisanalyticsv2::FlinkRuntime::new().map(Arc::new) {
+    let flink_runtime = fakecloud_kinesisanalyticsv2::FlinkRuntime::new().map(Arc::new);
+    if let Some(flink_runtime) = flink_runtime.clone() {
         kinesisanalyticsv2_service = kinesisanalyticsv2_service
             .with_runtime(flink_runtime)
             .with_s3(s3_delivery_for_logs.clone());
@@ -6029,7 +6068,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("servicediscovery").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "servicediscovery");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_servicediscovery::persistence::load_into(
                 &store,
@@ -6067,7 +6106,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("eks").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "eks");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_eks::persistence::load_into(&store, &eks_state) {
                 Ok(fakecloud_eks::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6123,7 +6162,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("glacier").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "glacier");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_glacier::persistence::load_into(&store, &glacier_state) {
                 Ok(fakecloud_glacier::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6161,7 +6200,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("elasticbeanstalk").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "elasticbeanstalk");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
@@ -6227,7 +6266,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("backup").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "backup");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_backup::persistence::load_into(&store, &backup_state) {
                 Ok(fakecloud_backup::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6259,7 +6298,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("ram").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "ram");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_ram::persistence::load_into(&store, &ram_state) {
                 Ok(fakecloud_ram::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6291,7 +6330,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("s3tables").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "s3tables");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_s3tables::persistence::load_into(&store, &s3tables_state) {
                 Ok(fakecloud_s3tables::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6323,7 +6362,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("lakeformation").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "lakeformation");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_lakeformation::persistence::load_into(&store, &lakeformation_state) {
                 Ok(fakecloud_lakeformation::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6356,7 +6395,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("codebuild").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "codebuild");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_codebuild::persistence::load_into(&store, &codebuild_state) {
                 Ok(fakecloud_codebuild::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6384,6 +6423,7 @@ async fn main() {
     if let Some(h) = codebuild_service.snapshot_hook() {
         cfn_snapshot_hooks.insert("codebuild", h);
     }
+    let codebuild_running = codebuild_service.running_builds();
     registry.register(Arc::new(codebuild_service));
 
     // AWS CodeConnections: awsJson1.0 control plane (connections, hosts,
@@ -6395,7 +6435,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("codeconnections").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "codeconnections");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_codeconnections::persistence::load_into(&store, &codeconnections_state)
             {
@@ -6430,7 +6470,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("codedeploy").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "codedeploy");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_codedeploy::persistence::load_into(&store, &codedeploy_state) {
                 Ok(fakecloud_codedeploy::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6464,7 +6504,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("codepipeline").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "codepipeline");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_codepipeline::persistence::load_into(&store, &codepipeline_state) {
                 Ok(fakecloud_codepipeline::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6498,7 +6538,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("codeartifact").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "codeartifact");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_codeartifact::persistence::load_into(&store, &codeartifact_state) {
                 Ok(fakecloud_codeartifact::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6533,7 +6573,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("efs").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "efs");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_efs::persistence::load_into(&store, &efs_state) {
                 Ok(fakecloud_efs::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6568,7 +6608,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("mq").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "mq");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_mq::persistence::load_into(&store, &mq_state) {
                 Ok(fakecloud_mq::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6615,7 +6655,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("kafka").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "kafka");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_kafka::persistence::load_into(&store, &kafka_state) {
                 Ok(fakecloud_kafka::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6662,7 +6702,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("codecommit").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "codecommit");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_codecommit::persistence::load_into(&store, &codecommit_state) {
                 Ok(fakecloud_codecommit::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6696,7 +6736,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("opensearch").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "opensearch");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_opensearch::persistence::load_into(&store, &opensearch_state) {
                 Ok(fakecloud_opensearch::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6730,7 +6770,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("appconfig").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "appconfig");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_appconfig::persistence::load_into(&store, &appconfig_state) {
                 Ok(fakecloud_appconfig::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6761,7 +6801,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("mwaa").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "mwaa");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_mwaa::persistence::load_into(&store, &mwaa_state) {
                 Ok(fakecloud_mwaa::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6792,7 +6832,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("xray").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "xray");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_xray::persistence::load_into(&store, &xray_state) {
                 Ok(fakecloud_xray::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6823,7 +6863,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("appsync").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "appsync");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_appsync::persistence::load_into(&store, &appsync_state) {
                 Ok(fakecloud_appsync::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6854,7 +6894,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("amplify").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "amplify");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_amplify::persistence::load_into(&store, &amplify_state) {
                 Ok(fakecloud_amplify::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6885,7 +6925,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("mediaconvert").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "mediaconvert");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_mediaconvert::persistence::load_into(&store, &mediaconvert_state) {
                 Ok(fakecloud_mediaconvert::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6917,7 +6957,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("serverlessrepo").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "serverlessrepo");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_serverlessrepo::persistence::load_into(&store, &serverlessrepo_state) {
                 Ok(fakecloud_serverlessrepo::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6949,7 +6989,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("iotdata").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "iotdata");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_iotdata::persistence::load_into(&store, &iotdata_state) {
                 Ok(fakecloud_iotdata::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -6983,7 +7023,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("pinpoint").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "pinpoint");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_pinpoint::persistence::load_into(&store, &pinpoint_state) {
                 Ok(fakecloud_pinpoint::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -7014,7 +7054,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("iot").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "iot");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_iot::persistence::load_into(&store, &iot_state) {
                 Ok(fakecloud_iot::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -7045,7 +7085,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("iotwireless").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "iotwireless");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_iotwireless::persistence::load_into(&store, &iotwireless_state) {
                 Ok(fakecloud_iotwireless::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -7077,7 +7117,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("sagemaker").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "sagemaker");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_sagemaker::persistence::load_into(&store, &sagemaker_state) {
                 Ok(fakecloud_sagemaker::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -7108,7 +7148,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("managedblockchain").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "managedblockchain");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_managedblockchain::persistence::load_into(
                 &store,
@@ -7145,7 +7185,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("fis").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "fis");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_fis::persistence::load_into(&store, &fis_state) {
                 Ok(fakecloud_fis::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -7196,9 +7236,7 @@ async fn main() {
             .as_ref()
             .expect("validated above")
             .clone();
-        let path = data_path
-            .join("resource-groups-tagging")
-            .join("snapshot.json");
+        let path = reset::snapshot_store_path(&data_path, "resource-groups-tagging");
         let store = fakecloud_persistence::DiskSnapshotStore::new(path);
         match fakecloud_resource_groups_tagging::persistence::load_into(
             &store,
@@ -7221,14 +7259,22 @@ async fn main() {
     } else {
         None
     };
-    registry.register(Arc::new(
+    let resource_groups_tagging_service =
         fakecloud_resource_groups_tagging::ResourceGroupsTaggingService::new(
             resource_groups_tagging_state.clone(),
             tag_provider_registry.clone(),
             resource_groups_tagging_snapshot_store,
-        ),
-    ));
+        );
+    if let Some(h) = resource_groups_tagging_service.snapshot_hook() {
+        reset_only_hooks.insert("resource-groups-tagging", h);
+    }
+    registry.register(Arc::new(resource_groups_tagging_service));
 
+    if let Some(h) = cloudformation_service.snapshot_hook() {
+        reset_only_hooks.insert("cloudformation", h);
+    }
+    // The reset endpoints persist through the same hooks (see `reset_late`).
+    let mut reset_hooks = cfn_snapshot_hooks.clone();
     let cloudformation_service = cloudformation_service
         .with_s3_store(s3_store.clone())
         .with_kms_hook(kms_hook_for_services.clone())
@@ -7262,7 +7308,7 @@ async fn main() {
                 .as_ref()
                 .expect("validated above")
                 .clone();
-            let path = data_path.join("cloudcontrol").join("snapshot.json");
+            let path = reset::snapshot_store_path(&data_path, "cloudcontrol");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_cloudcontrol::persistence::load_into(&store, &cloudcontrol_state) {
                 Ok(fakecloud_cloudcontrol::persistence::LoadOutcome::Loaded(accounts)) => {
@@ -7284,7 +7330,105 @@ async fn main() {
     if let Some(store) = cloudcontrol_snapshot_store {
         cloudcontrol_service = cloudcontrol_service.with_snapshot_store(store);
     }
+    if let Some(h) = cloudcontrol_service.snapshot_hook() {
+        reset_only_hooks.insert("cloudcontrol", h);
+    }
     registry.register(Arc::new(cloudcontrol_service));
+    // Every service is built: hand the reset endpoints the wiring they need
+    // to write a reset through to disk and to clear the services that have
+    // no dedicated `ResetState` field.
+    {
+        // Organizations gets its plain persist hook: the provisioner's also
+        // fires StackSets auto-deployment, which a reset has no part in.
+        reset_hooks.append(&mut reset_only_hooks);
+        if let Some(h) = organizations_persist_hook.clone() {
+            reset_hooks.insert("organizations", h);
+        }
+        let late = reset::LateReset::new(
+            reset_hooks,
+            reset::reset_services(reset::ResetServiceStates {
+                account: account_state.clone(),
+                amplify: amplify_state.clone(),
+                appconfig: appconfig_state.clone(),
+                appsync: appsync_state.clone(),
+                autoscaling: autoscaling_state.clone(),
+                backup: backup_state.clone(),
+                batch: batch_state.clone(),
+                ce: ce_state.clone(),
+                cloudcontrol: cloudcontrol_state.clone(),
+                cloudtrail: cloudtrail_state.clone(),
+                codeartifact: codeartifact_state.clone(),
+                codebuild: codebuild_state.clone(),
+                codecommit: codecommit_state.clone(),
+                codeconnections: codeconnections_state.clone(),
+                codedeploy: codedeploy_state.clone(),
+                codepipeline: codepipeline_state.clone(),
+                comprehend: comprehend_state.clone(),
+                dms: dms_state.clone(),
+                docdb: docdb_state.clone(),
+                dsql: dsql_state.clone(),
+                efs: efs_state.clone(),
+                eks: eks_state.clone(),
+                elasticbeanstalk: beanstalk_state.clone(),
+                elbv2: elbv2_state.clone(),
+                emr: emr_state.clone(),
+                fis: fis_state.clone(),
+                glacier: glacier_state.clone(),
+                identitystore: identitystore_state.clone(),
+                iot: iot_state.clone(),
+                iotdata: iotdata_state.clone(),
+                iotwireless: iotwireless_state.clone(),
+                kafka: kafka_state.clone(),
+                kafka_runtime: kafka_runtime.clone(),
+                kinesisanalyticsv2: kinesisanalyticsv2_state.clone(),
+                flink_runtime: flink_runtime.clone(),
+                lakeformation: lakeformation_state.clone(),
+                managedblockchain: managedblockchain_state.clone(),
+                mediaconvert: mediaconvert_state.clone(),
+                memorydb: memorydb_state.clone(),
+                mq: mq_state.clone(),
+                mq_runtime: mq_runtime.clone(),
+                codebuild_running: Some(codebuild_running.clone()),
+                mwaa: mwaa_state.clone(),
+                neptune: neptune_state.clone(),
+                opensearch: opensearch_state.clone(),
+                pinpoint: pinpoint_state.clone(),
+                pipes: pipes_state.clone(),
+                ram: ram_state.clone(),
+                redshift: redshift_state.clone(),
+                resource_groups: resource_groups_state.clone(),
+                resource_groups_tagging: resource_groups_tagging_state.clone(),
+                s3tables: s3tables_state.clone(),
+                sagemaker: sagemaker_state.clone(),
+                serverlessrepo: serverlessrepo_state.clone(),
+                servicediscovery: servicediscovery_state.clone(),
+                shield: shield_state.clone(),
+                ssoadmin: ssoadmin_state.clone(),
+                support: support_state.clone(),
+                swf: swf_state.clone(),
+                textract: textract_state.clone(),
+                timestream: timestream_state.clone(),
+                transcribe: transcribe_state.clone(),
+                transfer: transfer_state.clone(),
+                translate: translate_state.clone(),
+                verifiedpermissions: verifiedpermissions_state.clone(),
+                xray: xray_state.clone(),
+            }),
+            Some(s3_store.clone()),
+        );
+        // A snapshot-backed service the reset can't reach would come back
+        // from disk after `/_fakecloud/reset`. The reset unit tests hold the
+        // wiring complete; this names any gap a build still ships. Memory
+        // mode registers no hooks, so there is nothing to check there.
+        if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
+            for gap in late.gaps() {
+                tracing::warn!(%gap, "reset wiring gap: a reset may not persist");
+            }
+        }
+        if reset_late.set(late).is_err() {
+            unreachable!("reset wiring is filled once");
+        }
+    }
     // Spawn the Scheduler firing loop as a background task. Mirrors
     // EventBridge's delivery bus so every target type Scheduler
     // routes (`:sqs:`, `:sns:`, `:lambda:`, `:states:`, `:events:`)
@@ -9336,7 +9480,7 @@ async fn main() {
                         {
                             let data_path = std::path::PathBuf::from(data_path);
                             let store = fakecloud_persistence::DiskSnapshotStore::new(
-                                data_path.join("dynamodb").join("snapshot.json"),
+                                reset::snapshot_file_path(&data_path, "dynamodb"),
                             );
                             service
                                 .save_snapshot_to_store(Arc::new(store))
@@ -11686,9 +11830,9 @@ async fn main() {
                                 })),
                             )
                         }
-                        Err(msg) => (
-                            axum::http::StatusCode::NOT_FOUND,
-                            axum::Json(serde_json::json!({ "error": msg })),
+                        Err(err) => (
+                            err.status(),
+                            axum::Json(serde_json::json!({ "error": err.message() })),
                         ),
                     }
                 }
@@ -11709,9 +11853,9 @@ async fn main() {
                                 })),
                             )
                         }
-                        Err(msg) => (
-                            axum::http::StatusCode::NOT_FOUND,
-                            axum::Json(serde_json::json!({ "error": msg })),
+                        Err(err) => (
+                            err.status(),
+                            axum::Json(serde_json::json!({ "error": err.message() })),
                         ),
                     }
                 }
@@ -12049,11 +12193,13 @@ async fn main() {
                 let iam = iam_state.clone();
                 let orgs = organizations_state.clone();
                 let persist = organizations_persist_hook.clone();
+                let iam_persist = reset_late.get().and_then(|l| l.hook("iam"));
                 let changed = org_change_hooks.clone();
                 move |axum::Json(body): axum::Json<types::CreateAdminRequest>| {
                     let iam = iam.clone();
                     let orgs = orgs.clone();
                     let persist = persist.clone();
+                    let iam_persist = iam_persist.clone();
                     let changed = changed.clone();
                     async move {
                         // Membership of the NAMED organization, not of any
@@ -12084,6 +12230,11 @@ async fn main() {
                                     .into_response();
                             }
                         };
+                        // The admin user and its access key live in IAM state:
+                        // write them through, or a restart forgets them.
+                        if let Some(hook) = &iam_persist {
+                            hook().await;
+                        }
                         // Only an explicit `organizationId` mutates org state.
                         // A standalone bootstrap leaves every organization
                         // untouched, so there is nothing to persist or notify.

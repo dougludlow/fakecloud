@@ -1289,6 +1289,19 @@ impl CloudFormationService {
         self
     }
 
+    /// Persist hook for callers that change CloudFormation state from outside
+    /// the service (the reset endpoints): writes the current snapshot. `None`
+    /// in memory mode.
+    pub fn snapshot_hook(&self) -> Option<SnapshotHook> {
+        let store = self.snapshot_store.clone()?;
+        Some(fakecloud_persistence::snapshot_hook(
+            self.state.clone(),
+            store,
+            self.snapshot_lock.clone(),
+            |state, store, lock| save_snapshot_static(state, Some(store), lock),
+        ))
+    }
+
     pub(crate) async fn save_snapshot(&self) {
         let Some(store) = self.snapshot_store.clone() else {
             return;
